@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RuleHawk — firewall &amp; segmentation auditor</title>
+<meta name="description" content="Paste a Cisco IOS / ASA firewall config and get a ranked list of dead, shadowed, redundant, and dangerously-permissive rules in seconds. Runs entirely in your browser — your config never leaves your machine." />
+<!--
+  RuleHawk web demo — 100% client-side.
+  The engine under docs/rulehawk/ is a VENDORED copy of the top-level rulehawk/
+  package, served same-origin so the analysis runs in-browser via Pyodide and
+  the pasted config never touches a server. Re-sync after engine changes with:
+      make sync-web      (see Makefile)
+-->
+<style>
+  :root{
+    --bg:#fafaf9; --surface:#fff; --border:#e5e5e5; --border-strong:#d4d4d4;
+    --text:#1c1c1a; --muted:#57534e; --faint:#8a857e; --accent:#4f46e5;
+    --crit:#b42318; --crit-bg:#fef3f2; --high:#b54708; --high-bg:#fffaeb;
+    --med:#854d0e; --med-bg:#fefce8; --low:#475467; --low-bg:#f2f4f7; --ok:#067647;
+    --mono:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.5;}
+  .wrap{max-width:920px;margin:0 auto;padding:32px 20px 64px;}
+  header.top{display:flex;align-items:center;gap:12px;margin-bottom:6px;}
+  .logo{width:30px;height:30px;color:var(--accent);flex:0 0 auto}
+  h1{font-size:22px;font-weight:680;letter-spacing:-.01em;margin:0}
+  .sub{color:var(--muted);font-size:15px;margin:4px 0 0}
+  .ghlink{margin-left:auto;font-size:13px;color:var(--muted);text-decoration:none;
+    border:1px solid var(--border-strong);padding:6px 10px;border-radius:6px;white-space:nowrap}
+  .ghlink:hover{color:var(--text);border-color:var(--faint)}
+  .privacy{display:flex;gap:9px;align-items:flex-start;margin:18px 0 22px;
+    background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:11px 13px;
+    font-size:13.5px;color:#14532d}
+  .privacy b{font-weight:650}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:18px}
+  label.fld{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:7px}
+  textarea{width:100%;font-family:var(--mono);font-size:13px;line-height:1.55;
+    border:1px solid var(--border-strong);border-radius:7px;padding:11px;resize:vertical;
+    background:#fcfcfb;color:var(--text)}
+  #config{min-height:190px}
+  #policy{min-height:96px}
+  .row{display:flex;gap:9px;flex-wrap:wrap;align-items:center;margin-top:12px}
+  button{font:inherit;font-size:14px;font-weight:550;cursor:pointer;border-radius:7px;
+    padding:9px 16px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text)}
+  button:hover{border-color:var(--faint)}
+  button.primary{background:#1c1c1a;color:#fff;border-color:#1c1c1a}
+  button.primary:hover{background:#000}
+  button:disabled{opacity:.5;cursor:default}
+  .linkbtn{background:none;border:none;color:var(--accent);padding:0;font-size:13px}
+  .linkbtn:hover{text-decoration:underline}
+  details.adv{margin-top:14px;border-top:1px solid var(--border);padding-top:12px}
+  details.adv summary{cursor:pointer;font-size:13px;color:var(--muted);font-weight:550}
+  .status{font-size:13px;color:var(--faint);margin:2px 0 0;min-height:18px}
+  .status.err{color:var(--crit)}
+  .spin{display:inline-block;width:12px;height:12px;border:2px solid var(--border-strong);
+    border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  /* results */
+  #results{display:none}
+  .scorebar{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-bottom:8px}
+  .score{font-size:34px;font-weight:720;letter-spacing:-.02em}
+  .score small{font-size:15px;font-weight:500;color:var(--faint)}
+  .chips{display:flex;gap:7px;flex-wrap:wrap}
+  .chip{font-size:12px;font-weight:600;padding:3px 9px;border-radius:20px;border:1px solid}
+  .chip.c{color:var(--crit);background:var(--crit-bg);border-color:#fecaca}
+  .chip.h{color:var(--high);background:var(--high-bg);border-color:#fde68a}
+  .chip.m{color:var(--med);background:var(--med-bg);border-color:#fde68a}
+  .chip.l{color:var(--low);background:var(--low-bg);border-color:var(--border-strong)}
+  .chip.zero{color:var(--faint);background:var(--surface);border-color:var(--border)}
+  .finding{border:1px solid var(--border);border-left-width:3px;border-radius:7px;padding:12px 14px;margin-top:11px}
+  .finding.critical{border-left-color:var(--crit)} .finding.high{border-left-color:var(--high)}
+  .finding.medium{border-left-color:var(--med)} .finding.low{border-left-color:var(--low)}
+  .finding.info{border-left-color:var(--faint)}
+  .fhead{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:6px}
+  .sev{font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:2px 7px;border-radius:4px}
+  .sev.critical{color:#fff;background:var(--crit)} .sev.high{color:#fff;background:var(--high)}
+  .sev.medium{color:#fff;background:var(--med)} .sev.low{color:#fff;background:var(--low)}
+  .sev.info{color:#fff;background:var(--faint)}
+  .kind{font-size:13px;font-weight:600} .rid{font-size:12px;color:var(--faint);font-family:var(--mono)}
+  .frule{font-family:var(--mono);font-size:12.5px;background:#f7f7f6;border-radius:5px;padding:5px 8px;margin:5px 0;overflow-x:auto}
+  .frow{font-size:13.5px;margin:3px 0} .frow b{color:var(--muted);font-weight:600}
+  .cause{color:var(--crit)} .fix{color:var(--ok)}
+  .notes{margin-top:16px;font-size:12.5px;color:var(--muted)}
+  .notes code{font-family:var(--mono);background:#f2f4f7;padding:1px 4px;border-radius:3px}
+  .empty{padding:14px;text-align:center;color:var(--ok);font-weight:600}
+  .norules{padding:14px;background:var(--high-bg);border:1px solid #fde68a;border-radius:7px;color:var(--med);font-size:14px}
+  footer{margin-top:10px;font-size:13px;color:var(--muted)}
+  footer code{font-family:var(--mono);background:#f2f4f7;padding:2px 6px;border-radius:4px;font-size:12.5px}
+  footer .cli{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin:8px 0}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 4 6v6c0 5 3.5 7.5 8 10 4.5-2.5 8-5 8-10V6l-8-4z"/><path d="m9 12 2 2 4-4"/></svg>
+    <div>
+      <h1>RuleHawk</h1>
+      <p class="sub">Firewall &amp; segmentation auditor — paste a config, get verifiable findings in seconds.</p>
+    </div>
+    <a class="ghlink" href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">View on GitHub ↗</a>
+  </header>
+
+  <div class="privacy">
+    <span aria-hidden="true">🔒</span>
+    <span><b>Runs entirely in your browser.</b> Your config is analyzed locally via WebAssembly — it never leaves your machine, is never uploaded, and nothing is stored. It's the same open-source engine you can <a href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">read and run yourself</a>.</span>
+  </div>
+
+  <div class="card">
+    <label class="fld" for="config">Firewall / ACL config (Cisco IOS extended ACL or ASA access-list)</label>
+    <textarea id="config" spellcheck="false" placeholder="ip access-list extended EDGE_IN&#10; permit tcp any host 203.0.113.10 eq 443&#10; ..."></textarea>
+    <div class="row">
+      <button class="primary" id="audit" disabled>Audit</button>
+      <button id="sample">Load sample</button>
+      <button id="clear">Clear</button>
+      <span class="status" id="status"><span class="spin"></span>Loading analysis engine…</span>
+    </div>
+    <details class="adv">
+      <summary>Segmentation policy (optional, advanced)</summary>
+      <p style="font-size:13px;color:var(--muted);margin:10px 0 7px">
+        Declare zones and <code>must_not_reach</code> rules; RuleHawk proves isolation or returns a concrete witness packet the ACL wrongly permits.</p>
+      <textarea id="policy" spellcheck="false" placeholder='{"zones":{"PCI":["10.10.0.0/16"],"CORP":["10.20.0.0/16"]},"must_not_reach":[{"src":"CORP","dst":"PCI","proto":"tcp","ports":[445,3389,22]}]}'></textarea>
+      <div class="row"><button id="samplePolicy" class="linkbtn">load sample policy</button></div>
+    </details>
+  </div>
+
+  <div class="card" id="results"></div>
+
+  <footer>
+    <div>Prefer the terminal? It's a one-file install — runs locally, scriptable, CI-ready:</div>
+    <div class="cli"><code>pipx run rulehawk acl.txt</code> &nbsp;·&nbsp; or <code>pip install rulehawk &amp;&amp; rulehawk acl.txt --json</code></div>
+    <div>Open-source (Apache-2.0) · <a href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">github.com/optimesh-ai/RuleHawk</a> · exits non-zero on critical/high for CI gating.</div>
+  </footer>
+</div>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script>
+const SAMPLE_ACL = `! Sample Cisco IOS extended ACL with intentional, realistic problems
+ip access-list extended EDGE_IN
+ permit tcp any host 203.0.113.10 eq 443
+ deny tcp 10.0.0.0 0.255.255.255 any eq 23
+ permit tcp 10.0.0.0 0.255.255.255 host 203.0.113.10 eq 23
+ permit tcp any any eq 3389
+ permit tcp host 198.51.100.5 host 203.0.113.10 eq 443
+ deny ip 192.168.0.0 0.0.255.255 any
+ permit ip 192.168.5.0 0.0.0.255 any
+ permit tcp any any eq 445
+ permit ip any any
+ deny tcp any any eq 22`;
+const SAMPLE_POLICY = `{
+  "zones": { "PCI": ["10.10.0.0/16"], "CORP": ["10.20.0.0/16"], "DMZ": ["203.0.113.0/24"] },
+  "must_not_reach": [
+    {"src": "CORP", "dst": "PCI", "proto": "tcp", "ports": [445, 3389, 22]},
+    {"src": "DMZ",  "dst": "PCI", "proto": "ip"}
+  ]
+}`;
+const ENGINE_MODULES = ["__init__","model","parse","analyze","report","segcheck"];
+
+const $ = id => document.getElementById(id);
+const statusEl = $("status"), auditBtn = $("audit");
+function setStatus(html, isErr){ statusEl.className = "status" + (isErr?" err":""); statusEl.innerHTML = html; }
+function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+let pyodide = null;
+(async function boot(){
+  try{
+    pyodide = await loadPyodide();
+    pyodide.FS.mkdir("rulehawk");
+    for(const m of ENGINE_MODULES){
+      const r = await fetch(`./rulehawk/${m}.py`, {cache:"no-cache"});
+      if(!r.ok) throw new Error(`could not load engine module ${m}.py (${r.status})`);
+      pyodide.FS.writeFile(`rulehawk/${m}.py`, await r.text());
+    }
+    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
+    setStatus("Ready — paste a config and click Audit.");
+    auditBtn.disabled = false;
+  }catch(e){
+    setStatus("Failed to load the engine: " + esc(e.message), true);
+  }
+})();
+
+function audit(){
+  if(!pyodide){ return; }
+  const cfg = $("config").value;
+  if(!cfg.trim()){ setStatus("Paste a config first (or click “Load sample”).", true); return; }
+  setStatus('<span class="spin"></span>Analyzing…');
+  auditBtn.disabled = true;
+  // defer so the spinner paints before the (fast) synchronous run
+  setTimeout(() => {
+    try{
+      pyodide.globals.set("cfg", cfg);
+      pyodide.globals.set("pol", $("policy").value || "");
+      const out = pyodide.runPython(`
+import json
+from rulehawk.parse import parse_acls
+from rulehawk.analyze import analyze
+from rulehawk.report import to_json
+from rulehawk.segcheck import check_segmentation
+aces, notes = parse_acls(cfg)
+findings = analyze(aces)
+_pol = pol.strip()
+if _pol:
+    try:
+        findings = findings + check_segmentation(aces, json.loads(_pol))
+    except Exception as e:
+        notes = notes + ["segmentation policy error: " + str(e)]
+to_json(findings, notes, len(aces))
+`);
+      render(JSON.parse(out));
+      setStatus("Done — analyzed " + cfg.split(/\r?\n/).filter(l=>l.trim()).length + " input lines locally.");
+    }catch(e){
+      setStatus("Analysis error: " + esc(e.message), true);
+    }finally{
+      auditBtn.disabled = false;
+    }
+  }, 30);
+}
+
+const SEVS = [["critical","c"],["high","h"],["medium","m"],["low","l"]];
+function render(d){
+  const box = $("results");
+  box.style.display = "block";
+  if(d.status === "no_rules_parsed"){
+    box.innerHTML = `<div class="norules"><b>No ACL rules parsed.</b> This is <i>not</i> a clean bill of health —
+      check the input is a Cisco IOS extended ACL or ASA access-list.</div>` + notesHTML(d.parse_notes);
+    box.scrollIntoView({behavior:"smooth",block:"nearest"});
+    return;
+  }
+  const c = d.findings_by_severity;
+  let chips = SEVS.map(([k,cls]) =>
+    `<span class="chip ${c[k]?cls:'zero'}">${c[k]} ${k}</span>`).join("");
+  let html = `<div class="scorebar">
+      <div class="score">${d.score}<small>/100</small></div>
+      <div class="chips">${chips}</div>
+    </div>
+    <div style="font-size:13px;color:var(--faint)">${d.rules_analyzed} rules analyzed · ${d.findings_total} finding${d.findings_total===1?'':'s'}</div>`;
+  if(!d.findings.length){
+    html += `<div class="empty">No issues found. ✓</div>`;
+  } else {
+    for(const f of d.findings){
+      html += `<div class="finding ${f.severity}">
+        <div class="fhead">
+          <span class="sev ${f.severity}">${f.severity}</span>
+          <span class="kind">${esc(f.kind)}</span>
+          <span class="rid">${esc(f.rule_id)}</span>
+        </div>
+        <div class="frule">${esc(f.rule)}</div>
+        ${f.cited?`<div class="frow cause"><b>caused by:</b> <span style="font-family:var(--mono)">${esc(f.cited)}</span></div>`:""}
+        <div class="frow"><b>why:</b> ${esc(f.message)}</div>
+        ${f.fix?`<div class="frow fix"><b>fix:</b> ${esc(f.fix)}</div>`:""}
+      </div>`;
+    }
+  }
+  html += notesHTML(d.parse_notes);
+  box.innerHTML = html;
+  box.scrollIntoView({behavior:"smooth",block:"nearest"});
+}
+function notesHTML(notes){
+  if(!notes || !notes.length) return "";
+  return `<div class="notes"><b>Parse notes</b> (${notes.length} line(s) not fully modeled — surfaced, never silently dropped):<br>`
+    + notes.slice(0,20).map(n=>`<code>${esc(n)}</code>`).join("<br>") + `</div>`;
+}
+
+$("audit").addEventListener("click", audit);
+$("sample").addEventListener("click", () => { $("config").value = SAMPLE_ACL; });
+$("clear").addEventListener("click", () => { $("config").value=""; $("results").style.display="none"; });
+$("samplePolicy").addEventListener("click", () => {
+  $("policy").value = SAMPLE_POLICY;
+  $("policy").closest("details").open = true;
+});
+</script>
+</body>
+</html>
