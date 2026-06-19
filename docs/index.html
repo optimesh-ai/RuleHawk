@@ -163,7 +163,7 @@ const ENGINE_MODULES = ["__init__","model","parse","analyze","report","segcheck"
 const $ = id => document.getElementById(id);
 const statusEl = $("status"), auditBtn = $("audit");
 function setStatus(html, isErr){ statusEl.className = "status" + (isErr?" err":""); statusEl.innerHTML = html; }
-function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 let pyodide = null;
 (async function boot(){
@@ -187,6 +187,13 @@ function audit(){
   if(!pyodide){ return; }
   const cfg = $("config").value;
   if(!cfg.trim()){ setStatus("Paste a config first (or click “Load sample”).", true); return; }
+  // Analysis is O(n²) per ACL and runs synchronously in the tab; cap the demo so
+  // a huge paste can't freeze the page. Big files belong in the (faster) CLI.
+  const lineCount = cfg.split(/\r?\n/).filter(l=>l.trim()).length;
+  if(lineCount > 4000){
+    setStatus(`Large config (${lineCount} lines). The in-browser demo caps analysis to keep your tab responsive — run the CLI below for files this size.`, true);
+    return;
+  }
   setStatus('<span class="spin"></span>Analyzing…');
   auditBtn.disabled = true;
   // defer so the spinner paints before the (fast) synchronous run

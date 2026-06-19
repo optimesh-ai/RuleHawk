@@ -85,16 +85,19 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
         if b.action != "permit" or b.stateful:
             # `established` permits are return-traffic — not an over-permission.
             continue
-        if b.proto in _WILDCARD_PROTO and b.src_any and b.dst_any:
-            findings.append(Finding(
-                _id(b), "permit-any-any", "critical",
-                f"permit {b.proto} any any — allows ALL traffic; defeats the ACL.",
-                b.raw, fix="replace with least-privilege permits + a default deny"))
-        elif b.src_any and b.dst_any:
-            findings.append(Finding(
-                _id(b), "broad-any-any", "high",
-                f"permit {b.proto} any any — very broad; allows all {b.proto} "
-                f"between any hosts.", b.raw, fix="scope the source and/or destination"))
+        # Only a rule whose space is EXACT can be called over-permissive — an
+        # over-approximated (imprecise) address must never drive an any/any verdict.
+        if b.src_any and b.dst_any and not b.imprecise:
+            if b.proto in _WILDCARD_PROTO:
+                findings.append(Finding(
+                    _id(b), "permit-any-any", "critical",
+                    f"permit {b.proto} any any — allows ALL traffic; defeats the ACL.",
+                    b.raw, fix="replace with least-privilege permits + a default deny"))
+            else:
+                findings.append(Finding(
+                    _id(b), "broad-any-any", "high",
+                    f"permit {b.proto} any any — very broad; allows all {b.proto} "
+                    f"between any hosts.", b.raw, fix="scope the source and/or destination"))
         # Dangerous services exposed to any source (skip imprecise port spaces).
         if b.src_any and b.proto in ("tcp", "udp") and not b.imprecise:
             hits = sorted({name for port, name in _DANGEROUS_PORTS.items()

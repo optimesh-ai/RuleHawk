@@ -46,7 +46,10 @@ def _rule_matches(r: ACE, proto: str, src: str, dst: str, port: Optional[int]):
     returns True (matches), False (no match), or "indeterminate"."""
     if r.stateful:
         return False  # `established` matches only return traffic, not a new flow
-    if not (r.proto in _WILDCARD_PROTO or r.proto == proto):
+    # When the assertion proto is wildcard ("ip" = any protocol), a rule of ANY
+    # protocol can enable the forbidden flow, so don't reject on proto. Only a
+    # specific probe (tcp/udp/icmp) requires the rule's proto to match.
+    if proto not in _WILDCARD_PROTO and not (r.proto in _WILDCARD_PROTO or r.proto == proto):
         return False
     s, d = ipaddress.ip_address(src), ipaddress.ip_address(dst)
     if s not in r.src or d not in r.dst:
