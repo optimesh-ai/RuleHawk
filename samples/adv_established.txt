@@ -1,0 +1,3 @@
+ip access-list extended ESTAB
+ permit tcp any any established
+ deny tcp any host 10.0.0.5 eq 22

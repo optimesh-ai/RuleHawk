@@ -1,0 +1,3 @@
+ip access-list extended ICMPT
+ permit icmp any any echo
+ deny icmp any any echo-reply

@@ -1,0 +1,9 @@
+ip access-list extended EDGE_IN
+ permit tcp any host 203.0.113.10 eq 443
+ permit tcp any host 203.0.113.10 eq 80
+ permit tcp any host 203.0.113.11 eq 25
+ deny ip 10.0.0.0 0.255.255.255 any
+ deny ip 172.16.0.0 0.15.255.255 any
+ permit tcp 192.0.2.0 0.0.0.255 any established
+ permit udp any host 203.0.113.53 eq 53
+ deny ip any any

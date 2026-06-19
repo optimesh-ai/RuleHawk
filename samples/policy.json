@@ -1,0 +1,11 @@
+{
+  "zones": {
+    "PCI":  ["10.10.0.0/16"],
+    "CORP": ["10.20.0.0/16"],
+    "DMZ":  ["203.0.113.0/24"]
+  },
+  "must_not_reach": [
+    {"src": "CORP", "dst": "PCI", "proto": "tcp", "ports": [445, 3389, 22]},
+    {"src": "DMZ",  "dst": "PCI", "proto": "ip"}
+  ]
+}

@@ -1,0 +1,3 @@
+ip access-list extended NEQFP
+ deny tcp any any neq 443
+ permit tcp any host 10.0.0.9 eq 443

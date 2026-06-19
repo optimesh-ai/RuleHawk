@@ -1,0 +1,4 @@
+ip access-list extended UNION
+ permit tcp 10.0.0.0 0.0.0.255 any eq 443
+ permit tcp 10.0.1.0 0.0.0.255 any eq 443
+ deny tcp 10.0.0.0 0.0.1.255 any eq 443

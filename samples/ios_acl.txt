@@ -1,0 +1,12 @@
+! Sample Cisco IOS extended ACL with intentional, realistic problems
+ip access-list extended EDGE_IN
+ permit tcp any host 203.0.113.10 eq 443
+ deny tcp 10.0.0.0 0.255.255.255 any eq 23
+ permit tcp 10.0.0.0 0.255.255.255 host 203.0.113.10 eq 23
+ permit tcp any any eq 3389
+ permit tcp host 198.51.100.5 host 203.0.113.10 eq 443
+ deny ip 192.168.0.0 0.0.255.255 any
+ permit ip 192.168.5.0 0.0.0.255 any
+ permit tcp any any eq 445
+ permit ip any any
+ deny tcp any any eq 22
