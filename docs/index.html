@@ -4,12 +4,12 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>RuleHawk — firewall &amp; segmentation auditor</title>
-<meta name="description" content="Paste a Cisco IOS / ASA firewall config and get a ranked list of dead, shadowed, redundant, and dangerously-permissive rules in seconds. Runs entirely in your browser — your config never leaves your machine." />
+<meta name="description" content="Paste or upload a Cisco IOS / ASA firewall config and get a ranked list of dead, shadowed, redundant, and dangerously-permissive rules in seconds. Runs entirely in your browser — your config never leaves your machine." />
 <!--
-  RuleHawk web demo — 100% client-side.
+  RuleHawk web tool — 100% client-side.
   The engine under docs/rulehawk/ is a VENDORED copy of the top-level rulehawk/
-  package, served same-origin so the analysis runs in-browser via Pyodide and
-  the pasted config never touches a server. Re-sync after engine changes with:
+  package, served same-origin so analysis runs in-browser (Pyodide, in a Web
+  Worker) and the config never touches a server. Re-sync after engine changes:
       make sync-web      (see Makefile)
 -->
 <style>
@@ -18,6 +18,7 @@
     --text:#1c1c1a; --muted:#57534e; --faint:#8a857e; --accent:#4f46e5;
     --crit:#b42318; --crit-bg:#fef3f2; --high:#b54708; --high-bg:#fffaeb;
     --med:#854d0e; --med-bg:#fefce8; --low:#475467; --low-bg:#f2f4f7; --ok:#067647;
+    --ok-bg:#f0fdf4;
     --mono:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
   }
   *{box-sizing:border-box}
@@ -33,11 +34,13 @@
     border:1px solid var(--border-strong);padding:6px 10px;border-radius:6px;white-space:nowrap}
   .ghlink:hover{color:var(--text);border-color:var(--faint)}
   .privacy{display:flex;gap:9px;align-items:flex-start;margin:18px 0 22px;
-    background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:11px 13px;
+    background:var(--ok-bg);border:1px solid #bbf7d0;border-radius:8px;padding:11px 13px;
     font-size:13.5px;color:#14532d}
   .privacy b{font-weight:650}
   .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:18px}
+  .card.dragging{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg,#eef2ff)}
   label.fld{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:7px}
+  .fld .hint{font-weight:400;color:var(--faint)}
   textarea{width:100%;font-family:var(--mono);font-size:13px;line-height:1.55;
     border:1px solid var(--border-strong);border-radius:7px;padding:11px;resize:vertical;
     background:#fcfcfb;color:var(--text)}
@@ -50,6 +53,7 @@
   button.primary{background:#1c1c1a;color:#fff;border-color:#1c1c1a}
   button.primary:hover{background:#000}
   button:disabled{opacity:.5;cursor:default}
+  button.small{font-size:12.5px;padding:6px 11px}
   .linkbtn{background:none;border:none;color:var(--accent);padding:0;font-size:13px}
   .linkbtn:hover{text-decoration:underline}
   details.adv{margin-top:14px;border-top:1px solid var(--border);padding-top:12px}
@@ -61,6 +65,7 @@
   @keyframes sp{to{transform:rotate(360deg)}}
   /* results */
   #results{display:none}
+  .results-actions{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
   .scorebar{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-bottom:8px}
   .score{font-size:34px;font-weight:720;letter-spacing:-.02em}
   .score small{font-size:15px;font-weight:500;color:var(--faint)}
@@ -80,10 +85,23 @@
   .sev.critical{color:#fff;background:var(--crit)} .sev.high{color:#fff;background:var(--high)}
   .sev.medium{color:#fff;background:var(--med)} .sev.low{color:#fff;background:var(--low)}
   .sev.info{color:#fff;background:var(--faint)}
-  .kind{font-size:13px;font-weight:600} .rid{font-size:12px;color:var(--faint);font-family:var(--mono)}
+  .kind{font-size:13px;font-weight:600}
+  .rid{font-size:12px;color:var(--accent);font-family:var(--mono);background:none;border:0;padding:0;cursor:pointer}
+  .rid:hover{text-decoration:underline}
   .frule{font-family:var(--mono);font-size:12.5px;background:#f7f7f6;border-radius:5px;padding:5px 8px;margin:5px 0;overflow-x:auto}
   .frow{font-size:13.5px;margin:3px 0} .frow b{color:var(--muted);font-weight:600}
   .cause{color:var(--crit)} .fix{color:var(--ok)}
+  .witness{font-family:var(--mono);font-size:13px;background:#fff;border:1px solid var(--border-strong);
+    border-radius:5px;padding:6px 9px;margin:5px 0;display:inline-block;color:var(--crit)}
+  /* segmentation panel */
+  .segpanel{border:1px solid var(--border);border-radius:9px;padding:14px;margin-bottom:16px;background:#fcfcfb}
+  .seghdr{font-size:13px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+  .segbanner{font-size:14px;font-weight:650;border-radius:7px;padding:9px 12px;margin-bottom:6px}
+  .segbanner.pass{background:var(--ok-bg);color:#14532d;border:1px solid #bbf7d0}
+  .segbanner.fail{background:var(--crit-bg);color:var(--crit);border:1px solid #fecaca}
+  .segbanner.warn{background:var(--med-bg);color:var(--med);border:1px solid #fde68a}
+  .policyerr{background:var(--crit-bg);border:1px solid #fecaca;color:var(--crit);
+    border-radius:7px;padding:10px 12px;margin-bottom:14px;font-size:13.5px}
   .notes{margin-top:16px;font-size:12.5px;color:var(--muted)}
   .notes code{font-family:var(--mono);background:#f2f4f7;padding:1px 4px;border-radius:3px}
   .empty{padding:14px;text-align:center;color:var(--ok);font-weight:600}
@@ -92,6 +110,14 @@
   footer code{font-family:var(--mono);background:#f2f4f7;padding:2px 6px;border-radius:4px;font-size:12.5px}
   footer .cli{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin:8px 0}
   a{color:var(--accent)}
+  @media (max-width:640px){
+    .wrap{padding:20px 14px 48px}
+    header.top{flex-wrap:wrap}
+    .ghlink{margin-left:0;order:3}
+    h1{font-size:20px}
+    .score{font-size:28px}
+    .scorebar{gap:10px}
+  }
 </style>
 </head>
 <body>
@@ -100,7 +126,7 @@
     <svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 4 6v6c0 5 3.5 7.5 8 10 4.5-2.5 8-5 8-10V6l-8-4z"/><path d="m9 12 2 2 4-4"/></svg>
     <div>
       <h1>RuleHawk</h1>
-      <p class="sub">Firewall &amp; segmentation auditor — paste a config, get verifiable findings in seconds.</p>
+      <p class="sub">Firewall &amp; segmentation auditor — paste or upload a config, get verifiable findings in seconds.</p>
     </div>
     <a class="ghlink" href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">View on GitHub ↗</a>
   </header>
@@ -110,19 +136,22 @@
     <span><b>Runs entirely in your browser.</b> Your config is analyzed locally via WebAssembly — it never leaves your machine, is never uploaded, and nothing is stored. It's the same open-source engine you can <a href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">read and run yourself</a>.</span>
   </div>
 
-  <div class="card">
-    <label class="fld" for="config">Firewall / ACL config (Cisco IOS extended ACL or ASA access-list)</label>
-    <textarea id="config" spellcheck="false" placeholder="ip access-list extended EDGE_IN&#10; permit tcp any host 203.0.113.10 eq 443&#10; ..."></textarea>
+  <div class="card" id="config-card">
+    <label class="fld" for="config">Firewall / ACL config <span class="hint">— Cisco IOS extended ACL or ASA access-list · paste, drag &amp; drop a file, or upload</span></label>
+    <textarea id="config" spellcheck="false" placeholder="ip access-list extended EDGE_IN&#10; permit tcp any host 203.0.113.10 eq 443&#10; ...&#10;&#10;…or drag a config file onto this box."></textarea>
+    <input type="file" id="file" accept=".txt,.cfg,.conf,.acl,.lst,.log,text/plain" style="display:none" />
     <div class="row">
       <button class="primary" id="audit" disabled>Audit</button>
+      <button id="upload">Upload file</button>
       <button id="sample">Load sample</button>
       <button id="clear">Clear</button>
+      <button id="cancel" style="display:none">Cancel</button>
       <span class="status" id="status"><span class="spin"></span>Loading analysis engine…</span>
     </div>
     <details class="adv">
-      <summary>Segmentation policy (optional, advanced)</summary>
+      <summary>Segmentation policy (optional) — prove zones can't reach each other</summary>
       <p style="font-size:13px;color:var(--muted);margin:10px 0 7px">
-        Declare zones and <code>must_not_reach</code> rules; RuleHawk proves isolation or returns a concrete witness packet the ACL wrongly permits.</p>
+        Declare zones and <code>must_not_reach</code> rules; RuleHawk proves isolation or returns the concrete <b>witness packet</b> the ACL wrongly permits — audit-grade evidence.</p>
       <textarea id="policy" spellcheck="false" placeholder='{"zones":{"PCI":["10.10.0.0/16"],"CORP":["10.20.0.0/16"]},"must_not_reach":[{"src":"CORP","dst":"PCI","proto":"tcp","ports":[445,3389,22]}]}'></textarea>
       <div class="row"><button id="samplePolicy" class="linkbtn">load sample policy</button></div>
     </details>
@@ -159,53 +188,16 @@ const SAMPLE_POLICY = `{
   ]
 }`;
 const ENGINE_MODULES = ["__init__","model","parse","analyze","report","segcheck"];
+const PYODIDE_VER = "v0.26.4";
+// Fallback (main-thread) analysis stays synchronous, so cap it; the worker path has no cap.
+const FALLBACK_MAX_LINES = 4000;
 
-const $ = id => document.getElementById(id);
-const statusEl = $("status"), auditBtn = $("audit");
-function setStatus(html, isErr){ statusEl.className = "status" + (isErr?" err":""); statusEl.innerHTML = html; }
-function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-
-let pyodide = null;
-(async function boot(){
-  try{
-    pyodide = await loadPyodide();
-    pyodide.FS.mkdir("rulehawk");
-    for(const m of ENGINE_MODULES){
-      const r = await fetch(`./rulehawk/${m}.py`, {cache:"no-cache"});
-      if(!r.ok) throw new Error(`could not load engine module ${m}.py (${r.status})`);
-      pyodide.FS.writeFile(`rulehawk/${m}.py`, await r.text());
-    }
-    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
-    setStatus("Ready — paste a config and click Audit.");
-    auditBtn.disabled = false;
-  }catch(e){
-    setStatus("Failed to load the engine: " + esc(e.message), true);
-  }
-})();
-
-function audit(){
-  if(!pyodide){ return; }
-  const cfg = $("config").value;
-  if(!cfg.trim()){ setStatus("Paste a config first (or click “Load sample”).", true); return; }
-  // Analysis is O(n²) per ACL and runs synchronously in the tab; cap the demo so
-  // a huge paste can't freeze the page. Big files belong in the (faster) CLI.
-  const lineCount = cfg.split(/\r?\n/).filter(l=>l.trim()).length;
-  if(lineCount > 4000){
-    setStatus(`Large config (${lineCount} lines). The in-browser demo caps analysis to keep your tab responsive — run the CLI below for files this size.`, true);
-    return;
-  }
-  setStatus('<span class="spin"></span>Analyzing…');
-  auditBtn.disabled = true;
-  // defer so the spinner paints before the (fast) synchronous run
-  setTimeout(() => {
-    try{
-      pyodide.globals.set("cfg", cfg);
-      pyodide.globals.set("pol", $("policy").value || "");
-      const out = pyodide.runPython(`
+// Same Python the worker runs — used only by the main-thread fallback.
+const ANALYZE_PY = `
 import json
 from rulehawk.parse import parse_acls
 from rulehawk.analyze import analyze
-from rulehawk.report import to_json
+from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
 aces, notes = parse_acls(cfg)
 findings = analyze(aces)
@@ -215,70 +207,270 @@ if _pol:
         findings = findings + check_segmentation(aces, json.loads(_pol))
     except Exception as e:
         notes = notes + ["segmentation policy error: " + str(e)]
-to_json(findings, notes, len(aces))
-`);
-      render(JSON.parse(out));
-      setStatus("Done — analyzed " + cfg.split(/\r?\n/).filter(l=>l.trim()).length + " input lines locally.");
-    }catch(e){
-      setStatus("Analysis error: " + esc(e.message), true);
-    }finally{
-      auditBtn.disabled = false;
+_lines = cfg.split("\\n")
+_rl, _cur = {}, 0
+for a in aces:
+    for _i in range(_cur, len(_lines)):
+        if _lines[_i].strip() == a.raw.strip():
+            _rl[a.acl + ":" + str(a.seq)] = _i + 1
+            _cur = _i + 1
+            break
+json.dumps({"report_json": json.loads(to_json(findings, notes, len(aces))),
+            "report_text": to_text(findings, notes, len(aces)),
+            "rule_lines": _rl})
+`;
+
+const $ = id => document.getElementById(id);
+const statusEl = $("status"), auditBtn = $("audit"), cancelBtn = $("cancel");
+function setStatus(html, isErr){ statusEl.className = "status" + (isErr?" err":""); statusEl.innerHTML = html; }
+function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+let mode = null;          // "worker" | "main"
+let worker = null;
+let pyodide = null;       // only used in main fallback
+let reqId = 0;            // matches worker responses to requests
+let lastResult = { text:"", jsonStr:"", ruleLines:{} };
+
+// ---- engine boot: prefer Web Worker, fall back to main thread ----
+function makeWorker(){
+  const w = new Worker("worker.js");
+  w.onmessage = (e) => {
+    const m = e.data || {};
+    if(m.type === "ready"){ mode = "worker"; ready(); }
+    else if(m.type === "error"){ console.warn("worker engine failed:", m.message); bootMain(); }
+    else if(m.type === "result"){ onResult(m); }
+  };
+  w.onerror = () => { console.warn("worker errored; falling back"); try{w.terminate()}catch(_){} worker=null; bootMain(); };
+  return w;
+}
+async function bootMain(){
+  if(mode === "main") return;
+  try{
+    if(typeof loadPyodide === "undefined") throw new Error("Pyodide loader unavailable");
+    pyodide = await loadPyodide();
+    pyodide.FS.mkdir("rulehawk");
+    for(const m of ENGINE_MODULES){
+      const r = await fetch(`./rulehawk/${m}.py`, {cache:"no-cache"});
+      if(!r.ok) throw new Error(`could not load engine module ${m}.py (${r.status})`);
+      pyodide.FS.writeFile(`rulehawk/${m}.py`, await r.text());
     }
+    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
+    mode = "main"; ready();
+  }catch(e){
+    setStatus("Failed to load the engine: " + esc(e.message||e), true);
+  }
+}
+function ready(){
+  setStatus("Ready — paste or upload a config and click Audit.");
+  auditBtn.disabled = false;
+}
+(function boot(){
+  try{
+    if(typeof Worker === "undefined") return bootMain();
+    worker = makeWorker();
+  }catch(e){ bootMain(); }
+})();
+
+// ---- run an audit ----
+function audit(){
+  if(auditBtn.disabled && !cancelBtn.style.display) return;
+  const cfg = $("config").value;
+  if(!cfg.trim()){ setStatus("Paste or upload a config first (or click “Load sample”).", true); return; }
+  const policy = $("policy").value || "";
+  setStatus('<span class="spin"></span>Analyzing…');
+  auditBtn.disabled = true;
+
+  if(mode === "worker" && worker){
+    cancelBtn.style.display = "";
+    const id = ++reqId;
+    worker.postMessage({type:"audit", id, cfg, policy});
+    return;
+  }
+  // main-thread fallback: synchronous, so guard very large inputs
+  const lineCount = cfg.split(/\r?\n/).filter(l=>l.trim()).length;
+  if(lineCount > FALLBACK_MAX_LINES){
+    setStatus(`Large config (${lineCount} lines) and the background engine isn't available here — run the CLI below for files this size.`, true);
+    auditBtn.disabled = false; return;
+  }
+  setTimeout(() => {
+    try{
+      pyodide.globals.set("cfg", cfg);
+      pyodide.globals.set("pol", policy);
+      onResult({id: ++reqId, envelope: pyodide.runPython(ANALYZE_PY)}, true);
+    }catch(e){ setStatus("Analysis error: " + esc(e.message||e), true); }
+    finally{ auditBtn.disabled = false; }
   }, 30);
 }
 
+function onResult(m, isMain){
+  if(!isMain && m.id !== reqId) return;   // ignore stale (post-cancel) results
+  cancelBtn.style.display = "none";
+  auditBtn.disabled = false;
+  if(m.error){ setStatus("Analysis error: " + esc(m.error), true); return; }
+  let env;
+  try{ env = JSON.parse(m.envelope); }
+  catch(e){ setStatus("Could not read analysis result: " + esc(e.message||e), true); return; }
+  lastResult = { text: env.report_text, jsonStr: JSON.stringify(env.report_json, null, 2), ruleLines: env.rule_lines || {} };
+  render(env.report_json);
+  setStatus(`Done — analyzed ${env.report_json.rules_analyzed} rules locally.`);
+}
+
+function cancel(){
+  if(mode !== "worker" || !worker) return;
+  try{ worker.terminate(); }catch(_){}
+  worker = makeWorker(); mode = null; reqId++;   // bump so any late msg is ignored
+  cancelBtn.style.display = "none";
+  auditBtn.disabled = true;
+  setStatus('<span class="spin"></span>Cancelled — re-initializing engine…');
+}
+
+// ---- take-away: copy + download ----
+function copyText(s){
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(s).then(()=>flashStatus("Report copied to clipboard."),
+      ()=>fallbackCopy(s));
+  } else fallbackCopy(s);
+}
+function fallbackCopy(s){
+  const t=document.createElement("textarea"); t.value=s; document.body.appendChild(t); t.select();
+  try{ document.execCommand("copy"); flashStatus("Report copied to clipboard."); }catch(_){}
+  document.body.removeChild(t);
+}
+function downloadBlob(name, mime, content){
+  const b=new Blob([content],{type:mime}); const u=URL.createObjectURL(b);
+  const a=document.createElement("a"); a.href=u; a.download=name; document.body.appendChild(a);
+  a.click(); a.remove(); URL.revokeObjectURL(u);
+}
+let _flashT=null;
+function flashStatus(msg){ setStatus(msg); clearTimeout(_flashT); _flashT=setTimeout(()=>setStatus("Ready."),2500); }
+
+// ---- click a finding to locate its rule in the config ----
+function locateRule(ruleId){
+  const ln = (lastResult.ruleLines||{})[ruleId];
+  const ta = $("config"); if(!ln) return;
+  const lines = ta.value.split("\n");
+  let start=0; for(let i=0;i<ln-1;i++) start += lines[i].length + 1;
+  const end = start + (lines[ln-1]||"").length;
+  ta.focus(); ta.setSelectionRange(start, end);
+  const lh = 13*1.55;
+  ta.scrollTop = Math.max(0, (ln-1)*lh - ta.clientHeight/2);
+  ta.scrollIntoView({behavior:"smooth", block:"center"});
+}
+
+// ---- render ----
 const SEVS = [["critical","c"],["high","h"],["medium","m"],["low","l"]];
+function findingHTML(f){
+  const loc = (lastResult.ruleLines||{})[f.rule_id]
+    ? `<button class="rid" data-rid="${esc(f.rule_id)}" title="Jump to this rule in the config">${esc(f.rule_id)} ↦</button>`
+    : `<span class="rid">${esc(f.rule_id)}</span>`;
+  return `<div class="finding ${f.severity}">
+    <div class="fhead">
+      <span class="sev ${f.severity}">${f.severity}</span>
+      <span class="kind">${esc(f.kind)}</span>
+      ${loc}
+    </div>
+    ${f.rule?`<div class="frule">${esc(f.rule)}</div>`:""}
+    ${f.witness?`<div class="frow"><b>witness packet:</b></div><div class="witness">${esc(f.witness)}</div>`:""}
+    ${f.cited?`<div class="frow cause"><b>caused by:</b> <span style="font-family:var(--mono)">${esc(f.cited)}</span></div>`:""}
+    <div class="frow"><b>why:</b> ${esc(f.message)}</div>
+    ${f.fix?`<div class="frow fix"><b>fix:</b> ${esc(f.fix)}</div>`:""}
+  </div>`;
+}
+
 function render(d){
   const box = $("results");
   box.style.display = "block";
+
+  // policy parse error surfaced prominently
+  const policyErr = (d.parse_notes||[]).filter(n => n.indexOf("segmentation policy error:") === 0);
+
   if(d.status === "no_rules_parsed"){
-    box.innerHTML = `<div class="norules"><b>No ACL rules parsed.</b> This is <i>not</i> a clean bill of health —
-      check the input is a Cisco IOS extended ACL or ASA access-list.</div>` + notesHTML(d.parse_notes);
-    box.scrollIntoView({behavior:"smooth",block:"nearest"});
-    return;
+    box.innerHTML = (policyErr.length?`<div class="policyerr"><b>Policy error.</b> ${esc(policyErr[0])}</div>`:"")
+      + `<div class="norules"><b>No ACL rules parsed.</b> This is <i>not</i> a clean bill of health —
+      check the input is a Cisco IOS extended ACL or ASA access-list.</div>` + notesHTML(d.parse_notes, true);
+    box.scrollIntoView({behavior:"smooth",block:"nearest"}); return;
   }
+
   const c = d.findings_by_severity;
-  let chips = SEVS.map(([k,cls]) =>
-    `<span class="chip ${c[k]?cls:'zero'}">${c[k]} ${k}</span>`).join("");
-  let html = `<div class="scorebar">
+  const seg = d.findings.filter(f => f.kind.indexOf("segmentation-") === 0);
+  const rest = d.findings.filter(f => f.kind.indexOf("segmentation-") !== 0);
+
+  let html = `<div class="results-actions">
+      <button class="small" data-act="copy">Copy report</button>
+      <button class="small" data-act="json">Download JSON</button>
+      <button class="small" data-act="txt">Download .txt</button>
+    </div>`;
+
+  if(policyErr.length) html += `<div class="policyerr"><b>Policy error.</b> ${esc(policyErr[0])}</div>`;
+
+  // segmentation panel (only when a policy produced seg findings)
+  if(seg.length){
+    const hasViol = seg.some(f=>f.kind==="segmentation-violation");
+    const hasInd  = seg.some(f=>f.kind==="segmentation-indeterminate");
+    const cls = hasViol ? "fail" : (hasInd ? "warn" : "pass");
+    const label = hasViol ? "✗ Segmentation FAILED — forbidden flow is permitted"
+                : hasInd  ? "⚠ Segmentation INDETERMINATE — manual review needed"
+                : "✓ Segmentation holds — no permitted flow violates the policy";
+    html += `<div class="segpanel"><div class="seghdr">Segmentation policy</div>
+      <div class="segbanner ${cls}">${label}</div>`
+      + seg.map(findingHTML).join("") + `</div>`;
+  }
+
+  let chips = SEVS.map(([k,cls]) => `<span class="chip ${c[k]?cls:'zero'}">${c[k]} ${k}</span>`).join("");
+  html += `<div class="scorebar">
       <div class="score">${d.score}<small>/100</small></div>
       <div class="chips">${chips}</div>
     </div>
     <div style="font-size:13px;color:var(--faint)">${d.rules_analyzed} rules analyzed · ${d.findings_total} finding${d.findings_total===1?'':'s'}</div>`;
-  if(!d.findings.length){
+
+  if(!rest.length && !seg.length){
     html += `<div class="empty">No issues found. ✓</div>`;
   } else {
-    for(const f of d.findings){
-      html += `<div class="finding ${f.severity}">
-        <div class="fhead">
-          <span class="sev ${f.severity}">${f.severity}</span>
-          <span class="kind">${esc(f.kind)}</span>
-          <span class="rid">${esc(f.rule_id)}</span>
-        </div>
-        <div class="frule">${esc(f.rule)}</div>
-        ${f.cited?`<div class="frow cause"><b>caused by:</b> <span style="font-family:var(--mono)">${esc(f.cited)}</span></div>`:""}
-        <div class="frow"><b>why:</b> ${esc(f.message)}</div>
-        ${f.fix?`<div class="frow fix"><b>fix:</b> ${esc(f.fix)}</div>`:""}
-      </div>`;
-    }
+    html += rest.map(findingHTML).join("");
   }
   html += notesHTML(d.parse_notes);
   box.innerHTML = html;
+
+  // wire dynamic buttons
+  box.querySelectorAll("[data-rid]").forEach(b => b.addEventListener("click", () => locateRule(b.dataset.rid)));
+  box.querySelectorAll("[data-act]").forEach(b => b.addEventListener("click", () => {
+    if(b.dataset.act==="copy") copyText(lastResult.text);
+    if(b.dataset.act==="json") downloadBlob("rulehawk-report.json","application/json",lastResult.jsonStr);
+    if(b.dataset.act==="txt")  downloadBlob("rulehawk-report.txt","text/plain",lastResult.text);
+  }));
   box.scrollIntoView({behavior:"smooth",block:"nearest"});
 }
-function notesHTML(notes){
-  if(!notes || !notes.length) return "";
-  return `<div class="notes"><b>Parse notes</b> (${notes.length} line(s) not fully modeled — surfaced, never silently dropped):<br>`
-    + notes.slice(0,20).map(n=>`<code>${esc(n)}</code>`).join("<br>") + `</div>`;
+function notesHTML(notes, all){
+  const shown = (notes||[]).filter(n => all || n.indexOf("segmentation policy error:") !== 0);
+  if(!shown.length) return "";
+  return `<div class="notes"><b>Parse notes</b> (${shown.length} line(s) not fully modeled — surfaced, never silently dropped):<br>`
+    + shown.slice(0,20).map(n=>`<code>${esc(n)}</code>`).join("<br>") + `</div>`;
 }
 
+// ---- input: file upload + drag & drop ----
+function loadFile(file){
+  if(!file) return;
+  if(file.size > 8*1024*1024){ setStatus("That file is large (>8 MB) — paste the ACL section instead.", true); return; }
+  const fr = new FileReader();
+  fr.onload = () => { $("config").value = fr.result; $("results").style.display="none";
+    setStatus(`Loaded ${esc(file.name)} — click Audit.`); };
+  fr.onerror = () => setStatus("Could not read that file.", true);
+  fr.readAsText(file);
+}
+const card = $("config-card");
+["dragenter","dragover"].forEach(ev => card.addEventListener(ev, e => { e.preventDefault(); card.classList.add("dragging"); }));
+["dragleave","drop"].forEach(ev => card.addEventListener(ev, e => { e.preventDefault(); if(ev!=="dragleave"||e.target===card) card.classList.remove("dragging"); }));
+card.addEventListener("drop", e => { card.classList.remove("dragging"); if(e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
+
+// ---- wiring ----
 $("audit").addEventListener("click", audit);
-$("sample").addEventListener("click", () => { $("config").value = SAMPLE_ACL; });
+$("cancel").addEventListener("click", cancel);
+$("upload").addEventListener("click", () => $("file").click());
+$("file").addEventListener("change", e => loadFile(e.target.files[0]));
+$("sample").addEventListener("click", () => { $("config").value = SAMPLE_ACL; $("results").style.display="none"; });
 $("clear").addEventListener("click", () => { $("config").value=""; $("results").style.display="none"; });
-$("samplePolicy").addEventListener("click", () => {
-  $("policy").value = SAMPLE_POLICY;
-  $("policy").closest("details").open = true;
-});
+$("samplePolicy").addEventListener("click", () => { $("policy").value = SAMPLE_POLICY; $("policy").closest("details").open = true; });
+document.addEventListener("keydown", e => { if((e.metaKey||e.ctrlKey) && e.key==="Enter" && !auditBtn.disabled) audit(); });
 </script>
 </body>
 </html>

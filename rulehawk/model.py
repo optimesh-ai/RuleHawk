@@ -112,3 +112,56 @@ def covers(a: ACE, b: ACE) -> bool:
         if not a.dst_port.covers(b.dst_port):
             return False
     return True
+
+
+# --- Cumulative / union shadowing support ----------------------------------
+# `covers()` proves a rule dead from ONE earlier rule. A rule can also be dead
+# under the UNION of several earlier rules (e.g. two /24 permits make a /23 deny
+# unreachable). The helpers below let analyze.py detect that — soundly: we only
+# combine EXACT (non-imprecise, non-stateful) earlier rules whose every non-IP
+# dimension already covers the target, then prove the IP space is fully covered
+# by exact `ipaddress` set subtraction. No over-approximation => no false positive.
+
+def _union_covers(target: _IPNet, nets) -> bool:
+    """True iff `target` is fully contained in the union of `nets` (exact).
+
+    Two IP networks are always either disjoint or nested, so subtracting each
+    coverer from the residual set and collapsing is exact and terminating."""
+    residual = [target]
+    for n in nets:
+        if n.version != target.version:
+            continue
+        nxt = []
+        for r in residual:
+            if r.subnet_of(n):
+                continue                      # r fully removed by n
+            if n.subnet_of(r):
+                nxt.extend(r.address_exclude(n))
+            else:
+                nxt.append(r)                 # disjoint — keep r
+        residual = list(ipaddress.collapse_addresses(nxt)) if nxt else []
+        if not residual:
+            return True
+    return not residual
+
+
+def _compatible_coverer(a: ACE, b: ACE) -> bool:
+    """True iff `a` may join a union that proves `b` dead: exact, and every
+    dimension EXCEPT the IP rectangle already covers `b` (mirrors covers()'s
+    soundness gates), so only IP coverage remains to prove."""
+    if a.imprecise or a.stateful:
+        return False
+    if not _proto_covers(a.proto, b.proto):
+        return False
+    if a.proto == "icmp" and b.proto == "icmp":
+        if a.icmp_type is not None and a.icmp_type != b.icmp_type:
+            return False
+    if b.proto in _PORTED:
+        if not a.src_port.covers(b.src_port) or not a.dst_port.covers(b.dst_port):
+            return False
+    return True
+
+
+def covered_dimensions(a: ACE, b: ACE) -> "tuple[bool, bool]":
+    """(does a span all of b.src, does a span all of b.dst) — reuses _net_covers."""
+    return _net_covers(a.src, b.src), _net_covers(a.dst, b.dst)

@@ -111,7 +111,8 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                                 f"{dname}): the ACL PERMITS {swit} -> {dwit}"
                                 f"{portsfx} ({proto}) via rule {dec.seq}.",
                                 dec.raw,
-                                fix=f"deny {sname}->{dname}{portsfx} before rule {dec.seq}"))
+                                fix=f"deny {sname}->{dname}{portsfx} before rule {dec.seq}",
+                                witness=f"{swit} -> {dwit}{portsfx} ({proto})"))
                             reported = True
                             break
                         if eff == "indeterminate":

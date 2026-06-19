@@ -21,7 +21,8 @@ def to_json(findings: List[Finding], notes: List[str], n_rules: int) -> str:
         "findings_by_severity": _counts(findings),
         "findings": [
             {"rule_id": f.rule_id, "kind": f.kind, "severity": f.severity,
-             "message": f.message, "rule": f.rule, "cited": f.cited, "fix": f.fix}
+             "message": f.message, "rule": f.rule, "cited": f.cited, "fix": f.fix,
+             "witness": f.witness}
             for f in _sorted(findings)
         ],
         "parse_notes": notes,

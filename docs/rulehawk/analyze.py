@@ -18,9 +18,14 @@ so we never recommend deleting a load-bearing rule.
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
-from .model import ACE, _WILDCARD_PROTO, covers
+from .model import (ACE, _WILDCARD_PROTO, _compatible_coverer, covered_dimensions,
+                    covers, _union_covers)
+
+# Max compatible earlier rules considered when testing cumulative coverage. Beyond
+# this we under-report (stay fast/sound) rather than risk slowdown — documented.
+_UNION_K = 64
 
 _SEV_WEIGHT = {"critical": 25, "high": 10, "medium": 4, "low": 1, "info": 0}
 
@@ -46,16 +51,79 @@ class Finding:
     rule: str
     cited: str = ""
     fix: str = ""
+    witness: str = ""   # segmentation: the concrete packet, e.g. "10.20.0.1 -> 10.10.0.1:445 (tcp)"
 
 
 def _id(a: ACE) -> str:
     return f"{a.acl}:{a.seq}"
 
 
+def _minimize(target, spanners, attr) -> List[ACE]:
+    """Greedily drop coverers whose removal still leaves `target` covered, so the
+    citation is the smallest provably-sufficient set (explainability)."""
+    result = list(spanners)
+    for a in list(result):
+        trial = [x for x in result if x is not a]
+        if trial and _union_covers(target, [getattr(x, attr) for x in trial]):
+            result = trial
+    return result
+
+
+def _union_shadow(b: ACE, earlier: List[ACE]) -> Optional[Tuple[str, str, List[ACE]]]:
+    """If b's IP space is fully covered by the UNION of compatible earlier exact
+    rules, return (kind, severity, cited_rules). Else None.
+
+    Sound (never over-claims) and conservative: only single-dimension unions —
+    coverers that each span all of b.dst whose srcs union to b.src (Case A), or
+    the symmetric Case B. Reached only when no SINGLE rule already covers b, so a
+    genuine union needs >=2 rules."""
+    coverers = [a for a in earlier if _compatible_coverer(a, b)]
+    if len(coverers) < 2:
+        return None
+    if len(coverers) > _UNION_K:                       # keep the broadest
+        coverers = sorted(coverers,
+                          key=lambda a: a.src.num_addresses + a.dst.num_addresses,
+                          reverse=True)[:_UNION_K]
+    dims = [(a, covered_dimensions(a, b)) for a in coverers]
+    dst_spanners = [a for a, (cs, cd) in dims if cd]   # each spans all of b.dst
+    src_spanners = [a for a, (cs, cd) in dims if cs]   # each spans all of b.src
+
+    chosen = None
+    if len(dst_spanners) >= 2 and _union_covers(b.src, [a.src for a in dst_spanners]):
+        chosen = _minimize(b.src, dst_spanners, "src")
+    elif len(src_spanners) >= 2 and _union_covers(b.dst, [a.dst for a in src_spanners]):
+        chosen = _minimize(b.dst, src_spanners, "dst")
+    if not chosen or len(chosen) < 2:
+        return None
+
+    if {a.action for a in chosen} == {b.action}:
+        return ("union-redundant", "low", chosen)
+    if b.action == "deny":
+        return ("union-shadowed-deny-dead", "critical", chosen)
+    return ("union-shadowed-permit-dead", "high", chosen)
+
+
+_UNION_MSG = {
+    "union-shadowed-deny-dead": (
+        "This deny NEVER takes effect — earlier rules {seqs} cumulatively "
+        "already allow the same traffic. The traffic you meant to block is ALLOWED.",
+        "make the deny match only traffic not already permitted, or move it above rules {seqs}"),
+    "union-shadowed-permit-dead": (
+        "This permit NEVER takes effect — earlier rules {seqs} cumulatively "
+        "already drop the same traffic. Likely a silent connectivity loss.",
+        "move rule {seq} above rules {seqs}, or narrow them"),
+    "union-redundant": (
+        "Rule is redundant — its traffic is already fully handled by earlier "
+        "rules {seqs}; safe to remove.",
+        "remove rule {seq}"),
+}
+
+
 def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
     findings: List[Finding] = []
     for i, b in enumerate(aces):
         # Shadowing: the first EXACT earlier rule whose space covers b kills b.
+        shadowed = False
         for a in aces[:i]:
             if not covers(a, b):       # covers() already excludes imprecise/stateful a
                 continue
@@ -80,7 +148,21 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
                     f"(rule {a.seq}) already allows the same traffic. The "
                     f"traffic you meant to block is ALLOWED.",
                     b.raw, a.raw, fix=f"move rule {b.seq} above rule {a.seq}"))
+            shadowed = True
             break
+
+        # No single rule covers b — is it dead under the UNION of earlier rules?
+        if not shadowed:
+            u = _union_shadow(b, aces[:i])
+            if u:
+                kind, sev, chosen = u
+                seqs = ", ".join(str(a.seq) for a in sorted(chosen, key=lambda x: x.seq))
+                msg, fix = _UNION_MSG[kind]
+                findings.append(Finding(
+                    _id(b), kind, sev,
+                    msg.format(seqs=seqs, seq=b.seq), b.raw,
+                    cited=f"rules {seqs} (cumulative)",
+                    fix=fix.format(seqs=seqs, seq=b.seq)))
 
         if b.action != "permit" or b.stateful:
             # `established` permits are return-traffic — not an over-permission.
