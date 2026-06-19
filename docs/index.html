@@ -12,111 +12,125 @@
   Worker) and the config never touches a server. Re-sync after engine changes:
       make sync-web      (see Makefile)
 -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;450;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root{
-    --bg:#fafaf9; --surface:#fff; --border:#e5e5e5; --border-strong:#d4d4d4;
-    --text:#1c1c1a; --muted:#57534e; --faint:#8a857e; --accent:#4f46e5;
-    --crit:#b42318; --crit-bg:#fef3f2; --high:#b54708; --high-bg:#fffaeb;
-    --med:#854d0e; --med-bg:#fefce8; --low:#475467; --low-bg:#f2f4f7; --ok:#067647;
-    --ok-bg:#f0fdf4;
-    --mono:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
+    --bg:#f4f4f4; --surface:#ffffff; --panel:#fbfbfb;
+    --border:#e0e0e0; --border-strong:#c6c6c6;
+    --text:#161616; --muted:#525252; --faint:#8d8d8d;
+    --accent:#0f62fe; --ink:#161616;
+    --crit:#da1e28; --crit-bg:#fff1f2; --crit-bd:#ffd7d9;
+    --high:#8a5300; --high-bg:#fff8ec; --high-bd:#ffe3bf;
+    --med:#6c5400;  --med-bg:#fcf7e3;  --med-bd:#efe3ad;
+    --low:#525252;  --low-bg:#f2f2f2;  --low-bd:#e0e0e0;
+    --ok:#198038;   --ok-bg:#f0fbf3;   --ok-bd:#c4e7cd;
+    --sans:"IBM Plex Sans",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--text);
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-    line-height:1.5;}
-  .wrap{max-width:920px;margin:0 auto;padding:32px 20px 64px;}
-  header.top{display:flex;align-items:center;gap:12px;margin-bottom:6px;}
-  .logo{width:30px;height:30px;color:var(--accent);flex:0 0 auto}
-  h1{font-size:22px;font-weight:680;letter-spacing:-.01em;margin:0}
-  .sub{color:var(--muted);font-size:15px;margin:4px 0 0}
+  html,body{margin:0}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);
+    line-height:1.5;-webkit-font-smoothing:antialiased;border-top:3px solid var(--accent);}
+  .wrap{max-width:940px;margin:0 auto;padding:40px 24px 72px;}
+  header.top{display:flex;align-items:center;gap:12px;margin-bottom:4px;}
+  .logo{width:26px;height:26px;color:var(--accent);flex:0 0 auto}
+  h1{font-size:20px;font-weight:600;letter-spacing:-.01em;margin:0}
+  .sub{color:var(--muted);font-size:14.5px;margin:3px 0 0}
   .ghlink{margin-left:auto;font-size:13px;color:var(--muted);text-decoration:none;
-    border:1px solid var(--border-strong);padding:6px 10px;border-radius:6px;white-space:nowrap}
+    border:1px solid var(--border-strong);padding:6px 11px;border-radius:3px;white-space:nowrap}
   .ghlink:hover{color:var(--text);border-color:var(--faint)}
-  .privacy{display:flex;gap:9px;align-items:flex-start;margin:18px 0 22px;
-    background:var(--ok-bg);border:1px solid #bbf7d0;border-radius:8px;padding:11px 13px;
-    font-size:13.5px;color:#14532d}
-  .privacy b{font-weight:650}
-  .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:18px}
-  .card.dragging{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg,#eef2ff)}
-  label.fld{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:7px}
-  .fld .hint{font-weight:400;color:var(--faint)}
-  textarea{width:100%;font-family:var(--mono);font-size:13px;line-height:1.55;
-    border:1px solid var(--border-strong);border-radius:7px;padding:11px;resize:vertical;
-    background:#fcfcfb;color:var(--text)}
-  #config{min-height:190px}
+  .privacy{display:flex;gap:8px;align-items:center;margin:20px 0 24px;
+    background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--ok);
+    border-radius:3px;padding:10px 14px;font-size:13px;color:var(--muted)}
+  .privacy svg{flex:0 0 auto;color:var(--ok)}
+  .privacy b{font-weight:600;color:var(--text)}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:20px;margin-bottom:18px}
+  .card.dragging{border-color:var(--accent);box-shadow:0 0 0 2px rgba(15,98,254,.15)}
+  label.fld{display:block;font-size:11.5px;font-weight:600;letter-spacing:.02em;text-transform:uppercase;
+    color:var(--muted);margin-bottom:8px}
+  .fld .hint{font-weight:400;letter-spacing:0;text-transform:none;color:var(--faint)}
+  textarea{width:100%;font-family:var(--mono);font-size:12.5px;line-height:1.6;
+    border:1px solid var(--border-strong);border-radius:4px;padding:11px;resize:vertical;
+    background:var(--surface);color:var(--text)}
+  textarea:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var(--accent)}
+  #config{min-height:200px}
   #policy{min-height:96px}
-  .row{display:flex;gap:9px;flex-wrap:wrap;align-items:center;margin-top:12px}
-  button{font:inherit;font-size:14px;font-weight:550;cursor:pointer;border-radius:7px;
-    padding:9px 16px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text)}
-  button:hover{border-color:var(--faint)}
-  button.primary{background:#1c1c1a;color:#fff;border-color:#1c1c1a}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px}
+  button{font:inherit;font-size:13.5px;font-weight:500;cursor:pointer;border-radius:4px;
+    padding:9px 15px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text);
+    transition:background .12s ease,border-color .12s ease}
+  button:hover{background:var(--low-bg)}
+  button.primary{background:var(--ink);color:#fff;border-color:var(--ink)}
   button.primary:hover{background:#000}
-  button:disabled{opacity:.5;cursor:default}
-  button.small{font-size:12.5px;padding:6px 11px}
+  button:disabled{opacity:.45;cursor:default}
+  button.small{font-size:12px;padding:6px 11px}
   .linkbtn{background:none;border:none;color:var(--accent);padding:0;font-size:13px}
-  .linkbtn:hover{text-decoration:underline}
-  details.adv{margin-top:14px;border-top:1px solid var(--border);padding-top:12px}
-  details.adv summary{cursor:pointer;font-size:13px;color:var(--muted);font-weight:550}
+  .linkbtn:hover{background:none;text-decoration:underline}
+  details.adv{margin-top:16px;border-top:1px solid var(--border);padding-top:14px}
+  details.adv summary{cursor:pointer;font-size:12.5px;color:var(--muted);font-weight:500}
+  details.adv summary:hover{color:var(--text)}
   .status{font-size:13px;color:var(--faint);margin:2px 0 0;min-height:18px}
   .status.err{color:var(--crit)}
-  .spin{display:inline-block;width:12px;height:12px;border:2px solid var(--border-strong);
-    border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--border-strong);
+    border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px;margin-right:7px}
   @keyframes sp{to{transform:rotate(360deg)}}
   /* results */
   #results{display:none}
-  .results-actions{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
-  .scorebar{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-bottom:8px}
-  .score{font-size:34px;font-weight:720;letter-spacing:-.02em}
-  .score small{font-size:15px;font-weight:500;color:var(--faint)}
-  .chips{display:flex;gap:7px;flex-wrap:wrap}
-  .chip{font-size:12px;font-weight:600;padding:3px 9px;border-radius:20px;border:1px solid}
-  .chip.c{color:var(--crit);background:var(--crit-bg);border-color:#fecaca}
-  .chip.h{color:var(--high);background:var(--high-bg);border-color:#fde68a}
-  .chip.m{color:var(--med);background:var(--med-bg);border-color:#fde68a}
-  .chip.l{color:var(--low);background:var(--low-bg);border-color:var(--border-strong)}
+  .results-actions{display:flex;gap:8px;flex-wrap:wrap;margin:-2px 0 18px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+  .scorebar{display:flex;align-items:baseline;gap:20px;flex-wrap:wrap;margin-bottom:6px}
+  .score{font-family:var(--mono);font-size:30px;font-weight:500;letter-spacing:-.01em;color:var(--text)}
+  .score small{font-size:14px;color:var(--faint)}
+  .chips{display:flex;gap:6px;flex-wrap:wrap}
+  .chip{font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:3px;border:1px solid;font-family:var(--mono)}
+  .chip.c{color:var(--crit);background:var(--crit-bg);border-color:var(--crit-bd)}
+  .chip.h{color:var(--high);background:var(--high-bg);border-color:var(--high-bd)}
+  .chip.m{color:var(--med);background:var(--med-bg);border-color:var(--med-bd)}
+  .chip.l{color:var(--low);background:var(--low-bg);border-color:var(--low-bd)}
   .chip.zero{color:var(--faint);background:var(--surface);border-color:var(--border)}
-  .finding{border:1px solid var(--border);border-left-width:3px;border-radius:7px;padding:12px 14px;margin-top:11px}
+  .meta{font-size:12.5px;color:var(--faint);margin-bottom:4px}
+  .finding{border:1px solid var(--border);border-left:3px solid var(--low);border-radius:4px;padding:13px 15px;margin-top:10px}
   .finding.critical{border-left-color:var(--crit)} .finding.high{border-left-color:var(--high)}
   .finding.medium{border-left-color:var(--med)} .finding.low{border-left-color:var(--low)}
-  .finding.info{border-left-color:var(--faint)}
-  .fhead{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:6px}
-  .sev{font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:2px 7px;border-radius:4px}
-  .sev.critical{color:#fff;background:var(--crit)} .sev.high{color:#fff;background:var(--high)}
-  .sev.medium{color:#fff;background:var(--med)} .sev.low{color:#fff;background:var(--low)}
-  .sev.info{color:#fff;background:var(--faint)}
-  .kind{font-size:13px;font-weight:600}
+  .finding.info{border-left-color:var(--border-strong)}
+  .fhead{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:7px}
+  .sev{font-size:10.5px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;padding:2px 7px;border-radius:3px;border:1px solid}
+  .sev.critical{color:var(--crit);background:var(--crit-bg);border-color:var(--crit-bd)}
+  .sev.high{color:var(--high);background:var(--high-bg);border-color:var(--high-bd)}
+  .sev.medium{color:var(--med);background:var(--med-bg);border-color:var(--med-bd)}
+  .sev.low{color:var(--low);background:var(--low-bg);border-color:var(--low-bd)}
+  .sev.info{color:var(--low);background:var(--low-bg);border-color:var(--low-bd)}
+  .kind{font-size:13px;font-weight:600;font-family:var(--mono)}
   .rid{font-size:12px;color:var(--accent);font-family:var(--mono);background:none;border:0;padding:0;cursor:pointer}
-  .rid:hover{text-decoration:underline}
-  .frule{font-family:var(--mono);font-size:12.5px;background:#f7f7f6;border-radius:5px;padding:5px 8px;margin:5px 0;overflow-x:auto}
-  .frow{font-size:13.5px;margin:3px 0} .frow b{color:var(--muted);font-weight:600}
-  .cause{color:var(--crit)} .fix{color:var(--ok)}
-  .witness{font-family:var(--mono);font-size:13px;background:#fff;border:1px solid var(--border-strong);
-    border-radius:5px;padding:6px 9px;margin:5px 0;display:inline-block;color:var(--crit)}
+  .rid:hover{background:none;text-decoration:underline}
+  .frule{font-family:var(--mono);font-size:12px;background:var(--panel);border:1px solid var(--border);border-radius:3px;padding:6px 9px;margin:6px 0;overflow-x:auto;color:var(--text)}
+  .frow{font-size:13px;margin:4px 0;color:var(--text)} .frow b{color:var(--muted);font-weight:600}
+  .cause{color:var(--muted)} .fix{color:var(--ok)}
+  .witness{font-family:var(--mono);font-size:12.5px;background:var(--crit-bg);border:1px solid var(--crit-bd);
+    border-radius:3px;padding:6px 10px;margin:5px 0;display:inline-block;color:var(--crit)}
   /* segmentation panel */
-  .segpanel{border:1px solid var(--border);border-radius:9px;padding:14px;margin-bottom:16px;background:#fcfcfb}
-  .seghdr{font-size:13px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
-  .segbanner{font-size:14px;font-weight:650;border-radius:7px;padding:9px 12px;margin-bottom:6px}
-  .segbanner.pass{background:var(--ok-bg);color:#14532d;border:1px solid #bbf7d0}
-  .segbanner.fail{background:var(--crit-bg);color:var(--crit);border:1px solid #fecaca}
-  .segbanner.warn{background:var(--med-bg);color:var(--med);border:1px solid #fde68a}
-  .policyerr{background:var(--crit-bg);border:1px solid #fecaca;color:var(--crit);
-    border-radius:7px;padding:10px 12px;margin-bottom:14px;font-size:13.5px}
-  .notes{margin-top:16px;font-size:12.5px;color:var(--muted)}
-  .notes code{font-family:var(--mono);background:#f2f4f7;padding:1px 4px;border-radius:3px}
-  .empty{padding:14px;text-align:center;color:var(--ok);font-weight:600}
-  .norules{padding:14px;background:var(--high-bg);border:1px solid #fde68a;border-radius:7px;color:var(--med);font-size:14px}
-  footer{margin-top:10px;font-size:13px;color:var(--muted)}
-  footer code{font-family:var(--mono);background:#f2f4f7;padding:2px 6px;border-radius:4px;font-size:12.5px}
-  footer .cli{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin:8px 0}
+  .segpanel{border:1px solid var(--border);border-radius:6px;padding:16px;margin-bottom:18px;background:var(--panel)}
+  .seghdr{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);margin-bottom:9px}
+  .segbanner{font-size:13.5px;font-weight:600;border-radius:4px;padding:9px 12px;margin-bottom:8px;border:1px solid}
+  .segbanner.pass{background:var(--ok-bg);color:var(--ok);border-color:var(--ok-bd)}
+  .segbanner.fail{background:var(--crit-bg);color:var(--crit);border-color:var(--crit-bd)}
+  .segbanner.warn{background:var(--med-bg);color:var(--med);border-color:var(--med-bd)}
+  .policyerr{background:var(--crit-bg);border:1px solid var(--crit-bd);color:var(--crit);
+    border-radius:4px;padding:10px 12px;margin-bottom:16px;font-size:13px}
+  .notes{margin-top:18px;font-size:12px;color:var(--muted)}
+  .notes code{font-family:var(--mono);background:var(--panel);border:1px solid var(--border);padding:1px 4px;border-radius:3px}
+  .empty{padding:16px 0;color:var(--ok);font-weight:600;font-size:14px}
+  .norules{padding:13px;background:var(--high-bg);border:1px solid var(--high-bd);border-radius:4px;color:var(--high);font-size:13.5px}
+  footer{margin-top:14px;font-size:12.5px;color:var(--muted)}
+  footer code{font-family:var(--mono);background:var(--surface);border:1px solid var(--border);padding:2px 6px;border-radius:3px;font-size:12px}
+  footer .cli{background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:12px 14px;margin:8px 0}
   a{color:var(--accent)}
   @media (max-width:640px){
-    .wrap{padding:20px 14px 48px}
+    .wrap{padding:24px 16px 48px}
     header.top{flex-wrap:wrap}
     .ghlink{margin-left:0;order:3}
-    h1{font-size:20px}
-    .score{font-size:28px}
-    .scorebar{gap:10px}
+    .scorebar{gap:12px}
   }
 </style>
 </head>
@@ -128,12 +142,12 @@
       <h1>RuleHawk</h1>
       <p class="sub">Firewall &amp; segmentation auditor — paste or upload a config, get verifiable findings in seconds.</p>
     </div>
-    <a class="ghlink" href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">View on GitHub ↗</a>
+    <a class="ghlink" href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">View on GitHub</a>
   </header>
 
   <div class="privacy">
-    <span aria-hidden="true">🔒</span>
-    <span><b>Runs entirely in your browser.</b> Your config is analyzed locally via WebAssembly — it never leaves your machine, is never uploaded, and nothing is stored. It's the same open-source engine you can <a href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">read and run yourself</a>.</span>
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+    <span><b>Runs entirely in your browser.</b> Configs are analyzed locally via WebAssembly — nothing is uploaded or stored. Same open-source engine you can <a href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">read and run yourself</a>.</span>
   </div>
 
   <div class="card" id="config-card">
@@ -150,7 +164,7 @@
     </div>
     <details class="adv">
       <summary>Segmentation policy (optional) — prove zones can't reach each other</summary>
-      <p style="font-size:13px;color:var(--muted);margin:10px 0 7px">
+      <p style="font-size:13px;color:var(--muted);margin:11px 0 8px">
         Declare zones and <code>must_not_reach</code> rules; RuleHawk proves isolation or returns the concrete <b>witness packet</b> the ACL wrongly permits — audit-grade evidence.</p>
       <textarea id="policy" spellcheck="false" placeholder='{"zones":{"PCI":["10.10.0.0/16"],"CORP":["10.20.0.0/16"]},"must_not_reach":[{"src":"CORP","dst":"PCI","proto":"tcp","ports":[445,3389,22]}]}'></textarea>
       <div class="row"><button id="samplePolicy" class="linkbtn">load sample policy</button></div>
@@ -352,7 +366,7 @@ function locateRule(ruleId){
   let start=0; for(let i=0;i<ln-1;i++) start += lines[i].length + 1;
   const end = start + (lines[ln-1]||"").length;
   ta.focus(); ta.setSelectionRange(start, end);
-  const lh = 13*1.55;
+  const lh = 12.5*1.6;
   ta.scrollTop = Math.max(0, (ln-1)*lh - ta.clientHeight/2);
   ta.scrollIntoView({behavior:"smooth", block:"center"});
 }
@@ -361,7 +375,7 @@ function locateRule(ruleId){
 const SEVS = [["critical","c"],["high","h"],["medium","m"],["low","l"]];
 function findingHTML(f){
   const loc = (lastResult.ruleLines||{})[f.rule_id]
-    ? `<button class="rid" data-rid="${esc(f.rule_id)}" title="Jump to this rule in the config">${esc(f.rule_id)} ↦</button>`
+    ? `<button class="rid" data-rid="${esc(f.rule_id)}" title="Jump to this rule in the config">${esc(f.rule_id)}</button>`
     : `<span class="rid">${esc(f.rule_id)}</span>`;
   return `<div class="finding ${f.severity}">
     <div class="fhead">
@@ -370,7 +384,7 @@ function findingHTML(f){
       ${loc}
     </div>
     ${f.rule?`<div class="frule">${esc(f.rule)}</div>`:""}
-    ${f.witness?`<div class="frow"><b>witness packet:</b></div><div class="witness">${esc(f.witness)}</div>`:""}
+    ${f.witness?`<div class="frow"><b>witness packet</b></div><div class="witness">${esc(f.witness)}</div>`:""}
     ${f.cited?`<div class="frow cause"><b>caused by:</b> <span style="font-family:var(--mono)">${esc(f.cited)}</span></div>`:""}
     <div class="frow"><b>why:</b> ${esc(f.message)}</div>
     ${f.fix?`<div class="frow fix"><b>fix:</b> ${esc(f.fix)}</div>`:""}
@@ -408,9 +422,9 @@ function render(d){
     const hasViol = seg.some(f=>f.kind==="segmentation-violation");
     const hasInd  = seg.some(f=>f.kind==="segmentation-indeterminate");
     const cls = hasViol ? "fail" : (hasInd ? "warn" : "pass");
-    const label = hasViol ? "✗ Segmentation FAILED — forbidden flow is permitted"
-                : hasInd  ? "⚠ Segmentation INDETERMINATE — manual review needed"
-                : "✓ Segmentation holds — no permitted flow violates the policy";
+    const label = hasViol ? "Segmentation failed — a forbidden flow is permitted"
+                : hasInd  ? "Segmentation indeterminate — manual review needed"
+                : "Segmentation holds — no permitted flow violates the policy";
     html += `<div class="segpanel"><div class="seghdr">Segmentation policy</div>
       <div class="segbanner ${cls}">${label}</div>`
       + seg.map(findingHTML).join("") + `</div>`;
@@ -421,10 +435,10 @@ function render(d){
       <div class="score">${d.score}<small>/100</small></div>
       <div class="chips">${chips}</div>
     </div>
-    <div style="font-size:13px;color:var(--faint)">${d.rules_analyzed} rules analyzed · ${d.findings_total} finding${d.findings_total===1?'':'s'}</div>`;
+    <div class="meta">${d.rules_analyzed} rules analyzed · ${d.findings_total} finding${d.findings_total===1?'':'s'}</div>`;
 
   if(!rest.length && !seg.length){
-    html += `<div class="empty">No issues found. ✓</div>`;
+    html += `<div class="empty">No issues found.</div>`;
   } else {
     html += rest.map(findingHTML).join("");
   }
