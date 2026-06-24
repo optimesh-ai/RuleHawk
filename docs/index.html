@@ -125,6 +125,20 @@
   footer{margin-top:14px;font-size:12.5px;color:var(--muted)}
   footer code{font-family:var(--mono);background:var(--surface);border:1px solid var(--border);padding:2px 6px;border-radius:3px;font-size:12px}
   footer .cli{background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:12px 14px;margin:8px 0}
+  /* results call-to-action (the free tool → product funnel) */
+  .cta{margin-top:22px;border:1px solid var(--border);border-top:3px solid var(--accent);
+    border-radius:6px;padding:18px 20px;background:var(--surface)}
+  .cta-h{font-size:15px;font-weight:600;color:var(--text);margin-bottom:5px}
+  .cta-b{font-size:13.5px;color:var(--muted);margin-bottom:13px;max-width:660px}
+  .cta-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .cta-btn{display:inline-block;font-size:13.5px;font-weight:500;text-decoration:none;
+    background:var(--ink);color:#fff;border:1px solid var(--ink);border-radius:4px;padding:9px 15px}
+  .cta-btn:hover{background:#000}
+  .cta-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .cta-form input{font:inherit;font-size:13px;border:1px solid var(--border-strong);border-radius:4px;
+    padding:8px 11px;min-width:210px;color:var(--text);background:var(--surface)}
+  .cta-form input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var(--accent)}
+  .cta-msg{font-size:12.5px;color:var(--ok);font-weight:500}
   a{color:var(--accent)}
   @media (max-width:640px){
     .wrap{padding:24px 16px 48px}
@@ -488,6 +502,7 @@ function render(d){
     html += rest.map(findingHTML).join("");
   }
   html += notesHTML(d.parse_notes);
+  html += ctaHTML();
   box.innerHTML = html;
 
   // wire dynamic buttons
@@ -497,6 +512,22 @@ function render(d){
     if(b.dataset.act==="json") downloadBlob("rulehawk-report.json","application/json",lastResult.jsonStr);
     if(b.dataset.act==="txt")  downloadBlob("rulehawk-report.txt","text/plain",lastResult.text);
   }));
+
+  // CTA: outbound "get updates" + (if LEAD_ENDPOINT set) an email opt-in
+  box.querySelectorAll("[data-cta]").forEach(b =>
+    b.addEventListener("click", () => track("cta_click", {target: b.dataset.cta})));
+  const lead = box.querySelector("[data-lead]");
+  if(lead) lead.addEventListener("submit", e => {
+    e.preventDefault();
+    const input = lead.querySelector("input"), msg = lead.querySelector("[data-leadmsg]");
+    const email = (input.value || "").trim();
+    if(!email) return;
+    submitLead(email, d).then(() => {
+      if(msg){ msg.style.color = "var(--ok)"; msg.textContent = "Thanks — we'll be in touch."; }
+      input.disabled = true; lead.querySelector("button").disabled = true;
+    }).catch(() => { if(msg){ msg.style.color = "var(--crit)"; msg.textContent = "Couldn't submit — try again."; } });
+  });
+
   box.scrollIntoView({behavior:"smooth",block:"nearest"});
 }
 function notesHTML(notes, all){
@@ -504,6 +535,38 @@ function notesHTML(notes, all){
   if(!shown.length) return "";
   return `<div class="notes"><b>Parse notes</b> (${shown.length} line(s) not fully modeled — surfaced, never silently dropped):<br>`
     + shown.slice(0,20).map(n=>`<code>${esc(n)}</code>`).join("<br>") + `</div>`;
+}
+
+// ---- results call-to-action: turn a one-shot audit into the product funnel ----
+function ctaHTML(){
+  let row = `<a class="cta-btn" href="${esc(WAITLIST_URL)}" target="_blank" rel="noopener" data-cta="updates">Get updates →</a>`;
+  if(LEAD_ENDPOINT){
+    row += `<form class="cta-form" data-lead>
+      <input type="email" required placeholder="you@company.com" aria-label="Work email" />
+      <button class="small" type="submit">Notify me</button>
+      <span class="cta-msg" data-leadmsg></span>
+    </form>`;
+  }
+  return `<div class="cta">
+    <div class="cta-h">RuleHawk audits one config, once.</div>
+    <div class="cta-b">Want continuous monitoring across every change, more vendors (NX-OS, Juniper,
+      Palo Alto, AWS Security Groups), and exportable audit evidence for PCI / CMMC? That's what
+      OptiMesh is building on top of this engine.</div>
+    <div class="cta-row">${row}</div>
+  </div>`;
+}
+
+// Only fires when the user explicitly asks to be contacted. Sends the email plus
+// the finding counts already on screen — still never the config text.
+function submitLead(email, d){
+  if(!LEAD_ENDPOINT) return Promise.reject(new Error("lead capture disabled"));
+  track("lead_capture", {});
+  const c = d.findings_by_severity || {};
+  return fetch(LEAD_ENDPOINT, {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ email, ref: REF, ts: Date.now(),
+      criticals: c.critical||0, highs: c.high||0, rules: d.rules_analyzed||0 })
+  }).then(r => { if(!r.ok) throw new Error("lead submit failed"); });
 }
 
 // ---- input: file upload + drag & drop ----
