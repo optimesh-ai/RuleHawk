@@ -181,3 +181,55 @@ def test_default_accept_flagged_overly_permissive():
     aces, _ = parse_junos(cfg)
     kinds = {f.kind for f in analyze(aces)}
     assert "permit-any-any" in kinds
+
+
+# ── RH-3 soundness regression (verifier-found false-CRITICAL) ──────────────────
+# When a port/address VALUE fails to parse, the dimension must NOT silently widen
+# to ANY with imprecise=False: an all-unparsed permit would then COVER a later
+# deny and emit a false CRITICAL "intent-inversion-deny-dead". The fix flips
+# imprecise on any unparsed value so the rule can never prove another rule dead.
+from rulehawk.analyze import analyze as _analyze_aces  # noqa: E402
+
+
+def test_unparsed_port_value_marks_imprecise_not_silent_any():
+    cfg = """
+    firewall { family inet { filter F {
+        term ALLOW { from { protocol tcp; destination-port totally-bogus-svc; } then accept; }
+    } } }
+    """
+    aces, notes = parse_junos(cfg)
+    assert len(aces) == 1
+    a = aces[0]
+    # dimension fell back to ANY (no parsable port) ...
+    assert a.dst_port.is_any()
+    # ... but MUST be flagged imprecise so it can never prove deadness.
+    assert a.imprecise is True
+    assert any("totally-bogus-svc" in n and "imprecise" in n for n in notes)
+
+
+def test_unparsed_address_value_marks_imprecise():
+    cfg = """
+    firewall { family inet { filter F {
+        term ALLOW { from { source-address not-an-ip; protocol tcp; destination-port 80; } then accept; }
+    } } }
+    """
+    aces, notes = parse_junos(cfg)
+    assert len(aces) == 1
+    assert aces[0].src_any           # widened to ANY src
+    assert aces[0].imprecise is True
+    assert any("not-an-ip" in n and "imprecise" in n for n in notes)
+
+
+def test_unparsed_port_does_not_falsely_kill_later_deny():
+    # The actual harm: an imprecise all-ANY permit must NOT prove a real later
+    # deny on 445 dead. Before the fix this emitted a false CRITICAL.
+    cfg = """
+    firewall { family inet { filter F {
+        term ALLOW { from { protocol tcp; destination-port totally-bogus-svc; } then accept; }
+        term BLOCK { from { protocol tcp; destination-port 445; } then discard; }
+    } } }
+    """
+    aces, _ = parse_junos(cfg)
+    kinds = {f.kind for f in _analyze_aces(aces)}
+    assert "intent-inversion-deny-dead" not in kinds, (
+        "an imprecise (unparsed-value) permit must never prove a later deny dead")

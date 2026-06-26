@@ -169,27 +169,44 @@ def _addrs(vals: List[str], label: str, notes: List[str]) -> Tuple[List[_IPNet],
         try:
             nets.append(ipaddress.ip_network(v if "/" in v else f"{v}/32", strict=False))
         except ValueError:
-            notes.append(f"unparsed Junos address '{v}' in {label}")
+            # Can't parse this address. Skipping it alone would let an all-bad
+            # set fall back to ANY and over-approximate, which could falsely
+            # prove a later deny dead. Mark imprecise so this ACE is never used
+            # to prove another rule dead (trust > coverage).
+            imprecise = True
+            notes.append(f"unparsed Junos address '{v}' in {label} "
+                         f"(marked imprecise — verify manually)")
     return nets, imprecise
 
 
-def _ports(vals: List[str], label: str, key: str, notes: List[str]) -> List[PortRange]:
+def _ports(vals: List[str], label: str, key: str,
+           notes: List[str]) -> Tuple[List[PortRange], bool]:
+    """Parse a Junos port set. Returns (ranges, imprecise).
+
+    A value we cannot parse is skipped with a note AND flips imprecise: an
+    all-unparsed port set otherwise falls back to ANY (in _parse_term) and
+    could falsely prove a later deny rule dead — the trust-breaking case."""
     ranges: List[PortRange] = []
+    imprecise = False
     for v in vals:
         if "-" in v and not v.startswith("-"):
             lo, hi = v.split("-", 1)
             ln, hn = _port_num(lo), _port_num(hi)
             if ln < 0 or hn < 0:
-                notes.append(f"unparsed Junos {key} '{v}' in {label}")
+                imprecise = True
+                notes.append(f"unparsed Junos {key} '{v}' in {label} "
+                             f"(marked imprecise — verify manually)")
                 continue
             ranges.append(PortRange(min(ln, hn), max(ln, hn)))
         else:
             p = _port_num(v)
             if p < 0:
-                notes.append(f"unparsed Junos {key} '{v}' in {label}")
+                imprecise = True
+                notes.append(f"unparsed Junos {key} '{v}' in {label} "
+                             f"(marked imprecise — verify manually)")
                 continue
             ranges.append(PortRange(p, p))
-    return ranges
+    return ranges, imprecise
 
 
 @dataclass
@@ -217,9 +234,13 @@ def _parse_from(from_toks: List[str], label: str, notes: List[str]) -> _Match:
         elif key in ("protocol", "next-header"):
             m.protos += [_proto(v) for v in vals]
         elif key == "source-port":
-            m.sports += _ports(vals, label, key, notes)
+            pr, imp = _ports(vals, label, key, notes)
+            m.sports += pr
+            m.imprecise |= imp
         elif key == "destination-port":
-            m.dports += _ports(vals, label, key, notes)
+            pr, imp = _ports(vals, label, key, notes)
+            m.dports += pr
+            m.imprecise |= imp
         elif key in ("tcp-established", "tcp-flags", "tcp-initial"):
             # return-traffic / flag match — like Cisco `established`: not a new flow.
             m.stateful = True
