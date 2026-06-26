@@ -52,7 +52,8 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int) -> str:
                "=" * 64,
                "",
                " Nothing was analyzed (this is NOT a clean bill of health).",
-               " Check the input is a Cisco IOS extended ACL or ASA access-list."]
+               " Check the input is a Cisco IOS extended ACL, ASA access-list,"
+               " or Juniper Junos firewall filter."]
         if notes:
             out.append("")
             out.append(f" Parse notes ({len(notes)}):")

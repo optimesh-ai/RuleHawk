@@ -2,8 +2,9 @@
 from .analyze import Finding, analyze, score
 from .model import ACE, covers
 from .parse import parse_acls
+from .parse_junos import parse_junos
 from .report import to_json, to_text
 
 __version__ = "0.1.0"
 __all__ = ["ACE", "Finding", "analyze", "score", "covers", "parse_acls",
-           "to_json", "to_text"]
+           "parse_junos", "to_json", "to_text"]

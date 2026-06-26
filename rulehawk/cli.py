@@ -1,7 +1,9 @@
-"""RuleHawk CLI:  rulehawk <config-file> [--json]
+"""RuleHawk CLI:  rulehawk <config-file> [--json] [--junos]
 
-Day-1 value: point it at a firewall/ACL config file (Cisco IOS extended ACL or
-Cisco ASA) and get a ranked hygiene report in seconds. Reads stdin if no file.
+Day-1 value: point it at a firewall/ACL config file (Cisco IOS extended ACL,
+Cisco ASA, or Juniper Junos firewall filter) and get a ranked hygiene report in
+seconds. The vendor is auto-detected; force Junos with --junos. Reads stdin if
+no file.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import sys
 
 from .analyze import analyze, score
 from .parse import parse_acls
+from .parse_junos import detect as detect_junos, parse_junos
 from .report import to_json, to_text
 from .segcheck import check_segmentation
 
@@ -18,7 +21,8 @@ from .segcheck import check_segmentation
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     as_json = "--json" in argv
-    argv = [a for a in argv if a != "--json"]
+    force_junos = "--junos" in argv
+    argv = [a for a in argv if a not in ("--json", "--junos")]
     policy_path = None
     if "--policy" in argv:
         k = argv.index("--policy")
@@ -36,7 +40,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         text = sys.stdin.read()  # no file, or explicit "-"
 
-    aces, notes = parse_acls(text)
+    if force_junos or detect_junos(text):
+        aces, notes = parse_junos(text)
+    else:
+        aces, notes = parse_acls(text)
     findings = analyze(aces)
     if policy_path:
         try:
