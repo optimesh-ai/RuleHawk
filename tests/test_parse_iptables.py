@@ -1,0 +1,238 @@
+"""Linux iptables / ip6tables filter frontend (RH-5).
+
+The iptables parser emits the same `(List[ACE], notes)` IR as the Cisco / Junos /
+PAN-OS parsers, so the existing analysis / segmentation engine consumes it
+unchanged. These tests pin the four properties the task requires:
+  1. happy path  — a real-shaped iptables-save filter table (and the command
+     form) map to the right ordered first-match ACEs, with the chain default
+     policy appended as the implicit trailing rule;
+  2. discipline  — every unmodeled construct (conntrack/state, ipset, interface,
+     a NAT/other table, a custom-chain jump, multiport beyond the single-range
+     model) is SURFACED as a note, never silently dropped;
+  3. value       — an iptables sample produces a concrete segmentation
+     violation, and an earlier DROP blocks the flow with no false alarm;
+  4. soundness   — an unparsed/over-approximated value is flagged imprecise, so
+     it can never prove a later deny dead (the RH-3 lesson).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from rulehawk import analyze, parse_iptables  # noqa: E402
+from rulehawk.analyze import analyze as _analyze_aces  # noqa: E402
+from rulehawk.parse_iptables import detect  # noqa: E402
+from rulehawk.segcheck import check_segmentation  # noqa: E402
+
+# A real-shaped iptables-save filter table: SSH from a mgmt net, web to a server,
+# then a default DROP policy on INPUT.
+_SAVE_CFG = """
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -s 10.0.0.0/8 -p tcp --dport 22 -j ACCEPT
+-A INPUT -p tcp --dport 443 -j ACCEPT
+-A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+COMMIT
+"""
+
+
+def test_detect_routes_iptables_not_other_vendors():
+    assert detect(_SAVE_CFG) is True
+    assert detect("iptables -A INPUT -p tcp --dport 22 -j ACCEPT\n") is True
+    cisco = "ip access-list extended A\n permit tcp any any eq 443\n"
+    junos = "firewall { family inet { filter F { term T { then accept; } } } }"
+    panos = "set rulebase security rules r from any to any action allow\n"
+    assert detect(cisco) is False
+    assert detect(junos) is False
+    assert detect(panos) is False
+
+
+def test_happy_path_save_form_maps_to_aces():
+    aces, notes = parse_iptables(_SAVE_CFG)
+    # 4 explicit INPUT rules (the `-i lo` one is kept but imprecise) + the
+    # appended default-DROP policy = 5 ACEs, all in the INPUT chain.
+    inp = [a for a in aces if a.acl == "INPUT"]
+    assert len(inp) == 5
+    # The OUTPUT chain's ACCEPT policy is appended as its own (separate) ACE.
+    out = [a for a in aces if a.acl == "OUTPUT"]
+    assert len(out) == 1 and out[0].action == "permit" and out[0].src_any
+
+    ssh = next(a for a in inp if a.dst_port.lo == 22)
+    assert ssh.action == "permit" and ssh.proto == "tcp"
+    assert str(ssh.src) == "10.0.0.0/8"
+    assert ssh.imprecise is False
+
+    web = next(a for a in inp if a.dst_port.lo == 443)
+    assert web.action == "permit" and web.src_any            # no -s => any
+    assert web.imprecise is False
+
+    icmp = next(a for a in inp if a.proto == "icmp")
+    assert icmp.icmp_type == "echo-request"
+
+    # The default policy is the LAST rule of the chain and is a deny any/any.
+    last = sorted(inp, key=lambda a: a.seq)[-1]
+    assert last.action == "deny" and last.src_any and last.dst_any
+    assert "policy" in last.raw
+
+
+def test_command_form_equivalent():
+    cfg = (
+        "iptables -P INPUT DROP\n"
+        "iptables -A INPUT -s 192.168.1.0/24 -p tcp --dport 3306 -j ACCEPT\n"
+        "ip6tables -A INPUT -p tcp --dport 80 -j DROP\n"   # mixed: still parses
+    )
+    aces, _ = parse_iptables(cfg)
+    permits = [a for a in aces if a.action == "permit"]
+    assert any(str(a.src) == "192.168.1.0/24" and a.dst_port.lo == 3306
+               for a in permits)
+
+
+def test_multiport_expands_exactly_not_imprecise():
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -p tcp -m multiport --dports 80,443,8080 -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    permits = sorted(a.dst_port.lo for a in aces if a.action == "permit")
+    assert permits == [80, 443, 8080]                       # exact union of 3 ACEs
+    assert all(a.imprecise is False for a in aces if a.action == "permit")
+    assert any("multiport" in n and "expanded" in n for n in notes)
+
+
+def test_conntrack_state_modeled_stateful_and_surfaced():
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    est = [a for a in aces if a.action == "permit"]
+    assert est and est[0].stateful is True                  # return-traffic only
+    assert any("stateful" in n and ("conntrack" in n or "state" in n) for n in notes)
+
+
+def test_interface_match_marks_imprecise_and_surfaced():
+    cfg = ("*filter\n:FORWARD DROP [0:0]\n"
+           "-A FORWARD -i eth0 -s 10.0.0.0/8 -p tcp --dport 22 -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    rule = next(a for a in aces if a.dst_port.lo == 22)
+    assert rule.imprecise is True                           # -i narrows; can't model
+    assert any("interface" in n and "imprecise" in n for n in notes)
+
+
+def test_custom_chain_jump_surfaced_not_silent():
+    cfg = ("*filter\n:INPUT DROP [0:0]\n:DOCKER - [0:0]\n"
+           "-A INPUT -j DOCKER\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    # The jump to the custom DOCKER chain emits no decision ACE (effect unknown)
+    # but MUST be surfaced — never an invisible hole.
+    assert not [a for a in aces if a.acl == "INPUT" and "policy" not in a.raw]
+    assert any("custom chain" in n and "DOCKER" in n for n in notes)
+
+
+def test_nat_table_and_masquerade_surfaced():
+    cfg = ("*nat\n:POSTROUTING ACCEPT [0:0]\n"
+           "-A POSTROUTING -o eth0 -j MASQUERADE\nCOMMIT\n"
+           "*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -p tcp --dport 22 -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    # Only the filter table is modeled; the nat table is surfaced and skipped.
+    assert all(a.acl == "INPUT" for a in aces)
+    assert any("nat" in n.lower() and "not modeled" in n for n in notes)
+
+
+_SEG_POLICY = {
+    "zones": {"PCI": ["10.10.0.0/16"], "CORP": ["10.20.0.0/16"]},
+    "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp", "ports": [445]}],
+}
+
+
+def test_segmentation_violation_on_iptables_forward():
+    # A FORWARD rule that permits CORP->PCI on 445 is a concrete segmentation
+    # violation with an auditor-grade witness packet.
+    cfg = ("*filter\n:FORWARD ACCEPT [0:0]\n"
+           "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 445 -j ACCEPT\n"
+           "COMMIT\n")
+    aces, _ = parse_iptables(cfg)
+    findings = check_segmentation(aces, _SEG_POLICY)
+    viol = [f for f in findings if f.kind == "segmentation-violation"]
+    assert viol and viol[0].severity == "critical"
+    assert "10.20" in viol[0].message and "10.10" in viol[0].message
+    assert ":445" in viol[0].witness
+
+
+def test_earlier_drop_blocks_no_false_alarm():
+    # The forbidden flow is DROPped before the broad ACCEPT policy -> PASS, not a
+    # violation (first-match semantics honored, same as the other vendors).
+    cfg = ("*filter\n:FORWARD ACCEPT [0:0]\n"
+           "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 445 -j DROP\n"
+           "COMMIT\n")
+    aces, _ = parse_iptables(cfg)
+    kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
+    assert "segmentation-violation" not in kinds
+    assert "segmentation-ok" in kinds
+
+
+def test_default_accept_policy_flagged_overly_permissive():
+    # A default-ACCEPT INPUT chain is the dangerous host-firewall default — the
+    # appended `permit ip any any` must trip the overly-permissive check.
+    cfg = "*filter\n:INPUT ACCEPT [0:0]\nCOMMIT\n"
+    aces, _ = parse_iptables(cfg)
+    kinds = {f.kind for f in analyze(aces)}
+    assert "permit-any-any" in kinds
+
+
+# ── RH-5 soundness regression (the RH-3 lesson) ────────────────────────────────
+# An over-approximated permit (unparsed port, ipset membership, negation) must
+# NOT silently widen and prove a later deny dead — that would emit a false
+# CRITICAL "intent-inversion-deny-dead" and could recommend deleting a real rule.
+
+def test_unparsed_port_marks_imprecise():
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -p tcp --dport not-a-port -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.dst_port.is_any()              # fell back to ANY ...
+    assert rule.imprecise is True              # ... but flagged so it can't prove deadness
+    assert any("not-a-port" in n and "imprecise" in n for n in notes)
+
+
+def test_ipset_match_marks_imprecise():
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -m set --match-set badips src -p tcp --dport 22 -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.imprecise is True
+    assert any("ipset" in n and "badips" in n and "imprecise" in n for n in notes)
+
+
+def test_negated_source_marks_imprecise():
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT ! -s 10.0.0.0/8 -p tcp --dport 22 -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.src_any and rule.imprecise is True
+    assert any("negated source" in n and "imprecise" in n for n in notes)
+
+
+def test_imprecise_permit_does_not_falsely_kill_later_deny():
+    # The actual harm: an imprecise all-ANY permit must NOT prove a later real
+    # deny on 445 dead. Without the imprecise flag this emits a false CRITICAL.
+    cfg = ("*filter\n:FORWARD DROP [0:0]\n"
+           "-A FORWARD -m set --match-set anyset src -j ACCEPT\n"
+           "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 445 -j DROP\n"
+           "COMMIT\n")
+    aces, _ = parse_iptables(cfg)
+    kinds = {f.kind for f in _analyze_aces(aces)}
+    assert "intent-inversion-deny-dead" not in kinds, (
+        "an imprecise (ipset) permit must never prove a later deny dead")
+
+
+def test_ipv6_rules_use_v6_any():
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -s 2001:db8::/32 -p tcp --dport 22 -j ACCEPT\nCOMMIT\n")
+    aces, _ = parse_iptables(cfg)
+    rule = next(a for a in aces if a.dst_port.lo == 22)
+    assert rule.src.version == 6
+    assert rule.dst.version == 6 and rule.dst_any   # unspecified dst -> ::/0
