@@ -7,9 +7,12 @@ auto-detect by the mask's bit pattern rather than guessing the vendor; a
 non-contiguous or genuinely ambiguous mask marks the entry `imprecise` and emits
 a parse note, so it can never be used to (wrongly) prove another rule dead.
 
-`neq` ports and `established` are modeled honestly: `neq` -> imprecise (its true
-space is non-contiguous), `established` -> stateful. ICMP type qualifiers are
-captured so `echo` and `echo-reply` aren't treated as the same packet space.
+Service port operators are modeled honestly and, where soundly possible,
+PRECISELY: `eq`/`range` -> one exact range; `lt P` -> [MIN, P-1]; `gt P` ->
+[P+1, MAX]; `neq P` -> the EXACT union of [MIN, P-1] and [P+1, MAX] (expanded to
+one ACE per sub-range, so it stays exact, never widened). `established` ->
+stateful. ICMP type qualifiers are captured so `echo` and `echo-reply` aren't
+treated as the same packet space.
 Unmodeled lines (object-group, etc.) are surfaced as notes, never silently dropped.
 """
 
@@ -132,10 +135,26 @@ def _parse_port_op(tokens: List[str], i: int) -> Tuple[List[PortRange], int, boo
             return [ANY_PORTS], i + 2, True, 0
         return [PortRange(PORT_MIN, p - 1)], i + 2, False, 0
     if op == "neq":
-        # neq's true space is non-contiguous (everything EXCEPT p). We cannot
-        # represent that as one range, so over-approximate to ANY and mark the
-        # entry imprecise — it must never be used to prove another rule dead.
-        return [ANY_PORTS], i + 2, True, 0
+        # neq P's true space is non-contiguous (every port EXCEPT P), i.e. the
+        # EXACT union of two contiguous ranges [MIN, P-1] and [P+1, MAX]. The IR
+        # already expands a port LIST into one ACE per range (the same mechanism
+        # as a multi-port `eq a b c`), so we can model neq PRECISELY rather than
+        # over-approximating to ANY+imprecise: emit both sub-ranges. Each emitted
+        # range is exact (never widened), so this can only turn an INDETERMINATE
+        # into a precise PASS/CRITICAL — it can never manufacture a false PASS
+        # (a port P stays uncovered, exactly as `neq P` intends). Degenerate ends
+        # collapse cleanly: `neq 0` -> just [1, MAX]; `neq 65535` -> just [0, 65534].
+        p = _port_num(tokens[i + 1])
+        if p < 0:                            # unparsable service name -> fail closed
+            return [ANY_PORTS], i + 2, True, 0
+        ranges: List[PortRange] = []
+        if p > PORT_MIN:
+            ranges.append(PortRange(PORT_MIN, p - 1))
+        if p < PORT_MAX:
+            ranges.append(PortRange(p + 1, PORT_MAX))
+        if not ranges:                       # unreachable after clamp; stay sound
+            return [ANY_PORTS], i + 2, True, 0
+        return ranges, i + 2, False, 0
     return [ANY_PORTS], i, False, 0
 
 
@@ -267,8 +286,11 @@ def _expand_proto(p: Optional[str]) -> Optional[List[str]]:
 
 
 def _svc_port(rest: List[str], idx: int) -> Optional[PortRange]:
-    """Parse `eq P` / `range LO HI` at rest[idx:]. Only exact, contiguous forms;
-    lt/gt/neq stay unmodeled (-> caller fails closed)."""
+    """Parse an exact, contiguous service-port operator at rest[idx:] -> one
+    PortRange. Handles `eq P` / `range LO HI` / `lt P` -> [MIN, P-1] / `gt P` ->
+    [P+1, MAX]. `neq` is non-contiguous (two ranges) and cannot be expressed as a
+    single PortRange here, so it stays unmodeled (-> caller fails closed,
+    INDETERMINATE) — never widened into a (possibly false) PASS."""
     if idx >= len(rest):
         return None
     op = rest[idx].lower()
@@ -280,6 +302,12 @@ def _svc_port(rest: List[str], idx: int) -> Optional[PortRange]:
         if lo < 0 or hi < 0:
             return None
         return PortRange(min(lo, hi), max(lo, hi))
+    if op == "lt":
+        p = _port_num(rest[idx + 1])
+        return PortRange(PORT_MIN, p - 1) if p > PORT_MIN else None
+    if op == "gt":
+        p = _port_num(rest[idx + 1])
+        return PortRange(p + 1, PORT_MAX) if 0 <= p < PORT_MAX else None
     return None
 
 

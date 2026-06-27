@@ -59,9 +59,26 @@ def test_unrelated_permit_does_not_violate():
     assert "segmentation-ok" in kinds
 
 
-def test_neq_rule_is_indeterminate_not_false_pass():
-    # An imprecise deciding rule must not be silently called PASS.
+def test_neq_covering_445_is_precise_critical():
+    # `neq 80` permits EVERY port except 80 — including the forbidden 445. The
+    # complement is the exact union of [0,79] and [81,65535]; we model it
+    # precisely (two ACEs), so this is a CONCRETE violation, not a vague
+    # INDETERMINATE. (It was INDETERMINATE before neq precision; never a PASS.)
     acl = ("ip access-list extended T\n"
            " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 neq 80\n")
     kinds = {k for k, _ in _kinds(acl)}
-    assert "segmentation-indeterminate" in kinds
+    assert "segmentation-violation" in kinds
+    assert "segmentation-indeterminate" not in kinds
+
+
+def test_neq_excluding_445_is_precise_pass_never_false():
+    # `neq 445` is the ONE operator that does NOT permit 445 — its complement is
+    # [0,444] U [446,65535]. Port 445 is genuinely uncovered, so (with no other
+    # permit) CORP truly cannot reach PCI:445 -> a PRECISE pass, and crucially
+    # NEVER a false PASS: the verdict is segmentation-ok ONLY because 445 sits in
+    # neither modeled range. Soundness guard: never ok when 445 IS in the complement.
+    acl = ("ip access-list extended T\n"
+           " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 neq 445\n")
+    kinds = {k for k, _ in _kinds(acl)}
+    assert "segmentation-violation" not in kinds
+    assert "segmentation-ok" in kinds
