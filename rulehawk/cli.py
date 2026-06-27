@@ -1,9 +1,9 @@
-"""RuleHawk CLI:  rulehawk <config-file> [--json] [--junos]
+"""RuleHawk CLI:  rulehawk <config-file> [--json] [--junos] [--panos]
 
 Day-1 value: point it at a firewall/ACL config file (Cisco IOS extended ACL,
-Cisco ASA, or Juniper Junos firewall filter) and get a ranked hygiene report in
-seconds. The vendor is auto-detected; force Junos with --junos. Reads stdin if
-no file.
+Cisco ASA, Juniper Junos firewall filter, or Palo Alto PAN-OS security policy)
+and get a ranked hygiene report in seconds. The vendor is auto-detected; force
+Junos with --junos or PAN-OS with --panos. Reads stdin if no file.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import sys
 from .analyze import analyze, score
 from .parse import parse_acls
 from .parse_junos import detect as detect_junos, parse_junos
+from .parse_panos import detect as detect_panos, parse_panos
 from .report import to_json, to_text
 from .segcheck import check_segmentation
 
@@ -22,7 +23,8 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     as_json = "--json" in argv
     force_junos = "--junos" in argv
-    argv = [a for a in argv if a not in ("--json", "--junos")]
+    force_panos = "--panos" in argv
+    argv = [a for a in argv if a not in ("--json", "--junos", "--panos")]
     policy_path = None
     if "--policy" in argv:
         k = argv.index("--policy")
@@ -40,8 +42,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         text = sys.stdin.read()  # no file, or explicit "-"
 
-    if force_junos or detect_junos(text):
+    if force_junos or (not force_panos and detect_junos(text)):
         aces, notes = parse_junos(text)
+    elif force_panos or detect_panos(text):
+        aces, notes = parse_panos(text)
     else:
         aces, notes = parse_acls(text)
     findings = analyze(aces)
