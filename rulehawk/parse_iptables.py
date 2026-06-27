@@ -140,7 +140,8 @@ class _Rule:
     """Accumulated match state for one `-A` rule, before ACE expansion."""
 
     __slots__ = ("src", "dst", "proto", "sports", "dports", "stateful",
-                 "imprecise", "icmp_type", "action", "skip_note", "modules")
+                 "imprecise", "icmp_type", "action", "skip_note", "modules",
+                 "jump_custom")
 
     def __init__(self) -> None:
         self.src: Optional[_IPNet] = None
@@ -154,6 +155,7 @@ class _Rule:
         self.action: Optional[str] = None
         self.skip_note: Optional[str] = None   # set => rule emits no ACE (surfaced)
         self.modules: List[str] = []
+        self.jump_custom: Optional[str] = None  # target name of an unmodeled custom-chain jump
 
 
 _PROTO_NUM = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6",
@@ -293,6 +295,10 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
             else:
                 # A jump to a user-defined chain: its effect (accept/drop/return)
                 # is indeterminate in this flat model -> surface, emit no decision.
+                # In a TRANSIT chain we ALSO emit an imprecise marker (see add_rule)
+                # so the FORWARD verdict fails closed instead of FALSE-PASSing a leak
+                # hidden inside the sub-chain.
+                r.jump_custom = nxt or ""
                 r.skip_note = (f"iptables jump to custom chain `-j {nxt}` in {label} — "
                                f"sub-chain effect not modeled (no decision emitted; "
                                f"flatten or verify the chain manually)")
@@ -394,6 +400,21 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
         r = _parse_rule(args, label, notes)
         if r.skip_note is not None:
             notes.append(r.skip_note)
+            # SOUNDNESS / fail-closed: a jump to an unmodeled custom chain on the
+            # TRANSIT path can carry a forbidden inter-zone flow we don't model
+            # (the leak lives inside the sub-chain). Emitting no ACE let the
+            # FORWARD default-deny shadow the real permit and FALSE-PASS the leak.
+            # Instead, emit an IMPRECISE permit covering the jump rule's matched
+            # space, positioned where the jump fires (before the chain's default
+            # policy). The engine already turns an imprecise match into
+            # segmentation-INDETERMINATE, so segcheck can no longer conclude a
+            # clean PASS for any flow the sub-chain could touch. Non-transit hooks
+            # (INPUT/OUTPUT) don't decide inter-zone reachability, so they keep the
+            # surface-only behavior (no synthetic ACE).
+            if r.jump_custom is not None and _is_transit(ch):
+                r.action = "permit"
+                r.imprecise = True
+                seqs[ch] = _expand(ch, r, seqs[ch], by_chain[ch], default6)
             return
         if r.action is None:
             notes.append(f"iptables rule in {ch} has no terminating target "

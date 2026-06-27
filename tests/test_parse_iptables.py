@@ -233,6 +233,80 @@ def test_multichain_no_false_pass_for_dmz_rule_and_legit_flow_passes():
     assert len(viols) == 1 and "10.10.0" in viols[0].message  # dst is PCI, not DMZ
 
 
+# ── RH-iptables soundness regression: leak hidden in a jumped custom chain ─────
+# `-A FORWARD -j CROSSZONE` jumps the TRANSIT path into a custom chain whose
+# ACCEPT rule permits CORP->PCI:445. The custom-chain effect is unmodeled, so the
+# jump emitted no decision — and the FORWARD default-deny then shadowed the
+# CROSSZONE permit in the flat first-match stream, FALSE-PASSing a real leak.
+# Fail-closed fix: an unmodeled transit jump emits an IMPRECISE marker that the
+# engine turns into segmentation-INDETERMINATE, so a clean PASS is impossible for
+# any flow the sub-chain could carry.
+
+_CUSTOM_JUMP_LEAK = (
+    "*filter\n"
+    ":INPUT DROP [0:0]\n"
+    ":FORWARD DROP [0:0]\n"
+    ":CROSSZONE - [0:0]\n"
+    "-A FORWARD -j CROSSZONE\n"
+    "-A CROSSZONE -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 445 -j ACCEPT\n"
+    "COMMIT\n"
+)
+
+
+def test_custom_chain_jump_on_transit_path_is_indeterminate_not_ok():
+    """The residual false PASS: a leak inside a custom chain reached via a FORWARD
+    jump must yield segmentation-INDETERMINATE (fail closed), NEVER segmentation-ok.
+    Mutation guard: deleting the imprecise-marker emit in add_rule reverts this to
+    a segmentation-ok FALSE PASS."""
+    aces, notes = parse_iptables(_CUSTOM_JUMP_LEAK)
+    findings = check_segmentation(aces, _MULTI_CHAIN_POLICY)
+    corp = [f for f in findings if "CORP" in (f.rule_id or "") or "CORP" in f.message]
+    # CORP->PCI:445 (the hidden leak) must NOT be reported as isolated.
+    assert not [f for f in findings
+                if f.kind == "segmentation-ok" and "CORP" in (f.rule_id or "")], \
+        "CORP->PCI must not FALSE-PASS when the leak hides in a jumped custom chain"
+    assert any(f.kind == "segmentation-indeterminate" for f in corp), \
+        "an unmodeled transit jump must fail closed to segmentation-indeterminate"
+    # The jump is still surfaced as a parse note (never an invisible hole).
+    assert any("custom chain" in n and "CROSSZONE" in n for n in notes)
+
+
+def test_custom_chain_jump_emits_imprecise_transit_marker():
+    """Mechanism check: the FORWARD jump produces an imprecise transit ACE that
+    sits before the chain default policy; the custom chain itself stays transit."""
+    aces, _ = parse_iptables(_CUSTOM_JUMP_LEAK)
+    fwd = [a for a in aces if a.acl == "FORWARD" and "policy" not in a.raw]
+    assert fwd and all(a.imprecise and a.transit for a in fwd)
+
+
+def test_custom_chain_jump_on_input_stays_surface_only():
+    """A jump on the NON-transit INPUT hook does not decide inter-zone reachability,
+    so it keeps the surface-only behavior (no synthetic ACE) — no regression to the
+    existing custom-chain-jump test."""
+    cfg = ("*filter\n:INPUT DROP [0:0]\n:DOCKER - [0:0]\n"
+           "-A INPUT -j DOCKER\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    assert not [a for a in aces if a.acl == "INPUT" and "policy" not in a.raw]
+    assert any("custom chain" in n and "DOCKER" in n for n in notes)
+
+
+def test_clean_fully_modeled_config_still_passes():
+    """No over-blocking regression: a fully-modeled FORWARD config with NO unmodeled
+    construct and no permitted forbidden flow must still cleanly PASS."""
+    cfg = ("*filter\n"
+           ":INPUT DROP [0:0]\n"
+           ":FORWARD DROP [0:0]\n"
+           # only a benign, non-forbidden transit flow is permitted:
+           "-A FORWARD -s 10.20.0.0/16 -d 10.30.0.0/16 -p tcp --dport 443 -j ACCEPT\n"
+           "COMMIT\n")
+    aces, _ = parse_iptables(cfg)
+    findings = check_segmentation(aces, _MULTI_CHAIN_POLICY)
+    kinds = {f.kind for f in findings}
+    assert "segmentation-ok" in kinds
+    assert "segmentation-indeterminate" not in kinds
+    assert "segmentation-violation" not in kinds
+
+
 def test_earlier_drop_blocks_no_false_alarm():
     # The forbidden flow is DROPped before the broad ACCEPT policy -> PASS, not a
     # violation (first-match semantics honored, same as the other vendors).
