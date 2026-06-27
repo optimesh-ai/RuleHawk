@@ -162,6 +162,77 @@ def test_segmentation_violation_on_iptables_forward():
     assert ":445" in viol[0].witness
 
 
+# ── RH-iptables soundness regression: cross-chain shadowing (FALSE PASS) ───────
+# A transit (inter-zone) packet is forwarded through the box and traverses ONLY
+# the FORWARD chain. A normal host firewall sets `:INPUT DROP` / `:OUTPUT DROP`
+# defaults. Before the fix the frontend flattened INPUT/FORWARD/OUTPUT into one
+# ordered first-match stream, so INPUT's default `deny ip any any` (emitted first)
+# shadowed the later FORWARD permit and segcheck FALSE-PASSed a real CORP->PCI:445
+# leak. The FORWARD chain alone must govern the inter-zone verdict.
+
+_MULTI_CHAIN_LEAK = (
+    "*filter\n"
+    ":INPUT DROP [0:0]\n"        # host-inbound default deny — must NOT shadow FORWARD
+    ":FORWARD DROP [0:0]\n"
+    ":OUTPUT ACCEPT [0:0]\n"     # host-outbound default accept — must NOT count as transit
+    # the real inter-zone leak (transit path):
+    "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 445 -j ACCEPT\n"
+    # a legitimate, allowed transit flow that must keep PASSing where asserted:
+    "-A FORWARD -s 10.20.0.0/16 -d 10.30.0.0/16 -p tcp --dport 443 -j ACCEPT\n"
+    "COMMIT\n"
+)
+
+_MULTI_CHAIN_POLICY = {
+    "zones": {"PCI": ["10.10.0.0/16"], "CORP": ["10.20.0.0/16"],
+              "DMZ": ["203.0.113.0/24"]},
+    "must_not_reach": [
+        {"src": "CORP", "dst": "PCI", "proto": "tcp", "ports": [445]},
+        {"src": "DMZ", "dst": "PCI", "proto": "ip"},
+    ],
+}
+
+
+def test_multichain_input_drop_does_not_shadow_forward_leak():
+    """The core soundness regression: with INPUT/OUTPUT default policies present,
+    the FORWARD CORP->PCI:445 leak MUST surface as a CRITICAL violation (it used
+    to FALSE-PASS because INPUT's default deny shadowed FORWARD). Reverting the
+    `transit` exclusion makes this test fail."""
+    aces, _ = parse_iptables(_MULTI_CHAIN_LEAK)
+    findings = check_segmentation(aces, _MULTI_CHAIN_POLICY)
+    viol = [f for f in findings if f.kind == "segmentation-violation"]
+    assert viol, "FALSE PASS: FORWARD CORP->PCI:445 leak hidden by INPUT default deny"
+    assert viol[0].severity == "critical"
+    assert "FORWARD" in viol[0].rule_id          # the witness is in the FORWARD chain
+    assert "10.20" in viol[0].message and "10.10" in viol[0].message
+    assert ":445" in viol[0].witness
+
+
+def test_multichain_input_output_flagged_non_transit():
+    """INPUT/OUTPUT ACEs are excluded from the transit witness (transit=False);
+    FORWARD ACEs stay transit-eligible. This is the mechanism the fix relies on."""
+    aces, _ = parse_iptables(_MULTI_CHAIN_LEAK)
+    assert all(a.transit for a in aces if a.acl == "FORWARD")
+    assert all(not a.transit for a in aces if a.acl in ("INPUT", "OUTPUT"))
+
+
+def test_multichain_no_false_pass_for_dmz_rule_and_legit_flow_passes():
+    """No false PASS hiding under the noise: DMZ->PCI stays isolated (PASS, no
+    permit on that path) and the legitimate CORP->DMZ:443 transit flow is not
+    mis-reported as a violation."""
+    aces, _ = parse_iptables(_MULTI_CHAIN_LEAK)
+    findings = check_segmentation(aces, _MULTI_CHAIN_POLICY)
+    by_label = {f.rule_id: f for f in findings}
+    # DMZ!->PCI: no permit on that path anywhere -> a clean PASS, not a violation.
+    dmz_oks = [f for f in findings if f.kind == "segmentation-ok" and "DMZ" in f.rule_id]
+    assert dmz_oks, "DMZ->PCI should PASS (isolated), not be silently dropped"
+    assert not [f for f in findings
+                if f.kind == "segmentation-violation" and "DMZ" in (f.rule_id or "")]
+    # The only violation is the CORP->PCI:445 leak; the legit CORP->DMZ:443 flow
+    # (not asserted as forbidden) raises nothing.
+    viols = [f for f in findings if f.kind == "segmentation-violation"]
+    assert len(viols) == 1 and "10.10.0" in viols[0].message  # dst is PCI, not DMZ
+
+
 def test_earlier_drop_blocks_no_false_alarm():
     # The forbidden flow is DROPped before the broad ACCEPT policy -> PASS, not a
     # violation (first-match semantics honored, same as the other vendors).

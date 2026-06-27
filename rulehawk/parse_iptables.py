@@ -62,6 +62,20 @@ _NONTERMINATING = {"LOG", "AUDIT", "MARK", "CONNMARK", "TOS", "TCPMSS",
 # Built-in chains that carry a default policy (custom chains default to RETURN).
 _BASE_CHAINS = frozenset({"INPUT", "FORWARD", "OUTPUT"})
 
+# Host in/out hooks: a TRANSIT (inter-zone) packet is forwarded through the box
+# and traverses ONLY the FORWARD chain, never INPUT (locally-destined) or OUTPUT
+# (locally-originated). So INPUT/OUTPUT ACEs must NOT participate in the inter-
+# zone segmentation witness search — their default-deny would otherwise shadow a
+# FORWARD permit and FALSE-PASS a real leak. They stay available for hygiene
+# analysis (shadow/least-privilege), just flagged `transit=False`. FORWARD and
+# any user chains keep `transit=True` (safe side: at worst an over-report, never
+# a hidden leak).
+_NON_TRANSIT_CHAINS = frozenset({"INPUT", "OUTPUT"})
+
+
+def _is_transit(chain: str) -> bool:
+    return chain not in _NON_TRANSIT_CHAINS
+
 
 def detect(text: str) -> bool:
     """Heuristic: does `text` look like iptables/ip6tables rules?
@@ -327,6 +341,7 @@ def _expand(chain: str, r: _Rule, seq: int, entries: List[ACE],
     ported = r.proto in ("tcp", "udp", "sctp")
     sports = (r.sports or [ANY_PORTS]) if ported else [ANY_PORTS]
     dports = (r.dports or [ANY_PORTS]) if ported else [ANY_PORTS]
+    transit = _is_transit(chain)
     for sp in sports:
         for dp in dports:
             seq += 1
@@ -334,7 +349,8 @@ def _expand(chain: str, r: _Rule, seq: int, entries: List[ACE],
                 seq=seq, action=r.action, proto=r.proto, src=src, dst=dst,
                 src_port=sp, dst_port=dp, icmp_type=r.icmp_type,
                 stateful=r.stateful, imprecise=r.imprecise,
-                raw=_raw(chain, r.action, r.proto, src, dst, sp, dp), acl=chain))
+                raw=_raw(chain, r.action, r.proto, src, dst, sp, dp), acl=chain,
+                transit=transit))
     return seq
 
 
@@ -484,7 +500,8 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             act = policies[ch]
             chain_aces.append(ACE(
                 seq=seqs[ch], action=act, proto="ip", src=any_net, dst=any_net,
-                raw=f"{ch}: default policy {act} (chain policy)", acl=ch))
+                raw=f"{ch}: default policy {act} (chain policy)", acl=ch,
+                transit=_is_transit(ch)))
         elif chain_aces and ch in _BASE_CHAINS:
             notes.append(f"iptables base chain {ch} has rules but no explicit default "
                          f"policy in this config — default not modeled (paste the "
@@ -492,19 +509,22 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
         entries.extend(chain_aces)
 
     # iptables base chains (INPUT/FORWARD/OUTPUT) are INDEPENDENT first-match
-    # hooks, but the shared segmentation engine evaluates the emitted ACEs as one
-    # ordered context (its existing multi-ACL behavior, reused unchanged). For
-    # zone-to-zone segmentation the FORWARD chain is the relevant path — surface
-    # this so a cross-chain "indeterminate" is understood, not mistaken for a gap.
+    # hooks. A transit (inter-zone) packet is forwarded through the box and
+    # traverses ONLY the FORWARD chain, so the INPUT/OUTPUT host hooks are flagged
+    # `transit=False` (see `_is_transit`) and excluded from the inter-zone
+    # segmentation witness search — one hook's default-deny can no longer shadow a
+    # FORWARD permit (the soundness fix). Surface the chain inventory so the FORWARD
+    # scoping is visible to an auditor.
     chains_with_rules = [c for c in chains if any(
         "policy" not in a.raw for a in by_chain[c])]
     if len(chains_with_rules) > 1:
         notes.append("multiple iptables chains present "
                      f"({', '.join(chains_with_rules)}); they are independent "
-                     "first-match hooks but segmentation evaluates them as one "
-                     "ordered context — for zone-to-zone audits the FORWARD chain "
-                     "is the inter-zone path (filter per chain if a verdict looks "
-                     "cross-contaminated).")
+                     "first-match hooks. Inter-zone segmentation is decided by the "
+                     "FORWARD chain only (transit path); the INPUT/OUTPUT host hooks "
+                     "are excluded from the cross-zone witness search so their "
+                     "default policy cannot shadow a FORWARD rule (they remain in "
+                     "hygiene/shadow analysis).")
 
     if not entries and not notes:
         notes.append("no iptables filter-table rules found "

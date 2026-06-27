@@ -77,6 +77,15 @@ def _eval_acl(aces: List[ACE], proto: str, src: str, dst: str,
 
 def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
     findings: List[Finding] = []
+    # Inter-zone (transit) segmentation is decided ONLY by ACEs that govern
+    # forwarded traffic. iptables INPUT/OUTPUT are host in/out hooks that never
+    # see a transit packet, so they're flagged `transit=False` by the frontend
+    # and excluded here — otherwise INPUT's default `deny ip any any` would
+    # shadow a later FORWARD permit in the flat first-match stream and FALSE-PASS
+    # a real leak. All other vendors leave `transit=True`, so this is a no-op for
+    # them. Excluding only host hooks can never hide a transit leak (it removes no
+    # FORWARD/Cisco rule); it just stops cross-context shadowing.
+    aces = [a for a in aces if a.transit]
     zones = {name: [_net(c) for c in cidrs]
              for name, cidrs in (policy.get("zones") or {}).items()}
     for assertion in (policy.get("must_not_reach") or []):

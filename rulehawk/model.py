@@ -67,6 +67,14 @@ class ACE:
     imprecise: bool = False           # over-approximated space (neq / bad mask)
     raw: str = ""
     acl: str = ""
+    transit: bool = True              # participates in INTER-ZONE (transit) segmentation.
+    # True for vendors whose ACLs filter forwarded traffic (Cisco/Junos/PAN-OS,
+    # and the iptables FORWARD chain). False for direction contexts that NEVER
+    # see transit packets (the iptables INPUT/OUTPUT host hooks): a transit packet
+    # traverses ONLY FORWARD, so one host hook's default-deny must never shadow a
+    # FORWARD permit in the segmentation witness search. Non-transit ACEs stay
+    # available for hygiene analysis (shadow/least-privilege), just not the
+    # inter-zone witness. Default True keeps single-context vendors unchanged.
 
     @property
     def src_any(self) -> bool:
