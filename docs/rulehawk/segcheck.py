@@ -77,6 +77,29 @@ def _eval_acl(aces: List[ACE], proto: str, src: str, dst: str,
 
 def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
     findings: List[Finding] = []
+    # Inter-zone (transit) segmentation is decided ONLY by ACEs that govern
+    # forwarded traffic. iptables INPUT/OUTPUT are host in/out hooks that never
+    # see a transit packet, so they're flagged `transit=False` by the frontend
+    # and excluded here — otherwise INPUT's default `deny ip any any` would
+    # shadow a later FORWARD permit in the flat first-match stream and FALSE-PASS
+    # a real leak. All other vendors leave `transit=True`, so this is a no-op for
+    # them. Excluding only host hooks can never hide a transit leak (it removes no
+    # FORWARD/Cisco rule); it just stops cross-context shadowing.
+    aces = [a for a in aces if a.transit]
+    # Each ACL / Junos filter is an INDEPENDENT first-match context (applied to
+    # its own interface + direction). One ACL's catch-all `deny ip any any` must
+    # NEVER shadow a PERMIT in a *different* ACL during the witness search — that
+    # cross-context shadow let a real leak in ACL B FALSE-PASS because ACL A
+    # default-denied the witness first (the same shape as the iptables INPUT vs
+    # FORWARD bug, here across Cisco/Junos ACLs). So when we evaluate a candidate
+    # permit's witness we restrict the first-match stream to the candidate's own
+    # ACL (`by_acl[r.acl]`). Within a single ACL, ordering / earlier denies are
+    # still honored exactly. iptables custom chains keep working: the FORWARD
+    # jump-marker is encountered as the first candidate and decides (indeterminate)
+    # within FORWARD before any sub-chain permit is reached.
+    by_acl: dict = {}
+    for a in aces:
+        by_acl.setdefault(a.acl, []).append(a)
     zones = {name: [_net(c) for c in cidrs]
              for name, cidrs in (policy.get("zones") or {}).items()}
     for assertion in (policy.get("must_not_reach") or []):
@@ -101,7 +124,10 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                                 and not r.imprecise and not r.dst_port.contains(port)):
                             continue
                         swit, dwit = _witness_host(si), _witness_host(di)
-                        eff, dec = _eval_acl(aces, proto, swit, dwit, port)
+                        # Evaluate the witness ONLY within the candidate rule's own
+                        # ACL — a deny in another (independent) ACL cannot block it.
+                        eff, dec = _eval_acl(by_acl.get(r.acl, aces),
+                                             proto, swit, dwit, port)
                         portsfx = f":{port}" if port is not None else ""
                         if eff == "permit":
                             findings.append(Finding(

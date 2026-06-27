@@ -3,17 +3,38 @@
    engine from ./rulehawk/ (next to this file) so the config never leaves the
    browser. Loaded by docs/index.html; falls back to main-thread if unavailable. */
 
-const ENGINE_MODULES = ["__init__", "model", "parse", "analyze", "report", "segcheck"];
+// Every engine module the in-browser tool loads. This MUST stay a superset of
+// the parsers used in ANALYZE_PY below: a vendor whose parser isn't loaded here
+// can never be audited, and the UI must never claim it. tests/test_hosted_
+// parity.py fails the build if this list, the dispatch, or the engine drift apart.
+const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
+                        "parse_iptables", "analyze", "report", "segcheck"];
 
 // Build the report envelope: structured JSON + human-readable text + a
 // rule_id -> source-line map so the UI can jump from a finding to its rule.
+//
+// Vendor auto-detection mirrors the CLI (rulehawk/cli.py): the SAME detect()
+// gates in the SAME order (Junos -> PAN-OS -> iptables -> Cisco IOS/ASA
+// fallback), calling the SAME parsers the CLI runs — so the hosted tool's
+// verdicts are the CLI's, fail-closed soundness included, never a browser
+// reimplementation that could diverge into a false PASS.
 const ANALYZE_PY = `
 import json
 from rulehawk.parse import parse_acls
+from rulehawk.parse_junos import detect as detect_junos, parse_junos
+from rulehawk.parse_panos import detect as detect_panos, parse_panos
+from rulehawk.parse_iptables import detect as detect_iptables, parse_iptables
 from rulehawk.analyze import analyze
 from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
-aces, notes = parse_acls(cfg)
+if detect_junos(cfg):
+    vendor, (aces, notes) = "Juniper Junos", parse_junos(cfg)
+elif detect_panos(cfg):
+    vendor, (aces, notes) = "Palo Alto PAN-OS", parse_panos(cfg)
+elif detect_iptables(cfg):
+    vendor, (aces, notes) = "Linux iptables", parse_iptables(cfg)
+else:
+    vendor, (aces, notes) = "Cisco IOS / ASA", parse_acls(cfg)
 findings = analyze(aces)
 _pol = pol.strip()
 if _pol:
@@ -31,7 +52,7 @@ for a in aces:
             break
 json.dumps({"report_json": json.loads(to_json(findings, notes, len(aces))),
             "report_text": to_text(findings, notes, len(aces)),
-            "rule_lines": _rl})
+            "rule_lines": _rl, "vendor": vendor})
 `;
 
 let pyReady = null;
@@ -45,7 +66,9 @@ async function boot() {
     if (!r.ok) throw new Error(`could not load engine module ${m}.py (${r.status})`);
     pyodide.FS.writeFile(`rulehawk/${m}.py`, await r.text());
   }
-  pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
+  pyodide.runPython("import sys; sys.path.insert(0, '.'); "
+    + "import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, "
+    + "rulehawk.parse_iptables, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
   return pyodide;
 }
 

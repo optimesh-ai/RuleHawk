@@ -7,9 +7,12 @@ auto-detect by the mask's bit pattern rather than guessing the vendor; a
 non-contiguous or genuinely ambiguous mask marks the entry `imprecise` and emits
 a parse note, so it can never be used to (wrongly) prove another rule dead.
 
-`neq` ports and `established` are modeled honestly: `neq` -> imprecise (its true
-space is non-contiguous), `established` -> stateful. ICMP type qualifiers are
-captured so `echo` and `echo-reply` aren't treated as the same packet space.
+Service port operators are modeled honestly and, where soundly possible,
+PRECISELY: `eq`/`range` -> one exact range; `lt P` -> [MIN, P-1]; `gt P` ->
+[P+1, MAX]; `neq P` -> the EXACT union of [MIN, P-1] and [P+1, MAX] (expanded to
+one ACE per sub-range, so it stays exact, never widened). `established` ->
+stateful. ICMP type qualifiers are captured so `echo` and `echo-reply` aren't
+treated as the same packet space.
 Unmodeled lines (object-group, etc.) are surfaced as notes, never silently dropped.
 """
 
@@ -17,7 +20,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from .model import ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet
 
@@ -93,44 +96,66 @@ def _parse_addr(tokens: List[str], i: int) -> Tuple[_IPNet, int, bool]:
     return ipaddress.ip_network(f"{addr}/{plen}", strict=False), i + 2, imprecise
 
 
-def _parse_port_op(tokens: List[str], i: int) -> Tuple[PortRange, int, bool, int]:
-    """Parse an optional port operator; return (range, next_i, imprecise, dropped).
+def _parse_port_op(tokens: List[str], i: int) -> Tuple[List[PortRange], int, bool, int]:
+    """Parse an optional port operator; return (ranges, next_i, imprecise, extra).
 
-    `dropped` is the count of trailing port tokens NOT modeled. IOS allows a
-    multi-port `eq a b c`; the model holds a single range, so only the first
-    port is analyzed and the rest are reported via a parse note — never silently
-    dropped (that would hide e.g. an exposed RDP port)."""
+    Returns a LIST of port ranges so a multi-port `eq a b c` is expanded to the
+    EXACT union of per-port rules (mirrors the Junos/iptables/PAN-OS frontends),
+    instead of keeping only the first port. Dropping the extra ports used to be a
+    silent FALSE-PASS: `permit tcp CORP PCI eq www 445` really permits 445, but
+    the model kept only port 80 and segcheck wrongly concluded PASS. `extra` is
+    the count of additional `eq` ports (surfaced as a note for the audit trail)."""
     if i >= len(tokens):
-        return ANY_PORTS, i, False, 0
+        return [ANY_PORTS], i, False, 0
     op = tokens[i]
     if op == "eq":
-        p = _port_num(tokens[i + 1])
-        j, dropped = i + 2, 0
+        ports: List[int] = [_port_num(tokens[i + 1])]
+        j = i + 2
         while j < len(tokens) and _is_port_token(tokens[j]):  # extra eq ports
+            ports.append(_port_num(tokens[j]))
             j += 1
-            dropped += 1
-        return (PortRange(p, p) if p >= 0 else ANY_PORTS), j, p < 0, dropped
+        ranges = [PortRange(p, p) for p in ports if p >= 0]
+        imprecise = any(p < 0 for p in ports)
+        if not ranges:                       # all unparsable -> ANY + imprecise
+            return [ANY_PORTS], j, True, 0
+        return ranges, j, imprecise, len(ports) - 1
     if op == "range":
         lo, hi = _port_num(tokens[i + 1]), _port_num(tokens[i + 2])
         if lo < 0 or hi < 0:
-            return ANY_PORTS, i + 3, True, 0
-        return PortRange(min(lo, hi), max(lo, hi)), i + 3, False, 0
+            return [ANY_PORTS], i + 3, True, 0
+        return [PortRange(min(lo, hi), max(lo, hi))], i + 3, False, 0
     if op == "gt":
         p = _port_num(tokens[i + 1])
         if p < 0 or p >= PORT_MAX:
-            return ANY_PORTS, i + 2, True, 0
-        return PortRange(p + 1, PORT_MAX), i + 2, False, 0
+            return [ANY_PORTS], i + 2, True, 0
+        return [PortRange(p + 1, PORT_MAX)], i + 2, False, 0
     if op == "lt":
         p = _port_num(tokens[i + 1])
         if p <= PORT_MIN:
-            return ANY_PORTS, i + 2, True, 0
-        return PortRange(PORT_MIN, p - 1), i + 2, False, 0
+            return [ANY_PORTS], i + 2, True, 0
+        return [PortRange(PORT_MIN, p - 1)], i + 2, False, 0
     if op == "neq":
-        # neq's true space is non-contiguous (everything EXCEPT p). We cannot
-        # represent that as one range, so over-approximate to ANY and mark the
-        # entry imprecise — it must never be used to prove another rule dead.
-        return ANY_PORTS, i + 2, True, 0
-    return ANY_PORTS, i, False, 0
+        # neq P's true space is non-contiguous (every port EXCEPT P), i.e. the
+        # EXACT union of two contiguous ranges [MIN, P-1] and [P+1, MAX]. The IR
+        # already expands a port LIST into one ACE per range (the same mechanism
+        # as a multi-port `eq a b c`), so we can model neq PRECISELY rather than
+        # over-approximating to ANY+imprecise: emit both sub-ranges. Each emitted
+        # range is exact (never widened), so this can only turn an INDETERMINATE
+        # into a precise PASS/CRITICAL — it can never manufacture a false PASS
+        # (a port P stays uncovered, exactly as `neq P` intends). Degenerate ends
+        # collapse cleanly: `neq 0` -> just [1, MAX]; `neq 65535` -> just [0, 65534].
+        p = _port_num(tokens[i + 1])
+        if p < 0:                            # unparsable service name -> fail closed
+            return [ANY_PORTS], i + 2, True, 0
+        ranges: List[PortRange] = []
+        if p > PORT_MIN:
+            ranges.append(PortRange(PORT_MIN, p - 1))
+        if p < PORT_MAX:
+            ranges.append(PortRange(p + 1, PORT_MAX))
+        if not ranges:                       # unreachable after clamp; stay sound
+            return [ANY_PORTS], i + 2, True, 0
+        return ranges, i + 2, False, 0
+    return [ANY_PORTS], i, False, 0
 
 
 def _entry_tokens(line: str) -> List[str]:
@@ -141,6 +166,397 @@ def _entry_tokens(line: str) -> List[str]:
     return s.split()
 
 
+_ANY_NET = ipaddress.ip_network("0.0.0.0/0")
+# Lines we recognize as an ACE (start with permit/deny) but cannot reduce to an
+# L3/L4 rectangle: object-group / object / service-object references, or an
+# unparseable operand. Matched on the original line.
+_OPAQUE_RE = re.compile(
+    r"(?i)\b(object-group|object|addrgroup|portgroup|service-object|"
+    r"port-object|group-object)\b")
+
+
+def _opaque_ace(action: str, seq: int, acl: str, raw: str) -> ACE:
+    """A fail-CLOSED stand-in for a permit/deny line we can't model (object-group
+    /object reference, or an unparseable operand). Over-approximated to ANY
+    proto/src/dst and marked `imprecise`, so:
+      * analyze() never uses it to prove another rule dead and emits no spurious
+        any/any or exposure finding (imprecise is excluded from both), and
+      * segcheck() turns it into segmentation-INDETERMINATE for any flow it could
+        touch — an unmodeled permit can no longer FALSE-PASS a real CORP->PCI leak
+        hidden behind the group. Dropping the line (the old behavior) was the bug.
+    Mirrors the iptables custom-chain-jump fail-closed marker."""
+    return ACE(seq=seq, action=action, proto="ip", src=_ANY_NET, dst=_ANY_NET,
+               imprecise=True, raw=raw, acl=acl)
+
+
+# --- object-group / object resolution (two-pass) ---------------------------
+# ASA/IOS configs name reusable address & service sets (`object-group network`,
+# `object network`, `object-group service`, `object service`) and reference them
+# from ACEs. Pass 1 (`_collect_defs`) reads the definitions; pass 2 (`_resolve_
+# entry`) expands a referencing ACE to the EXACT union of member ACEs (mirrors
+# the Junos/PAN-OS multi-value union).
+#
+# SOUNDNESS (never manufacture a false PASS): a reference is resolved ONLY when
+# every member resolves to an exact L3/L4 space. Anything we cannot fully and
+# exactly resolve — an UNDEFINED group, an unparseable member, a reference cycle,
+# an empty/degenerate group, or an expansion that exceeds `_MAX_EXPAND` — is NOT
+# resolved; it falls back to the existing fail-closed opaque ACE (any/any,
+# imprecise -> segmentation INDETERMINATE), never to empty / any-isolated. So
+# resolution can only turn an INDETERMINATE into a PRECISE verdict; it can never
+# weaken a real leak into a (false) PASS.
+_MAX_EXPAND = 256
+_PORT_OPS = frozenset({"eq", "range", "neq", "lt", "gt"})
+
+# Net members:  ("net", _IPNet) | ("ng", name) | ("no", name) | ("bad",)
+# Svc members:  ("svc", proto, PortRange) | ("sg", name) | ("so", name) | ("bad",)
+
+
+class _Defs:
+    """Collected object-group / object definitions (the pass-1 result)."""
+
+    def __init__(self) -> None:
+        self.net_groups: dict = {}   # name -> [net member, ...]
+        self.net_objs: dict = {}     # name -> [net member, ...]
+        self.svc_groups: dict = {}   # name -> [svc member, ...]
+        self.svc_objs: dict = {}     # name -> [svc member, ...]
+
+
+def _host_net(addr: str) -> _IPNet:
+    return ipaddress.ip_network(addr + ("/128" if ":" in addr else "/32"),
+                                strict=False)
+
+
+def _net_member(rest: List[str]) -> Tuple:
+    """A `network-object ...` operand -> a single net member (fail-closed on any
+    form we can't reduce exactly)."""
+    try:
+        if not rest:
+            return ("bad",)
+        t0 = rest[0].lower()
+        if t0 == "host":
+            return ("net", _host_net(rest[1]))
+        if t0 == "object":
+            return ("no", rest[1])
+        if "/" in rest[0]:
+            return ("net", ipaddress.ip_network(rest[0], strict=False))
+        if len(rest) >= 2:
+            plen, kind = _classify_mask(rest[1])
+            if kind in ("ambiguous", "noncontiguous"):
+                return ("bad",)              # non-exact mask -> fail closed
+            return ("net", ipaddress.ip_network(f"{rest[0]}/{plen}", strict=False))
+        return ("net", _host_net(rest[0]))   # bare address == host
+    except (ValueError, IndexError):
+        return ("bad",)
+
+
+def _obj_net_members(rest: List[str]) -> List[Tuple]:
+    """An `object network` body line (`host`/`subnet`/`range`) -> net members.
+    A `range A B` summarizes to the EXACT set of CIDRs covering [A, B]."""
+    try:
+        if not rest:
+            return [("bad",)]
+        kw = rest[0].lower()
+        if kw == "host":
+            return [("net", _host_net(rest[1]))]
+        if kw == "subnet":
+            if "/" in rest[1]:
+                return [("net", ipaddress.ip_network(rest[1], strict=False))]
+            plen, kind = _classify_mask(rest[2])
+            if kind in ("ambiguous", "noncontiguous"):
+                return [("bad",)]
+            return [("net", ipaddress.ip_network(f"{rest[1]}/{plen}", strict=False))]
+        if kw == "range":
+            lo = ipaddress.ip_address(rest[1])
+            hi = ipaddress.ip_address(rest[2])
+            return [("net", n) for n in ipaddress.summarize_address_range(lo, hi)]
+        return [("bad",)]                    # fqdn / unsupported -> fail closed
+    except (ValueError, IndexError):
+        return [("bad",)]
+
+
+def _expand_proto(p: Optional[str]) -> Optional[List[str]]:
+    if p is None:
+        return None
+    p = p.lower()
+    if p == "tcp-udp":
+        return ["tcp", "udp"]
+    if p in ("tcp", "udp", "icmp", "ip", "ipv6"):
+        return [p]
+    return None                              # unknown -> fail closed
+
+
+def _svc_port(rest: List[str], idx: int) -> Optional[PortRange]:
+    """Parse an exact, contiguous service-port operator at rest[idx:] -> one
+    PortRange. Handles `eq P` / `range LO HI` / `lt P` -> [MIN, P-1] / `gt P` ->
+    [P+1, MAX]. `neq` is non-contiguous (two ranges) and cannot be expressed as a
+    single PortRange here, so it stays unmodeled (-> caller fails closed,
+    INDETERMINATE) — never widened into a (possibly false) PASS."""
+    if idx >= len(rest):
+        return None
+    op = rest[idx].lower()
+    if op == "eq":
+        p = _port_num(rest[idx + 1])
+        return PortRange(p, p) if p >= 0 else None
+    if op == "range":
+        lo, hi = _port_num(rest[idx + 1]), _port_num(rest[idx + 2])
+        if lo < 0 or hi < 0:
+            return None
+        return PortRange(min(lo, hi), max(lo, hi))
+    if op == "lt":
+        p = _port_num(rest[idx + 1])
+        return PortRange(PORT_MIN, p - 1) if p > PORT_MIN else None
+    if op == "gt":
+        p = _port_num(rest[idx + 1])
+        return PortRange(p + 1, PORT_MAX) if 0 <= p < PORT_MAX else None
+    return None
+
+
+def _svc_members(rest: List[str], header_proto: Optional[str]) -> List[Tuple]:
+    """A `service-object ...` / `port-object ...` / `service ...` body -> svc
+    members. `header_proto` is the `object-group service NAME <proto>` protocol
+    used by bare `port-object` lines."""
+    try:
+        if not rest:
+            return [("bad",)]
+        t0 = rest[0].lower()
+        if t0 == "object":
+            return [("so", rest[1])]
+        if t0 in _PORT_OPS:                  # port-object: proto from the header
+            protos = _expand_proto(header_proto)
+            pr = _svc_port(rest, 0)
+            if protos is None or pr is None:
+                return [("bad",)]
+            return [("svc", p, pr) for p in protos]
+        protos = _expand_proto(t0)           # service-object PROTO ...
+        if protos is None:
+            return [("bad",)]
+        idx = 1
+        if idx < len(rest) and rest[idx].lower() in ("source", "destination"):
+            if rest[idx].lower() == "source":
+                return [("bad",)]            # source-port set: we model dst -> fail closed
+            idx += 1
+        if idx >= len(rest):                 # protocol only -> any port
+            return [("svc", p, ANY_PORTS) for p in protos]
+        pr = _svc_port(rest, idx)
+        if pr is None:
+            return [("bad",)]
+        return [("svc", p, pr) for p in protos]
+    except (ValueError, IndexError):
+        return [("bad",)]
+
+
+def _collect_defs(text: str) -> _Defs:
+    """Pass 1: read every object-group / object definition in the config."""
+    defs = _Defs()
+    cur = None          # ("ng"|"no"|"sg"|"so"|"other", name)
+    header_proto = None
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("!"):
+            continue
+        low = s.lower()
+        m = re.match(r"(?i)^object-group\s+network\s+(\S+)", s)
+        if m:
+            cur, header_proto = ("ng", m.group(1)), None
+            defs.net_groups.setdefault(m.group(1), [])
+            continue
+        m = re.match(r"(?i)^object-group\s+service\s+(\S+)(?:\s+(\S+))?", s)
+        if m:
+            cur, header_proto = ("sg", m.group(1)), (m.group(2) or "").lower() or None
+            defs.svc_groups.setdefault(m.group(1), [])
+            continue
+        m = re.match(r"(?i)^object\s+network\s+(\S+)", s)
+        if m:
+            cur, header_proto = ("no", m.group(1)), None
+            defs.net_objs.setdefault(m.group(1), [])
+            continue
+        m = re.match(r"(?i)^object\s+service\s+(\S+)", s)
+        if m:
+            cur, header_proto = ("so", m.group(1)), None
+            defs.svc_objs.setdefault(m.group(1), [])
+            continue
+        if low.startswith("object-group "):          # protocol / icmp-type / ... groups
+            cur = ("other", "")
+            continue
+        if (low.startswith("access-list") or low.startswith("ip access-list")
+                or low.startswith("ipv6 access-list") or low.startswith("object ")):
+            cur = None
+            continue
+        if cur is None or cur[0] == "other":
+            continue
+        toks = s.split()
+        kw, ctype, name = toks[0].lower(), cur[0], cur[1]
+        if kw == "network-object" and ctype == "ng":
+            defs.net_groups[name].append(_net_member(toks[1:]))
+        elif kw == "group-object":
+            if ctype == "ng":
+                defs.net_groups[name].append(("ng", toks[1]))
+            elif ctype == "sg":
+                defs.svc_groups[name].append(("sg", toks[1]))
+        elif kw in ("service-object", "port-object") and ctype == "sg":
+            defs.svc_groups[name].extend(_svc_members(toks[1:], header_proto))
+        elif kw in ("host", "subnet", "range") and ctype == "no":
+            defs.net_objs[name].extend(_obj_net_members(toks))
+        elif kw == "service" and ctype == "so":
+            defs.svc_objs[name].extend(_svc_members(toks[1:], None))
+    return defs
+
+
+def _resolve_nets(defs: _Defs, kind: str, name: str, seen: frozenset):
+    """Resolve a network group/object to an EXACT list of nets, or None if it is
+    undefined / has an unparseable member / cycles / is empty (all fail-closed)."""
+    key = (kind, name)
+    if key in seen:
+        return None                                  # cycle -> fail closed
+    members = (defs.net_groups if kind == "ng" else defs.net_objs).get(name)
+    if members is None:
+        return None                                  # undefined -> fail closed
+    seen = seen | {key}
+    out: List[_IPNet] = []
+    for mem in members:
+        if mem[0] == "net":
+            out.append(mem[1])
+        elif mem[0] in ("ng", "no"):
+            sub = _resolve_nets(defs, mem[0], mem[1], seen)
+            if sub is None:
+                return None
+            out.extend(sub)
+        else:                                        # ("bad",)
+            return None
+    return out or None                               # empty group -> fail closed
+
+
+def _resolve_svcs(defs: _Defs, kind: str, name: str, seen: frozenset):
+    """Resolve a service group/object to an EXACT list of (proto, PortRange), or
+    None (fail-closed) on undefined / unparseable member / cycle / empty."""
+    key = (kind, name)
+    if key in seen:
+        return None
+    members = (defs.svc_groups if kind == "sg" else defs.svc_objs).get(name)
+    if members is None:
+        return None
+    seen = seen | {key}
+    out: List[Tuple[str, PortRange]] = []
+    for mem in members:
+        if mem[0] == "svc":
+            out.append((mem[1], mem[2]))
+        elif mem[0] in ("sg", "so"):
+            sub = _resolve_svcs(defs, mem[0], mem[1], seen)
+            if sub is None:
+                return None
+            out.extend(sub)
+        else:
+            return None
+    return out or None
+
+
+def _operand_addr(toks: List[str], i: int, defs: _Defs):
+    """Parse a src/dst address operand, resolving object(-group) refs.
+    Returns (nets|None, next_i, imprecise). None nets -> caller fails closed."""
+    t = toks[i].lower()
+    if t == "object-group":
+        return _resolve_nets(defs, "ng", toks[i + 1], frozenset()), i + 2, False
+    if t == "object":
+        return _resolve_nets(defs, "no", toks[i + 1], frozenset()), i + 2, False
+    net, ni, imp = _parse_addr(toks, i)
+    return [net], ni, imp
+
+
+def _is_svc_ref(toks: List[str], i: int, defs: _Defs) -> bool:
+    if i + 1 >= len(toks):
+        return False
+    t = toks[i].lower()
+    return ((t == "object-group" and toks[i + 1] in defs.svc_groups)
+            or (t == "object" and toks[i + 1] in defs.svc_objs))
+
+
+def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str):
+    """Pass 2: expand one object-referencing ACE to the exact union of member
+    ACEs, or return None to fall back to the fail-closed opaque ACE."""
+    action = toks[0].lower()
+    n = len(toks)
+    i = 1
+    proto: Optional[str] = None
+    proto_combos = None                      # service group occupying the proto slot
+    if i < n and _is_svc_ref(toks, i, defs):
+        kind = "sg" if toks[i].lower() == "object-group" else "so"
+        proto_combos = _resolve_svcs(defs, kind, toks[i + 1], frozenset())
+        if proto_combos is None:
+            return None
+        i += 2
+    elif i < n:
+        proto = toks[i].lower()
+        i += 1
+    else:
+        return None
+    if i >= n:
+        return None
+
+    srcs, i, imp_s = _operand_addr(toks, i, defs)
+    if srcs is None:
+        return None
+    imprecise = imp_s
+    ported = proto in ("tcp", "udp") if proto else True
+
+    # Optional source port (only a literal operator; a source SERVICE group is
+    # rare — leave it unresolved/fail-closed rather than grow the model).
+    src_ports: List[PortRange] = [ANY_PORTS]
+    if i < n and ported and toks[i].lower() in _PORT_OPS:
+        src_ports, i, imp_sp, _ = _parse_port_op(toks, i)
+        imprecise = imprecise or imp_sp
+    elif i < n and _is_svc_ref(toks, i, defs):
+        return None
+
+    if i >= n:
+        return None
+    dsts, i, imp_d = _operand_addr(toks, i, defs)
+    if dsts is None:
+        return None
+    imprecise = imprecise or imp_d
+
+    # Build the (proto, dst_port) combinations.
+    combos: List[Tuple[str, PortRange]] = []
+    if proto_combos is not None:             # service group set proto + dst port
+        combos = list(proto_combos)
+    elif i < n and _is_svc_ref(toks, i, defs):
+        kind = "sg" if toks[i].lower() == "object-group" else "so"
+        svcs = _resolve_svcs(defs, kind, toks[i + 1], frozenset())
+        if svcs is None:
+            return None
+        i += 2
+        for cproto, dp in svcs:              # keep only members compatible with the ACE proto
+            if proto in (None, "ip", "ipv4", "ipv6") or cproto == "ip" or cproto == proto:
+                combos.append((proto if proto and cproto == "ip" else cproto, dp))
+        if not combos:                       # tcp ACE over a udp-only group, etc.
+            return None
+    elif i < n and ported and toks[i].lower() in _PORT_OPS:
+        dst_ports, i, imp_dp, _ = _parse_port_op(toks, i)
+        imprecise = imprecise or imp_dp
+        combos = [(proto, dp) for dp in dst_ports]
+    else:
+        combos = [(proto or "ip", ANY_PORTS)]
+
+    if len(srcs) * len(dsts) * len(src_ports) * len(combos) > _MAX_EXPAND:
+        return None                          # over-cap -> fail closed (one opaque ACE)
+
+    rest = toks[i:]
+    stateful = any(t.lower() == "established" for t in rest)
+    aces: List[ACE] = []
+    m = seq
+    for s in srcs:
+        for d in dsts:
+            for sp in src_ports:
+                for cproto, dp in combos:
+                    m += 1
+                    aces.append(ACE(
+                        seq=m, action=action, proto=cproto, src=s, dst=d,
+                        src_port=sp, dst_port=dp, stateful=stateful,
+                        imprecise=imprecise, raw=raw, acl=acl))
+    note = (f"resolved object-group/object reference to {len(aces)} exact "
+            f"ACE(s): {raw}")
+    return aces, [note]
+
+
 def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     """Parse all ACLs in `text`; return (entries, notes).
 
@@ -149,6 +565,7 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     """
     entries: List[ACE] = []
     notes: List[str] = []
+    defs = _collect_defs(text)               # pass 1: object-group / object defs
     current_acl = "(unnamed)"
     seq = 0
     for raw in text.splitlines():
@@ -165,41 +582,70 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             current_acl = m.group(1)
         if not re.search(r"(?i)\b(permit|deny)\b", stripped):
             continue
-        if re.search(r"(?i)object-group|addrgroup|portgroup", stripped):
-            notes.append(f"unmodeled (object-group): {stripped}")
-            continue
         toks = _entry_tokens(raw.strip())
         if not toks or toks[0].lower() not in _ACTIONS:
             if "remark" not in stripped.lower():
                 notes.append(f"unparsed: {stripped}")
             continue
-        try:
-            ace, enotes = _parse_entry(toks, seq + 1, current_acl, stripped)
-        except (IndexError, ValueError, ipaddress.AddressValueError):
-            notes.append(f"unparsed: {stripped}")
+        action = toks[0].lower()
+        # Object-group / object references expand a permit in ways we don't model.
+        # DROPPING such a line let segcheck FALSE-PASS a real leak hidden behind
+        # the group (the line carries an action on the transit path). Fail closed:
+        # emit an opaque imprecise stand-in (segcheck -> indeterminate, not OK).
+        if _OPAQUE_RE.search(stripped):
+            # Pass 2: try to expand the reference precisely from the collected
+            # definitions. Only a FULLY-exact resolution is accepted; anything
+            # else (undefined / unparseable member / cycle / over-cap) returns
+            # None and we keep the fail-closed opaque ACE (INDETERMINATE).
+            resolved = None
+            try:
+                resolved = _resolve_entry(toks, defs, seq, current_acl, stripped)
+            except (IndexError, ValueError, ipaddress.AddressValueError):
+                resolved = None
+            if resolved is not None:
+                races, rnotes = resolved
+                seq += len(races)
+                entries.extend(races)
+                notes.extend(rnotes)
+                continue
+            notes.append(f"unmodeled (object-group): {stripped}")
+            seq += 1
+            entries.append(_opaque_ace(action, seq, current_acl, stripped))
             continue
-        seq += 1
-        entries.append(ace)
+        try:
+            aces, enotes = _parse_entry(toks, seq, current_acl, stripped)
+        except (IndexError, ValueError, ipaddress.AddressValueError):
+            # Recognized as an ACE but unparseable — fail closed rather than drop,
+            # so an unreadable permit can't be silently treated as isolated.
+            notes.append(f"unparsed (kept fail-closed): {stripped}")
+            seq += 1
+            entries.append(_opaque_ace(action, seq, current_acl, stripped))
+            continue
+        seq += len(aces)
+        entries.extend(aces)
         notes.extend(enotes)
     return entries, notes
 
 
 def _parse_entry(toks: List[str], seq: int, acl: str, raw: str):
+    """Parse one ACE line into a LIST of ACEs (a multi-port `eq` expands to the
+    exact union of per-port rules). ACEs are numbered seq+1, seq+2, ...; the
+    caller advances its counter by len(result)."""
     action = toks[0].lower()
     proto = toks[1].lower()
     ported = proto in ("tcp", "udp")
     i = 2
-    drop_sp = drop_dp = 0
+    extra_sp = extra_dp = 0
     src, i, imp_s = _parse_addr(toks, i)
     if ported:
-        src_port, i, imp_sp, drop_sp = _parse_port_op(toks, i)
+        src_ports, i, imp_sp, extra_sp = _parse_port_op(toks, i)
     else:
-        src_port, imp_sp = ANY_PORTS, False
+        src_ports, imp_sp = [ANY_PORTS], False
     dst, i, imp_d = _parse_addr(toks, i)
     if ported:
-        dst_port, i, imp_dp, drop_dp = _parse_port_op(toks, i)
+        dst_ports, i, imp_dp, extra_dp = _parse_port_op(toks, i)
     else:
-        dst_port, imp_dp = ANY_PORTS, False
+        dst_ports, imp_dp = [ANY_PORTS], False
     rest = toks[i:]
     stateful = any(t.lower() == "established" for t in rest)
     icmp_type = None
@@ -212,10 +658,16 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str):
     notes: List[str] = []
     if imp_s or imp_d:
         notes.append(f"imprecise mask (treated conservatively): {raw}")
-    if drop_sp or drop_dp:
-        notes.append("multi-port `eq` only partly modeled (first port analyzed; "
-                     f"remaining port(s) ignored — verify them manually): {raw}")
-    ace = ACE(seq=seq, action=action, proto=proto, src=src, dst=dst,
-              src_port=src_port, dst_port=dst_port, icmp_type=icmp_type,
-              stateful=stateful, imprecise=imprecise, raw=raw, acl=acl)
-    return ace, notes
+    if extra_sp or extra_dp:
+        notes.append("multi-port `eq` expanded to the exact union of per-port "
+                     f"rules ({extra_sp + extra_dp} extra port(s) now modeled, "
+                     f"not dropped): {raw}")
+    aces: List[ACE] = []
+    n = seq
+    for sp in src_ports:
+        for dp in dst_ports:
+            n += 1
+            aces.append(ACE(seq=n, action=action, proto=proto, src=src, dst=dst,
+                            src_port=sp, dst_port=dp, icmp_type=icmp_type,
+                            stateful=stateful, imprecise=imprecise, raw=raw, acl=acl))
+    return aces, notes

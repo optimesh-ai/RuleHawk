@@ -9,6 +9,22 @@ from .analyze import Finding, score
 
 _ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
+# Cap text output so a pathological config can't print thousands of lines, but
+# NEVER silently drop: when we elide, we say how many remain and where to see
+# them in full. Real ASA configs routinely carry hundreds of object-group lines,
+# so the old hard `[:20]` truncation hid most of them (the JSON path was always
+# complete) — a soundness regression for the "surface, never drop" promise.
+_NOTES_CAP = 200
+
+
+def _note_lines(notes: List[str]) -> List[str]:
+    out = [f"   ! {n}" for n in notes[:_NOTES_CAP]]
+    extra = len(notes) - _NOTES_CAP
+    if extra > 0:
+        out.append(f"   ... and {extra} more not shown — re-run with --json "
+                   f"for the complete list.")
+    return out
+
 
 def to_json(findings: List[Finding], notes: List[str], n_rules: int) -> str:
     return json.dumps({
@@ -36,11 +52,12 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int) -> str:
                "=" * 64,
                "",
                " Nothing was analyzed (this is NOT a clean bill of health).",
-               " Check the input is a Cisco IOS extended ACL or ASA access-list."]
+               " Check the input is a Cisco IOS extended ACL, ASA access-list,"
+               " or Juniper Junos firewall filter."]
         if notes:
             out.append("")
             out.append(f" Parse notes ({len(notes)}):")
-            out += [f"   ! {n}" for n in notes[:20]]
+            out += _note_lines(notes)
         return "\n".join(out)
     sc = score(findings)
     counts = _counts(findings)
@@ -72,9 +89,9 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int) -> str:
             lines.append(f"   - {f.rule_id}: {f.rule}")
     if notes:
         lines.append("")
-        lines.append(f" Parse notes ({len(notes)} line(s) not fully modeled):")
-        for n in notes[:20]:
-            lines.append(f"   ! {n}")
+        lines.append(f" Parse notes ({len(notes)} line(s) — resolved expansions "
+                     f"and lines not fully modeled):")
+        lines += _note_lines(notes)
     return "\n".join(lines)
 
 
