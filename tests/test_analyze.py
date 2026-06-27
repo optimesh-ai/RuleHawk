@@ -14,7 +14,9 @@ from rulehawk.parse import _parse_entry  # noqa: E402
 
 def _ace(line, seq=1, acl="A"):
     toks = line.split()
-    return _parse_entry(toks, seq, acl, line)[0]  # _parse_entry -> (ace, note)
+    # _parse_entry -> (aces_list, notes); a line may expand to >1 ACE (multi-port
+    # `eq`). These covers() cases are single-port, so take the first ACE.
+    return _parse_entry(toks, seq - 1, acl, line)[0][0]
 
 
 def _kinds(text):
@@ -92,10 +94,14 @@ def test_clean_acl_scores_100():
 # --- parser fidelity -----------------------------------------------------
 
 def test_object_group_is_noted_not_dropped_silently():
+    # An object-group permit is surfaced as a note AND kept as a fail-CLOSED
+    # opaque ACE (imprecise, any/any) — never dropped. Dropping it let segcheck
+    # FALSE-PASS a real leak hidden behind the group (see the soundness audit).
     text = ("ip access-list extended T\n"
             " permit tcp object-group SRC any eq 443\n")
     aces, notes = parse_acls(text)
-    assert aces == [] and any("object-group" in n for n in notes)
+    assert len(aces) == 1 and aces[0].imprecise is True
+    assert any("object-group" in n for n in notes)
 
 
 def test_asa_access_list_form_parses():

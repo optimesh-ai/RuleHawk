@@ -93,44 +93,50 @@ def _parse_addr(tokens: List[str], i: int) -> Tuple[_IPNet, int, bool]:
     return ipaddress.ip_network(f"{addr}/{plen}", strict=False), i + 2, imprecise
 
 
-def _parse_port_op(tokens: List[str], i: int) -> Tuple[PortRange, int, bool, int]:
-    """Parse an optional port operator; return (range, next_i, imprecise, dropped).
+def _parse_port_op(tokens: List[str], i: int) -> Tuple[List[PortRange], int, bool, int]:
+    """Parse an optional port operator; return (ranges, next_i, imprecise, extra).
 
-    `dropped` is the count of trailing port tokens NOT modeled. IOS allows a
-    multi-port `eq a b c`; the model holds a single range, so only the first
-    port is analyzed and the rest are reported via a parse note — never silently
-    dropped (that would hide e.g. an exposed RDP port)."""
+    Returns a LIST of port ranges so a multi-port `eq a b c` is expanded to the
+    EXACT union of per-port rules (mirrors the Junos/iptables/PAN-OS frontends),
+    instead of keeping only the first port. Dropping the extra ports used to be a
+    silent FALSE-PASS: `permit tcp CORP PCI eq www 445` really permits 445, but
+    the model kept only port 80 and segcheck wrongly concluded PASS. `extra` is
+    the count of additional `eq` ports (surfaced as a note for the audit trail)."""
     if i >= len(tokens):
-        return ANY_PORTS, i, False, 0
+        return [ANY_PORTS], i, False, 0
     op = tokens[i]
     if op == "eq":
-        p = _port_num(tokens[i + 1])
-        j, dropped = i + 2, 0
+        ports: List[int] = [_port_num(tokens[i + 1])]
+        j = i + 2
         while j < len(tokens) and _is_port_token(tokens[j]):  # extra eq ports
+            ports.append(_port_num(tokens[j]))
             j += 1
-            dropped += 1
-        return (PortRange(p, p) if p >= 0 else ANY_PORTS), j, p < 0, dropped
+        ranges = [PortRange(p, p) for p in ports if p >= 0]
+        imprecise = any(p < 0 for p in ports)
+        if not ranges:                       # all unparsable -> ANY + imprecise
+            return [ANY_PORTS], j, True, 0
+        return ranges, j, imprecise, len(ports) - 1
     if op == "range":
         lo, hi = _port_num(tokens[i + 1]), _port_num(tokens[i + 2])
         if lo < 0 or hi < 0:
-            return ANY_PORTS, i + 3, True, 0
-        return PortRange(min(lo, hi), max(lo, hi)), i + 3, False, 0
+            return [ANY_PORTS], i + 3, True, 0
+        return [PortRange(min(lo, hi), max(lo, hi))], i + 3, False, 0
     if op == "gt":
         p = _port_num(tokens[i + 1])
         if p < 0 or p >= PORT_MAX:
-            return ANY_PORTS, i + 2, True, 0
-        return PortRange(p + 1, PORT_MAX), i + 2, False, 0
+            return [ANY_PORTS], i + 2, True, 0
+        return [PortRange(p + 1, PORT_MAX)], i + 2, False, 0
     if op == "lt":
         p = _port_num(tokens[i + 1])
         if p <= PORT_MIN:
-            return ANY_PORTS, i + 2, True, 0
-        return PortRange(PORT_MIN, p - 1), i + 2, False, 0
+            return [ANY_PORTS], i + 2, True, 0
+        return [PortRange(PORT_MIN, p - 1)], i + 2, False, 0
     if op == "neq":
         # neq's true space is non-contiguous (everything EXCEPT p). We cannot
         # represent that as one range, so over-approximate to ANY and mark the
         # entry imprecise — it must never be used to prove another rule dead.
-        return ANY_PORTS, i + 2, True, 0
-    return ANY_PORTS, i, False, 0
+        return [ANY_PORTS], i + 2, True, 0
+    return [ANY_PORTS], i, False, 0
 
 
 def _entry_tokens(line: str) -> List[str]:
@@ -139,6 +145,29 @@ def _entry_tokens(line: str) -> List[str]:
     # ASA prefix: name, optional `line N` (from `show access-list`), optional `extended`.
     s = re.sub(r"(?i)^access-list\s+\S+\s+(?:line\s+\d+\s+)?(?:extended\s+)?", "", s)
     return s.split()
+
+
+_ANY_NET = ipaddress.ip_network("0.0.0.0/0")
+# Lines we recognize as an ACE (start with permit/deny) but cannot reduce to an
+# L3/L4 rectangle: object-group / object / service-object references, or an
+# unparseable operand. Matched on the original line.
+_OPAQUE_RE = re.compile(
+    r"(?i)\b(object-group|object|addrgroup|portgroup|service-object|"
+    r"port-object|group-object)\b")
+
+
+def _opaque_ace(action: str, seq: int, acl: str, raw: str) -> ACE:
+    """A fail-CLOSED stand-in for a permit/deny line we can't model (object-group
+    /object reference, or an unparseable operand). Over-approximated to ANY
+    proto/src/dst and marked `imprecise`, so:
+      * analyze() never uses it to prove another rule dead and emits no spurious
+        any/any or exposure finding (imprecise is excluded from both), and
+      * segcheck() turns it into segmentation-INDETERMINATE for any flow it could
+        touch — an unmodeled permit can no longer FALSE-PASS a real CORP->PCI leak
+        hidden behind the group. Dropping the line (the old behavior) was the bug.
+    Mirrors the iptables custom-chain-jump fail-closed marker."""
+    return ACE(seq=seq, action=action, proto="ip", src=_ANY_NET, dst=_ANY_NET,
+               imprecise=True, raw=raw, acl=acl)
 
 
 def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
@@ -165,41 +194,55 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             current_acl = m.group(1)
         if not re.search(r"(?i)\b(permit|deny)\b", stripped):
             continue
-        if re.search(r"(?i)object-group|addrgroup|portgroup", stripped):
-            notes.append(f"unmodeled (object-group): {stripped}")
-            continue
         toks = _entry_tokens(raw.strip())
         if not toks or toks[0].lower() not in _ACTIONS:
             if "remark" not in stripped.lower():
                 notes.append(f"unparsed: {stripped}")
             continue
-        try:
-            ace, enotes = _parse_entry(toks, seq + 1, current_acl, stripped)
-        except (IndexError, ValueError, ipaddress.AddressValueError):
-            notes.append(f"unparsed: {stripped}")
+        action = toks[0].lower()
+        # Object-group / object references expand a permit in ways we don't model.
+        # DROPPING such a line let segcheck FALSE-PASS a real leak hidden behind
+        # the group (the line carries an action on the transit path). Fail closed:
+        # emit an opaque imprecise stand-in (segcheck -> indeterminate, not OK).
+        if _OPAQUE_RE.search(stripped):
+            notes.append(f"unmodeled (object-group): {stripped}")
+            seq += 1
+            entries.append(_opaque_ace(action, seq, current_acl, stripped))
             continue
-        seq += 1
-        entries.append(ace)
+        try:
+            aces, enotes = _parse_entry(toks, seq, current_acl, stripped)
+        except (IndexError, ValueError, ipaddress.AddressValueError):
+            # Recognized as an ACE but unparseable — fail closed rather than drop,
+            # so an unreadable permit can't be silently treated as isolated.
+            notes.append(f"unparsed (kept fail-closed): {stripped}")
+            seq += 1
+            entries.append(_opaque_ace(action, seq, current_acl, stripped))
+            continue
+        seq += len(aces)
+        entries.extend(aces)
         notes.extend(enotes)
     return entries, notes
 
 
 def _parse_entry(toks: List[str], seq: int, acl: str, raw: str):
+    """Parse one ACE line into a LIST of ACEs (a multi-port `eq` expands to the
+    exact union of per-port rules). ACEs are numbered seq+1, seq+2, ...; the
+    caller advances its counter by len(result)."""
     action = toks[0].lower()
     proto = toks[1].lower()
     ported = proto in ("tcp", "udp")
     i = 2
-    drop_sp = drop_dp = 0
+    extra_sp = extra_dp = 0
     src, i, imp_s = _parse_addr(toks, i)
     if ported:
-        src_port, i, imp_sp, drop_sp = _parse_port_op(toks, i)
+        src_ports, i, imp_sp, extra_sp = _parse_port_op(toks, i)
     else:
-        src_port, imp_sp = ANY_PORTS, False
+        src_ports, imp_sp = [ANY_PORTS], False
     dst, i, imp_d = _parse_addr(toks, i)
     if ported:
-        dst_port, i, imp_dp, drop_dp = _parse_port_op(toks, i)
+        dst_ports, i, imp_dp, extra_dp = _parse_port_op(toks, i)
     else:
-        dst_port, imp_dp = ANY_PORTS, False
+        dst_ports, imp_dp = [ANY_PORTS], False
     rest = toks[i:]
     stateful = any(t.lower() == "established" for t in rest)
     icmp_type = None
@@ -212,10 +255,16 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str):
     notes: List[str] = []
     if imp_s or imp_d:
         notes.append(f"imprecise mask (treated conservatively): {raw}")
-    if drop_sp or drop_dp:
-        notes.append("multi-port `eq` only partly modeled (first port analyzed; "
-                     f"remaining port(s) ignored — verify them manually): {raw}")
-    ace = ACE(seq=seq, action=action, proto=proto, src=src, dst=dst,
-              src_port=src_port, dst_port=dst_port, icmp_type=icmp_type,
-              stateful=stateful, imprecise=imprecise, raw=raw, acl=acl)
-    return ace, notes
+    if extra_sp or extra_dp:
+        notes.append("multi-port `eq` expanded to the exact union of per-port "
+                     f"rules ({extra_sp + extra_dp} extra port(s) now modeled, "
+                     f"not dropped): {raw}")
+    aces: List[ACE] = []
+    n = seq
+    for sp in src_ports:
+        for dp in dst_ports:
+            n += 1
+            aces.append(ACE(seq=n, action=action, proto=proto, src=src, dst=dst,
+                            src_port=sp, dst_port=dp, icmp_type=icmp_type,
+                            stateful=stateful, imprecise=imprecise, raw=raw, acl=acl))
+    return aces, notes

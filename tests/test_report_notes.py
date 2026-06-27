@@ -13,8 +13,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rulehawk import parse_acls, to_json, to_text  # noqa: E402
 
-# 25 object-group lines: each is recognized as an ACE but not fully modeled,
-# so each becomes a parse note. 25 > the old cap of 20.
+# 25 object-group lines: each is recognized as an ACE but not fully modeled, so
+# each becomes a parse note (AND a fail-closed opaque ACE — see the soundness
+# audit). 25 > the old cap of 20, so this still exercises note non-truncation.
 _CONFIG = "ip access-list extended TEST\n" + "\n".join(
     f" permit tcp object-group GRP{i} any eq 80" for i in range(1, 26))
 
@@ -29,12 +30,11 @@ def test_all_notes_present_in_json():
 def test_text_report_does_not_silently_drop_notes():
     aces, notes = parse_acls(_CONFIG)
     assert len(notes) == 25
-    # n_rules==0 here (all 25 lines are unmodeled), exercising the no-rules branch.
     text = to_text([], notes, len(aces))
     shown = text.count("unmodeled (object-group)")
     assert shown == 25, f"expected all 25 notes printed, got {shown}"
     # The header count must match what's actually shown — no lying.
-    assert "Parse notes (25)" in text
+    assert f"Parse notes ({len(notes)} line(s)" in text
 
 
 def test_text_report_elides_with_explicit_pointer_past_cap():
