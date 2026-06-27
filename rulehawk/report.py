@@ -89,7 +89,8 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int) -> str:
             lines.append(f"   - {f.rule_id}: {f.rule}")
     if notes:
         lines.append("")
-        lines.append(f" Parse notes ({len(notes)} line(s) not fully modeled):")
+        lines.append(f" Parse notes ({len(notes)} line(s) — resolved expansions "
+                     f"and lines not fully modeled):")
         lines += _note_lines(notes)
     return "\n".join(lines)
 

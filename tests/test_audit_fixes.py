@@ -101,11 +101,14 @@ def test_multiport_eq_models_every_port_exactly():
     assert ports == [(23, 23), (3389, 3389)] and all(not a.imprecise for a in aces)
 
 
-def test_object_group_permit_fails_closed_not_ok():
-    # An object-group permit on the CORP->PCI path can't be modeled; dropping it
-    # let segcheck conclude PASS. Now it's a fail-closed opaque ACE -> the flow is
-    # INDETERMINATE, never segmentation-ok.
-    # Mutation guard: drop object-group lines again -> reverts to segmentation-ok.
+def test_object_group_permit_resolves_to_precise_violation():
+    # An object-group permit on the CORP->PCI path. The group DEFINITIONS are in
+    # the config, so the two-pass resolver expands the reference to the EXACT
+    # member ACEs -> a PRECISE critical violation (not just INDETERMINATE).
+    # Either way segmentation-ok must never appear (no false PASS); when the
+    # definitions are present we now also gain precision.
+    # Mutation guard: break the resolver -> reverts to INDETERMINATE (still sound,
+    # loses precision); drop the lines entirely -> reverts to segmentation-ok.
     aces, _ = parse_acls(
         "object-group network CORP_NET\n network-object 10.20.0.0 255.255.0.0\n"
         "object-group network PCI_NET\n network-object 10.10.0.0 255.255.0.0\n"
@@ -113,7 +116,8 @@ def test_object_group_permit_fails_closed_not_ok():
         " permit tcp object-group CORP_NET object-group PCI_NET eq 445\n")
     kinds = _seg_kinds(aces)
     assert "segmentation-ok" not in kinds, "FALSE PASS: object-group leak hidden"
-    assert "segmentation-indeterminate" in kinds
+    assert "segmentation-violation" in kinds
+    assert all(not a.imprecise for a in aces)   # resolved exactly, not fail-closed
 
 
 def test_asa_object_reference_fails_closed_not_ok():
