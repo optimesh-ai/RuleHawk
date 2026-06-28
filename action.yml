@@ -1,0 +1,191 @@
+name: 'RuleHawk firewall gate'
+description: >-
+  Audit Cisco IOS/ASA, Juniper Junos, Palo Alto PAN-OS and Linux iptables
+  firewall configs for dead/shadowed rules, dangerous exposure, and broken zone
+  segmentation — and gate the PR with concrete, eyeball-verifiable witness
+  packets. Pure-Python, zero dependencies, runs entirely in your runner: your
+  config never leaves your infrastructure.
+author: 'OptiMesh'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  configs:
+    description: >-
+      Files or globs to audit, whitespace/newline separated (recursive ** is
+      supported). Example: "firewall/**/*.conf network/acls/*.acl".
+    required: true
+  policy:
+    description: >-
+      Path to a segmentation policy JSON (zones + must_not_reach). Omit to run
+      hygiene checks only.
+    required: false
+    default: ''
+  fail-on:
+    description: 'Fail the check at this severity or worse: critical | high | medium | low | none'
+    required: false
+    default: 'high'
+  vendor:
+    description: 'Force a vendor for every file: auto | ios | junos | panos | iptables'
+    required: false
+    default: 'auto'
+  comment:
+    description: 'Post/update a single sticky PR comment with the findings (true|false)'
+    required: false
+    default: 'true'
+  upload-sarif:
+    description: >-
+      Upload SARIF to GitHub code scanning so each finding is annotated on the
+      exact line in the PR diff (true|false). Needs code scanning enabled and
+      `security-events: write`.
+    required: false
+    default: 'true'
+  working-directory:
+    description: 'Directory to run the audit in'
+    required: false
+    default: '.'
+  python-version:
+    description: >-
+      Optional Python to set up (RuleHawk needs >=3.9). Leave empty to use the
+      python3 already on the runner — that is the fast path (no setup step).
+    required: false
+    default: ''
+
+outputs:
+  passed:
+    description: 'true when no finding met the fail-on threshold'
+    value: ${{ steps.gate.outputs.passed }}
+  score:
+    description: 'Lowest hygiene score (0-100) across the audited files'
+    value: ${{ steps.gate.outputs.score }}
+  worst-severity:
+    description: 'Highest severity found: critical | high | medium | low | none'
+    value: ${{ steps.gate.outputs.worst }}
+  sarif-file:
+    description: 'Path to the generated SARIF report'
+    value: ${{ steps.gate.outputs.sarif }}
+
+runs:
+  using: 'composite'
+  steps:
+    # Optional Python setup — skipped by default (GitHub runners already ship
+    # Python 3.9+, so the common path adds zero install time).
+    - name: Set up Python
+      if: inputs.python-version != ''
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    # The whole gate. RuleHawk is pure-Python with no dependencies, so we run it
+    # straight from the action's checkout via PYTHONPATH — no `pip install`, no
+    # Docker image pull. It typically finishes in well under a second.
+    - name: Run RuleHawk gate
+      id: gate
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        RH_CONFIGS: ${{ inputs.configs }}
+        RH_POLICY: ${{ inputs.policy }}
+        RH_FAIL_ON: ${{ inputs.fail-on }}
+        RH_VENDOR: ${{ inputs.vendor }}
+        # Import the engine from the action's own checkout (zero install).
+        PYTHONPATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        SARIF="${RUNNER_TEMP:-/tmp}/rulehawk.sarif"
+        JSON="${RUNNER_TEMP:-/tmp}/rulehawk.json"
+        COMMENT="${RUNNER_TEMP:-/tmp}/rulehawk-comment.md"
+        POLICY_ARGS=()
+        if [ -n "${RH_POLICY}" ]; then POLICY_ARGS=(--policy "${RH_POLICY}"); fi
+
+        # `set -f` (noglob) hands ** / * patterns to RuleHawk verbatim so its own
+        # recursive globber expands them — whitespace still splits multiple
+        # patterns into separate arguments.
+        # errexit OFF for the rest of this step: the gate's own exit code is the
+        # verdict (captured below), and reporting is best-effort — nothing here may
+        # abort the step, or a failed gate could be masked as green.
+        set +e -f
+        python3 -m rulehawk gate ${RH_CONFIGS} \
+          "${POLICY_ARGS[@]}" \
+          --fail-on "${RH_FAIL_ON}" \
+          --vendor "${RH_VENDOR}" \
+          --sarif "${SARIF}" \
+          --json "${JSON}" \
+          --comment "${COMMENT}"
+        RC=$?
+        set +f
+
+        # Persist the verdict FIRST so nothing below can mask it (the final
+        # 'Enforce' step re-raises it after SARIF + comment have posted).
+        echo "${RC}" > "${RUNNER_TEMP:-/tmp}/rulehawk.rc"
+
+        # Surface paths + parsed outputs for later steps (best-effort; never abort).
+        # Only advertise an artifact path when the file truly exists, so the SARIF
+        # upload / comment steps never try to read a file a failed gate didn't write.
+        {
+          [ -f "${SARIF}" ]   && echo "sarif=${SARIF}"     || echo "sarif="
+          [ -f "${JSON}" ]    && echo "json=${JSON}"       || echo "json="
+          [ -f "${COMMENT}" ] && echo "comment=${COMMENT}" || echo "comment="
+          echo "exit_code=${RC}"
+        } >> "${GITHUB_OUTPUT}"
+        python3 - "${JSON}" >> "${GITHUB_OUTPUT}" <<'PY' || true
+        import json, sys
+        d = json.load(open(sys.argv[1]))
+        print("passed=" + ("true" if d["passed"] else "false"))
+        print("score=" + ("" if d["score"] is None else str(d["score"])))
+        print("worst=" + str(d["worst_severity"]))
+        PY
+        exit 0
+
+    # Annotate the exact changed lines in the PR diff (and feed the Security tab).
+    # `always()` so a failing gate still uploads; harmless no-op if disabled.
+    - name: Upload SARIF to code scanning
+      if: always() && inputs.upload-sarif == 'true' && steps.gate.outputs.sarif != ''
+      continue-on-error: true
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ steps.gate.outputs.sarif }}
+        category: rulehawk
+
+    # Post / update ONE sticky comment so reviewers see the verdict + witnesses in
+    # the conversation. continue-on-error keeps fork PRs (read-only token) green
+    # on the comment step — the check + SARIF still gate the merge.
+    - name: Sticky PR comment
+      if: always() && inputs.comment == 'true' && github.event_name == 'pull_request' && steps.gate.outputs.comment != ''
+      continue-on-error: true
+      uses: actions/github-script@v9
+      with:
+        script: |
+          const fs = require('fs');
+          const marker = '<!-- rulehawk-gate -->';
+          let body = '';
+          try { body = fs.readFileSync('${{ steps.gate.outputs.comment }}', 'utf8'); }
+          catch (e) { core.warning('no comment body: ' + e); return; }
+          const {owner, repo} = context.repo;
+          const issue_number = context.payload.pull_request.number;
+          const {data: comments} = await github.rest.issues.listComments(
+            {owner, repo, issue_number, per_page: 100});
+          const mine = comments.find(c => c.body && c.body.includes(marker));
+          if (mine) {
+            await github.rest.issues.updateComment(
+              {owner, repo, comment_id: mine.id, body});
+          } else {
+            await github.rest.issues.createComment(
+              {owner, repo, issue_number, body});
+          }
+
+    # Re-raise the gate verdict so the check goes red exactly when it should.
+    - name: Enforce gate verdict
+      if: always()
+      shell: bash
+      run: |
+        RC="$(cat "${RUNNER_TEMP:-/tmp}/rulehawk.rc" 2>/dev/null || echo 0)"
+        if [ "${RC}" = "2" ]; then
+          echo "::error title=RuleHawk gate failed (fail-closed)::One or more configs parsed to zero rules — RuleHawk will not certify isolation it could not verify. Check the vendor/format, or set the 'vendor' input."
+          exit 1
+        elif [ "${RC}" != "0" ]; then
+          echo "::error title=RuleHawk gate failed::Findings at or above '${{ inputs.fail-on }}' block this change — see the job summary and PR comment."
+          exit 1
+        fi
+        echo "RuleHawk gate passed (worst severity: ${{ steps.gate.outputs.worst }})."

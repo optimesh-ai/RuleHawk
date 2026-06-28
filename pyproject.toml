@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rulehawk"
-version = "0.1.0"
-description = "Self-serve firewall/ACL hygiene & segmentation auditor (IOS/ASA)"
+version = "0.2.0"
+description = "Self-serve firewall/ACL hygiene & segmentation auditor + CI gate (Cisco/Juniper/Palo Alto/iptables)"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"

@@ -13,6 +13,41 @@ pip install -e .   # then:  rulehawk acl.txt
 
 Exit code is non-zero when a critical/high finding exists → drop it in CI.
 
+## CI gate — audit a whole repo on every PR (GitHub Action)
+Keep your firewall configs in git and let RuleHawk gate every change. The
+`rulehawk gate` subcommand audits many files at once and emits a SARIF report
+(inline diff annotations), a sticky PR comment, and a job summary; it fails the
+check at a severity threshold you choose:
+
+```
+rulehawk gate firewall/**/*.txt --policy policy.json --fail-on high
+```
+
+As a GitHub Action it's a **composite, pure-Python, zero-install** step (no Docker
+pull, no `pip install` — it runs from its own checkout; a full repo audits in
+under a second) and your config never leaves the runner:
+
+```yaml
+permissions: { contents: read, security-events: write, pull-requests: write }
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: optimesh-ai/RuleHawk@v1
+        with:
+          configs: firewall/**/*.txt
+          policy:  .rulehawk/policy.json
+          fail-on: high
+```
+
+A bad change that opens CORP→PCI on SMB/445 gets blocked with the witness packet
+`10.20.0.1 -> 10.10.0.1:445` annotated on the exact line. A file that parses to
+**zero** rules **fails closed** (exit 2) — RuleHawk never certifies isolation it
+could not verify. See [`docs/github-action.md`](docs/github-action.md) for all
+inputs/outputs and the [worked example repo](https://github.com/optimesh-ai/acme-firewall-configs)
+for a copy-pasteable setup with a live bad-PR demo.
+
 ## Segmentation-intent (the audit/compliance layer)
 Declare zones + `must_not_reach` rules in a JSON policy, and RuleHawk proves
 isolation or reports a **concrete witness packet** the ACL wrongly permits — the
@@ -24,7 +59,8 @@ SEGMENTATION VIOLATION (CORP must not reach PCI): the ACL PERMITS
 ```
 An earlier `deny` that already blocks the flow yields PASS (no false alarm); a
 rule we can't model exactly (neq/complex mask) is flagged "indeterminate, review"
-rather than a false pass. See `samples/policy.json`.
+rather than a false pass. See `samples/policy.json` for an example and
+[`docs/policy.md`](docs/policy.md) for the full policy schema.
 
 ## What it finds (today)
 - **Intent inversions** — a `permit` that never fires because an earlier `deny`
@@ -84,7 +120,11 @@ Apache-2.0 — see `LICENSE`.
 ## Layout
 - `rulehawk/model.py` — normalized ACE + `covers()` (packet-space containment).
 - `rulehawk/parse.py` — IOS/ASA parser (unmodeled lines are surfaced, not dropped).
+- `rulehawk/parse_junos.py` / `parse_panos.py` / `parse_iptables.py` — vendor frontends.
 - `rulehawk/analyze.py` — the rule-space analysis engine (the core IP).
+- `rulehawk/segcheck.py` — segmentation-intent proof (witness packets).
 - `rulehawk/report.py` — text + JSON reports.
-- `rulehawk/cli.py` — `python -m rulehawk`.
-- `tests/` — correctness tests for the analysis engine.
+- `rulehawk/gate.py` — the CI gate: multi-file audit → SARIF + PR comment + summary.
+- `rulehawk/cli.py` — `python -m rulehawk` (+ the `gate` subcommand).
+- `action.yml` — the composite GitHub Action (see `docs/github-action.md`).
+- `tests/` — correctness tests for the analysis engine and the gate.

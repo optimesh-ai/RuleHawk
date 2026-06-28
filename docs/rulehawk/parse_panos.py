@@ -370,7 +370,7 @@ def _raw(name: str, action: str, proto: str, s: _IPNet, d: _IPNet,
 
 def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
                 addresses, addr_groups, services,
-                entries: List[ACE], notes: List[str]) -> int:
+                entries: List[ACE], notes: List[str], line: int = 0) -> int:
     label = f"security/{name}"
 
     if fields.get("disabled", []) and fields["disabled"][0].lower() == "yes":
@@ -436,7 +436,7 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
                     stateful=False, imprecise=imprecise,
                     raw=_raw(name, action, proto, s, d,
                              sp if ported else ANY_PORTS, dp if ported else ANY_PORTS),
-                    acl="security"))
+                    acl="security", line=line))
     return seq
 
 
@@ -456,17 +456,22 @@ def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
     consume the result unchanged. Rule order = first appearance of each rule
     name (PAN-OS evaluates one ordered rulebase, first match wins).
     """
-    lines = [_tok(ln) for ln in text.splitlines() if ln.strip()]
+    numbered = [(i, _tok(ln)) for i, ln in enumerate(text.splitlines(), 1)
+                if ln.strip()]
+    lines = [toks for _, toks in numbered]
     notes: List[str] = []
     entries: List[ACE] = []
 
     addresses, addr_groups, services = _collect_objects(lines, notes)
 
     # Second pass: accumulate each rule's fields (split across lines) in
-    # first-appearance order, then assemble the ordered rulebase.
+    # first-appearance order, then assemble the ordered rulebase. We remember the
+    # source line of each rule for the CI gate's diff annotations — preferring the
+    # line that carries `action` (the rule's decisive line), else first appearance.
     order: List[str] = []
     rules: "Dict[str, Dict[str, List[str]]]" = {}
-    for toks in lines:
+    rule_lines: Dict[str, int] = {}
+    for lineno, toks in numbered:
         if not toks or toks[0] != "set":
             continue
         k = _rule_anchor(toks)
@@ -476,13 +481,16 @@ def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
         if name not in rules:
             rules[name] = {}
             order.append(name)
-        for key, vals in _read_fields(toks[k + 2:]).items():
+        fields_here = _read_fields(toks[k + 2:])
+        for key, vals in fields_here.items():
             rules[name].setdefault(key, []).extend(vals)
+        if "action" in fields_here or name not in rule_lines:
+            rule_lines[name] = lineno
 
     seq = 0
     for name in order:
         seq = _build_rule(name, rules[name], seq, addresses, addr_groups,
-                          services, entries, notes)
+                          services, entries, notes, rule_lines.get(name, 0))
 
     if not entries and re.search(r"<\s*(?:rulebase|security|entry)\b", text):
         notes.append("PAN-OS XML config detected but not yet supported — export "
