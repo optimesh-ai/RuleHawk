@@ -175,7 +175,7 @@ _OPAQUE_RE = re.compile(
     r"port-object|group-object)\b")
 
 
-def _opaque_ace(action: str, seq: int, acl: str, raw: str) -> ACE:
+def _opaque_ace(action: str, seq: int, acl: str, raw: str, line: int = 0) -> ACE:
     """A fail-CLOSED stand-in for a permit/deny line we can't model (object-group
     /object reference, or an unparseable operand). Over-approximated to ANY
     proto/src/dst and marked `imprecise`, so:
@@ -186,7 +186,7 @@ def _opaque_ace(action: str, seq: int, acl: str, raw: str) -> ACE:
         hidden behind the group. Dropping the line (the old behavior) was the bug.
     Mirrors the iptables custom-chain-jump fail-closed marker."""
     return ACE(seq=seq, action=action, proto="ip", src=_ANY_NET, dst=_ANY_NET,
-               imprecise=True, raw=raw, acl=acl)
+               imprecise=True, raw=raw, acl=acl, line=line)
 
 
 # --- object-group / object resolution (two-pass) ---------------------------
@@ -470,7 +470,8 @@ def _is_svc_ref(toks: List[str], i: int, defs: _Defs) -> bool:
             or (t == "object" and toks[i + 1] in defs.svc_objs))
 
 
-def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str):
+def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
+                   line: int = 0):
     """Pass 2: expand one object-referencing ACE to the exact union of member
     ACEs, or return None to fall back to the fail-closed opaque ACE."""
     action = toks[0].lower()
@@ -551,7 +552,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str):
                     aces.append(ACE(
                         seq=m, action=action, proto=cproto, src=s, dst=d,
                         src_port=sp, dst_port=dp, stateful=stateful,
-                        imprecise=imprecise, raw=raw, acl=acl))
+                        imprecise=imprecise, raw=raw, acl=acl, line=line))
     note = (f"resolved object-group/object reference to {len(aces)} exact "
             f"ACE(s): {raw}")
     return aces, [note]
@@ -568,7 +569,7 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     defs = _collect_defs(text)               # pass 1: object-group / object defs
     current_acl = "(unnamed)"
     seq = 0
-    for raw in text.splitlines():
+    for lineno, raw in enumerate(text.splitlines(), 1):
         stripped = raw.strip()
         if not stripped or stripped.startswith("!"):
             continue
@@ -599,7 +600,8 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             # None and we keep the fail-closed opaque ACE (INDETERMINATE).
             resolved = None
             try:
-                resolved = _resolve_entry(toks, defs, seq, current_acl, stripped)
+                resolved = _resolve_entry(toks, defs, seq, current_acl, stripped,
+                                          lineno)
             except (IndexError, ValueError, ipaddress.AddressValueError):
                 resolved = None
             if resolved is not None:
@@ -610,16 +612,16 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
                 continue
             notes.append(f"unmodeled (object-group): {stripped}")
             seq += 1
-            entries.append(_opaque_ace(action, seq, current_acl, stripped))
+            entries.append(_opaque_ace(action, seq, current_acl, stripped, lineno))
             continue
         try:
-            aces, enotes = _parse_entry(toks, seq, current_acl, stripped)
+            aces, enotes = _parse_entry(toks, seq, current_acl, stripped, lineno)
         except (IndexError, ValueError, ipaddress.AddressValueError):
             # Recognized as an ACE but unparseable — fail closed rather than drop,
             # so an unreadable permit can't be silently treated as isolated.
             notes.append(f"unparsed (kept fail-closed): {stripped}")
             seq += 1
-            entries.append(_opaque_ace(action, seq, current_acl, stripped))
+            entries.append(_opaque_ace(action, seq, current_acl, stripped, lineno))
             continue
         seq += len(aces)
         entries.extend(aces)
@@ -627,7 +629,7 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     return entries, notes
 
 
-def _parse_entry(toks: List[str], seq: int, acl: str, raw: str):
+def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0):
     """Parse one ACE line into a LIST of ACEs (a multi-port `eq` expands to the
     exact union of per-port rules). ACEs are numbered seq+1, seq+2, ...; the
     caller advances its counter by len(result)."""
@@ -669,5 +671,6 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str):
             n += 1
             aces.append(ACE(seq=n, action=action, proto=proto, src=src, dst=dst,
                             src_port=sp, dst_port=dp, icmp_type=icmp_type,
-                            stateful=stateful, imprecise=imprecise, raw=raw, acl=acl))
+                            stateful=stateful, imprecise=imprecise, raw=raw,
+                            acl=acl, line=line))
     return aces, notes

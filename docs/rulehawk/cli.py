@@ -5,6 +5,10 @@ Cisco ASA, Juniper Junos firewall filter, Palo Alto PAN-OS security policy, or
 Linux iptables/ip6tables filter rules) and get a ranked hygiene report in
 seconds. The vendor is auto-detected; force Junos with --junos, PAN-OS with
 --panos, or iptables with --iptables. Reads stdin if no file.
+
+Subcommand:  rulehawk gate <file-or-glob>... [--policy P] [--fail-on LEVEL] ...
+audits many configs at once and emits SARIF + a PR-comment + a step summary for
+the GitHub Action gate (see rulehawk/gate.py). `rulehawk gate --help` for detail.
 """
 
 from __future__ import annotations
@@ -23,6 +27,11 @@ from .segcheck import check_segmentation
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    # Subcommand: `rulehawk gate ...` runs the multi-file CI gate (SARIF, PR
+    # comment, severity threshold). Everything else is the single-file report.
+    if argv and argv[0] == "gate":
+        from .gate import main as gate_main
+        return gate_main(argv[1:])
     as_json = "--json" in argv
     force_junos = "--junos" in argv
     force_panos = "--panos" in argv

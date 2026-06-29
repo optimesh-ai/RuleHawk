@@ -67,6 +67,11 @@ class ACE:
     imprecise: bool = False           # over-approximated space (neq / bad mask)
     raw: str = ""
     acl: str = ""
+    line: int = 0                     # 1-based source line of this rule in its file
+    # (0 = unknown). Set by the parser frontends so the CI gate can annotate the
+    # exact line in a PR diff (SARIF). All expanded ACEs from one source line share
+    # its line number; synthetic ACEs (e.g. an iptables chain default policy) carry
+    # the line of the construct that implied them, or 0 if none.
     transit: bool = True              # participates in INTER-ZONE (transit) segmentation.
     # True for vendors whose ACLs filter forwarded traffic (Cisco/Junos/PAN-OS,
     # and the iptables FORWARD chain). False for direction contexts that NEVER

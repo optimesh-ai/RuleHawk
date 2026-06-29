@@ -291,7 +291,7 @@ def _raw(tname: str, action: str, proto: str, s: _IPNet, d: _IPNet,
 
 
 def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
-                entries: List[ACE], notes: List[str]) -> int:
+                entries: List[ACE], notes: List[str], line: int = 0) -> int:
     label = f"{fname}/{tname}"
     from_toks: List[str] = []
     then_toks: List[str] = []
@@ -355,21 +355,40 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
                             seq=seq, action=action, proto=proto, src=s, dst=d,
                             src_port=sp, dst_port=dp, icmp_type=None,
                             stateful=m.stateful, imprecise=imprecise,
-                            raw=_raw(tname, action, proto, s, d, sp, dp), acl=fname))
+                            raw=_raw(tname, action, proto, s, d, sp, dp),
+                            acl=fname, line=line))
     return seq
 
 
 def _parse_filter(fname: str, body: List[str], entries: List[ACE],
-                  notes: List[str]) -> None:
+                  notes: List[str], term_lines: "dict") -> None:
     seq = 0
     i, n = 0, len(body)
     while i < n:
         if body[i] == "term" and i + 2 < n and body[i + 2] == "{":
             tname = body[i + 1]
             tbody, i = _read_block(body, i + 2)
-            seq = _parse_term(fname, tname, tbody, seq, entries, notes)
+            seq = _parse_term(fname, tname, tbody, seq, entries, notes,
+                              term_lines.get((fname, tname), 0))
         else:
             i += 1
+
+
+def _term_line_map(text: str) -> "dict":
+    """Best-effort map (filter, term) -> 1-based source line, by a light line scan
+    of the brace-form config (the tokenizer flattens line structure, so the CI
+    gate's diff annotations recover the term's line from here). Term names are
+    unique within a filter, so keying by (filter, term) is unambiguous."""
+    out: dict = {}
+    cur_filter: Optional[str] = None
+    for i, ln in enumerate(text.splitlines(), 1):
+        mf = re.search(r"\bfilter\s+(\S+?)\s*\{", ln)
+        if mf:
+            cur_filter = mf.group(1)
+        mt = re.search(r"\bterm\s+(\S+?)\s*\{", ln)
+        if mt and cur_filter is not None:
+            out.setdefault((cur_filter, mt.group(1)), i)
+    return out
 
 
 def parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
@@ -379,6 +398,7 @@ def parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
     consume the result unchanged.
     """
     toks = _tokenize(text)
+    term_lines = _term_line_map(text)
     entries: List[ACE] = []
     notes: List[str] = []
     i, n = 0, len(toks)
@@ -389,7 +409,7 @@ def parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
         if toks[i] == "filter" and i + 2 < n and toks[i + 2] == "{":
             fname = toks[i + 1]
             fbody, i = _read_block(toks, i + 2)
-            _parse_filter(fname, fbody, entries, notes)
+            _parse_filter(fname, fbody, entries, notes, term_lines)
         else:
             i += 1
 

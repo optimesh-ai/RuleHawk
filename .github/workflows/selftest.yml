@@ -1,0 +1,52 @@
+name: RuleHawk CI
+
+# The engine's own gate: run the analysis-engine test suite on every change, and
+# dogfood the composite Action end-to-end on a known-clean sample so the gate
+# wiring itself is exercised in real CI.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Engine test suite
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install pytest
+        run: python -m pip install --quiet pytest
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Verify the web demo vendored engine is in sync
+        run: |
+          rsync -a --delete --exclude='__pycache__' --exclude='*.pyc' \
+            rulehawk/ /tmp/_engine_check/
+          diff -r /tmp/_engine_check/ docs/rulehawk/ \
+            || (echo "::error::docs/rulehawk drifted — run 'make sync-web'"; exit 1)
+
+  action-selftest:
+    name: Dogfood the Action (composite, end-to-end)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Use the action from this very checkout (local `./`). A clean sample +
+      # the segmentation policy must pass the gate with exit 0 — proving the
+      # zero-install PYTHONPATH wiring works on a real runner.
+      - name: RuleHawk gate (expect PASS on a clean sample)
+        uses: ./
+        with:
+          configs: samples/adv_realistic.txt
+          policy: samples/policy.json
+          fail-on: high
+          upload-sarif: false      # no code-scanning dependency in the self-test
+          comment: false

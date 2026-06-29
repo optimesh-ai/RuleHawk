@@ -334,7 +334,7 @@ def _raw(chain: str, action: str, proto: str, s: _IPNet, d: _IPNet,
 
 
 def _expand(chain: str, r: _Rule, seq: int, entries: List[ACE],
-            default6: bool) -> int:
+            default6: bool, line: int = 0) -> int:
     """Expand one parsed rule into ACEs (one per src/dst-port combo)."""
     v6 = default6
     if r.src is not None:
@@ -356,7 +356,7 @@ def _expand(chain: str, r: _Rule, seq: int, entries: List[ACE],
                 src_port=sp, dst_port=dp, icmp_type=r.icmp_type,
                 stateful=r.stateful, imprecise=r.imprecise,
                 raw=_raw(chain, r.action, r.proto, src, dst, sp, dp), acl=chain,
-                transit=transit))
+                line=line, transit=transit))
     return seq
 
 
@@ -384,6 +384,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     by_chain: Dict[str, List[ACE]] = {}
     seqs: Dict[str, int] = {}
     policies: Dict[str, str] = {}                # chain -> permit|deny (from policy)
+    policy_lines: Dict[str, int] = {}            # chain -> source line of its `-P`/`:` policy
     table = "filter"                             # iptables-save default before *table
     table_is_filter = True
     other_tables_noted: set = set()
@@ -394,7 +395,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             seqs[ch] = 0
             chains.append(ch)
 
-    def add_rule(ch: str, args: List[str]) -> None:
+    def add_rule(ch: str, args: List[str], line: int = 0) -> None:
         ensure_chain(ch)
         label = f"{ch}:{seqs[ch] + 1}"
         r = _parse_rule(args, label, notes)
@@ -414,21 +415,22 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             if r.jump_custom is not None and _is_transit(ch):
                 r.action = "permit"
                 r.imprecise = True
-                seqs[ch] = _expand(ch, r, seqs[ch], by_chain[ch], default6)
+                seqs[ch] = _expand(ch, r, seqs[ch], by_chain[ch], default6, line)
             return
         if r.action is None:
             notes.append(f"iptables rule in {ch} has no terminating target "
                          f"(-j ACCEPT/DROP/REJECT) — skipped")
             return
-        seqs[ch] = _expand(ch, r, seqs[ch], by_chain[ch], default6)
+        seqs[ch] = _expand(ch, r, seqs[ch], by_chain[ch], default6, line)
 
-    def set_policy(ch: str, pol: str) -> None:
+    def set_policy(ch: str, pol: str, line: int = 0) -> None:
         act = _TERMINATING.get(pol.upper())
         if act is not None:
             policies[ch] = act
+            policy_lines[ch] = line
             ensure_chain(ch)
 
-    for raw in text.splitlines():
+    for lineno, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -449,7 +451,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                 continue
             parts = line[1:].split()
             if len(parts) >= 2 and parts[0] in _BASE_CHAINS:
-                set_policy(parts[0], parts[1])
+                set_policy(parts[0], parts[1], lineno)
             elif len(parts) >= 1:
                 ensure_chain(parts[0])           # custom chain declaration
             continue
@@ -485,7 +487,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             k = toks.index("-A") if "-A" in toks else toks.index("--append")
             if k + 1 < len(toks):
                 ch = toks[k + 1]
-                add_rule(ch, toks[k + 2:])
+                add_rule(ch, toks[k + 2:], lineno)
         elif "-I" in toks or "--insert" in toks:
             # Insert: surfaced (we can't reorder soundly without the index math);
             # treat as append-at-position-unknown -> note, then append for coverage.
@@ -498,11 +500,11 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                     args = args[1:]
                 notes.append(f"iptables `-I {ch}` insert in {ch} appended at end for "
                              f"analysis — original insert position not modeled (verify)")
-                add_rule(ch, args)
+                add_rule(ch, args, lineno)
         elif "-P" in toks or "--policy" in toks:
             k = toks.index("-P") if "-P" in toks else toks.index("--policy")
             if k + 2 < len(toks):
-                set_policy(toks[k + 1], toks[k + 2])
+                set_policy(toks[k + 1], toks[k + 2], lineno)
         elif "-N" in toks or "--new-chain" in toks:
             k = toks.index("-N") if "-N" in toks else toks.index("--new-chain")
             if k + 1 < len(toks):
@@ -522,7 +524,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             chain_aces.append(ACE(
                 seq=seqs[ch], action=act, proto="ip", src=any_net, dst=any_net,
                 raw=f"{ch}: default policy {act} (chain policy)", acl=ch,
-                transit=_is_transit(ch)))
+                line=policy_lines.get(ch, 0), transit=_is_transit(ch)))
         elif chain_aces and ch in _BASE_CHAINS:
             notes.append(f"iptables base chain {ch} has rules but no explicit default "
                          f"policy in this config — default not modeled (paste the "
