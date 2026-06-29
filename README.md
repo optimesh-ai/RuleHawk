@@ -73,8 +73,25 @@ rather than a false pass. See `samples/policy.json` for an example and
 - A hygiene **score** and an exportable **JSON** report.
 
 ## Vendors today
-Cisco IOS extended ACLs, Cisco ASA access-lists. (Roadmap: NX-OS, Juniper,
-Palo Alto, AWS Security Groups/NACLs, iptables/nftables.)
+Cisco IOS extended ACLs, Cisco ASA access-lists (with object-group resolution),
+Juniper Junos firewall filters (brace form), Palo Alto PAN-OS security policy (set
+format), and Linux iptables/ip6tables filter rules — vendor auto-detected.
+(Roadmap: NX-OS, FortiGate, AWS Security Groups/NACLs, nftables.)
+
+## Scope & limits (what it does *not* model)
+RuleHawk is a fast, sound **config-change gate**, not a network-wide reachability
+simulator. It reasons about the **layer-3/4 packet space** only
+`(action, proto, src-net, dst-net, src-port, dst-port, icmp-type)`:
+- **NAT is not modeled** — it audits the filter (ACL/policy) layer; verify address
+  translation separately (ASA `nat`/`static` are out of scope; the iptables `nat`
+  table is surfaced as a note).
+- **No routing/topology** — each config is an independent first-match context, so a
+  `segmentation-violation` means "a ruleset on the path permits the forbidden flow,"
+  not a full end-to-end reachability proof (that's [Batfish](https://github.com/batfish/batfish)).
+- **L7/identity** (PAN-OS app-ID, source-user), `time-range`, `inactive`, interface
+  bindings, and fragments are over-approximated/treated conservatively and surfaced
+  as notes — RuleHawk errs toward over-reporting and **fails closed**, never toward a
+  false "isolated."
 
 ## Why it exists
 Firewall-rule sprawl and segmentation proof are an acute, recurring pain — and the
