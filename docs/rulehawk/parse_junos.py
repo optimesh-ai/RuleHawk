@@ -66,9 +66,13 @@ _MAX_EXPAND = 256
 def detect(text: str) -> bool:
     """Heuristic: does `text` look like a Junos firewall-filter config?
 
-    Requires the brace-form signature (`filter NAME {` ... `term` ... `then`) so
-    a Cisco ACL — which has none of these keywords — is never misrouted here.
+    Accepts the brace-form (`filter NAME { ... term ... then ...}`) and the
+    set-display form (`set firewall family inet filter NAME term NAME ...`).
+    A Cisco ACL has none of these markers, so it is never misrouted here.
     """
+    if re.search(r"^set\s+firewall\s+family\s+\S+\s+filter\s+\S+\s+term\s+",
+                 text, re.MULTILINE):
+        return True
     return bool(
         re.search(r"\bfilter\s+\S+\s*\{", text)
         and re.search(r"\bterm\b", text)
@@ -391,12 +395,128 @@ def _term_line_map(text: str) -> "dict":
     return out
 
 
+# --- set-display format parser -------------------------------------------
+# Each line: `set firewall family <inet|inet6> filter <fname> term <tname>
+#              from <key> <val...>` or `... then <action>`.
+# We collect all from/then lines per (fname, tname) — preserving the
+# declaration order of terms — then re-use the brace-form per-term machinery
+# (_parse_from / _parse_then / _parse_term) unchanged. The set lines arrive
+# one directive at a time: multi-value address/port lists are written as
+# repeated lines (`from source-address 10/8` then `from source-address 10.1/16`)
+# so we accumulate values per key before handing them to _parse_from, which
+# already understands multi-value lists.
+
+# Pattern:
+#   set firewall family <fam> filter <fname> term <tname>
+#         from <key> [<val>...]
+#     or  then <action-or-modifier> [<val>...]
+_SET_LINE_RE = re.compile(
+    r"^set\s+firewall\s+family\s+\S+\s+filter\s+(\S+)\s+term\s+(\S+)\s+"
+    r"(from|then)\s+(.*)",
+    re.IGNORECASE,
+)
+
+
+def _parse_junos_set(text: str) -> Tuple[List[ACE], List[str]]:
+    """Parse Junos set-display format into (entries, notes).
+
+    Iterates the set lines in source order; terms are emitted in first-seen
+    order within each filter, preserving first-match semantics.
+    """
+    # (fname, tname) -> {"from": {key: [vals...]}, "then": [tokens...],
+    #                    "line": <first-seen 1-based line>}
+    # We use a list to track insertion order (filter/term declaration order).
+    term_order: List[Tuple[str, str]] = []
+    term_data: dict = {}
+
+    entries: List[ACE] = []
+    notes: List[str] = []
+
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        m = _SET_LINE_RE.match(raw.strip())
+        if not m:
+            continue
+        fname, tname, clause, rest = (m.group(1), m.group(2),
+                                      m.group(3).lower(), m.group(4).strip())
+        key = (fname, tname)
+        if key not in term_data:
+            term_order.append(key)
+            term_data[key] = {"from": {}, "then": [], "line": lineno}
+
+        rest_toks = rest.split()
+        if clause == "from":
+            if not rest_toks:
+                continue
+            fkey = rest_toks[0]
+            fvals = rest_toks[1:]
+            td_from = term_data[key]["from"]
+            if fkey not in td_from:
+                td_from[fkey] = []
+            td_from[fkey].extend(fvals)
+        else:                               # clause == "then"
+            # Accumulate then-tokens; separate statements end with implicit ";"
+            # which the brace-form parser marks with ";" tokens. We insert a
+            # synthetic ";" between successive then-clauses so _parse_then's
+            # _split_semicolons works correctly.
+            if term_data[key]["then"]:
+                term_data[key]["then"].append(";")
+            term_data[key]["then"].extend(rest_toks)
+
+    # Reconstruct synthetic token streams for each term and call the existing
+    # per-term parser. We rebuild from_toks so that multi-value keys (e.g.
+    # multiple source-address lines) become `key { v1 ; v2 ; }` blocks that
+    # _read_conditions already handles.
+    seq_per_filter: dict = {}   # fname -> running seq counter
+    for fname, tname in term_order:
+        td = term_data[(fname, tname)]
+        seq = seq_per_filter.get(fname, 0)
+
+        # Build from_toks: for each key, emit `key { val1 ; val2 ; }` when
+        # there are multiple values (the brace-block form that _read_conditions
+        # understands), or `key val ;` for a single value.
+        from_toks: List[str] = []
+        for fkey, fvals in td["from"].items():
+            if len(fvals) > 1:
+                block: List[str] = [fkey, "{"]
+                for v in fvals:
+                    block += [v, ";"]
+                block.append("}")
+                from_toks += block
+            else:
+                from_toks += [fkey] + fvals + [";"]
+
+        then_toks = td["then"]
+        # Build a synthetic tbody that _parse_term can consume:
+        # `from { <from_toks> } then { <then_toks> }`
+        tbody: List[str] = []
+        if from_toks:
+            tbody += ["from", "{"] + from_toks + ["}"]
+        if then_toks:
+            tbody += ["then", "{"] + then_toks + ["}"]
+
+        seq = _parse_term(fname, tname, tbody, seq, entries, notes,
+                          td["line"])
+        seq_per_filter[fname] = seq
+
+    return entries, notes
+
+
 def parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
     """Parse Junos firewall filters in `text`; return (entries, notes).
+
+    Auto-detects the format: the brace-form (`show configuration`) is parsed
+    by the block-walking tokenizer; the set-display form (`set firewall …`)
+    is parsed by the line-oriented `_parse_junos_set` helper. Both emit the
+    same `(List[ACE], notes)` IR; the rest of the engine is unchanged.
 
     Same contract as `parse.parse_acls`, so `analyze`/`check_segmentation`
     consume the result unchanged.
     """
+    # set-display form: every firewall rule is a `set firewall ...` line.
+    if re.search(r"^set\s+firewall\s+family\s+\S+\s+filter\s+\S+\s+term\s+",
+                 text, re.MULTILINE):
+        return _parse_junos_set(text)
+
     toks = _tokenize(text)
     term_lines = _term_line_map(text)
     entries: List[ACE] = []
@@ -413,7 +533,4 @@ def parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
         else:
             i += 1
 
-    if not entries and re.search(r"\bset\b.*\bfilter\b", text):
-        notes.append("Junos 'set'-display format detected but not yet supported — "
-                     "paste the curly-brace `show configuration` form to audit it.")
     return entries, notes
