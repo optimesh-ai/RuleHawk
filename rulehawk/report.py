@@ -42,6 +42,12 @@ def to_json(findings: List[Finding], notes: List[str], n_rules: int) -> str:
             for f in _sorted(findings)
         ],
         "parse_notes": notes,
+        "upsell": ({
+            "has_actionable": True,
+            "actionable_count": sum(1 for f in findings if f.severity in ("critical", "high")),
+            "message": "Config Studio can generate verified remediation for these findings — with rollback scripts and compliance tags.",
+            "url": "https://optimesh.ai/studio",
+        } if any(f.severity in ("critical", "high") for f in findings) else None),
     }, indent=2)
 
 
@@ -92,6 +98,15 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int) -> str:
         lines.append(f" Parse notes ({len(notes)} line(s) — resolved expansions "
                      f"and lines not fully modeled):")
         lines += _note_lines(notes)
+    # Config Studio upsell — only when there are actionable findings
+    actionable = [f for f in findings if f.severity in ("critical", "high")]
+    if actionable:
+        lines.append("")
+        lines.append("-" * 64)
+        lines.append(f" Found {len(actionable)} critical/high issue(s) that need fixing.")
+        lines.append(" Config Studio can generate verified remediation commands")
+        lines.append(" for each finding — with rollback scripts and compliance tags.")
+        lines.append(" Try it: https://optimesh.ai/studio")
     return "\n".join(lines)
 
 
