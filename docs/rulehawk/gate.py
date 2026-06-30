@@ -43,6 +43,8 @@ from .parse import parse_acls
 from .parse_iptables import detect as detect_iptables, parse_iptables
 from .parse_junos import detect as detect_junos, parse_junos
 from .parse_panos import detect as detect_panos, parse_panos
+from .parse_nxos import detect as detect_nxos, parse_nxos
+from .parse_eos import detect as detect_eos, parse_eos
 from .segcheck import check_segmentation
 
 # Severity ordering shared by the threshold logic, SARIF level mapping, and the
@@ -151,6 +153,8 @@ _VENDORS = {
     "junos": "junos", "juniper": "junos",
     "panos": "panos", "paloalto": "panos", "palo-alto": "panos",
     "iptables": "iptables", "netfilter": "iptables",
+    "nxos": "nxos", "nx-os": "nxos", "nexus": "nxos",
+    "eos": "eos", "arista": "eos",
 }
 
 
@@ -165,6 +169,10 @@ def _pick_parser(text: str, vendor: str):
             return "panos", parse_panos
         if v == "iptables":
             return "iptables", parse_iptables
+        if v == "nxos":
+            return "nxos", parse_nxos
+        if v == "eos":
+            return "eos", parse_eos
         return "ios-asa", parse_acls
     if detect_junos(text):
         return "junos", parse_junos
@@ -172,6 +180,10 @@ def _pick_parser(text: str, vendor: str):
         return "panos", parse_panos
     if detect_iptables(text):
         return "iptables", parse_iptables
+    if detect_nxos(text):
+        return "nxos", parse_nxos
+    if detect_eos(text):
+        return "eos", parse_eos
     return "ios-asa", parse_acls
 
 
