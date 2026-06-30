@@ -73,10 +73,11 @@ rather than a false pass. See `samples/policy.json` for an example and
 - A hygiene **score** and an exportable **JSON** report.
 
 ## Vendors today
-Cisco IOS extended ACLs, Cisco ASA access-lists (with object-group resolution),
-Juniper Junos firewall filters (brace form), Palo Alto PAN-OS security policy (set
-format), and Linux iptables/ip6tables filter rules — vendor auto-detected.
-(Roadmap: NX-OS, FortiGate, AWS Security Groups/NACLs, nftables.)
+Cisco IOS extended ACLs, Cisco NX-OS access-lists, Cisco ASA access-lists (with
+object-group resolution), Arista EOS access-lists, Juniper Junos firewall filters
+(brace form), Palo Alto PAN-OS security policy (set format), and Linux
+iptables/ip6tables filter rules — vendor auto-detected.
+(Roadmap: FortiGate, AWS Security Groups/NACLs, nftables.)
 
 ## Scope & limits (what it does *not* model)
 RuleHawk is a fast, sound **config-change gate**, not a network-wide reachability
@@ -137,7 +138,7 @@ Apache-2.0 — see `LICENSE`.
 ## Layout
 - `rulehawk/model.py` — normalized ACE + `covers()` (packet-space containment).
 - `rulehawk/parse.py` — IOS/ASA parser (unmodeled lines are surfaced, not dropped).
-- `rulehawk/parse_junos.py` / `parse_panos.py` / `parse_iptables.py` — vendor frontends.
+- `rulehawk/parse_nxos.py` / `parse_eos.py` / `parse_junos.py` / `parse_panos.py` / `parse_iptables.py` — vendor frontends.
 - `rulehawk/analyze.py` — the rule-space analysis engine (the core IP).
 - `rulehawk/segcheck.py` — segmentation-intent proof (witness packets).
 - `rulehawk/report.py` — text + JSON reports.
