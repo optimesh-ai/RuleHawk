@@ -1,10 +1,6 @@
 name: 'RuleHawk firewall gate'
 description: >-
-  Audit Cisco IOS/ASA, Juniper Junos, Palo Alto PAN-OS and Linux iptables
-  firewall configs for dead/shadowed rules, dangerous exposure, and broken zone
-  segmentation — and gate the PR with concrete, eyeball-verifiable witness
-  packets. Pure-Python, zero dependencies, runs entirely in your runner: your
-  config never leaves your infrastructure.
+  Multi-vendor firewall config auditor: finds dead rules and dangerous exposure, proves it with witness packets.
 author: 'OptiMesh'
 branding:
   icon: 'shield'
