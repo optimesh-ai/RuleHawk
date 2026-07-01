@@ -146,3 +146,21 @@ Apache-2.0 — see `LICENSE`.
 - `rulehawk/cli.py` — `python -m rulehawk` (+ the `gate` subcommand).
 - `action.yml` — the composite GitHub Action (see `docs/github-action.md`).
 - `tests/` — correctness tests for the analysis engine and the gate.
+- `scripts/check_vendor_sync.py` — stdlib-only sync guard (called by the test suite).
+
+## Contributing — keeping the hosted tool in sync
+
+`docs/rulehawk/` is a vendored copy of the canonical engine (`rulehawk/`) that
+the public hosted tool loads client-side via Pyodide.  **These two trees must
+remain byte-identical at all times.**  If they drift the hosted page silently
+serves a stale parser while the CLI is already fixed — this has happened before.
+
+**Workflow:**
+
+1. Edit the engine under `rulehawk/` (never edit `docs/rulehawk/` directly).
+2. Re-sync the vendored copy: `make sync-web`
+3. Confirm byte-identity: `make check-vendor-sync` (exits 0 if in sync).
+4. Commit both `rulehawk/` and `docs/rulehawk/` changes together.
+
+CI enforces this automatically: `tests/test_vendor_sync.py` runs on every
+`python -m pytest` invocation and will fail the build if any `.py` file drifts.
