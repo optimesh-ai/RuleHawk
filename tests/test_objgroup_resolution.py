@@ -163,8 +163,11 @@ def test_asa_singular_object_forms_resolve():
     assert all(not a.imprecise for a in aces)
 
 
-# A partially-resolvable group (one unparseable member) stays fail-closed.
-def test_partial_group_stays_indeterminate():
+# A partially-resolvable group (one unparseable member) with a resolved member
+# that ALREADY proves the leak now produces CRITICAL rather than INDETERMINATE.
+# The non-contiguous mask makes one member bad; the clean 10.20/16 member fully
+# resolves and its space lies in the CORP zone -> provably CRITICAL.
+def test_partial_group_proven_leak_is_critical():
     cfg = (
         "object-group network CORP_NET\n"
         " network-object 10.20.0.0 255.255.0.0\n"
@@ -174,11 +177,16 @@ def test_partial_group_stays_indeterminate():
         "ip access-list extended OUT\n"
         " permit tcp object-group CORP_NET object-group PCI_NET eq 445\n"
     )
-    aces, _ = parse_acls(cfg)
+    aces, notes = parse_acls(cfg)
     kinds = _kinds(aces)
-    assert "segmentation-indeterminate" in kinds
-    assert "segmentation-ok" not in kinds
-    assert aces[0].imprecise is True
+    # Resolved member (10.20/16 -> PCI:445) is a proven CORP->PCI:445 violation.
+    assert "segmentation-violation" in kinds          # CRITICAL, not suppressed
+    assert "segmentation-ok" not in kinds             # no false PASS
+    # Parser emits: one precise ACE for the resolved member + one opaque ACE.
+    assert len(aces) == 2
+    assert aces[0].imprecise is False                 # precise ACE for 10.20/16
+    assert aces[1].imprecise is True                  # opaque ACE for unresolved member
+    assert any("partially resolved" in n for n in notes)
 
 
 # A reference cycle (A -> B -> A) must terminate and fail closed, not loop.

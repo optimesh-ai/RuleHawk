@@ -426,6 +426,42 @@ def _resolve_nets(defs: _Defs, kind: str, name: str, seen: frozenset):
     return out or None                               # empty group -> fail closed
 
 
+def _resolve_nets_partial(defs: _Defs, kind: str, name: str, seen: frozenset
+                          ) -> Tuple[Optional[List[_IPNet]], bool]:
+    """Like _resolve_nets but tolerates bad members instead of failing on the first.
+
+    Returns ``(resolved, has_unresolved)``.
+
+    * ``(None, True)``  — the group is entirely unresolvable (undefined, cycle,
+      or all members bad / empty); caller must still fail closed.
+    * ``(nets, False)`` — all members resolved exactly (same as _resolve_nets).
+    * ``(nets, True)``  — *some* members resolved (returned in *nets*) and at
+      least one member could not be resolved.  The caller can emit precise ACEs
+      for the resolved subset PLUS one opaque ACE for the remainder.
+
+    Used only from _operand_addr in partial mode."""
+    key = (kind, name)
+    if key in seen:
+        return None, True                       # cycle -> fail closed
+    members = (defs.net_groups if kind == "ng" else defs.net_objs).get(name)
+    if members is None:
+        return None, True                       # undefined -> fail closed
+    seen = seen | {key}
+    out: List[_IPNet] = []
+    has_unresolved = False
+    for mem in members:
+        if mem[0] == "net":
+            out.append(mem[1])
+        elif mem[0] in ("ng", "no"):
+            sub, sub_unres = _resolve_nets_partial(defs, mem[0], mem[1], seen)
+            if sub is not None:
+                out.extend(sub)
+            has_unresolved = has_unresolved or sub_unres
+        else:                                   # ("bad",)
+            has_unresolved = True
+    return (out if out else None), has_unresolved
+
+
 def _resolve_svcs(defs: _Defs, kind: str, name: str, seen: frozenset):
     """Resolve a service group/object to an EXACT list of (proto, PortRange), or
     None (fail-closed) on undefined / unparseable member / cycle / empty."""
@@ -450,16 +486,28 @@ def _resolve_svcs(defs: _Defs, kind: str, name: str, seen: frozenset):
     return out or None
 
 
-def _operand_addr(toks: List[str], i: int, defs: _Defs):
+def _operand_addr(toks: List[str], i: int, defs: _Defs,
+                  partial: bool = False) -> Tuple:
     """Parse a src/dst address operand, resolving object(-group) refs.
-    Returns (nets|None, next_i, imprecise). None nets -> caller fails closed."""
+    Returns (nets|None, next_i, imprecise, has_unresolved).
+    None nets means the caller must fail closed. has_unresolved is True only
+    when partial=True and the group has members that could not be resolved
+    (the returned nets cover only the resolvable subset)."""
     t = toks[i].lower()
     if t == "object-group":
-        return _resolve_nets(defs, "ng", toks[i + 1], frozenset()), i + 2, False
+        if partial:
+            nets, has_unres = _resolve_nets_partial(defs, "ng", toks[i + 1], frozenset())
+        else:
+            nets, has_unres = _resolve_nets(defs, "ng", toks[i + 1], frozenset()), False
+        return nets, i + 2, False, has_unres
     if t == "object":
-        return _resolve_nets(defs, "no", toks[i + 1], frozenset()), i + 2, False
+        if partial:
+            nets, has_unres = _resolve_nets_partial(defs, "no", toks[i + 1], frozenset())
+        else:
+            nets, has_unres = _resolve_nets(defs, "no", toks[i + 1], frozenset()), False
+        return nets, i + 2, False, has_unres
     net, ni, imp = _parse_addr(toks, i)
-    return [net], ni, imp
+    return [net], ni, imp, False
 
 
 def _is_svc_ref(toks: List[str], i: int, defs: _Defs) -> bool:
@@ -471,9 +519,16 @@ def _is_svc_ref(toks: List[str], i: int, defs: _Defs) -> bool:
 
 
 def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
-                   line: int = 0):
+                   line: int = 0, partial: bool = False):
     """Pass 2: expand one object-referencing ACE to the exact union of member
-    ACEs, or return None to fall back to the fail-closed opaque ACE."""
+    ACEs, or return None to fall back to the fail-closed opaque ACE.
+
+    When *partial* is True the address operands are resolved via
+    _resolve_nets_partial: if some group members are unresolvable the returned
+    list contains precise ACEs for the resolved subset PLUS one opaque (any/any,
+    imprecise) ACE for the unresolved remainder.  This is SOUND: the proven-
+    reachable subset is modeled exactly (never widened), and the unresolved
+    remainder stays INDETERMINATE — never silently PASS."""
     action = toks[0].lower()
     n = len(toks)
     i = 1
@@ -493,7 +548,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     if i >= n:
         return None
 
-    srcs, i, imp_s = _operand_addr(toks, i, defs)
+    srcs, i, imp_s, has_unres_s = _operand_addr(toks, i, defs, partial)
     if srcs is None:
         return None
     imprecise = imp_s
@@ -510,7 +565,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
 
     if i >= n:
         return None
-    dsts, i, imp_d = _operand_addr(toks, i, defs)
+    dsts, i, imp_d, has_unres_d = _operand_addr(toks, i, defs, partial)
     if dsts is None:
         return None
     imprecise = imprecise or imp_d
@@ -555,6 +610,18 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
                         imprecise=imprecise, raw=raw, acl=acl, line=line))
     note = (f"resolved object-group/object reference to {len(aces)} exact "
             f"ACE(s): {raw}")
+
+    # Partial-resolution mode: if any address operand had unresolvable members,
+    # append one opaque (any/any, imprecise) ACE for the unresolved remainder so
+    # those members stay INDETERMINATE and never silently PASS.
+    if partial and (has_unres_s or has_unres_d):
+        m += 1
+        aces.append(_opaque_ace(action, m, acl, raw, line))
+        note = (
+            f"partially resolved object-group/object reference: "
+            f"{len(aces) - 1} exact ACE(s) + 1 opaque (unresolved members): {raw}"
+        )
+
     return aces, [note]
 
 
@@ -597,13 +664,26 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             # Pass 2: try to expand the reference precisely from the collected
             # definitions. Only a FULLY-exact resolution is accepted; anything
             # else (undefined / unparseable member / cycle / over-cap) returns
-            # None and we keep the fail-closed opaque ACE (INDETERMINATE).
+            # None and we try partial resolution next.
             resolved = None
             try:
                 resolved = _resolve_entry(toks, defs, seq, current_acl, stripped,
                                           lineno)
             except (IndexError, ValueError, ipaddress.AddressValueError):
                 resolved = None
+            if resolved is None:
+                # Partial-resolution pass: resolved address-group members emit
+                # precise ACEs; unresolved members get one trailing opaque ACE
+                # (any/any, imprecise -> INDETERMINATE, never silently PASS).
+                # This lets a proven leak via a resolved member be reported as
+                # CRITICAL instead of INDETERMINATE (soundness: the resolved
+                # member's space is exact; adding unresolved members can only
+                # EXPAND reachability, never remove the already-proven leak).
+                try:
+                    resolved = _resolve_entry(toks, defs, seq, current_acl,
+                                              stripped, lineno, partial=True)
+                except (IndexError, ValueError, ipaddress.AddressValueError):
+                    resolved = None
             if resolved is not None:
                 races, rnotes = resolved
                 seq += len(races)
