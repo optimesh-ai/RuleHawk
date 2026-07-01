@@ -9,6 +9,13 @@ seconds. The vendor is auto-detected; force Junos with --junos, PAN-OS with
 Subcommand:  rulehawk gate <file-or-glob>... [--policy P] [--fail-on LEVEL] ...
 audits many configs at once and emits SARIF + a PR-comment + a step summary for
 the GitHub Action gate (see rulehawk/gate.py). `rulehawk gate --help` for detail.
+
+Optional PATH-GROUNDING: with `--policy P --hh-snapshot DIR --hh-from DEVICE`,
+each segmentation-violation witness is routed through Hammerhead's forwarding
+model (`hammerhead reachability`) so violations on infeasible routing paths are
+suppressed to informational while confirmed leaks are stamped path-confirmed.
+Soundness: only a deterministic, NAT-free "not delivered" verdict ever downgrades
+a finding — NAT/error/unknown-device fail closed and keep it. See pathground.py.
 """
 
 from __future__ import annotations
@@ -21,8 +28,23 @@ from .parse import parse_acls
 from .parse_iptables import detect as detect_iptables, parse_iptables
 from .parse_junos import detect as detect_junos, parse_junos
 from .parse_panos import detect as detect_panos, parse_panos
+from .pathground import HammerheadReachOracle, path_ground
 from .report import to_json, to_text
 from .segcheck import check_segmentation
+
+
+def _take_opt(argv: list[str], name: str) -> str | None:
+    """Pop `--name VALUE` from argv in place; return VALUE, or None if absent.
+    Returns the sentinel '' when the flag is present but missing its value so the
+    caller can emit a usage error."""
+    if name not in argv:
+        return None
+    k = argv.index(name)
+    if k + 1 >= len(argv):
+        return ""  # present-but-empty -> caller reports the usage error
+    val = argv[k + 1]
+    del argv[k:k + 2]
+    return val
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,6 +60,16 @@ def main(argv: list[str] | None = None) -> int:
     force_iptables = "--iptables" in argv
     argv = [a for a in argv
             if a not in ("--json", "--junos", "--panos", "--iptables")]
+    hh_snapshot = _take_opt(argv, "--hh-snapshot")
+    hh_from = _take_opt(argv, "--hh-from")
+    if hh_snapshot == "" or hh_from == "":
+        print("rulehawk: --hh-snapshot and --hh-from each require a value",
+              file=sys.stderr)
+        return 2
+    if bool(hh_snapshot) != bool(hh_from):
+        print("rulehawk: path-grounding needs BOTH --hh-snapshot and --hh-from",
+              file=sys.stderr)
+        return 2
     policy_path = None
     if "--policy" in argv:
         k = argv.index("--policy")
@@ -71,7 +103,11 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as e:
             print(f"rulehawk: cannot read policy {policy_path!r}: {e}", file=sys.stderr)
             return 2
-        findings += check_segmentation(aces, policy)
+        seg = check_segmentation(aces, policy)
+        if hh_snapshot and hh_from:
+            oracle = HammerheadReachOracle(hh_snapshot, hh_from)
+            seg = path_ground(seg, oracle)
+        findings += seg
     if as_json:
         print(to_json(findings, notes, len(aces)))
     else:
