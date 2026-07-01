@@ -254,29 +254,42 @@ _CUSTOM_JUMP_LEAK = (
 
 
 def test_custom_chain_jump_on_transit_path_is_indeterminate_not_ok():
-    """The residual false PASS: a leak inside a custom chain reached via a FORWARD
-    jump must yield segmentation-INDETERMINATE (fail closed), NEVER segmentation-ok.
-    Mutation guard: deleting the imprecise-marker emit in add_rule reverts this to
-    a segmentation-ok FALSE PASS."""
+    """When the jumped custom chain IS fully modeled, precision resolution turns
+    the former INDETERMINATE into a precise CRITICAL verdict. CROSSZONE contains a
+    concrete ACCEPT for CORP->PCI:445 with no RETURN rules and no imprecise ACEs,
+    so the resolved permit ACE is emitted in FORWARD and segcheck flags CRITICAL.
+    Mutation guard: if resolution is disabled this reverts to INDETERMINATE or
+    FALSE-PASS — both wrong."""
     aces, notes = parse_iptables(_CUSTOM_JUMP_LEAK)
     findings = check_segmentation(aces, _MULTI_CHAIN_POLICY)
-    corp = [f for f in findings if "CORP" in (f.rule_id or "") or "CORP" in f.message]
-    # CORP->PCI:445 (the hidden leak) must NOT be reported as isolated.
+    # Fully-modeled CROSSZONE ACCEPT → precise CRITICAL, NOT INDETERMINATE
+    viol = [f for f in findings if f.kind == "segmentation-violation"]
+    assert viol, ("CORP->PCI:445 leak via fully-modeled CROSSZONE must surface "
+                  "as CRITICAL (precision resolution)")
+    assert viol[0].severity == "critical"
     assert not [f for f in findings
                 if f.kind == "segmentation-ok" and "CORP" in (f.rule_id or "")], \
-        "CORP->PCI must not FALSE-PASS when the leak hides in a jumped custom chain"
-    assert any(f.kind == "segmentation-indeterminate" for f in corp), \
-        "an unmodeled transit jump must fail closed to segmentation-indeterminate"
-    # The jump is still surfaced as a parse note (never an invisible hole).
+        "CORP->PCI must not FALSE-PASS"
+    # Precision resolution note must be present
+    assert any("resolved precisely" in n and "CROSSZONE" in n for n in notes)
+    # Original jump surface note must still be present (never an invisible hole)
     assert any("custom chain" in n and "CROSSZONE" in n for n in notes)
 
 
 def test_custom_chain_jump_emits_imprecise_transit_marker():
-    """Mechanism check: the FORWARD jump produces an imprecise transit ACE that
-    sits before the chain default policy; the custom chain itself stays transit."""
+    """Mechanism check: when CROSSZONE is fully modeled, the FORWARD jump
+    placeholder is replaced with a PRECISE transit ACE (permit tcp CORP->PCI:445).
+    The resolved ACE is non-imprecise — it represents a real, auditable permit."""
     aces, _ = parse_iptables(_CUSTOM_JUMP_LEAK)
     fwd = [a for a in aces if a.acl == "FORWARD" and "policy" not in a.raw]
-    assert fwd and all(a.imprecise and a.transit for a in fwd)
+    assert fwd, "FORWARD must have at least one non-policy ACE (the resolved jump)"
+    # Resolved ACE must be precise (not imprecise) and transit-eligible
+    assert all(not a.imprecise and a.transit for a in fwd), \
+        "resolved jump ACEs must be precise and transit=True"
+    # Must represent the CROSSZONE ACCEPT: permit tcp CORP->PCI dport 445
+    assert any(a.action == "permit" and a.proto == "tcp"
+               and a.dst_port.lo == 445 and a.dst_port.hi == 445
+               for a in fwd)
 
 
 def test_custom_chain_jump_on_input_stays_surface_only():
@@ -381,3 +394,178 @@ def test_ipv6_rules_use_v6_any():
     rule = next(a for a in aces if a.dst_port.lo == 22)
     assert rule.src.version == 6
     assert rule.dst.version == 6 and rule.dst_any   # unspecified dst -> ::/0
+
+
+# ── RH-iptables-precision: custom-chain jump precision resolution ─────────────
+# When the jumped chain IS fully modeled (all rules precise, no RETURN/NAT),
+# the imprecise placeholder is replaced with exact ACEs. The five tests below
+# cover: (a) drop → PASS, (b) accept → CRITICAL, (c) absent chain → INDETERMINATE,
+# (d) fall-through / implicit RETURN → parent rule fires, (e) cycle → fail closed.
+
+# Shared policy for (a)(b)(c)(d)(e) tests
+_PREC_POLICY = {
+    "zones": {"PCI": ["10.10.0.0/16"], "CORP": ["10.20.0.0/16"]},
+    "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp", "ports": [445]}],
+}
+
+
+def test_precision_modeled_chain_drop_gives_pass():
+    """(a) Transit jump to a fully-modeled chain that DROPs the forbidden flow.
+
+    ZONE_FILTER only contains an explicit DROP for tcp/445. Resolution replaces
+    the imprecise placeholder with a precise deny ACE. Segcheck must yield
+    segmentation-ok (PASS), never INDETERMINATE or CRITICAL."""
+    cfg = (
+        "*filter\n"
+        ":FORWARD DROP [0:0]\n"
+        ":ZONE_FILTER - [0:0]\n"
+        "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -j ZONE_FILTER\n"
+        "-A ZONE_FILTER -p tcp --dport 445 -j DROP\n"
+        "COMMIT\n"
+    )
+    aces, notes = parse_iptables(cfg)
+    findings = check_segmentation(aces, _PREC_POLICY)
+    kinds = {f.kind for f in findings}
+    assert "segmentation-ok" in kinds, \
+        "DROP in fully-modeled chain must give precise PASS"
+    assert "segmentation-indeterminate" not in kinds, \
+        "fully-modeled chain must not remain INDETERMINATE"
+    assert "segmentation-violation" not in kinds, \
+        "DROP must not give CRITICAL"
+    # Mechanism: FORWARD has a precise deny ACE for tcp/445
+    fwd_non_policy = [a for a in aces
+                      if a.acl == "FORWARD" and "policy" not in a.raw]
+    assert any(a.action == "deny" and not a.imprecise
+               and a.proto == "tcp" and a.dst_port.lo == 445
+               for a in fwd_non_policy), \
+        "resolved deny for tcp/445 must be a precise ACE in FORWARD"
+    assert any("resolved precisely" in n and "ZONE_FILTER" in n for n in notes)
+
+
+def test_precision_modeled_chain_accept_gives_critical():
+    """(b) Transit jump to a fully-modeled chain that ACCEPTs the forbidden flow.
+
+    The jump rule narrows src only (-s CORP); the custom chain further narrows
+    dst and proto (tcp/445 ACCEPT). Resolution computes the intersection and
+    emits a precise permit ACE → segcheck must report CRITICAL."""
+    cfg = (
+        "*filter\n"
+        ":FORWARD DROP [0:0]\n"
+        ":XZONE - [0:0]\n"
+        # Jump rule matches CORP source only (no dst/proto restriction here)
+        "-A FORWARD -s 10.20.0.0/16 -j XZONE\n"
+        # Subchain adds dst+proto restriction and ACCEPTs
+        "-A XZONE -d 10.10.0.0/16 -p tcp --dport 445 -j ACCEPT\n"
+        "COMMIT\n"
+    )
+    aces, notes = parse_iptables(cfg)
+    findings = check_segmentation(aces, _PREC_POLICY)
+    viol = [f for f in findings if f.kind == "segmentation-violation"]
+    assert viol, "ACCEPT in fully-modeled chain must give precise CRITICAL"
+    assert viol[0].severity == "critical"
+    assert ":445" in viol[0].witness
+    assert "10.20" in viol[0].message and "10.10" in viol[0].message
+    # The resolved FORWARD ACE must be precise (not imprecise)
+    fwd_non_policy = [a for a in aces
+                      if a.acl == "FORWARD" and "policy" not in a.raw]
+    assert any(a.action == "permit" and not a.imprecise
+               and a.proto == "tcp" and a.dst_port.lo == 445
+               for a in fwd_non_policy)
+    assert any("resolved precisely" in n and "XZONE" in n for n in notes)
+
+
+def test_precision_absent_chain_stays_indeterminate():
+    """(c) Transit jump to a chain that is never defined in this config.
+
+    The target MISSING_CHAIN is absent from by_chain → precision resolution
+    fails closed. The imprecise placeholder stays → segmentation-INDETERMINATE.
+    Never a false PASS."""
+    cfg = (
+        "*filter\n"
+        ":FORWARD DROP [0:0]\n"
+        # MISSING_CHAIN is referenced but never declared or populated
+        "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -j MISSING_CHAIN\n"
+        "COMMIT\n"
+    )
+    aces, notes = parse_iptables(cfg)
+    findings = check_segmentation(aces, _PREC_POLICY)
+    kinds = {f.kind for f in findings}
+    assert "segmentation-indeterminate" in kinds, \
+        "absent chain must keep imprecise placeholder → INDETERMINATE (fail closed)"
+    assert "segmentation-ok" not in kinds, \
+        "must not FALSE-PASS when target chain is absent"
+    # Jump must still be surfaced as a note (never an invisible hole)
+    assert any("custom chain" in n and "MISSING_CHAIN" in n for n in notes)
+    assert not any("resolved precisely" in n for n in notes)
+
+
+def test_precision_fallthrough_return_parent_rule_fires():
+    """(d) Fall-through / implicit RETURN path: precise resolution for matched
+    space, parent chain fires for unmatched space.
+
+    PORTCHECK only DROPs tcp/445. For the forbidden tcp/445 flow the custom chain
+    provides a precise deny → PASS (no violation). For all other traffic the custom
+    chain has no matching rule, so it falls through (implicit RETURN) and the next
+    FORWARD rule handles it — the FORWARD DROP policy then catches anything else."""
+    cfg = (
+        "*filter\n"
+        ":FORWARD DROP [0:0]\n"
+        ":PORTCHECK - [0:0]\n"
+        # Jump rule narrows to CORP→PCI space
+        "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -j PORTCHECK\n"
+        # Next FORWARD rule — fires for traffic that PORTCHECK does NOT terminate
+        "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 443 -j ACCEPT\n"
+        # PORTCHECK drops 445 only; 443 traffic falls through to parent
+        "-A PORTCHECK -p tcp --dport 445 -j DROP\n"
+        "COMMIT\n"
+    )
+    aces, notes = parse_iptables(cfg)
+
+    # tcp/445 must be blocked by the resolved deny → PASS (no isolation violation)
+    findings_445 = check_segmentation(aces, _PREC_POLICY)
+    kinds_445 = {f.kind for f in findings_445}
+    assert "segmentation-ok" in kinds_445, \
+        "tcp/445 must be precisely denied → PASS for isolation"
+    assert "segmentation-indeterminate" not in kinds_445, \
+        "fully-modeled PORTCHECK must not remain INDETERMINATE"
+
+    # The FORWARD rule for tcp/443 must still be present after renumbering
+    fwd_non_policy = [a for a in aces if a.acl == "FORWARD" and "policy" not in a.raw]
+    assert any(a.action == "permit" and a.proto == "tcp" and a.dst_port.lo == 443
+               for a in fwd_non_policy), \
+        "parent chain ACCEPT for tcp/443 must survive chain renumbering"
+
+    # Resolved deny for 445 must be precise
+    assert any(a.action == "deny" and not a.imprecise
+               and a.proto == "tcp" and a.dst_port.lo == 445
+               for a in fwd_non_policy)
+    assert any("resolved precisely" in n and "PORTCHECK" in n for n in notes)
+
+
+def test_precision_chain_cycle_fails_closed_no_hang():
+    """(e) Mutually-recursive chain cycle → fail closed, no infinite loop.
+
+    CHAIN_A jumps to CHAIN_B; CHAIN_B jumps back to CHAIN_A. Each sub-chain
+    jump emits an imprecise placeholder ACE in the respective chain. When
+    FORWARD→CHAIN_A is resolved, CHAIN_A has an imprecise ACE (from its own
+    sub-jump) → the "no imprecise ACE in subchain" gate fires → fail closed.
+    Result: INDETERMINATE. No hang. No false PASS."""
+    cfg = (
+        "*filter\n"
+        ":FORWARD DROP [0:0]\n"
+        ":CHAIN_A - [0:0]\n"
+        ":CHAIN_B - [0:0]\n"
+        "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -j CHAIN_A\n"
+        "-A CHAIN_A -j CHAIN_B\n"
+        "-A CHAIN_B -j CHAIN_A\n"
+        "COMMIT\n"
+    )
+    aces, notes = parse_iptables(cfg)
+    findings = check_segmentation(aces, _PREC_POLICY)
+    kinds = {f.kind for f in findings}
+    assert "segmentation-indeterminate" in kinds, \
+        "chain cycle must fail closed to INDETERMINATE (not hang, not FALSE-PASS)"
+    assert "segmentation-ok" not in kinds, \
+        "must not FALSE-PASS on a cyclic chain structure"
+    # Resolution was NOT applied (cycle blocked by imprecise-ACE gate)
+    assert not any("resolved precisely" in n for n in notes)
