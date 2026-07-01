@@ -486,6 +486,42 @@ def _resolve_svcs(defs: _Defs, kind: str, name: str, seen: frozenset):
     return out or None
 
 
+def _resolve_svcs_partial(defs: _Defs, kind: str, name: str, seen: frozenset
+                          ) -> Tuple[Optional[List[Tuple[str, PortRange]]], bool]:
+    """Like _resolve_svcs but tolerates bad members instead of failing on the first.
+
+    Returns ``(resolved, has_unresolved)``.
+
+    * ``(None, True)``  — the group is entirely unresolvable (undefined, cycle,
+      or all members bad / empty); caller must still fail closed.
+    * ``(svcs, False)`` — all members resolved exactly (same as _resolve_svcs).
+    * ``(svcs, True)``  — *some* members resolved (returned in *svcs*) and at
+      least one member could not be resolved.  The caller can emit precise ACEs
+      for the resolved subset PLUS one opaque ACE for the remainder.
+
+    Used only from _resolve_entry in partial mode."""
+    key = (kind, name)
+    if key in seen:
+        return None, True                       # cycle -> fail closed
+    members = (defs.svc_groups if kind == "sg" else defs.svc_objs).get(name)
+    if members is None:
+        return None, True                       # undefined -> fail closed
+    seen = seen | {key}
+    out: List[Tuple[str, PortRange]] = []
+    has_unresolved = False
+    for mem in members:
+        if mem[0] == "svc":
+            out.append((mem[1], mem[2]))
+        elif mem[0] in ("sg", "so"):
+            sub, sub_unres = _resolve_svcs_partial(defs, mem[0], mem[1], seen)
+            if sub is not None:
+                out.extend(sub)
+            has_unresolved = has_unresolved or sub_unres
+        else:                                   # ("bad",)
+            has_unresolved = True
+    return (out if out else None), has_unresolved
+
+
 def _operand_addr(toks: List[str], i: int, defs: _Defs,
                   partial: bool = False) -> Tuple:
     """Parse a src/dst address operand, resolving object(-group) refs.
@@ -523,20 +559,26 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     """Pass 2: expand one object-referencing ACE to the exact union of member
     ACEs, or return None to fall back to the fail-closed opaque ACE.
 
-    When *partial* is True the address operands are resolved via
-    _resolve_nets_partial: if some group members are unresolvable the returned
-    list contains precise ACEs for the resolved subset PLUS one opaque (any/any,
-    imprecise) ACE for the unresolved remainder.  This is SOUND: the proven-
-    reachable subset is modeled exactly (never widened), and the unresolved
-    remainder stays INDETERMINATE — never silently PASS."""
+    When *partial* is True, address operands are resolved via
+    _resolve_nets_partial AND service operands via _resolve_svcs_partial: if
+    some group members are unresolvable the returned list contains precise ACEs
+    for the resolved subset PLUS one opaque (any/any, imprecise) ACE for the
+    unresolved remainder.  This is SOUND: the proven-reachable subset is modeled
+    exactly (never widened), and the unresolved remainder stays INDETERMINATE —
+    never silently PASS."""
     action = toks[0].lower()
     n = len(toks)
     i = 1
     proto: Optional[str] = None
     proto_combos = None                      # service group occupying the proto slot
+    has_unres_svc = False
     if i < n and _is_svc_ref(toks, i, defs):
         kind = "sg" if toks[i].lower() == "object-group" else "so"
-        proto_combos = _resolve_svcs(defs, kind, toks[i + 1], frozenset())
+        if partial:
+            proto_combos, has_unres_svc = _resolve_svcs_partial(
+                defs, kind, toks[i + 1], frozenset())
+        else:
+            proto_combos = _resolve_svcs(defs, kind, toks[i + 1], frozenset())
         if proto_combos is None:
             return None
         i += 2
@@ -576,7 +618,11 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
         combos = list(proto_combos)
     elif i < n and _is_svc_ref(toks, i, defs):
         kind = "sg" if toks[i].lower() == "object-group" else "so"
-        svcs = _resolve_svcs(defs, kind, toks[i + 1], frozenset())
+        if partial:
+            svcs, _unres_dst = _resolve_svcs_partial(defs, kind, toks[i + 1], frozenset())
+            has_unres_svc = has_unres_svc or _unres_dst
+        else:
+            svcs = _resolve_svcs(defs, kind, toks[i + 1], frozenset())
         if svcs is None:
             return None
         i += 2
@@ -611,10 +657,11 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     note = (f"resolved object-group/object reference to {len(aces)} exact "
             f"ACE(s): {raw}")
 
-    # Partial-resolution mode: if any address operand had unresolvable members,
-    # append one opaque (any/any, imprecise) ACE for the unresolved remainder so
-    # those members stay INDETERMINATE and never silently PASS.
-    if partial and (has_unres_s or has_unres_d):
+    # Partial-resolution mode: if any address operand or service group had
+    # unresolvable members, append one opaque (any/any, imprecise) ACE for the
+    # unresolved remainder so those members stay INDETERMINATE and never silently
+    # PASS.
+    if partial and (has_unres_s or has_unres_d or has_unres_svc):
         m += 1
         aces.append(_opaque_ace(action, m, acl, raw, line))
         note = (
