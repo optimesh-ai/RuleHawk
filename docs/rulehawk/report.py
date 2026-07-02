@@ -38,7 +38,7 @@ def to_json(findings: List[Finding], notes: List[str], n_rules: int) -> str:
         "findings": [
             {"rule_id": f.rule_id, "kind": f.kind, "severity": f.severity,
              "message": f.message, "rule": f.rule, "cited": f.cited, "fix": f.fix,
-             "witness": f.witness}
+             "witness": f.witness, "line": f.line}
             for f in _sorted(findings)
         ],
         "parse_notes": notes,
@@ -74,6 +74,8 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int) -> str:
         lines.append("")
         lines.append(f"[{f.severity.upper():8}] {f.kind}  ({f.rule_id})")
         lines.append(f"   rule : {f.rule}")
+        if f.line:
+            lines.append(f"   line : {f.line}")
         if f.cited:
             lines.append(f"   cause: {f.cited}")
         lines.append(f"   why  : {f.message}")
