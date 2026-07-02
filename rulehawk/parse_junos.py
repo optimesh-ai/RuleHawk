@@ -152,14 +152,26 @@ def _proto(v: str) -> str:
     return _PROTO_NUM.get(v, v.lower())
 
 
-def _addrs(vals: List[str], label: str, notes: List[str]) -> Tuple[List[_IPNet], bool]:
-    """Parse a Junos address set. Returns (nets, imprecise).
+def _addrs(vals: List[str], label: str, notes: List[str]) -> Tuple[List[_IPNet], bool, bool]:
+    """Parse a Junos address set. Returns (nets, imprecise, has_unresolved).
 
-    `except` (set exclusion, e.g. `10/8 except 10.1/16`) can't be a single
-    rectangle, so we keep the broader prefix and mark the entry imprecise (it may
-    over-approximate but never under-approximate) — surfaced via a note."""
+    *imprecise* is True when any value introduces an approximation — either an
+    ``except`` exclusion or an unresolvable name.
+
+    *has_unresolved* is True ONLY when at least one value was an unresolvable
+    named reference (address-book entry, raised ``ValueError``).  It is NOT set
+    by ``except`` clauses.  The caller uses this flag to apply partial precision:
+    emit exact ACEs for the resolved CIDR subset plus one opaque ACE for the
+    unresolved remainder.
+
+    ``except`` (set exclusion, e.g. ``10/8 except 10.1/16``) keeps the broader
+    prefix and marks the entry imprecise (it may over-approximate).  Because the
+    resolved net is already wider than the rule's true match, the caller must not
+    emit a "precise" (non-imprecise) ACE in that case — hence ``except`` sets
+    *imprecise* but NOT *has_unresolved*."""
     nets: List[_IPNet] = []
     imprecise = False
+    has_unresolved = False
     for v in vals:
         if v == "except":
             imprecise = True
@@ -169,14 +181,18 @@ def _addrs(vals: List[str], label: str, notes: List[str]) -> Tuple[List[_IPNet],
         try:
             nets.append(ipaddress.ip_network(v if "/" in v else f"{v}/32", strict=False))
         except ValueError:
-            # Can't parse this address. Skipping it alone would let an all-bad
-            # set fall back to ANY and over-approximate, which could falsely
-            # prove a later deny dead. Mark imprecise so this ACE is never used
-            # to prove another rule dead (trust > coverage).
+            # Can't parse this address — it is a named address-book reference
+            # that isn't defined in the config snippet we received.  Skipping it
+            # alone would let an all-bad set fall back to ANY and over-approximate,
+            # which could falsely prove a later deny dead.  Mark imprecise so this
+            # ACE is never used to prove another rule dead (trust > coverage), and
+            # set has_unresolved so the caller can apply the partial-precision
+            # pattern (emit exact ACEs for the other resolved members).
             imprecise = True
+            has_unresolved = True
             notes.append(f"unparsed Junos address '{v}' in {label} "
                          f"(marked imprecise — verify manually)")
-    return nets, imprecise
+    return nets, imprecise, has_unresolved
 
 
 def _ports(vals: List[str], label: str, key: str,
@@ -218,29 +234,52 @@ class _Match:
     dports: List[PortRange] = field(default_factory=list)
     stateful: bool = False
     imprecise: bool = False
+    # Partial-precision tracking — used by _parse_term to apply the same
+    # "resolved subset exact + opaque remainder" pattern as parse.py's
+    # _resolve_nets_partial / _resolve_svcs_partial.
+    has_unresolved_src: bool = False   # ≥1 src address was an unresolved named ref
+    has_unresolved_dst: bool = False   # ≥1 dst address was an unresolved named ref
+    other_imprecise: bool = False      # imprecision from any source EXCEPT unresolved
+                                       # named addresses (e.g. except-clauses, port
+                                       # parse failures, unmodeled match keys).  When
+                                       # True the resolved-address subset is NOT exactly
+                                       # bounded, so partial-precision emission is blocked.
 
 
 def _parse_from(from_toks: List[str], label: str, notes: List[str]) -> _Match:
     m = _Match()
     for key, vals in _read_conditions(from_toks):
         if key in ("source-address",):
-            nets, imp = _addrs(vals, label, notes)
+            nets, imp, has_unres = _addrs(vals, label, notes)
             m.srcs += nets
             m.imprecise |= imp
+            m.has_unresolved_src |= has_unres
+            # An except-clause over-approximates the resolved net (the broader
+            # prefix is kept, not the subset after exclusion), so partial-precision
+            # emission is blocked — flag as other_imprecise.
+            if imp and not has_unres:
+                m.other_imprecise = True
         elif key in ("destination-address",):
-            nets, imp = _addrs(vals, label, notes)
+            nets, imp, has_unres = _addrs(vals, label, notes)
             m.dsts += nets
             m.imprecise |= imp
+            m.has_unresolved_dst |= has_unres
+            if imp and not has_unres:
+                m.other_imprecise = True
         elif key in ("protocol", "next-header"):
             m.protos += [_proto(v) for v in vals]
         elif key == "source-port":
             pr, imp = _ports(vals, label, key, notes)
             m.sports += pr
             m.imprecise |= imp
+            # A port-parse failure means the ACE's port space is approximate;
+            # emit it as imprecise even for resolved addresses.
+            m.other_imprecise |= imp
         elif key == "destination-port":
             pr, imp = _ports(vals, label, key, notes)
             m.dports += pr
             m.imprecise |= imp
+            m.other_imprecise |= imp
         elif key in ("tcp-established", "tcp-flags", "tcp-initial"):
             # return-traffic / flag match — like Cisco `established`: not a new flow.
             m.stateful = True
@@ -249,11 +288,16 @@ def _parse_from(from_toks: List[str], label: str, notes: List[str]) -> _Match:
         elif key in ("address", "port", "icmp-type", "icmp-code"):
             # direction-agnostic / typed matches we can't place in the rectangle:
             # over-approximate (mark imprecise) so it's never used to prove deadness.
+            # Also block partial precision: these conditions narrow the rule's true
+            # match space in a way we don't model, so a "precise" src/dst ACE would
+            # claim the rule matches flows the condition actually excludes.
             m.imprecise = True
+            m.other_imprecise = True
             notes.append(f"unmodeled Junos match '{key}' in {label} "
                          f"(treated conservatively/imprecise — verify manually)")
         else:
             m.imprecise = True
+            m.other_imprecise = True
             notes.append(f"unmodeled Junos match '{key}' in {label} "
                          f"(rule kept but marked imprecise — verify manually)")
     return m
@@ -332,18 +376,74 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
     dports = m.dports or [ANY_PORTS]
     imprecise = m.imprecise
 
+    cap_exceeded = False
     if len(srcs) * len(dsts) * len(protos) * len(sports) * len(dports) > _MAX_EXPAND:
         notes.append(f"Junos term {label} expands to >{_MAX_EXPAND} rules; modeled "
                      f"the first value per match and marked imprecise — verify manually")
         srcs, dsts, protos = srcs[:1], dsts[:1], protos[:1]
         sports, dports = sports[:1], dports[:1]
         imprecise = True
+        cap_exceeded = True
 
     if (any(p not in ("tcp", "udp") for p in protos)
             and (m.sports or m.dports)):
         notes.append(f"Junos term {label}: port match on a non-tcp/udp protocol — "
                      f"ports ignored for those protocols (verify manually)")
 
+    # --- Partial-precision path -----------------------------------------------
+    # When at least one source-address or destination-address value was an
+    # unresolvable named reference (address-book entry absent from this config
+    # snippet), AND no other imprecision source is present, emit EXACT ACEs for
+    # the resolved CIDR subset PLUS one opaque (any/any, imprecise=True) ACE for
+    # the unresolved remainder.
+    #
+    # Soundness contract (mirrors parse.py _resolve_nets_partial):
+    #   (1) Resolved-member ACEs are emitted with imprecise=False — their match
+    #       space is EXACT and can prove a CRITICAL verdict.
+    #   (2) Adding unresolved members can only EXPAND reachability, never remove a
+    #       proven leak, so reporting CRITICAL from the resolved subset is correct.
+    #   (3) The trailing opaque ACE keeps the unresolved portion INDETERMINATE —
+    #       it can never produce a false PASS or a false CRITICAL on its own.
+    #   (4) All-unresolved (m.srcs / m.dsts empty): the safety gate below blocks
+    #       partial emission — the any-net fallback would over-approximate the
+    #       source/destination space and risk a false CRITICAL.
+    _do_partial = (
+        (m.has_unresolved_src or m.has_unresolved_dst)  # at least one unresolved name
+        and not m.other_imprecise                         # no other approximation source
+        and not cap_exceeded                              # _MAX_EXPAND cap not hit
+        and (not m.has_unresolved_src or bool(m.srcs))   # partial src: resolved srcs exist
+        and (not m.has_unresolved_dst or bool(m.dsts))   # partial dst: resolved dsts exist
+    )
+    if _do_partial:
+        n_precise = 0
+        for proto in protos:
+            ported = proto in ("tcp", "udp")
+            for s in srcs:
+                for d in dsts:
+                    for sp in (sports if ported else [ANY_PORTS]):
+                        for dp in (dports if ported else [ANY_PORTS]):
+                            seq += 1
+                            n_precise += 1
+                            entries.append(ACE(
+                                seq=seq, action=action, proto=proto, src=s, dst=d,
+                                src_port=sp, dst_port=dp, icmp_type=None,
+                                stateful=m.stateful, imprecise=False,
+                                raw=_raw(tname, action, proto, s, d, sp, dp),
+                                acl=fname, line=line))
+        # Trailing opaque ACE covers the unresolved-name remainder.
+        seq += 1
+        entries.append(ACE(
+            seq=seq, action=action, proto="ip",
+            src=_ANY_NET, dst=_ANY_NET, imprecise=True,
+            raw=f"term {tname}: {action} ip any -> any (unresolved address remainder)",
+            acl=fname, line=line))
+        notes.append(
+            f"Junos term {label}: partially resolved address references — "
+            f"{n_precise} exact ACE(s) + 1 opaque for unresolved named addresses"
+        )
+        return seq
+
+    # Normal (non-partial) path — existing behaviour.
     for proto in protos:
         ported = proto in ("tcp", "udp")
         for s in srcs:
