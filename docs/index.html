@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>RuleHawk — firewall &amp; segmentation auditor</title>
-<meta name="description" content="Paste or upload a Cisco IOS / ASA, Juniper Junos, Palo Alto PAN-OS, or Linux iptables config and get a ranked list of dead, shadowed, redundant, and dangerously-permissive rules in seconds. Vendor is auto-detected. Runs entirely in your browser — your config never leaves your machine." />
+<meta name="description" content="Paste or upload a Cisco IOS / ASA, Cisco NX-OS, Juniper Junos, Palo Alto PAN-OS, Linux iptables, or Arista EOS config and get a ranked list of dead, shadowed, redundant, and dangerously-permissive rules in seconds. Vendor is auto-detected. Runs entirely in your browser — your config never leaves your machine." />
 <!--
   RuleHawk web tool — 100% client-side.
   The engine under docs/rulehawk/ is a VENDORED copy of the top-level rulehawk/
@@ -165,7 +165,7 @@
   </div>
 
   <div class="card" id="config-card">
-    <label class="fld" for="config">Firewall / ACL config <span class="hint">— Cisco IOS/ASA, Juniper Junos, Palo Alto PAN-OS, or Linux iptables · vendor auto-detected · paste, drag &amp; drop a file, or upload</span></label>
+    <label class="fld" for="config">Firewall / ACL config <span class="hint">— Cisco IOS/ASA, Cisco NX-OS, Juniper Junos, Palo Alto PAN-OS, Linux iptables, or Arista EOS · vendor auto-detected · paste, drag &amp; drop a file, or upload</span></label>
     <textarea id="config" spellcheck="false" placeholder="ip access-list extended EDGE_IN&#10; permit tcp any host 203.0.113.10 eq 443&#10; ...&#10;&#10;…or drag a config file onto this box."></textarea>
     <input type="file" id="file" accept=".txt,.cfg,.conf,.acl,.lst,.log,text/plain" style="display:none" />
     <div class="row">
@@ -215,7 +215,7 @@ const SAMPLE_POLICY = `{
     {"src": "DMZ",  "dst": "PCI", "proto": "ip"}
   ]
 }`;
-const ENGINE_MODULES = ["__init__","model","parse","parse_junos","parse_panos","parse_iptables","analyze","report","segcheck","pathground"];
+const ENGINE_MODULES = ["__init__","model","parse","parse_junos","parse_panos","parse_iptables","parse_nxos","parse_eos","analyze","report","segcheck","pathground"];
 const PYODIDE_VER = "v0.26.4";
 // Fallback (main-thread) analysis stays synchronous, so cap it; the worker path has no cap.
 const FALLBACK_MAX_LINES = 4000;
@@ -262,14 +262,16 @@ function track(event, props){
 }
 
 // Same Python the worker runs — used only by the main-thread fallback. Keep the
-// vendor dispatch identical to worker.js (and to rulehawk/cli.py) so the fallback
-// path can never audit a different vendor set than the worker path.
+// vendor dispatch identical to worker.js (and to rulehawk/gate.py _pick_parser) so
+// the fallback path can never audit a different vendor set than the worker path.
 const ANALYZE_PY = `
 import json
 from rulehawk.parse import parse_acls
 from rulehawk.parse_junos import detect as detect_junos, parse_junos
 from rulehawk.parse_panos import detect as detect_panos, parse_panos
 from rulehawk.parse_iptables import detect as detect_iptables, parse_iptables
+from rulehawk.parse_nxos import detect as detect_nxos, parse_nxos
+from rulehawk.parse_eos import detect as detect_eos, parse_eos
 from rulehawk.analyze import analyze
 from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
@@ -279,6 +281,10 @@ elif detect_panos(cfg):
     vendor, (aces, notes) = "Palo Alto PAN-OS", parse_panos(cfg)
 elif detect_iptables(cfg):
     vendor, (aces, notes) = "Linux iptables", parse_iptables(cfg)
+elif detect_nxos(cfg):
+    vendor, (aces, notes) = "Cisco NX-OS", parse_nxos(cfg)
+elif detect_eos(cfg):
+    vendor, (aces, notes) = "Arista EOS", parse_eos(cfg)
 else:
     vendor, (aces, notes) = "Cisco IOS / ASA", parse_acls(cfg)
 findings = analyze(aces)
@@ -335,7 +341,7 @@ async function bootMain(){
       if(!r.ok) throw new Error(`could not load engine module ${m}.py (${r.status})`);
       pyodide.FS.writeFile(`rulehawk/${m}.py`, await r.text());
     }
-    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
+    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
     mode = "main"; ready();
   }catch(e){
     setStatus("Failed to load the engine: " + esc(e.message||e), true);
@@ -473,8 +479,8 @@ function render(d){
   if(d.status === "no_rules_parsed"){
     box.innerHTML = (policyErr.length?`<div class="policyerr"><b>Policy error.</b> ${esc(policyErr[0])}</div>`:"")
       + `<div class="norules"><b>No ACL rules parsed.</b> This is <i>not</i> a clean bill of health —
-      check the input is a supported config (Cisco IOS/ASA, Juniper Junos,
-      Palo Alto PAN-OS, or Linux iptables).</div>` + notesHTML(d.parse_notes, true);
+      check the input is a supported config (Cisco IOS/ASA, Cisco NX-OS, Juniper Junos,
+      Palo Alto PAN-OS, Linux iptables, or Arista EOS).</div>` + notesHTML(d.parse_notes, true);
     box.scrollIntoView({behavior:"smooth",block:"nearest"}); return;
   }
 
@@ -563,10 +569,10 @@ function ctaHTML(){
   }
   return `<div class="cta">
     <div class="cta-h">RuleHawk audits one config, once.</div>
-    <div class="cta-b">This tool audits Cisco IOS/ASA, Juniper Junos, Palo Alto PAN-OS and Linux iptables
-      today. Want continuous monitoring across every change, still more vendors (NX-OS, AWS
-      Security Groups), and exportable audit evidence for PCI / CMMC? That's what
-      OptiMesh is building on top of this engine.</div>
+    <div class="cta-b">This tool audits Cisco IOS/ASA, Cisco NX-OS, Juniper Junos, Palo Alto PAN-OS,
+      Linux iptables, and Arista EOS today. Want continuous monitoring across every change,
+      still more vendors (AWS Security Groups, FortiOS), and exportable audit evidence for
+      PCI / CMMC? That's what OptiMesh is building on top of this engine.</div>
     <div class="cta-row">${row}</div>
   </div>`;
 }

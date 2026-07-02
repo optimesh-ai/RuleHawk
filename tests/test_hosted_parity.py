@@ -39,6 +39,8 @@ from rulehawk.parse import parse_acls  # noqa: E402
 from rulehawk.parse_iptables import detect as detect_iptables, parse_iptables  # noqa: E402
 from rulehawk.parse_junos import detect as detect_junos, parse_junos  # noqa: E402
 from rulehawk.parse_panos import detect as detect_panos, parse_panos  # noqa: E402
+from rulehawk.parse_nxos import detect as detect_nxos, parse_nxos  # noqa: E402
+from rulehawk.parse_eos import detect as detect_eos, parse_eos  # noqa: E402
 from rulehawk.segcheck import check_segmentation  # noqa: E402
 
 _DOCS = os.path.join(_ROOT, "docs")
@@ -53,6 +55,8 @@ _DISPATCH_PARSERS = {
     "parse_junos": "parse_junos",
     "parse_panos": "parse_panos",
     "parse_iptables": "parse_iptables",
+    "parse_nxos": "parse_nxos",
+    "parse_eos": "parse_eos",
     "parse_acls": "parse",          # Cisco IOS/ASA fallback lives in parse.py
 }
 
@@ -103,13 +107,17 @@ def _run_hosted(analyze_py: str, cfg: str, pol: str = "") -> dict:
 
 
 def _cli_route(cfg: str):
-    """The CLI's vendor dispatch (rulehawk/cli.py), as the parity oracle."""
+    """The CLI's vendor dispatch (rulehawk/gate.py _pick_parser), as the parity oracle."""
     if detect_junos(cfg):
         return "Juniper Junos", parse_junos(cfg)
     if detect_panos(cfg):
         return "Palo Alto PAN-OS", parse_panos(cfg)
     if detect_iptables(cfg):
         return "Linux iptables", parse_iptables(cfg)
+    if detect_nxos(cfg):
+        return "Cisco NX-OS", parse_nxos(cfg)
+    if detect_eos(cfg):
+        return "Arista EOS", parse_eos(cfg)
     return "Cisco IOS / ASA", parse_acls(cfg)
 
 
@@ -158,6 +166,24 @@ _POLICY = json.dumps({
 })
 
 _IPTABLES = _read(os.path.join(_ROOT, "samples", "iptables_save.txt"))
+
+# NX-OS: version with parens + feature line (NX-OS markers) + ip access-list
+_NXOS_CFG = """\
+version 9.3(10)
+feature interface-vlan
+ip access-list extended CORP_OUT
+ permit tcp 10.20.0.0 0.0.255.255 any eq 443
+ deny ip any any
+"""
+
+# EOS: ! Command: show comment (EOS marker) + ip access-list with sequence numbers
+_EOS_CFG = """\
+! Command: show running-config
+! device: leaf01 (EOS-4.29.2F)
+ip access-list CORP_OUT
+ 10 permit tcp 10.20.0.0 0.0.255.255 any eq 443
+ 20 deny ip any any
+"""
 
 
 # --------------------------------------------------------------------------- #
@@ -212,16 +238,12 @@ def test_worker_and_index_fallback_agree():
 
 def test_ui_supported_copy_names_no_unloaded_vendor():
     """The input label advertises which vendors the tool accepts. Every vendor it
-    names there must have a loaded parser; a vendor with no parser (e.g. NX-OS,
-    still roadmap) must NOT appear as supported."""
+    names there must have a loaded parser.  All six families now have parsers."""
     index = _read(_INDEX)
     label = re.search(r'for="config">.*?</label>', index, re.S).group(0).lower()
-    loaded = {"cisco", "junos", "pan-os", "iptables"}
-    for token in ("cisco", "junos", "pan-os", "iptables"):
+    loaded = {"cisco", "junos", "pan-os", "iptables", "nx-os", "arista"}
+    for token in ("cisco", "junos", "pan-os", "iptables", "nx-os", "arista"):
         assert token in label, f"supported-vendor copy omits a wired vendor: {token}"
-    # NX-OS has no parser yet — it must not be advertised as supported.
-    assert "nx-os" not in label and "nxos" not in label, \
-        "input label claims NX-OS, which has no parser (keep it roadmap-only)"
     assert loaded  # loaded set documents the audited families
 
 
@@ -233,6 +255,8 @@ def test_ui_supported_copy_names_no_unloaded_vendor():
     (_PANOS_CFG, "Palo Alto PAN-OS"),
     (_IPTABLES, "Linux iptables"),
     (_CISCO_INDET, "Cisco IOS / ASA"),
+    (_NXOS_CFG, "Cisco NX-OS"),
+    (_EOS_CFG, "Arista EOS"),
 ])
 def test_hosted_autodetects_same_vendor_as_cli(cfg, vendor):
     env = _run_hosted(_analyze_py(_read(_WORKER)), cfg)
@@ -240,7 +264,8 @@ def test_hosted_autodetects_same_vendor_as_cli(cfg, vendor):
     assert env["vendor"] == _cli_route(cfg)[0]
 
 
-@pytest.mark.parametrize("cfg", [_JUNOS_LEAK, _PANOS_CFG, _IPTABLES, _CISCO_INDET])
+@pytest.mark.parametrize("cfg", [_JUNOS_LEAK, _PANOS_CFG, _IPTABLES, _CISCO_INDET,
+                                  _NXOS_CFG, _EOS_CFG])
 def test_hosted_findings_match_cli_exactly(cfg):
     """Strongest assertion: the hosted entrypoint's findings == running the CLI's
     detect+parse+analyze+segcheck directly. Same engine, same verdicts."""
