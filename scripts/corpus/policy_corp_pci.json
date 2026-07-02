@@ -1,0 +1,9 @@
+{
+  "zones": {
+    "CORP": ["10.20.0.0/16"],
+    "PCI":  ["10.10.0.0/16"]
+  },
+  "must_not_reach": [
+    {"src": "CORP", "dst": "PCI", "proto": "tcp", "ports": [445]}
+  ]
+}
