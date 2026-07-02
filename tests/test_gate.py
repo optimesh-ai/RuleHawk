@@ -216,6 +216,56 @@ def test_segmentation_ok_is_info_not_a_violation(tmp_path):
 # --------------------------------------------------------------------------- #
 # SARIF 2.1.0 well-formedness
 # --------------------------------------------------------------------------- #
+def test_sarif_startline_exact_values(tmp_path):
+    """SARIF physicalLocation.region.startLine must equal the ACE's source-file
+    line number — not the rule sequence number and not a default 1.
+
+    Pins the full path: ACE.line -> line_by_id / Finding.line -> line_of ->
+    SARIF region.  The existing shape test only asserts startLine >= 1; this
+    test asserts the exact values so a regression (e.g. seq number emitted
+    instead of file line) is caught immediately."""
+    p = _write(str(tmp_path), "edge.acl", _CISCO)
+    g = gate.run_gate([p], _POLICY, "high")
+    s = json.loads(gate.to_sarif(g))
+    by_kind = {r["ruleId"]: r["locations"][0]["physicalLocation"]["region"]["startLine"]
+               for r in s["runs"][0]["results"]}
+    # _CISCO layout: line 1 = ACL header; lines 2-5 = rules in order.
+    assert by_kind["permit-any-any"] == 5        # `permit ip any any`     (seq 4)
+    assert by_kind["segmentation-violation"] == 4 # `permit tcp any any eq 445` (seq 3)
+    assert by_kind["redundant"] == 3              # the covered permit       (seq 2)
+
+
+def test_line_of_falls_back_to_finding_line():
+    """line_of must consult Finding.line when line_by_id cannot give a positive
+    line number.  Two concrete cases:
+
+      A. The entry in line_by_id exists but is 0 (parser did not track the line).
+         Finding.line (set by analyze / segcheck) is the authoritative fallback.
+      B. The rule_id is a zone-pair label (not acl:seq), so line_by_id has no
+         entry.  Finding.line is the only source of truth.
+      C. Both are absent/zero: hard minimum 1."""
+    from rulehawk.analyze import Finding
+
+    # Case A: line_by_id entry is 0, Finding.line carries the real line.
+    f_a = Finding("EDGE:3", "permit-any-any", "critical", "msg", "r", line=9)
+    fr_a = gate.FileResult("x.acl", "ios-asa", "ok", 1,
+                           findings=[f_a], line_by_id={("EDGE", 3): 0})
+    assert fr_a.line_of(f_a) == 9
+
+    # Case B: zone-pair rule_id — no acl:seq parse possible, line_by_id empty.
+    f_b = Finding("CORP!->PCI/tcp", "segmentation-indeterminate", "medium",
+                  "msg", "", line=7)
+    fr_b = gate.FileResult("x.acl", "ios-asa", "ok", 1,
+                           findings=[f_b], line_by_id={})
+    assert fr_b.line_of(f_b) == 7
+
+    # Case C: both unknown — sentinel 1 (SARIF lower-bound).
+    f_c = Finding("ZONE", "segmentation-ok", "info", "msg", "", line=0)
+    fr_c = gate.FileResult("x.acl", "ios-asa", "ok", 1,
+                           findings=[f_c], line_by_id={})
+    assert fr_c.line_of(f_c) == 1
+
+
 def test_sarif_shape_levels_and_lines(tmp_path):
     p = _write(str(tmp_path), "edge.acl", _CISCO)
     g = gate.run_gate([p], _POLICY, "high")

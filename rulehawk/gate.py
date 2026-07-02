@@ -123,14 +123,25 @@ class FileResult:
         return score(self.findings) if self.n_rules else None
 
     def line_of(self, f: Finding) -> int:
-        """Best-effort 1-based source line for a finding's rule, via its
-        `acl:seq` rule_id (info findings like segmentation-ok carry a zone label
-        instead and fall back to line 1)."""
+        """Best-effort 1-based source line for a finding's rule.
+
+        Lookup order:
+          1. line_by_id[(acl, seq)]  — preferred; built from ACE.line at parse time.
+          2. Finding.line             — direct fallback when line_by_id misses or
+                                       returns 0 (parser did not record a line) or
+                                       the rule_id is a zone-pair label rather than
+                                       an acl:seq (e.g. segmentation-ok).
+          3. 1                        — hard minimum; SARIF requires startLine >= 1.
+
+        Info findings (segmentation-ok) carry zone-pair rule_ids and are excluded
+        from SARIF by real_findings, so their fallback is safe."""
         acl_seq = _split_rule_id(f.rule_id)
         if acl_seq is not None and acl_seq in self.line_by_id:
             ln = self.line_by_id[acl_seq]
             if ln > 0:
                 return ln
+        if f.line > 0:
+            return f.line
         return 1
 
 
