@@ -8,7 +8,8 @@
 // can never be audited, and the UI must never claim it. tests/test_hosted_
 // parity.py fails the build if this list, the dispatch, or the engine drift apart.
 const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
-                        "parse_iptables", "analyze", "report", "segcheck"];
+                        "parse_iptables", "analyze", "report", "segcheck",
+                        "pathground"];
 
 // Build the report envelope: structured JSON + human-readable text + a
 // rule_id -> source-line map so the UI can jump from a finding to its rule.

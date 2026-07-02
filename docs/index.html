@@ -215,7 +215,7 @@ const SAMPLE_POLICY = `{
     {"src": "DMZ",  "dst": "PCI", "proto": "ip"}
   ]
 }`;
-const ENGINE_MODULES = ["__init__","model","parse","parse_junos","parse_panos","parse_iptables","analyze","report","segcheck"];
+const ENGINE_MODULES = ["__init__","model","parse","parse_junos","parse_panos","parse_iptables","analyze","report","segcheck","pathground"];
 const PYODIDE_VER = "v0.26.4";
 // Fallback (main-thread) analysis stays synchronous, so cap it; the worker path has no cap.
 const FALLBACK_MAX_LINES = 4000;
