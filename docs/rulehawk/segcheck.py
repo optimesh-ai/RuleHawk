@@ -138,7 +138,8 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                                 f"{portsfx} ({proto}) via rule {dec.seq}.",
                                 dec.raw,
                                 fix=f"deny {sname}->{dname}{portsfx} before rule {dec.seq}",
-                                witness=f"{swit} -> {dwit}{portsfx} ({proto})"))
+                                witness=f"{swit} -> {dwit}{portsfx} ({proto})",
+                                line=dec.line))
                             reported = True
                             break
                         if eff == "indeterminate":
@@ -148,7 +149,8 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                                 f"Cannot prove {sname} is isolated from {dname} — "
                                 f"rule {dec.seq} uses an unmodeled form "
                                 f"(neq/complex mask); review manually.",
-                                dec.raw, fix="rewrite the rule with explicit ports/masks"))
+                                dec.raw, fix="rewrite the rule with explicit ports/masks",
+                                line=dec.line))
                             reported = True
                             break
                     if reported:
