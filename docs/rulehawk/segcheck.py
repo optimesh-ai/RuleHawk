@@ -130,6 +130,13 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                                              proto, swit, dwit, port)
                         portsfx = f":{port}" if port is not None else ""
                         if eff == "permit":
+                            # Build a concrete, paste-ready fix: use the actual
+                            # intersecting CIDRs (si, di) instead of zone names so
+                            # the engineer can paste the deny directly into the ACL.
+                            # The intersections are engine-proven (si ⊆ zone_src ∩
+                            # r.src, di ⊆ zone_dst ∩ r.dst) — never invented.
+                            _port_part = f" port {port}" if port is not None else ""
+                            _line_part = f" (line {dec.line})" if dec.line else ""
                             findings.append(Finding(
                                 f"{r.acl}:{dec.seq}", "segmentation-violation",
                                 "critical",
@@ -137,7 +144,8 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                                 f"{dname}): the ACL PERMITS {swit} -> {dwit}"
                                 f"{portsfx} ({proto}) via rule {dec.seq}.",
                                 dec.raw,
-                                fix=f"deny {sname}->{dname}{portsfx} before rule {dec.seq}",
+                                fix=(f"deny {si} -> {di}{_port_part} "
+                                     f"before rule {dec.seq}{_line_part}"),
                                 witness=f"{swit} -> {dwit}{portsfx} ({proto})",
                                 line=dec.line))
                             reported = True

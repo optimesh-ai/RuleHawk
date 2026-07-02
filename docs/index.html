@@ -460,6 +460,7 @@ function findingHTML(f){
       <span class="sev ${f.severity}">${f.severity}</span>
       <span class="kind">${esc(f.kind)}</span>
       ${loc}
+      ${f.line ? `<span class="chip zero" title="Source file line">line&nbsp;${esc(String(f.line))}</span>` : ""}
     </div>
     ${f.rule?`<div class="frule">${esc(f.rule)}</div>`:""}
     ${f.witness?`<div class="frow"><b>witness packet</b></div><div class="witness">${esc(f.witness)}</div>`:""}

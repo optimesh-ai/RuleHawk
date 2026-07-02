@@ -177,3 +177,148 @@ def test_segmentation_violation_carries_correct_line():
     assert viol, "expected segmentation-violation"
     assert viol[0].line == 2, (
         f"segmentation violation should point to line 2, got {viol[0].line}")
+
+
+# ---------------------------------------------------------------------------
+# RH-FIX-LINES: fix strings cite source-file line numbers (never "line 0")
+# ---------------------------------------------------------------------------
+
+def test_fix_string_redundant_includes_line():
+    # rule 2 (line 3) is redundant; fix must say "remove rule 2 (line 3)".
+    text = (
+        "ip access-list extended T\n"               # line 1
+        " permit ip 10.0.0.0 0.255.255.255 any\n"  # line 2 → seq 1
+        " permit ip 10.1.0.0 0.0.255.255 any\n"    # line 3 → seq 2, redundant
+    )
+    aces, _ = parse_acls(text)
+    findings = analyze(aces)
+    red = [f for f in findings if f.kind == "redundant"]
+    assert red, "expected a redundant finding"
+    assert "(line 3)" in red[0].fix, (
+        f"redundant fix must cite the covered rule's file line, got: {red[0].fix!r}")
+
+
+def test_fix_string_intent_inversion_permit_dead_cites_both_lines():
+    # line 2: deny (seq 1) kills line 3's permit (seq 2).
+    text = (
+        "ip access-list extended T\n"                               # line 1
+        " deny tcp 10.0.0.0 0.255.255.255 any eq 23\n"             # line 2 → seq 1
+        " permit tcp 10.0.0.0 0.255.255.255 host 1.1.1.1 eq 23\n"  # line 3, dead
+    )
+    aces, _ = parse_acls(text)
+    findings = analyze(aces)
+    inv = [f for f in findings if f.kind == "intent-inversion-permit-dead"]
+    assert inv, "expected intent-inversion-permit-dead"
+    fix = inv[0].fix
+    assert "(line 3)" in fix, (
+        f"fix must cite the dead rule's line (3), got: {fix!r}")
+    assert "(line 2)" in fix, (
+        f"fix must cite the coverer's line (2), got: {fix!r}")
+
+
+def test_fix_string_intent_inversion_deny_dead_cites_both_lines():
+    # line 2: permit-any-any (seq 1); line 3: deny (seq 2, dead).
+    text = (
+        "ip access-list extended T\n"  # line 1
+        " permit ip any any\n"         # line 2 → seq 1
+        " deny tcp any any eq 22\n"    # line 3, dead
+    )
+    aces, _ = parse_acls(text)
+    findings = analyze(aces)
+    inv = [f for f in findings if f.kind == "intent-inversion-deny-dead"]
+    assert inv, "expected intent-inversion-deny-dead"
+    fix = inv[0].fix
+    assert "(line 3)" in fix, (
+        f"fix must cite the dead rule's line (3), got: {fix!r}")
+    assert "(line 2)" in fix, (
+        f"fix must cite the coverer's line (2), got: {fix!r}")
+
+
+def test_fix_string_no_line_annotation_when_line_is_zero():
+    # Programmatic ACEs (line=0) must never emit '(line 0)' in fix strings.
+    import ipaddress
+    from rulehawk.analyze import _analyze_one_acl
+    from rulehawk.model import ACE
+    a1 = ACE(seq=1, action="permit", proto="ip",
+             src=ipaddress.ip_network("10.0.0.0/8"),
+             dst=ipaddress.ip_network("0.0.0.0/0"),
+             acl="X", line=0)
+    a2 = ACE(seq=2, action="permit", proto="ip",
+             src=ipaddress.ip_network("10.1.0.0/16"),
+             dst=ipaddress.ip_network("0.0.0.0/0"),
+             acl="X", line=0)
+    findings = _analyze_one_acl([a1, a2])
+    red = [f for f in findings if f.kind == "redundant"]
+    assert red, "expected a redundant finding from programmatic ACEs"
+    assert "(line 0)" not in red[0].fix, (
+        "fix must not emit '(line 0)' for unknown-line rules")
+    assert "(line" not in red[0].fix, (
+        "fix must omit line annotation entirely when line is 0")
+
+
+# ---------------------------------------------------------------------------
+# RH-SEG-PASTEABLE: segcheck fix strings are paste-ready (concrete CIDRs)
+# ---------------------------------------------------------------------------
+
+_SEG_POLICY = {
+    "zones": {"CORP": ["10.20.0.0/16"], "PCI": ["10.10.0.0/16"]},
+    "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp", "ports": [445]}],
+}
+
+
+def test_segcheck_fix_contains_concrete_src_cidr():
+    text = (
+        "ip access-list extended T\n"                                         # line 1
+        " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq 445\n"  # line 2
+    )
+    aces, _ = parse_acls(text)
+    viol = [f for f in check_segmentation(aces, _SEG_POLICY)
+            if f.kind == "segmentation-violation"]
+    assert viol, "expected segmentation-violation"
+    fix = viol[0].fix
+    # The fix must reference a CIDR from the source intersection (10.20/16), not just
+    # zone labels — so it can be pasted directly into an ACL deny rule.
+    assert "10.20" in fix, (
+        f"fix must contain the concrete src CIDR, got: {fix!r}")
+
+
+def test_segcheck_fix_contains_concrete_dst_cidr():
+    text = (
+        "ip access-list extended T\n"                                         # line 1
+        " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq 445\n"  # line 2
+    )
+    aces, _ = parse_acls(text)
+    viol = [f for f in check_segmentation(aces, _SEG_POLICY)
+            if f.kind == "segmentation-violation"]
+    assert viol
+    fix = viol[0].fix
+    assert "10.10" in fix, (
+        f"fix must contain the concrete dst CIDR, got: {fix!r}")
+
+
+def test_segcheck_fix_contains_port():
+    text = (
+        "ip access-list extended T\n"
+        " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq 445\n"
+    )
+    aces, _ = parse_acls(text)
+    viol = [f for f in check_segmentation(aces, _SEG_POLICY)
+            if f.kind == "segmentation-violation"]
+    assert viol
+    assert "445" in viol[0].fix, (
+        f"fix must cite the forbidden port, got: {viol[0].fix!r}")
+
+
+def test_segcheck_fix_contains_permitting_rule_line():
+    # The permitting rule is on line 2; the fix must include '(line 2)'.
+    text = (
+        "ip access-list extended T\n"                                         # line 1
+        " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq 445\n"  # line 2
+    )
+    aces, _ = parse_acls(text)
+    viol = [f for f in check_segmentation(aces, _SEG_POLICY)
+            if f.kind == "segmentation-violation"]
+    assert viol
+    fix = viol[0].fix
+    assert "(line 2)" in fix, (
+        f"fix must cite the permitting rule's file line, got: {fix!r}")

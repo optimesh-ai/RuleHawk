@@ -29,6 +29,16 @@ _UNION_K = 64
 
 _SEV_WEIGHT = {"critical": 25, "high": 10, "medium": 4, "low": 1, "info": 0}
 
+
+def _line_sfx(line: int) -> str:
+    """Return ' (line N)' when line is non-zero, else empty string.
+
+    Used to annotate fix strings with source-file line numbers so a network
+    engineer can jump directly to the offending rule.  Never emits '(line 0)'
+    — line=0 means unknown, not line zero.
+    """
+    return f" (line {line})" if line else ""
+
 # Sensitive services that should not be reachable from `any`. SSH is separated:
 # bastion/management SSH-from-any is common, so it's MEDIUM, not HIGH like telnet.
 _DANGEROUS_PORTS = {
@@ -133,7 +143,8 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
                     _id(b), "redundant", "low",
                     f"Rule is redundant — fully covered by an earlier "
                     f"{a.action} (rule {a.seq}); safe to remove.",
-                    b.raw, a.raw, fix=f"remove rule {b.seq}",
+                    b.raw, a.raw,
+                    fix=f"remove rule {b.seq}{_line_sfx(b.line)}",
                     line=b.line))
             elif b.action == "permit":
                 findings.append(Finding(
@@ -142,7 +153,9 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
                     f"(rule {a.seq}) already drops the same traffic. "
                     f"Likely a silent connectivity loss.",
                     b.raw, a.raw,
-                    fix=f"move rule {b.seq} above rule {a.seq}, or narrow rule {a.seq}",
+                    fix=(f"move rule {b.seq}{_line_sfx(b.line)} above "
+                         f"rule {a.seq}{_line_sfx(a.line)}, "
+                         f"or narrow rule {a.seq}"),
                     line=b.line))
             else:
                 findings.append(Finding(
@@ -150,7 +163,9 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
                     f"This deny NEVER takes effect — an earlier permit "
                     f"(rule {a.seq}) already allows the same traffic. The "
                     f"traffic you meant to block is ALLOWED.",
-                    b.raw, a.raw, fix=f"move rule {b.seq} above rule {a.seq}",
+                    b.raw, a.raw,
+                    fix=(f"move rule {b.seq}{_line_sfx(b.line)} above "
+                         f"rule {a.seq}{_line_sfx(a.line)}"),
                     line=b.line))
             shadowed = True
             break
@@ -161,12 +176,16 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
             if u:
                 kind, sev, chosen = u
                 seqs = ", ".join(str(a.seq) for a in sorted(chosen, key=lambda x: x.seq))
-                msg, fix = _UNION_MSG[kind]
+                msg, fix_tmpl = _UNION_MSG[kind]
+                # Annotate the covered rule's seq reference with its file line when
+                # known — the {seq} placeholder in the template refers to b.
+                seq_with_line = f"{b.seq}{_line_sfx(b.line)}"
+                fix_str = fix_tmpl.format(seqs=seqs, seq=seq_with_line)
                 findings.append(Finding(
                     _id(b), kind, sev,
                     msg.format(seqs=seqs, seq=b.seq), b.raw,
                     cited=f"rules {seqs} (cumulative)",
-                    fix=fix.format(seqs=seqs, seq=b.seq),
+                    fix=fix_str,
                     line=b.line))
 
         if b.action != "permit" or b.stateful:
