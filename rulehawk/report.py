@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from .analyze import Finding, score
 
@@ -16,6 +16,12 @@ _ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 # complete) — a soundness regression for the "surface, never drop" promise.
 _NOTES_CAP = 200
 
+# Canonical human-readable list of every vendor format RuleHawk can parse.
+# Kept in one place so the zero-rules error message and docs stay in sync.
+_SUPPORTED_VENDORS = (
+    "Cisco IOS/ASA, NX-OS, Arista EOS, Juniper Junos, Palo Alto PAN-OS, iptables"
+)
+
 
 def _note_lines(notes: List[str]) -> List[str]:
     out = [f"   ! {n}" for n in notes[:_NOTES_CAP]]
@@ -26,8 +32,12 @@ def _note_lines(notes: List[str]) -> List[str]:
     return out
 
 
-def to_json(findings: List[Finding], notes: List[str], n_rules: int) -> str:
+def to_json(findings: List[Finding], notes: List[str], n_rules: int,
+            vendor: Optional[str] = None) -> str:
     return json.dumps({
+        # Additive field: machine-readable vendor label (ios-asa | junos | panos |
+        # iptables | nxos | eos). "ios-asa" is also the default/fallback.
+        "vendor": vendor or "ios-asa",
         # No parseable rules => not "clean", just nothing analyzed. Don't hand
         # the user a false 100/100 bill of health on input we couldn't read.
         "score": (score(findings) if n_rules else None),
@@ -45,15 +55,32 @@ def to_json(findings: List[Finding], notes: List[str], n_rules: int) -> str:
     }, indent=2)
 
 
-def to_text(findings: List[Finding], notes: List[str], n_rules: int) -> str:
+def to_text(findings: List[Finding], notes: List[str], n_rules: int,
+            vendor: Optional[str] = None) -> str:
+    _vendor = vendor or "ios-asa"
     if not n_rules:
+        # Soundness: zero rules is NOT a clean bill of health. Make the
+        # distinction explicit so the user cannot confuse "nothing parsed"
+        # with "audited and found clean". Exit code 2 mirrors gate.py's
+        # parse_failures path.
         out = ["=" * 64,
                " RuleHawk audit — NO ACL RULES PARSED",
                "=" * 64,
                "",
-               " Nothing was analyzed (this is NOT a clean bill of health).",
-               " Check the input is a Cisco IOS extended ACL, ASA access-list,"
-               " or Juniper Junos firewall filter."]
+               " No ACL/firewall rules found — nothing was audited.",
+               " This is NOT a clean result."]
+        if _vendor == "ios-asa":
+            # "ios-asa" is the fallback: no vendor was positively detected.
+            out += [
+                f" Detected: none of {_SUPPORTED_VENDORS}.",
+                " Check you pasted the config itself, not a description or JSON export.",
+            ]
+        else:
+            # A vendor WAS detected but the config had no parseable rules.
+            out += [
+                f" Detected format: {_vendor} — but no ACL/firewall rules were parsed.",
+                f" Supported: {_SUPPORTED_VENDORS}.",
+            ]
         if notes:
             out.append("")
             out.append(f" Parse notes ({len(notes)}):")
@@ -69,7 +96,12 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int) -> str:
                              ("critical", "high", "medium", "low")))
     lines.append("=" * 64)
     if not findings:
-        lines.append("\n  No issues found. ✅")
+        # Explicit: distinguish "0 findings with N rules analyzed" from "nothing
+        # parsed". The header already carries the rule count; this line names the
+        # vendor so the operator knows what format was actually audited.
+        lines.append(
+            f"\n  0 findings — {n_rules} rules analyzed ({_vendor}): policy is clean."
+        )
     for f in _sorted(findings):
         lines.append("")
         lines.append(f"[{f.severity.upper():8}] {f.kind}  ({f.rule_id})")

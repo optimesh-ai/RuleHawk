@@ -1,10 +1,10 @@
 """RuleHawk CLI:  rulehawk <config-file> [--json] [--junos] [--panos] [--iptables]
 
 Day-1 value: point it at a firewall/ACL config file (Cisco IOS extended ACL,
-Cisco ASA, Juniper Junos firewall filter, Palo Alto PAN-OS security policy, or
-Linux iptables/ip6tables filter rules) and get a ranked hygiene report in
-seconds. The vendor is auto-detected; force Junos with --junos, PAN-OS with
---panos, or iptables with --iptables. Reads stdin if no file.
+Cisco ASA, NX-OS, Arista EOS, Juniper Junos firewall filter, Palo Alto PAN-OS
+security policy, or Linux iptables/ip6tables filter rules) and get a ranked
+hygiene report in seconds. The vendor is auto-detected; force Junos with
+--junos, PAN-OS with --panos, or iptables with --iptables. Reads stdin if no file.
 
 Subcommand:  rulehawk gate <file-or-glob>... [--policy P] [--fail-on LEVEL] ...
 audits many configs at once and emits SARIF + a PR-comment + a step summary for
@@ -25,8 +25,10 @@ import sys
 
 from .analyze import analyze, score
 from .parse import parse_acls
+from .parse_eos import detect as detect_eos, parse_eos
 from .parse_iptables import detect as detect_iptables, parse_iptables
 from .parse_junos import detect as detect_junos, parse_junos
+from .parse_nxos import detect as detect_nxos, parse_nxos
 from .parse_panos import detect as detect_panos, parse_panos
 from .pathground import HammerheadReachOracle, path_ground
 from .report import to_json, to_text
@@ -87,15 +89,27 @@ def main(argv: list[str] | None = None) -> int:
     else:
         text = sys.stdin.read()  # no file, or explicit "-"
 
+    # Auto-detect vendor (same precedence order as gate.py _pick_parser).
+    # "ios-asa" is the fallback: no positive signal was found.
     forced = force_junos or force_panos or force_iptables
     if force_junos or (not forced and detect_junos(text)):
         aces, notes = parse_junos(text)
+        vendor = "junos"
     elif force_panos or (not forced and detect_panos(text)):
         aces, notes = parse_panos(text)
+        vendor = "panos"
     elif force_iptables or (not forced and detect_iptables(text)):
         aces, notes = parse_iptables(text)
+        vendor = "iptables"
+    elif not forced and detect_nxos(text):
+        aces, notes = parse_nxos(text)
+        vendor = "nxos"
+    elif not forced and detect_eos(text):
+        aces, notes = parse_eos(text)
+        vendor = "eos"
     else:
         aces, notes = parse_acls(text)
+        vendor = "ios-asa"
     findings = analyze(aces)
     if policy_path:
         try:
@@ -108,11 +122,16 @@ def main(argv: list[str] | None = None) -> int:
             oracle = HammerheadReachOracle(hh_snapshot, hh_from)
             seg = path_ground(seg, oracle)
         findings += seg
+    n_rules = len(aces)
     if as_json:
-        print(to_json(findings, notes, len(aces)))
+        print(to_json(findings, notes, n_rules, vendor))
     else:
-        print(to_text(findings, notes, len(aces)))
-    # Non-zero exit when a critical/high issue is present, so it's CI-usable.
+        print(to_text(findings, notes, n_rules, vendor))
+    # Distinct exit codes: 0 clean · 1 finding at critical/high · 2 parse failure.
+    # Exit 2 (fail-closed) when NOTHING was parsed: absence of findings must NOT
+    # imply a clean audit when the input was never read as a firewall config.
+    if not n_rules:
+        return 2
     return 1 if any(f.severity in ("critical", "high") for f in findings) else 0
 
 
