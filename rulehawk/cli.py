@@ -35,6 +35,38 @@ from .report import to_json, to_text
 from .segcheck import check_segmentation
 
 
+_USAGE = """rulehawk — firewall/ACL hygiene auditor (single-file report)
+
+usage:
+  rulehawk <config-file> [options]         audit ONE config file (exactly one)
+  rulehawk - [options]                     read the config from stdin
+  cat config | rulehawk [options]          piped stdin also works
+  rulehawk gate <file-or-glob>... [...]    multi-file CI gate (`rulehawk gate --help`)
+
+options:
+  --json               emit the machine-readable JSON report instead of text
+  --junos              force the Juniper Junos parser (skip auto-detection)
+  --panos              force the Palo Alto PAN-OS parser (skip auto-detection)
+  --iptables           force the Linux iptables parser (skip auto-detection)
+  --policy PATH        segmentation policy JSON (zones + must_not_reach)
+  --hh-snapshot DIR    Hammerhead snapshot dir for path-grounding (needs --hh-from)
+  --hh-from DEVICE     source device for path-grounding (needs --hh-snapshot)
+  -h, --help           show this help
+
+Vendor is auto-detected: Cisco IOS/ASA, Cisco NX-OS, Arista EOS, Juniper Junos,
+Palo Alto PAN-OS, Linux iptables/ip6tables.
+
+Single-file mode takes exactly one config file. To audit several at once (e.g.
+a shell glob like `rulehawk configs/*.txt`), use `rulehawk gate <files...>` —
+passing extra files here is an error (exit 2), never a partial audit.
+
+exit codes:
+  0  config parsed; no critical/high findings
+  1  at least one critical/high finding
+  2  parse failure (no rules parsed), unreadable input, or bad usage
+"""
+
+
 def _take_opt(argv: list[str], name: str) -> str | None:
     """Pop `--name VALUE` from argv in place; return VALUE, or None if absent.
     Returns the sentinel '' when the flag is present but missing its value so the
@@ -56,6 +88,11 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "gate":
         from .gate import main as gate_main
         return gate_main(argv[1:])
+    # Help first: `rulehawk --help` / `-h` must print usage and exit 0, never
+    # be mistaken for a config-file path (mirrors gate.py's pattern).
+    if "-h" in argv or "--help" in argv:
+        print(_USAGE)
+        return 0
     as_json = "--json" in argv
     force_junos = "--junos" in argv
     force_panos = "--panos" in argv
@@ -80,6 +117,29 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         policy_path = argv[k + 1]
         del argv[k:k + 2]
+    # Anything left that looks like a flag is an unknown option (bare "-" means
+    # stdin). Reject it explicitly instead of trying to open() it as a file —
+    # a typo like --jsn must say "unknown option", not "cannot read file".
+    for a in argv:
+        if a.startswith("-") and a != "-":
+            print(f"rulehawk: unknown option {a!r} (see `rulehawk --help`)",
+                  file=sys.stderr)
+            return 2
+    # Exactly one positional: silently auditing only argv[0] of a shell glob
+    # (`rulehawk configs/*.txt`) would hand the user a verdict for one file
+    # while they believe all were audited — the false bill of health this tool
+    # exists to prevent. Fail closed with bad-usage (exit 2) and point at the
+    # multi-file gate instead.
+    if len(argv) > 1:
+        print(f"rulehawk: got {len(argv)} config files; single-file mode "
+              "audits exactly one — use `rulehawk gate <files...>` for "
+              "multi-file audits", file=sys.stderr)
+        return 2
+    # Bare `rulehawk` on an interactive terminal would silently block on
+    # sys.stdin.read(); print usage instead. Piped/redirected stdin still works.
+    if not argv and sys.stdin.isatty():
+        print(_USAGE, file=sys.stderr)
+        return 2
     if argv and argv[0] != "-":
         try:
             text = open(argv[0], encoding="utf-8", errors="replace").read()

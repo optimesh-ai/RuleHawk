@@ -28,6 +28,36 @@ IP Access List PCI-ZONE
         20 deny ip any any
 """
 
+# Bare `show ip access-lists` paste — the most common operator copy/paste.
+# NO `!` provenance comments at all: the title-case "IP Access List NAME"
+# headers are the only EOS signal.  Two ACLs, the first ending in a terminal
+# deny, so any cross-ACL merge would falsely kill the second ACL's permits.
+_EOS_SHOW_BARE = """\
+IP Access List MGMT
+        10 permit tcp 10.0.0.0/8 any eq 22
+        20 deny ip any any log
+IP Access List WEB
+        10 permit tcp any 10.20.0.0/16 eq 443
+        20 permit tcp any 10.20.0.0/16 eq 80
+"""
+
+# NX-OS `show ip access-lists` renders the header in lower case
+# ("IP access list NAME") — must NOT trip the case-sensitive EOS signal.
+_NXOS_SHOW_ACL = """\
+IP access list CORP-IN
+        10 permit tcp 10.0.0.0/8 any eq 22
+        20 deny ip any any
+"""
+
+# IOS `show ip access-lists` renders "Extended IP access list NAME" — the
+# line never starts with "IP Access List", so the anchored EOS signal
+# must not fire.
+_IOS_SHOW_ACL = """\
+Extended IP access list OUTSIDE-IN
+    10 permit tcp 10.0.0.0 0.0.0.255 any eq 443
+    20 deny ip any any
+"""
+
 # management api block — another EOS marker
 _EOS_MGMT_API = """\
 management api http-commands
@@ -74,6 +104,21 @@ class TestDetect:
     def test_no_acl_no_detect(self):
         text = "! Command: show running-config\n! device: leaf01 (EOS-4.29)\n"
         assert detect(text) is False
+
+    def test_bare_show_paste_detected(self):
+        # Regression: a bare `show ip access-lists` paste has no `!` comment
+        # lines, so the show header itself must count as an EOS marker.
+        assert detect(_EOS_SHOW_BARE) is True
+
+    def test_nxos_lowercase_show_header_not_detected(self):
+        # NX-OS renders "IP access list NAME" (lower case) — the EOS signal
+        # is case-sensitive and must not fire.
+        assert detect(_NXOS_SHOW_ACL) is False
+
+    def test_ios_extended_show_header_not_detected(self):
+        # IOS renders "Extended IP access list NAME" — never line-initial
+        # "IP Access List", so the anchored EOS signal must not fire.
+        assert detect(_IOS_SHOW_ACL) is False
 
 
 class TestParseEos:
@@ -157,3 +202,26 @@ class TestGateIntegration:
         label, fn = _pick_parser(_IOS_PLAIN, "auto")
         assert label == "ios-asa"
         assert fn is parse_acls
+
+    def test_bare_show_paste_end_to_end(self):
+        # Regression for the false-dead-rule / segcheck-false-PASS vector:
+        # a bare two-ACL `show ip access-lists` paste must route to the EOS
+        # frontend, keep the ACLs distinct (no "(unnamed)" merge), and
+        # produce ZERO dead-rule findings — MGMT's terminal `deny ip any any`
+        # must not shadow WEB's live permits.
+        from rulehawk.analyze import analyze
+        from rulehawk.gate import _pick_parser
+
+        label, fn = _pick_parser(_EOS_SHOW_BARE, "auto")
+        assert label == "eos"
+        assert fn is parse_eos
+
+        aces, notes = fn(_EOS_SHOW_BARE)
+        assert sorted({a.acl for a in aces}) == ["MGMT", "WEB"]
+        assert "(unnamed)" not in {a.acl for a in aces}
+        assert len(aces) == 4  # every ACE line parsed, none dropped
+
+        findings = analyze(aces)
+        assert findings == [], [
+            (f.rule_id, f.kind, f.severity) for f in findings
+        ]

@@ -62,6 +62,23 @@ rule we can't model exactly (neq/complex mask) is flagged "indeterminate, review
 rather than a false pass. See `samples/policy.json` for an example and
 [`docs/policy.md`](docs/policy.md) for the full policy schema.
 
+### Path-grounded segmentation (Hammerhead)
+If you have a [Hammerhead](https://github.com/optimesh-ai/hammerhead) snapshot of
+the network, RuleHawk can verify each segmentation-violation witness against
+Hammerhead's forwarding model (`hammerhead reachability`), so violations on
+routing paths that can't actually deliver the packet are suppressed to
+informational, while confirmed leaks are stamped **path-confirmed**:
+
+```
+rulehawk config.txt --policy policy.json --hh-snapshot DIR --hh-from DEVICE
+```
+
+`DIR` is the Hammerhead snapshot directory and `DEVICE` is the source device the
+witness packet originates from. **Soundness rule:** only a deterministic,
+NAT-free "not delivered" verdict ever downgrades a finding — NAT on the path, an
+oracle error, or an unknown device all **fail closed** and the violation is kept
+(see `rulehawk/pathground.py`).
+
 ## What it finds (today)
 - **Intent inversions** — a `permit` that never fires because an earlier `deny`
   covers it (silent connectivity loss), or a `deny` that never fires because an
@@ -141,6 +158,7 @@ Apache-2.0 — see `LICENSE`.
 - `rulehawk/parse_nxos.py` / `parse_eos.py` / `parse_junos.py` / `parse_panos.py` / `parse_iptables.py` — vendor frontends.
 - `rulehawk/analyze.py` — the rule-space analysis engine (the core IP).
 - `rulehawk/segcheck.py` — segmentation-intent proof (witness packets).
+- `rulehawk/pathground.py` — Hammerhead path-grounding of segmentation witnesses (`--hh-snapshot`/`--hh-from`).
 - `rulehawk/report.py` — text + JSON reports.
 - `rulehawk/gate.py` — the CI gate: multi-file audit → SARIF + PR comment + summary.
 - `rulehawk/cli.py` — `python -m rulehawk` (+ the `gate` subcommand).

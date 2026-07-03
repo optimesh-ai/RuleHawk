@@ -20,7 +20,7 @@ import ipaddress
 from typing import List, Optional, Tuple
 
 from .analyze import Finding
-from .model import ACE, _WILDCARD_PROTO, _IPNet
+from .model import ACE, PORT_MAX, PORT_MIN, _WILDCARD_PROTO, _IPNet
 
 
 def _net(s: str) -> _IPNet:
@@ -75,6 +75,47 @@ def _eval_acl(aces: List[ACE], proto: str, src: str, dst: str,
     return "deny", None              # implicit default deny
 
 
+def _eval_portless(stream: List[ACE], proto: str, src: str, dst: str,
+                   r: ACE) -> Tuple[str, Optional[ACE], Optional[int]]:
+    """Concretize the port dimension of a PORTLESS tcp/udp assertion for
+    candidate permit `r`, then evaluate. Returns (effect, deciding_rule, port).
+
+    Why: with port=None the witness is abstract in the port dimension, so ANY
+    port-scoped earlier deny (e.g. `deny tcp any any eq 445`) first-matches the
+    abstract packet and yields a FALSE PASS while every other port leaks. A PASS
+    must be a proof about real packets, so we only ever evaluate CONCRETE ports.
+
+    Soundness/completeness (port dimension, for this witness host pair): the
+    first-match decision as a function of the destination port is piecewise
+    constant, changing only at boundaries of the port ranges of earlier rules
+    that match this witness's proto/src/dst (imprecise and stateful rules are
+    port-independent). Testing the leftmost point of every such piece inside
+    r's own port range — r.dst_port.lo plus each matching earlier rule's
+    dst_port.lo and dst_port.hi+1 — therefore covers EVERY distinct decision
+    region. If all of them are denied, every port in r's range is provably
+    denied for this witness pair and "deny" (-> PASS) is a real proof, not an
+    abstraction artifact. Any permitted/indeterminate region is found at its
+    representative and reported with that concrete port.
+    """
+    cands = {r.dst_port.lo, r.dst_port.hi, (r.dst_port.lo + r.dst_port.hi) // 2}
+    for e in stream:
+        if e is r:
+            break
+        if _rule_matches(e, proto, src, dst, None) is False:
+            continue  # port-independent non-match: no decision boundary here
+        for p in (e.dst_port.lo, e.dst_port.hi + 1):
+            if r.dst_port.lo <= p <= r.dst_port.hi:
+                cands.add(p)
+    # Prefer an ordinary port for the reported witness (0/65535 read as
+    # degenerate to auditors); ordering never affects soundness — we try every
+    # representative until one is not concretely denied.
+    for p in sorted(cands, key=lambda q: (q in (PORT_MIN, PORT_MAX), q)):
+        eff, dec = _eval_acl(stream, proto, src, dst, p)
+        if eff != "deny":
+            return eff, dec, p
+    return "deny", None, None        # provably denied across r's whole range
+
+
 def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
     findings: List[Finding] = []
     # Inter-zone (transit) segmentation is decided ONLY by ACEs that govern
@@ -126,15 +167,28 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                         swit, dwit = _witness_host(si), _witness_host(di)
                         # Evaluate the witness ONLY within the candidate rule's own
                         # ACL — a deny in another (independent) ACL cannot block it.
-                        eff, dec = _eval_acl(by_acl.get(r.acl, aces),
-                                             proto, swit, dwit, port)
-                        portsfx = f":{port}" if port is not None else ""
+                        stream = by_acl.get(r.acl, aces)
+                        wport = port
+                        if port is None and proto in ("tcp", "udp"):
+                            # Portless tcp/udp assertion: never evaluate an
+                            # abstract (port=None) witness — a port-scoped
+                            # earlier deny would first-match it and FALSE-PASS
+                            # a full-port leak. Concretize instead.
+                            eff, dec, wport = _eval_portless(
+                                stream, proto, swit, dwit, r)
+                        else:
+                            eff, dec = _eval_acl(stream, proto, swit, dwit, port)
+                        portsfx = f":{wport}" if wport is not None else ""
                         if eff == "permit":
                             # Build a concrete, paste-ready fix: use the actual
                             # intersecting CIDRs (si, di) instead of zone names so
                             # the engineer can paste the deny directly into the ACL.
                             # The intersections are engine-proven (si ⊆ zone_src ∩
                             # r.src, di ⊆ zone_dst ∩ r.dst) — never invented.
+                            # Fix scope = the ASSERTED ports: a portless
+                            # assertion forbids EVERY port, so the paste-ready
+                            # deny must be portless too (a deny on just the
+                            # witness port would leave the leak open).
                             _port_part = f" port {port}" if port is not None else ""
                             _line_part = f" (line {dec.line})" if dec.line else ""
                             findings.append(Finding(
@@ -168,10 +222,14 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
             if reported:
                 break
         if not reported:
+            # Portless assertions cover EVERY port, so say "on tcp" (any port),
+            # not the abstract "on tcp/[None]".
+            scope = ""
+            if proto != "ip":
+                scope = f" on {proto}" + ("" if ports == [None] else f"/{ports}")
             findings.append(Finding(
                 label, "segmentation-ok", "info",
-                f"PASS: {sname} cannot reach {dname}"
-                + (f" on {proto}/{ports}" if proto != "ip" else "")
+                f"PASS: {sname} cannot reach {dname}{scope}"
                 + " (no permitted witness flow found).", "",
                 fix=""))
     return findings

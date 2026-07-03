@@ -25,6 +25,14 @@ EOS distinguishing markers:
   * ``! Command: show``               — EOS show-command provenance comment
   * ``EOS`` in the ``! boot system``  line or boot-image path
   * ``management api http-commands``  — EOS-only management API block
+  * ``IP Access List NAME``           — the EOS ``show ip access-lists`` header
+    itself (title-case, line-anchored, case-SENSITIVE).  A bare paste of
+    ``show ip access-lists`` output carries none of the ``!`` provenance
+    comments above, so the header is the only signal.  It cannot collide with
+    other vendors: Cisco IOS renders ``Extended IP access list NAME`` /
+    ``Standard IP access list NAME`` (never line-initial ``IP``), and NX-OS
+    renders lower-case ``IP access list NAME``, which the case-sensitive
+    match rejects.
 """
 
 from __future__ import annotations
@@ -49,6 +57,14 @@ _ACL_HEADER = re.compile(
     re.MULTILINE,
 )
 
+# The EOS ``show ip access-lists`` header itself, as a detection signal.
+# Case-SENSITIVE and line-anchored on purpose: EOS renders the title-case
+# ``IP Access List NAME``; NX-OS renders lower-case ``IP access list NAME``
+# (rejected by case) and IOS renders ``Extended/Standard IP access list NAME``
+# (rejected by the ``^`` anchor).  This lets a bare paste of show output —
+# which has no ``!`` provenance comments — still route to the EOS frontend.
+_EOS_SHOW_HDR = re.compile(r"^IP\s+Access\s+List\s+\S", re.MULTILINE)
+
 # EOS ``show ip access-lists`` uses ``IP Access List NAME`` as the header line.
 # Rewrite it into the ``ip access-list NAME`` form that ``parse_acls`` recognises.
 _EOS_ACL_HDR_RE = re.compile(r"(?im)^IP\s+Access\s+List\s+(\S+)")
@@ -57,10 +73,17 @@ _EOS_ACL_HDR_RE = re.compile(r"(?im)^IP\s+Access\s+List\s+(\S+)")
 def detect(text: str) -> bool:
     """Heuristic: does ``text`` look like Arista EOS ACL output?
 
-    Requires a EOS-specific marker AND an ACL header.  IOS/ASA and NX-OS
-    configs share the ACL syntax but lack the EOS markers.
+    Requires an EOS-specific marker AND an ACL header.  IOS/ASA and NX-OS
+    configs share the ACL syntax but lack the EOS markers.  The title-case
+    ``IP Access List NAME`` show-format header counts as an EOS marker in its
+    own right (see ``_EOS_SHOW_HDR``): a bare ``show ip access-lists`` paste
+    has no ``!`` provenance comments, and that header appears in no other
+    vendor's output.
     """
-    return bool(_EOS_MARKERS.search(text) and _ACL_HEADER.search(text))
+    return bool(
+        (_EOS_MARKERS.search(text) or _EOS_SHOW_HDR.search(text))
+        and _ACL_HEADER.search(text)
+    )
 
 
 def parse_eos(text: str) -> Tuple[List[ACE], List[str]]:

@@ -165,16 +165,30 @@ def _oracle_with(tmp_path, returncode=0, stdout="", nat=False):
     return HammerheadReachOracle(str(d), "R1", runner=runner)
 
 
+def _trace(disposition):
+    """A minimal `hammerhead traceroute --format json` document."""
+    return json.dumps({"from": "R1", "src_ip": "10.20.0.1",
+                       "dst_ip": "10.10.0.1", "protocol": "tcp",
+                       "dst_port": 445, "hops": [],
+                       "disposition": disposition})
+
+
 _W = Witness("10.20.0.1", "10.10.0.1", "tcp", 445)
 
 
-def test_oracle_maps_reachable_true(tmp_path):
-    orc = _oracle_with(tmp_path, 0, json.dumps({"reachable": True}))
+def test_oracle_maps_delivered_to_reachable(tmp_path):
+    orc = _oracle_with(tmp_path, 0, _trace("Delivered"))
     assert orc(_W) is Reach.REACHABLE
 
 
-def test_oracle_maps_reachable_false(tmp_path):
-    orc = _oracle_with(tmp_path, 0, json.dumps({"reachable": False}))
+def test_oracle_maps_no_route_to_unreachable(tmp_path):
+    orc = _oracle_with(tmp_path, 0, _trace("No route at R7"))
+    assert orc(_W) is Reach.UNREACHABLE
+
+
+def test_oracle_tolerates_schema_token_no_route(tmp_path):
+    # schema.rs documents lowercase tokens; accept `no_route` too.
+    orc = _oracle_with(tmp_path, 0, _trace("no_route"))
     assert orc(_W) is Reach.UNREACHABLE
 
 
@@ -188,9 +202,147 @@ def test_oracle_bad_json_is_indeterminate(tmp_path):
     assert orc(_W) is Reach.INDETERMINATE
 
 
-def test_oracle_missing_field_is_indeterminate(tmp_path):
+def test_oracle_missing_disposition_is_indeterminate(tmp_path):
     orc = _oracle_with(tmp_path, 0, json.dumps({"from": "R1"}))
     assert orc(_W) is Reach.INDETERMINATE
+
+
+def test_oracle_non_string_disposition_is_indeterminate(tmp_path):
+    orc = _oracle_with(tmp_path, 0, json.dumps({"disposition": True}))
+    assert orc(_W) is Reach.INDETERMINATE
+
+
+# --- the tcp/80 false-PASS regression (BUILD packet 10) ----------------------
+
+def test_oracle_probes_witness_proto_and_port_not_tcp80(tmp_path):
+    """The probe must carry the witness tuple (tcp/445 here), never a fixed
+    tcp/80 reachability check — that is the bug that let an ACL-denied port 80
+    downgrade a deliverable port-445 leak."""
+    d = tmp_path / "snap"
+    d.mkdir()
+    (d / "r1.cfg").write_text("interface Gi0/0\n")
+    seen = []
+
+    def capture(argv):
+        seen.append(argv)
+        return _FakeProc(0, _trace("Delivered"))
+
+    orc = HammerheadReachOracle(str(d), "R1", runner=capture)
+    assert orc(_W) is Reach.REACHABLE
+    (argv,) = seen
+    assert argv[1] == "traceroute"
+    assert argv[argv.index("--proto") + 1] == "tcp"
+    assert argv[argv.index("--dport") + 1] == "445"
+    assert "reachability" not in argv
+
+
+def test_oracle_acl_denied_probe_is_indeterminate_not_unreachable(tmp_path):
+    """An ACL 'Denied' disposition must NOT downgrade: the probe's source port
+    is fixed while the witness ranges over all source ports, so a denied probe
+    does not prove the witness undeliverable. Fail closed."""
+    orc = _oracle_with(
+        tmp_path, 0, _trace('Denied by R2 ACL "TRANSIT" entry 3 (ingress)'))
+    assert orc(_W) is Reach.INDETERMINATE
+
+
+def test_transit_acl_deny_never_suppresses_the_leak_end_to_end(tmp_path):
+    """Full-pipeline regression for the false PASS: a real tcp/445 CORP->PCI
+    leak whose path ACL would deny a tcp/80 probe. The traceroute probe carries
+    tcp/445 and is Delivered -> the finding must STAY critical, path-confirmed.
+    (Under the old `hammerhead reachability` tcp/80 probe this leak was
+    silently downgraded to info.)"""
+    d = tmp_path / "snap"
+    d.mkdir()
+    (d / "r1.cfg").write_text("interface Gi0/0\n")
+
+    def acl_aware(argv):
+        dport = argv[argv.index("--dport") + 1] if "--dport" in argv else "80"
+        if dport == "80":  # transit ACL blocks web ports...
+            return _FakeProc(0, _trace('Denied by R2 ACL "TRANSIT" entry 1 (ingress)'))
+        return _FakeProc(0, _trace("Delivered"))  # ...but permits the leak port
+
+    orc = HammerheadReachOracle(str(d), "R1", runner=acl_aware)
+    after = path_ground(_seg_findings(), orc)
+    viol = next(f for f in after if f.kind == "segmentation-violation")
+    assert viol.severity == "critical"
+    assert "PATH-CONFIRMED" in viol.message
+    assert not any(f.kind == "segmentation-infeasible-path" for f in after)
+
+
+def test_oracle_other_dispositions_fail_closed(tmp_path):
+    for i, disp in enumerate(("Blackholed at R3", "Unreachable at R3",
+                              "Routing loop through R1 -> R2 -> R1",
+                              "Max hops exceeded",
+                              "uRPF dropped at R2 Gi0/1 (asymmetric path)",
+                              "???")):
+        base = tmp_path / str(i)
+        base.mkdir()
+        orc = _oracle_with(base, 0, _trace(disp))
+        assert orc(_W) is Reach.INDETERMINATE, disp
+
+
+# --- probe/witness instantiation rules ---------------------------------------
+
+def _capturing_oracle(tmp_path, disposition):
+    d = tmp_path / "snap"
+    d.mkdir()
+    (d / "r1.cfg").write_text("interface Gi0/0\n")
+    seen = []
+
+    def capture(argv):
+        seen.append(argv)
+        return _FakeProc(0, _trace(disposition))
+
+    return HammerheadReachOracle(str(d), "R1", runner=capture), seen
+
+
+def test_oracle_portless_tcp_witness_delivered_is_reachable(tmp_path):
+    # "tcp any-port" witness: the default-port probe is an instance of it.
+    orc, seen = _capturing_oracle(tmp_path, "Delivered")
+    assert orc(Witness("10.20.0.1", "10.10.0.1", "tcp", None)) is Reach.REACHABLE
+    (argv,) = seen
+    assert argv[argv.index("--proto") + 1] == "tcp" and "--dport" not in argv
+
+
+def test_oracle_ip_witness_delivered_is_reachable(tmp_path):
+    # witness proto "ip" covers ALL IP traffic, so any delivered probe proves it;
+    # no --proto/--dport is passed (CLI probes its default).
+    orc, seen = _capturing_oracle(tmp_path, "Delivered")
+    assert orc(Witness("10.20.0.1", "10.10.0.1", "ip", None)) is Reach.REACHABLE
+    (argv,) = seen
+    assert "--proto" not in argv and "--dport" not in argv
+
+
+def test_oracle_icmp_witness_delivered_is_reachable(tmp_path):
+    orc, seen = _capturing_oracle(tmp_path, "Delivered")
+    assert orc(Witness("10.20.0.1", "10.10.0.1", "icmp", None)) is Reach.REACHABLE
+    (argv,) = seen
+    assert argv[argv.index("--proto") + 1] == "icmp" and "--dport" not in argv
+
+
+def test_oracle_exotic_proto_delivered_is_indeterminate(tmp_path):
+    # A tcp-default probe delivering says nothing about an esp/gre witness.
+    orc = _oracle_with(tmp_path, 0, _trace("Delivered"))
+    assert orc(Witness("10.20.0.1", "10.10.0.1", "esp", None)) is Reach.INDETERMINATE
+
+
+def test_oracle_exotic_proto_no_route_still_unreachable(tmp_path):
+    # ...but a destination-FIB "No route" proof holds for every proto.
+    orc = _oracle_with(tmp_path, 0, _trace("No route at R7"))
+    assert orc(Witness("10.20.0.1", "10.10.0.1", "esp", None)) is Reach.UNREACHABLE
+
+
+def test_oracle_inexpressible_witness_fails_closed_without_running(tmp_path):
+    d = tmp_path / "snap"
+    d.mkdir()
+    (d / "r1.cfg").write_text("interface Gi0/0\n")
+
+    def boom(argv):
+        raise AssertionError("runner must not be called for an invalid probe")
+
+    orc = HammerheadReachOracle(str(d), "R1", runner=boom)
+    assert orc(Witness("2001:db8::1", "10.10.0.1", "tcp", 445)) is Reach.INDETERMINATE
+    assert orc(Witness("10.20.0.1", "10.10.0.1", "tcp", 70000)) is Reach.INDETERMINATE
 
 
 def test_oracle_nat_in_snapshot_fails_closed(tmp_path):
@@ -223,3 +375,111 @@ def test_oracle_runner_exception_is_indeterminate(tmp_path):
 
     orc = HammerheadReachOracle(str(d), "R1", runner=raiser)
     assert orc(_W) is Reach.INDETERMINATE
+
+
+# --- latency guards: per-witness memo + timeout circuit breaker (packet 21) --
+# Both guards are pure latency fixes: they return the SAME verdict the
+# un-guarded path would produce, so the post-grounding critical set is
+# unchanged (no false PASS can be introduced).
+
+import subprocess  # noqa: E402
+
+
+def _counting_runner(stdout, returncode=0):
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return _FakeProc(returncode, stdout)
+
+    return runner, calls
+
+
+def _clean_snapshot(tmp_path):
+    d = tmp_path / "snap"
+    d.mkdir()
+    (d / "r1.cfg").write_text("interface Gi0/0\n ip address 10.0.0.1 255.255.255.0\n")
+    return d
+
+
+def test_oracle_memoizes_repeat_witness_single_subprocess(tmp_path):
+    # Duplicate witnesses across assertions must pay ONE subprocess run, and
+    # the cached verdict must be identical to the fresh one.
+    d = _clean_snapshot(tmp_path)
+    runner, calls = _counting_runner(_trace("Delivered"))
+    orc = HammerheadReachOracle(str(d), "R1", runner=runner)
+    assert orc(_W) is Reach.REACHABLE
+    assert orc(_W) is Reach.REACHABLE  # served from memo
+    assert len(calls) == 1
+
+
+def test_oracle_memo_is_per_witness_not_global(tmp_path):
+    # Distinct witnesses each get their own probe — the memo never shares a
+    # verdict across different packets.
+    d = _clean_snapshot(tmp_path)
+    runner, calls = _counting_runner(_trace("No route at R7"))
+    orc = HammerheadReachOracle(str(d), "R1", runner=runner)
+    w2 = Witness("10.20.0.9", "10.10.0.9", "tcp", 3389)
+    assert orc(_W) is Reach.UNREACHABLE
+    assert orc(w2) is Reach.UNREACHABLE
+    assert len(calls) == 2
+
+
+def test_oracle_timeout_is_indeterminate_and_trips_breaker(tmp_path):
+    # First TimeoutExpired -> fail-closed INDETERMINATE (as before), and every
+    # LATER witness short-circuits to the same verdict without spawning another
+    # doomed 60s probe: worst case N x timeout collapses to ~1 x timeout.
+    d = _clean_snapshot(tmp_path)
+    calls = []
+
+    def hung(argv):
+        calls.append(argv)
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=60.0)
+
+    orc = HammerheadReachOracle(str(d), "R1", runner=hung)
+    assert orc(_W) is Reach.INDETERMINATE
+    assert orc(Witness("10.20.0.9", "10.10.0.9", "tcp", 3389)) is Reach.INDETERMINATE
+    assert orc(Witness("10.20.0.7", "10.10.0.7", "udp", 53)) is Reach.INDETERMINATE
+    assert len(calls) == 1  # only the first witness paid the timeout
+
+
+def test_oracle_breaker_does_not_invalidate_earlier_proofs(tmp_path):
+    # Verdicts proven BEFORE the timeout stay served from the memo afterwards:
+    # the breaker only suppresses NEW probes, it never rewrites history.
+    d = _clean_snapshot(tmp_path)
+    state = {"hang": False, "calls": 0}
+
+    def runner(argv):
+        state["calls"] += 1
+        if state["hang"]:
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=60.0)
+        return _FakeProc(0, _trace("No route at R7"))
+
+    orc = HammerheadReachOracle(str(d), "R1", runner=runner)
+    assert orc(_W) is Reach.UNREACHABLE  # proven while healthy
+    state["hang"] = True
+    w2 = Witness("10.20.0.9", "10.10.0.9", "tcp", 3389)
+    assert orc(w2) is Reach.INDETERMINATE  # trips breaker
+    assert orc(_W) is Reach.UNREACHABLE   # memo, no new subprocess
+    assert orc(w2) is Reach.INDETERMINATE  # stays fail-closed
+    assert state["calls"] == 2
+
+
+def test_oracle_non_timeout_errors_do_not_trip_breaker(tmp_path):
+    # An OSError (binary missing) is per-call INDETERMINATE but must NOT stop
+    # later witnesses from probing — only a proven hang trips the breaker.
+    d = _clean_snapshot(tmp_path)
+    state = {"fail_once": True, "calls": 0}
+
+    def runner(argv):
+        state["calls"] += 1
+        if state["fail_once"]:
+            state["fail_once"] = False
+            raise OSError("transient")
+        return _FakeProc(0, _trace("Delivered"))
+
+    orc = HammerheadReachOracle(str(d), "R1", runner=runner)
+    assert orc(_W) is Reach.INDETERMINATE
+    w2 = Witness("10.20.0.9", "10.10.0.9", "tcp", 3389)
+    assert orc(w2) is Reach.REACHABLE  # breaker not tripped; probe ran
+    assert state["calls"] == 2

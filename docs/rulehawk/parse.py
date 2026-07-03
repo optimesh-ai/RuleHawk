@@ -14,6 +14,15 @@ one ACE per sub-range, so it stays exact, never widened). `established` ->
 stateful. ICMP type qualifiers are captured so `echo` and `echo-reply` aren't
 treated as the same packet space.
 Unmodeled lines (object-group, etc.) are surfaced as notes, never silently dropped.
+Match-narrowing trailing qualifiers (`fragments`, `time-range`, `dscp`, `tos`,
+`precedence`, `ttl`) restrict what an ACE matches on a real device; they are not
+modeled, so the ACE is marked `imprecise` (fail closed) — a narrowed deny can
+never silently prove a segment isolated, and a narrowed permit can never assert
+a concrete violation. Any OTHER unrecognized trailing token (a TCP flag such as
+`syn`/`ack`, an `eq`-list service name outside the named-port table, pasted
+`show access-list` residue) also marks the ACE `imprecise` with a note — never
+silently ignored. `log`/`log-input` (including ASA log arguments) never narrow
+and stay exact.
 """
 
 from __future__ import annotations
@@ -38,6 +47,79 @@ _NAMED_PORTS = {
 _ACTIONS = ("permit", "deny")
 _TRAILING_NONTYPE = {"log", "log-input", "established", "fragments", "ttl",
                      "dscp", "time-range", "tos", "precedence"}
+# Match-NARROWING trailing qualifiers: on a real device each of these RESTRICTS
+# the packets the ACE matches (`fragments` -> non-initial fragments only,
+# `time-range` -> only inside the named window, dscp/tos/precedence/ttl -> only
+# matching-marked packets). Modeling such an ACE full-width is unsound: a
+# narrowed DENY evaluated full-width shadows a later broad permit and lets
+# segcheck FALSE-PASS a real leak. We don't model the narrowing itself; we mark
+# the ACE `imprecise` so downstream checks fail closed (indeterminate), exactly
+# like the iptables frontend does for `-f`/unknown options. `log`/`log-input`
+# do NOT narrow (stay exact); `established` is modeled exactly via `stateful`.
+_NARROWING_QUALS = {"fragments", "time-range", "dscp", "tos", "precedence",
+                    "ttl"}
+# Trailing keywords that CONSUME following argument token(s), so the argument is
+# never mistaken for an ICMP type (`time-range WORKHOURS` is not type
+# "WORKHOURS"). `ttl` takes an operator plus value(s) and is handled inline.
+_QUAL_ARGC = {"time-range": 1, "dscp": 1, "tos": 1, "precedence": 1}
+
+
+def _scan_trailing(rest: List[str]) -> Tuple[List[str], Optional[str], List[str]]:
+    """Scan an ACE's trailing tokens. Returns (narrowing, first_type_token,
+    extra_unknown): `narrowing` lists the match-narrowing qualifiers present
+    (caller marks the ACE imprecise), `first_type_token` is the first token
+    that is neither a known trailing keyword nor a consumed keyword argument
+    (the ICMP type slot for icmp ACEs), and `extra_unknown` lists every FURTHER
+    such token. Unrecognized trailing tokens are a false-PASS hazard: a TCP
+    flag (`syn`/`ack`/`rst`/`match-any`), an `eq`-list service name outside our
+    table, or pasted `show access-list` residue all NARROW or EXTEND what the
+    device really matches, so the caller must treat them as unknown (fail
+    closed -> imprecise), never silently ignore them. ASA `log` arguments
+    ([level] [interval N] | disable | default) are consumed so an exact logged
+    ACE is not falsely flagged."""
+    narrowing: List[str] = []
+    first_type: Optional[str] = None
+    extra_unknown: List[str] = []
+    j = 0
+    while j < len(rest):
+        t = rest[j].lower()
+        if t in _NARROWING_QUALS:
+            narrowing.append(t)
+            if t == "ttl":
+                # ttl OP V [V2]: consume the operator and one value (two for
+                # `range`).
+                j += 1
+                if j < len(rest):
+                    op = rest[j].lower()
+                    j += 1 + (2 if op == "range" else 1)
+                continue
+            j += 1 + _QUAL_ARGC.get(t, 0)
+            continue
+        if t in ("log", "log-input"):
+            # ASA log arguments: `log [level] [interval N]` or `log disable` /
+            # `log default`. Consume them so a logged-but-exact ACE stays exact
+            # (log never narrows the match).
+            j += 1
+            if j < len(rest) and rest[j].isdigit() and 0 <= int(rest[j]) <= 7:
+                j += 1                       # syslog level 0-7
+            while j < len(rest):
+                a = rest[j].lower()
+                if a == "interval" and j + 1 < len(rest) and rest[j + 1].isdigit():
+                    j += 2
+                elif a in ("disable", "default"):
+                    j += 1
+                else:
+                    break
+            continue
+        if t in _TRAILING_NONTYPE:           # established
+            j += 1
+            continue
+        if first_type is None:
+            first_type = rest[j]
+        else:
+            extra_unknown.append(rest[j])
+        j += 1
+    return narrowing, first_type, extra_unknown
 
 
 def _port_num(tok: str) -> int:
@@ -643,6 +725,26 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
 
     rest = toks[i:]
     stateful = any(t.lower() == "established" for t in rest)
+    narrowing, type_tok, extra_unknown = _scan_trailing(rest)
+    rnotes: List[str] = []
+    if narrowing:
+        # Same soundness rule as _parse_entry: a narrowed ACE modeled full-width
+        # could shadow a real leak (deny) or fake one (permit) — fail closed.
+        imprecise = True
+        rnotes.append("match-narrowing qualifier "
+                      + "/".join(sorted(set(narrowing)))
+                      + f" not modeled — marked imprecise, verify manually: {raw}")
+    # Unknown trailing tokens fail closed here for EVERY proto: unlike
+    # _parse_entry, this resolver never models an ICMP type, so even a
+    # legitimate type token narrows the match unmodeled (a full-width icmp deny
+    # over `echo` could falsely prove isolation). TCP flags / unresolvable
+    # service names are the same hazard as in _parse_entry.
+    unknown = ([type_tok] if type_tok is not None else []) + list(extra_unknown)
+    if unknown:
+        imprecise = True
+        rnotes.append("unrecognized trailing qualifier "
+                      + "/".join(unknown)
+                      + f" — marked imprecise, verify manually: {raw}")
     aces: List[ACE] = []
     m = seq
     for s in srcs:
@@ -669,7 +771,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
             f"{len(aces) - 1} exact ACE(s) + 1 opaque (unresolved members): {raw}"
         )
 
-    return aces, [note]
+    return aces, rnotes + [note]
 
 
 def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
@@ -777,16 +879,32 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0):
         dst_ports, imp_dp = [ANY_PORTS], False
     rest = toks[i:]
     stateful = any(t.lower() == "established" for t in rest)
-    icmp_type = None
-    if proto == "icmp":
-        for t in rest:
-            if t.lower() not in _TRAILING_NONTYPE:
-                icmp_type = t
-                break
-    imprecise = imp_s or imp_d or imp_sp or imp_dp
+    narrowing, type_tok, extra_unknown = _scan_trailing(rest)
+    icmp_type = type_tok if proto == "icmp" else None
+    # Unknown trailing tokens: for icmp the first free token is the (modeled)
+    # ICMP type; every other free token — and for non-icmp protos the first one
+    # too — is an unrecognized qualifier (a TCP flag like `syn`, an `eq`-list
+    # service name outside our table, pasted `show access-list` residue). Such
+    # a token changes what the device really matches in a way we don't model,
+    # so silently ignoring it is a false-PASS path (a `syn`-narrowed deny can
+    # "prove" isolation the device doesn't enforce; a dropped `exec` port can
+    # hide a real leak). Fail closed: mark imprecise and surface a note.
+    unknown = list(extra_unknown)
+    if type_tok is not None and proto != "icmp":
+        unknown.insert(0, type_tok)
+    imprecise = (imp_s or imp_d or imp_sp or imp_dp or bool(narrowing)
+                 or bool(unknown))
     notes: List[str] = []
     if imp_s or imp_d:
         notes.append(f"imprecise mask (treated conservatively): {raw}")
+    if narrowing:
+        notes.append("match-narrowing qualifier "
+                     + "/".join(sorted(set(narrowing)))
+                     + f" not modeled — marked imprecise, verify manually: {raw}")
+    if unknown:
+        notes.append("unrecognized trailing qualifier "
+                     + "/".join(unknown)
+                     + f" — marked imprecise, verify manually: {raw}")
     if extra_sp or extra_dp:
         notes.append("multi-port `eq` expanded to the exact union of per-port "
                      f"rules ({extra_sp + extra_dp} extra port(s) now modeled, "

@@ -299,6 +299,140 @@ def test_to_text_backward_compat_three_args():
     assert "0 findings" in out  # clean path still runs
 
 
+# ---------------------------------------------------------------------------
+# 7. FIRST-MINUTE CLI UX — --help, unknown flags, bare invocation on a TTY
+# ---------------------------------------------------------------------------
+
+class _FakeTTY:
+    """Stand-in for an interactive terminal stdin: isatty() is True and any
+    read would be a test bug (the CLI must never block on it)."""
+
+    def isatty(self):
+        return True
+
+    def read(self):  # pragma: no cover - reaching this is the failure mode
+        raise AssertionError("CLI read stdin on an interactive TTY (would hang)")
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_help_flag_prints_usage_and_exits_0(flag, capsys):
+    """`rulehawk --help` / `-h` must print usage and exit 0 — never be treated
+    as a config-file path (the old behavior errored with 'cannot read')."""
+    rc = cli_main([flag])
+    out = capsys.readouterr().out
+    assert rc == 0, f"{flag}: expected exit 0, got {rc}"
+    assert "usage:" in out, f"{flag}: usage text missing"
+    assert "cannot read" not in out
+    # The help must document the exit-code contract and key flags.
+    for token in ("--json", "--policy", "--hh-snapshot", "--hh-from",
+                  "exit codes", "gate"):
+        assert token in out, f"{flag}: '{token}' missing from help text"
+
+
+def test_help_wins_even_with_other_args(capsys):
+    """`rulehawk somefile --help` shows help (exit 0) rather than auditing."""
+    rc = cli_main(["somefile.acl", "--help"])
+    assert rc == 0
+    assert "usage:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("bad", ["--jsn", "--badflag", "-x", "--junoss"])
+def test_unknown_flag_is_rejected_as_unknown_option(bad, capsys):
+    """A typo'd flag must exit 2 with 'unknown option', NOT a misleading
+    'cannot read <flag>: No such file or directory'."""
+    rc = cli_main([bad])
+    err = capsys.readouterr().err
+    assert rc == 2, f"{bad}: expected exit 2, got {rc}"
+    assert "unknown option" in err, f"{bad}: 'unknown option' missing: {err!r}"
+    assert bad in err, f"{bad}: the offending flag must be named"
+    assert "No such file or directory" not in err
+    assert "--help" in err, "error must point the user at --help"
+
+
+def test_unknown_flag_after_file_is_rejected(tmp_path, capsys):
+    """`rulehawk clean.acl --jsn` must also fail fast, not silently ignore."""
+    p = tmp_path / "clean.acl"
+    p.write_text(_CLEAN_IOS, encoding="utf-8")
+    rc = cli_main([str(p), "--jsn"])
+    assert rc == 2
+    assert "unknown option" in capsys.readouterr().err
+
+
+def test_bare_invocation_on_tty_prints_usage_exit_2(monkeypatch, capsys):
+    """`rulehawk` alone on an interactive terminal must NOT block on stdin —
+    it prints usage to stderr and exits 2 (bad usage, fail-closed)."""
+    monkeypatch.setattr(sys, "stdin", _FakeTTY())
+    rc = cli_main([])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "usage:" in captured.err
+    assert captured.out == "", "usage on bad invocation goes to stderr"
+
+
+def test_piped_stdin_still_audited(monkeypatch):
+    """Non-TTY (piped) stdin with no file arg is still read and audited: the
+    day-1 `cat config | rulehawk` flow is unchanged. Clean config -> exit 0."""
+    import io
+    monkeypatch.setattr(sys, "stdin", io.StringIO(_CLEAN_IOS))
+    assert cli_main([]) == 0
+
+
+def test_explicit_dash_reads_stdin_even_on_tty(monkeypatch):
+    """`rulehawk -` explicitly requests stdin; it must read it (exit 0 on a
+    clean config), independent of the TTY guard on the bare invocation."""
+    import io
+    monkeypatch.setattr(sys, "stdin", io.StringIO(_CLEAN_IOS))
+    assert cli_main(["-"]) == 0
+
+
+def test_garbage_via_piped_stdin_still_exit_2(monkeypatch):
+    """Fail-closed contract on stdin input is preserved: garbage -> exit 2."""
+    import io
+    monkeypatch.setattr(sys, "stdin", io.StringIO("not a firewall config\n"))
+    assert cli_main([]) == 2
+
+
+def test_multiple_config_files_rejected_exit_2_points_at_gate(tmp_path, capsys):
+    """`rulehawk a.cfg b.cfg` (e.g. a shell glob) must NOT silently audit only
+    the first file — that is a false bill of health for the rest. It must exit
+    2 (bad usage) with a stderr message that points at `rulehawk gate`."""
+    a = tmp_path / "a.cfg"
+    b = tmp_path / "b.cfg"
+    a.write_text(_CLEAN_IOS, encoding="utf-8")
+    b.write_text(_CLEAN_IOS, encoding="utf-8")
+    rc = cli_main([str(a), str(b)])
+    captured = capsys.readouterr()
+    assert rc == 2, f"expected exit 2 on two positionals, got {rc}"
+    assert "2 config files" in captured.err, captured.err
+    assert "rulehawk gate" in captured.err, "error must point at the gate"
+    assert captured.out == "", "no report may be emitted for a partial audit"
+
+
+def test_multiple_files_rejected_even_with_flags(tmp_path, capsys):
+    """Flag stripping must not mask extra positionals: `a.cfg --json b.cfg`
+    is still two config files and still bad usage (exit 2)."""
+    a = tmp_path / "a.cfg"
+    b = tmp_path / "b.cfg"
+    a.write_text(_CLEAN_IOS, encoding="utf-8")
+    b.write_text("garbage", encoding="utf-8")
+    rc = cli_main([str(a), "--json", str(b)])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "rulehawk gate" in captured.err
+
+
+def test_single_config_file_still_audited_exit_0(tmp_path, capsys):
+    """The one-file happy path is unchanged: exactly one clean config file
+    still produces a report and exit 0."""
+    p = tmp_path / "clean.acl"
+    p.write_text(_CLEAN_IOS, encoding="utf-8")
+    rc = cli_main([str(p)])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "rules analyzed" in captured.out
+    assert captured.err == ""
+
+
 def test_supported_vendors_constant_covers_all_six():
     """_SUPPORTED_VENDORS must name all six vendor families so the error message
     stays current when parsers are added."""

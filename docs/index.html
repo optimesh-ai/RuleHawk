@@ -356,12 +356,27 @@ let reqId = 0;            // matches worker responses to requests
 let lastResult = { text:"", jsonStr:"", ruleLines:{} };
 
 // ---- engine boot: prefer Web Worker, fall back to main thread ----
+// Map the worker's additive {type:'progress'} boot posts (and bootMain's own
+// staged points) to honest status text, so the multi-second first load shows
+// what is actually happening instead of one static spinner.
+function bootProgressHtml(m){
+  m = m || {};
+  if(m.stage === "runtime") return '<span class="spin"></span>Downloading analysis runtime (one-time, ~10 MB)…';
+  if(m.stage === "engine"){
+    const total = (+m.total > 0) ? +m.total : ENGINE_MODULES.length;
+    const n = Math.min((+m.loaded || 0) + 1, total);
+    return '<span class="spin"></span>Loading RuleHawk engine (' + n + '/' + total + ')…';
+  }
+  if(m.stage === "start") return '<span class="spin"></span>Starting engine…';
+  return '<span class="spin"></span>Loading analysis engine…';
+}
 function makeWorker(){
   const w = new Worker("worker.js");
   w.onmessage = (e) => {
     const m = e.data || {};
     if(m.type === "ready"){ mode = "worker"; ready(); }
     else if(m.type === "error"){ console.warn("worker engine failed:", m.message); bootMain(); }
+    else if(m.type === "progress"){ if(mode !== "main") setStatus(bootProgressHtml(m)); }
     else if(m.type === "result"){ onResult(m); }
   };
   w.onerror = () => { console.warn("worker errored; falling back"); try{w.terminate()}catch(_){} worker=null; bootMain(); };
@@ -371,13 +386,17 @@ async function bootMain(){
   if(mode === "main") return;
   try{
     if(typeof loadPyodide === "undefined") throw new Error("Pyodide loader unavailable");
+    setStatus(bootProgressHtml({stage:"runtime"}));   // same staged points as the worker
     pyodide = await loadPyodide();
     pyodide.FS.mkdir("rulehawk");
-    for(const m of ENGINE_MODULES){
+    for(let i = 0; i < ENGINE_MODULES.length; i++){
+      const m = ENGINE_MODULES[i];
+      setStatus(bootProgressHtml({stage:"engine", loaded:i, total:ENGINE_MODULES.length}));
       const r = await fetch(`./rulehawk/${m}.py`, {cache:"no-cache"});
       if(!r.ok) throw new Error(`could not load engine module ${m}.py (${r.status})`);
       pyodide.FS.writeFile(`rulehawk/${m}.py`, await r.text());
     }
+    setStatus(bootProgressHtml({stage:"start"}));
     pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
     mode = "main"; ready();
   }catch(e){
@@ -682,7 +701,17 @@ $("audit").addEventListener("click", audit);
 $("cancel").addEventListener("click", cancel);
 $("upload").addEventListener("click", () => $("file").click());
 $("file").addEventListener("change", e => loadFile(e.target.files[0]));
-$("sample").addEventListener("click", () => { $("config").value = SAMPLE_ACL; $("results").style.display="none"; });
+$("sample").addEventListener("click", () => {
+  // The sample is the demo: pre-fill BOTH the config and the segmentation policy
+  // so a first-time visitor's very first Audit shows the witness-packet proof
+  // (the flagship differentiator) instead of leaving it hidden in the collapsed
+  // panel. The standalone "load sample policy" button below stays unchanged.
+  $("config").value = SAMPLE_ACL;
+  $("policy").value = SAMPLE_POLICY;
+  $("policy").closest("details").open = true;
+  $("results").style.display="none";
+  if(!auditBtn.disabled) setStatus("Sample config + PCI segmentation policy loaded — click Audit to prove CORP can reach PCI on 445 and see the witness packet.");
+});
 $("clear").addEventListener("click", () => { $("config").value=""; $("results").style.display="none"; });
 $("samplePolicy").addEventListener("click", () => { $("policy").value = SAMPLE_POLICY; $("policy").closest("details").open = true; });
 document.addEventListener("keydown", e => { if((e.metaKey||e.ctrlKey) && e.key==="Enter" && !auditBtn.disabled) audit(); });

@@ -109,3 +109,42 @@ def test_asa_access_list_form_parses():
             "access-list OUT extended permit ip any any\n")
     aces, _ = parse_acls(text)
     assert len(aces) == 2 and aces[0].dst_port.lo == 443
+
+
+# --- source-port-only trust (spoofable return-traffic permits) ------------
+
+def test_source_port_only_permit_is_flagged_high():
+    # `permit tcp any eq 53 any` — trusts an attacker-controlled source port
+    # to admit traffic to EVERY destination port.
+    text = ("ip access-list extended T\n"
+            " permit tcp any eq 53 any\n")
+    assert ("T:1", "source-port-trust") in _kinds(text)
+    aces, _ = parse_acls(text)
+    f = next(f for f in analyze(aces) if f.kind == "source-port-trust")
+    assert f.severity == "high" and "SOURCE port" in f.message
+
+
+def test_source_port_trust_established_is_exempt():
+    # `established` marks genuine return traffic — not source-port trust.
+    text = ("ip access-list extended T\n"
+            " permit tcp any eq 53 any established\n")
+    assert not any(k == "source-port-trust" for _, k in _kinds(text))
+
+
+def test_source_port_with_dst_port_is_not_flagged():
+    # A rule that ALSO scopes the destination port is properly constrained.
+    text = ("ip access-list extended T\n"
+            " permit tcp any eq 1024 any eq 443\n")
+    assert not any(k == "source-port-trust" for _, k in _kinds(text))
+
+
+def test_source_port_trust_imprecise_and_deny_are_exempt():
+    import dataclasses as _dc
+    a = _ace("permit tcp any eq 53 any")
+    assert any(f.kind == "source-port-trust" for f in analyze([a]))
+    # An over-approximated (imprecise) space must never drive the verdict.
+    assert not any(f.kind == "source-port-trust"
+                   for f in analyze([_dc.replace(a, imprecise=True)]))
+    # A deny is never over-permissive.
+    assert not any(f.kind == "source-port-trust"
+                   for f in analyze([_dc.replace(a, action="deny")]))

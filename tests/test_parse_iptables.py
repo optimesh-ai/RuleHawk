@@ -112,6 +112,64 @@ def test_conntrack_state_modeled_stateful_and_surfaced():
     assert any("stateful" in n and ("conntrack" in n or "state" in n) for n in notes)
 
 
+def test_negated_ctstate_marks_imprecise_not_stateful():
+    """`! --ctstate INVALID -j ACCEPT` matches the COMPLEMENT of INVALID — i.e.
+    everything else, INCLUDING NEW flows. It must NOT be modeled as a stateful
+    (return-traffic-only) rule; that direction FALSE-PASSes segmentation. The
+    complement isn't modeled, so it must be marked imprecise and surfaced."""
+    cfg = ("*filter\n:FORWARD DROP [0:0]\n"
+           "-A FORWARD -m conntrack ! --ctstate INVALID -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.stateful is False, (
+        "negated ctstate modeled as stateful — unsound (permits NEW flows)")
+    assert rule.imprecise is True
+    assert any("negated conntrack state" in n and "imprecise" in n for n in notes)
+
+
+def test_negated_state_module_form_also_imprecise():
+    """Same soundness rule for the legacy `-m state ! --state` spelling."""
+    cfg = ("*filter\n:FORWARD DROP [0:0]\n"
+           "-A FORWARD -m state ! --state INVALID,UNTRACKED -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.stateful is False and rule.imprecise is True
+    assert any("negated conntrack state" in n for n in notes)
+
+
+def test_negated_ctstate_repro_indeterminate_not_pass():
+    """The live repro from the finding: `:FORWARD DROP` + the common hygiene rule
+    `! --ctstate INVALID -j ACCEPT` used to yield a clean `segmentation-ok`
+    (FALSE PASS) for a CORP->PCI tcp/445 must_not_reach assertion, while the real
+    firewall ACCEPTs all non-INVALID traffic including NEW cross-zone flows.
+    The imprecise permit must fail closed to segmentation-INDETERMINATE."""
+    cfg = ("*filter\n:FORWARD DROP [0:0]\n"
+           "-A FORWARD -m conntrack ! --ctstate INVALID -j ACCEPT\nCOMMIT\n")
+    aces, _ = parse_iptables(cfg)
+    findings = check_segmentation(aces, _SEG_POLICY)
+    kinds = {f.kind for f in findings}
+    assert "segmentation-ok" not in kinds, (
+        "FALSE PASS: negated-ctstate ACCEPT hidden as stateful — CORP->PCI:445 "
+        "reported isolated while the rule permits NEW flows")
+    assert "segmentation-indeterminate" in kinds
+
+
+def test_non_negated_ctstate_still_stateful_no_regression():
+    """The straight (non-negated) return-traffic idiom keeps its precise stateful
+    model — no over-blocking regression from the negation fix."""
+    cfg = ("*filter\n:FORWARD DROP [0:0]\n"
+           "-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n"
+           "COMMIT\n")
+    aces, _ = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.stateful is True and rule.imprecise is False
+    # Stateful-only permit never opens a NEW flow -> the isolation check PASSes.
+    kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
+    assert "segmentation-ok" in kinds
+    assert "segmentation-violation" not in kinds
+    assert "segmentation-indeterminate" not in kinds
+
+
 def test_interface_match_marks_imprecise_and_surfaced():
     cfg = ("*filter\n:FORWARD DROP [0:0]\n"
            "-A FORWARD -i eth0 -s 10.0.0.0/8 -p tcp --dport 22 -j ACCEPT\nCOMMIT\n")
@@ -569,3 +627,95 @@ def test_precision_chain_cycle_fails_closed_no_hang():
         "must not FALSE-PASS on a cyclic chain structure"
     # Resolution was NOT applied (cycle blocked by imprecise-ACE gate)
     assert not any("resolved precisely" in n for n in notes)
+
+
+# ── RH-iptables soundness regression: icmpv6 type ignored by covers() ─────────
+# covers() gated the icmp_type comparison on proto == "icmp" only, so typed
+# ip6tables `--icmpv6-type` rules (proto "icmpv6") compared as if typeless: an
+# RA-accept (type 134) "covered" the NS/NA accepts (135/136) and analyze()
+# told the user rules 2-3 were shadowed/redundant — deleting them breaks IPv6
+# neighbor discovery. The type dimension must bind for BOTH ICMP families.
+
+def _mk_icmp6(icmp_type, seq=1, action="permit"):
+    import ipaddress
+    from rulehawk.model import ACE
+    any6 = ipaddress.ip_network("::/0")
+    return ACE(seq=seq, action=action, proto="icmpv6", src=any6, dst=any6,
+               icmp_type=icmp_type)
+
+
+def test_covers_respects_icmpv6_type():
+    """A typed icmpv6 rule must NOT cover a differently-typed (or untyped) one —
+    exactly the v4 icmp semantics."""
+    from rulehawk.model import covers
+    ra, ns, na = _mk_icmp6("134"), _mk_icmp6("135"), _mk_icmp6("136")
+    untyped = _mk_icmp6(None)
+    assert covers(ra, ns) is False, "type 134 must not cover type 135"
+    assert covers(ra, na) is False, "type 134 must not cover type 136"
+    # Typed-vs-untyped fails closed (an untyped rule spans MORE than one type).
+    assert covers(ra, untyped) is False
+    # A typeless icmpv6 rule still covers every type; same type still covers.
+    assert covers(untyped, ns) is True
+    assert covers(_mk_icmp6("135"), ns) is True
+
+
+def test_union_coverer_respects_icmpv6_type():
+    """The union-shadowing path mirrors covers()'s gates — same fix required."""
+    from rulehawk.model import _compatible_coverer
+    ra, ns = _mk_icmp6("134"), _mk_icmp6("135")
+    assert _compatible_coverer(ra, ns) is False
+    assert _compatible_coverer(_mk_icmp6(None), ns) is True
+    assert _compatible_coverer(_mk_icmp6("135"), ns) is True
+
+
+# The standard IPv6 ND/RA hygiene block: RA (134), NS (135), NA (136).
+_ND_HYGIENE_V6 = (
+    "ip6tables -P INPUT DROP\n"
+    "ip6tables -A INPUT -p icmpv6 --icmpv6-type 134 -j ACCEPT\n"
+    "ip6tables -A INPUT -p icmpv6 --icmpv6-type 135 -j ACCEPT\n"
+    "ip6tables -A INPUT -p icmpv6 --icmpv6-type 136 -j ACCEPT\n"
+)
+
+_SHADOW_KINDS = {"redundant", "intent-inversion-permit-dead",
+                 "intent-inversion-deny-dead", "union-shadowed-permit-dead",
+                 "union-shadowed-deny-dead"}
+
+
+def test_ip6tables_nd_hygiene_block_not_falsely_shadowed():
+    """End-to-end repro from the finding: the three typed icmpv6 accepts are
+    distinct match-spaces — analyze() must NOT call any of them shadowed,
+    redundant, or dead (that advice, followed, breaks neighbor discovery)."""
+    aces, _ = parse_iptables(_ND_HYGIENE_V6)
+    typed = sorted((a for a in aces if a.proto == "icmpv6"), key=lambda a: a.seq)
+    assert [a.icmp_type for a in typed] == ["134", "135", "136"]
+    assert all(a.src.version == 6 for a in typed), "ip6tables => v6 any nets"
+    findings = _analyze_aces(aces)
+    bad = [f for f in findings if f.kind in _SHADOW_KINDS]
+    assert not bad, (
+        "typed icmpv6 rules falsely reported shadowed/redundant: "
+        + "; ".join(f"{f.kind}: {f.message}" for f in bad))
+
+
+def test_ip6tables_true_duplicate_icmpv6_rule_still_flagged():
+    """No over-relaxation: an ACTUAL duplicate typed icmpv6 rule (same type)
+    must still be reported redundant, and an untyped icmpv6 accept must still
+    shadow a later typed one."""
+    cfg = (
+        "ip6tables -P INPUT DROP\n"
+        "ip6tables -A INPUT -p icmpv6 --icmpv6-type 134 -j ACCEPT\n"
+        "ip6tables -A INPUT -p icmpv6 --icmpv6-type 134 -j ACCEPT\n"
+    )
+    aces, _ = parse_iptables(cfg)
+    findings = _analyze_aces(aces)
+    assert any(f.kind == "redundant" for f in findings), \
+        "identical typed icmpv6 rule must still be flagged redundant"
+
+    cfg2 = (
+        "ip6tables -P INPUT DROP\n"
+        "ip6tables -A INPUT -p icmpv6 -j ACCEPT\n"
+        "ip6tables -A INPUT -p icmpv6 --icmpv6-type 135 -j ACCEPT\n"
+    )
+    aces2, _ = parse_iptables(cfg2)
+    findings2 = _analyze_aces(aces2)
+    assert any(f.kind == "redundant" for f in findings2), \
+        "typeless icmpv6 accept covers every type — later typed rule is redundant"

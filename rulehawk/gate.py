@@ -94,6 +94,11 @@ _KIND_HELP: Dict[str, str] = {
         "A sensitive service (telnet/SMB/RDP/DB/...) permitted from ANY source.",
     "ssh-exposure":
         "SSH permitted from ANY source — fine for a bastion, risky otherwise.",
+    "source-port-trust":
+        "A permit that matches only the SOURCE port (e.g. `permit tcp any eq "
+        "53 any`) — source ports are attacker-controlled, so the rule admits "
+        "traffic to every destination port. Match the destination port, or "
+        "add `established` if it is return traffic.",
     "segmentation-violation":
         "A declared zone isolation (must_not_reach) is broken: the config "
         "permits a concrete witness packet across the forbidden boundary.",
@@ -109,7 +114,7 @@ _KIND_HELP: Dict[str, str] = {
 class FileResult:
     """The audit of one config file."""
     path: str                       # path as given (used in SARIF/locations)
-    vendor: str                     # ios-asa | junos | panos | iptables
+    vendor: str                     # ios-asa | junos | panos | iptables | nxos | eos
     status: str                     # ok | no_rules_parsed | error
     n_rules: int
     findings: List[Finding] = field(default_factory=list)
@@ -657,7 +662,8 @@ options:
   --fail-on LEVEL      fail the gate at this severity or worse:
                        critical | high | medium | low | none   (default: high)
   --vendor V           force a vendor for every file:
-                       auto | ios | junos | panos | iptables   (default: auto)
+                       auto | ios | junos | panos | iptables | nxos | eos
+                       (default: auto)
   --sarif PATH         write a SARIF 2.1.0 report (for code scanning)
   --summary PATH       write the markdown report ('-' for stdout); defaults to
                        $GITHUB_STEP_SUMMARY when that env var is set
@@ -701,6 +707,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if fail_on not in ("critical", "high", "medium", "low", "none"):
         print(f"rulehawk gate: bad --fail-on {fail_on!r}", file=sys.stderr)
+        return 2
+    if vendor != "auto" and vendor not in _VENDORS:
+        print(f"rulehawk gate: unknown --vendor {vendor!r} "
+              "(choose: auto | ios | junos | panos | iptables | nxos | eos)",
+              file=sys.stderr)
         return 2
 
     patterns = [a for a in argv if not a.startswith("-")]

@@ -28,9 +28,15 @@ another rule dead (`covers()` refuses it) and segmentation yields an honest
 "indeterminate / review manually" instead of a possibly-wrong verdict.
 `conntrack`/`state` ESTABLISHED,RELATED matches are return-traffic only and map
 to `stateful` (like Cisco `established`). `multiport` is expanded to the exact
-union of per-port ACEs (sound, not imprecise). NAT/custom-chain jumps and other
-tables are surfaced, never silently dropped (an unmodeled line must never become
-an invisible hole).
+union of per-port ACEs (sound, not imprecise). NAT targets and other tables are
+surfaced, never silently dropped (an unmodeled line must never become an
+invisible hole). Transit-path jumps to custom chains ARE modeled when they can
+be proven: if the target chain is fully modeled (present, no imprecise rules,
+no RETURN/NAT control flow) the jump is resolved to precise ACEs by
+intersecting the jump's match space with each sub-chain rule; a jump that
+cannot be proven (absent chain, RETURN/NAT inside, imprecise sub-rules) fails
+closed as an imprecise, surfaced placeholder — indeterminate, never a silent
+hole. Host-hook (INPUT/OUTPUT) jumps are surfaced only (no transit decision).
 
 Scope (minimal but correct): both the `iptables-save` form (`*filter` ... `-A
 CHAIN ...` ... `COMMIT`) and the command form (`iptables -A CHAIN ...`), for the
@@ -248,7 +254,19 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
             i += 2
         elif t in ("--state", "--ctstate"):
             states = {s.strip().upper() for s in (nxt or "").split(",") if s.strip()}
-            if states and states <= {"ESTABLISHED", "RELATED", "INVALID", "UNTRACKED"}:
+            if negate:
+                # `! --ctstate X` matches the COMPLEMENT of X. The common hygiene
+                # idiom `! --ctstate INVALID -j ACCEPT` therefore accepts all
+                # non-INVALID traffic INCLUDING NEW cross-zone flows — modeling
+                # it as stateful (return-traffic only) would FALSE-PASS a
+                # segmentation assertion. The complement of a state set isn't
+                # modeled, so fail closed: mark imprecise (segcheck turns an
+                # imprecise permit into segmentation-indeterminate, never PASS).
+                r.imprecise = True
+                notes.append(f"negated conntrack state (`! {t} {nxt}`) in {label} "
+                             f"— complement not modeled, marked imprecise — "
+                             f"verify manually")
+            elif states and states <= {"ESTABLISHED", "RELATED", "INVALID", "UNTRACKED"}:
                 # No NEW: return-traffic only -> stateful (never proves a flow open).
                 r.stateful = True
                 notes.append(f"iptables conntrack/state {sorted(states)} in {label} "
@@ -294,15 +312,18 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                                f"rewriting is not modeled (filter-space only; verify "
                                f"the NAT table manually)")
             else:
-                # A jump to a user-defined chain: its effect (accept/drop/return)
-                # is indeterminate in this flat model -> surface, emit no decision.
-                # In a TRANSIT chain we ALSO emit an imprecise marker (see add_rule)
-                # so the FORWARD verdict fails closed instead of FALSE-PASSing a leak
-                # hidden inside the sub-chain.
+                # A jump to a user-defined chain. On the TRANSIT path we emit an
+                # imprecise placeholder (see add_rule) so the FORWARD verdict
+                # fails closed, then a post-parse pass replaces it with precise
+                # ACEs when the target chain is fully modeled (see the precision
+                # resolution pass in parse_iptables). Host hooks (INPUT/OUTPUT)
+                # surface the jump only — no decision emitted.
                 r.jump_custom = nxt or ""
                 r.skip_note = (f"iptables jump to custom chain `-j {nxt}` in {label} — "
-                               f"sub-chain effect not modeled (no decision emitted; "
-                               f"flatten or verify the chain manually)")
+                               f"transit-path jumps are resolved to precise ACEs "
+                               f"below if the chain is fully modeled, otherwise "
+                               f"kept indeterminate (fail-closed); host "
+                               f"INPUT/OUTPUT jumps are surfaced only")
             i += 2
         elif t == "-f" or t == "--fragment":
             r.imprecise = True

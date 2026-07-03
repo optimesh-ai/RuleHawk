@@ -110,17 +110,32 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int,
             lines.append(f"   line : {f.line}")
         if f.cited:
             lines.append(f"   cause: {f.cited}")
+        if f.witness:
+            # Segmentation: the concrete provable packet (e.g.
+            # "10.20.0.1 -> 10.10.0.1:445 (tcp)") — the machine-checkable
+            # artifact an auditor pastes into a ticket or packet-tracer.
+            # Every other surface (JSON, SARIF, step summary, PR comment)
+            # already shows it; the CLI text report must too.
+            lines.append(f"   pkt  : {f.witness}")
         lines.append(f"   why  : {f.message}")
         if f.fix:
             lines.append(f"   fix  : {f.fix}")
-    # Cleanup plan: the safe-to-delete (redundant) rules, collected.
-    dead = [f for f in findings if f.kind == "redundant"]
+    # Cleanup plan: the safe-to-delete (redundant) rules, collected. Both
+    # redundancy kinds belong here — "redundant" (covered by ONE earlier
+    # same-action rule) and "union-redundant" (covered by the UNION of several
+    # earlier same-action rules); the union message literally says "safe to
+    # remove", so omitting it would make the copy-into-ticket section
+    # under-report what the engine already proved deletable.
+    dead = [f for f in findings if f.kind in ("redundant", "union-redundant")]
     if dead:
         lines.append("")
         lines.append("-" * 64)
         lines.append(f" Cleanup plan: {len(dead)} redundant rule(s) safe to remove:")
         for f in dead:
-            lines.append(f"   - {f.rule_id}: {f.rule}")
+            # Include the config file line when known so the operator can apply
+            # the deletion without grepping the config by hand.
+            loc = f" (line {f.line})" if f.line else ""
+            lines.append(f"   - {f.rule_id}{loc}: {f.rule}")
     if notes:
         lines.append("")
         lines.append(f" Parse notes ({len(notes)} line(s) — resolved expansions "

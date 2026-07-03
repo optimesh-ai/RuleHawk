@@ -215,3 +215,63 @@ def test_ip_range_address_expands_exactly():
     # 10.10.0.0-10.10.0.255 summarizes exactly to a single /24.
     assert {str(a.dst) for a in aces} == {"10.10.0.0/24"}
     assert all(a.imprecise is False for a in aces)
+
+
+# ── negate-source/destination soundness (false-PASS regression) ───────────────
+# `negate-source yes` means the rule matches the COMPLEMENT of the listed set.
+# Modeling the LISTED nets (even marked imprecise) UNDER-approximates: segcheck
+# skips any ACE whose modeled src doesn't contain the probe, so a probe outside
+# the listed set never sees the permit and the audit prints a false PASS. The
+# negated dimension must widen to ANY (⊇ complement), imprecise=True — the same
+# discipline parse_iptables applies to `! -s` (src left at ANY).
+
+def test_negate_source_widens_to_any_not_listed_nets():
+    cfg = """
+    set address corp-net ip-netmask 10.99.0.0/16
+    set rulebase security rules allow-except from any to any source [ corp-net ] negate-source yes destination 10.10.0.0/16 application any service any action allow
+    """
+    aces, notes = parse_panos(cfg)
+    assert len(aces) == 1
+    a = aces[0]
+    # The real match is everything EXCEPT 10.99.0.0/16 — the modeled src must be
+    # ANY (a superset), never the listed 10.99.0.0/16 (a disjoint set).
+    assert str(a.src) == "0.0.0.0/0"
+    assert str(a.dst) == "10.10.0.0/16"       # non-negated dim stays exact
+    assert a.imprecise is True                # ANY over-approximates -> no proofs
+    assert any("negate-source" in n and "widened to any" in n for n in notes)
+
+
+def test_negate_destination_widens_to_any_not_listed_nets():
+    cfg = """
+    set address dmz-net ip-netmask 192.0.2.0/24
+    set rulebase security rules allow-except from any to any source 10.20.0.0/16 destination [ dmz-net ] negate-destination yes application any service any action allow
+    """
+    aces, notes = parse_panos(cfg)
+    assert len(aces) == 1
+    a = aces[0]
+    assert str(a.dst) == "0.0.0.0/0"          # complement -> widened to ANY
+    assert str(a.src) == "10.20.0.0/16"       # non-negated dim stays exact
+    assert a.imprecise is True
+    assert any("negate-destination" in n and "widened to any" in n for n in notes)
+
+
+def test_negate_source_repro_indeterminate_not_pass():
+    # The live repro: 'source [ CORP-NET(10.99/16) ] negate-source yes action
+    # allow' + default deny. The real firewall PERMITS 10.20.0.0/16 -> PCI
+    # (10.20/16 is outside the negated set), so a green "PASS: CORP cannot reach
+    # PCI" is a false compliance claim. The honest verdict is INDETERMINATE.
+    cfg = """
+    set address corp-net ip-netmask 10.99.0.0/16
+    set rulebase security rules allow-except from any to any source [ corp-net ] negate-source yes destination any application any service any action allow
+    set rulebase security rules default-deny from any to any source any destination any application any service any action deny
+    """
+    aces, _ = parse_panos(cfg)
+    findings = check_segmentation(aces, _SEG_POLICY)
+    kinds = {f.kind for f in findings}
+    assert "segmentation-ok" not in kinds, (
+        "FALSE PASS: negate-source permit modeled as the listed net — the real "
+        "firewall permits CORP->PCI (CORP is outside the negated set)")
+    # Fail-closed, not fail-wrong: no concrete witness exists in the modeled
+    # space, so it must be INDETERMINATE (review manually), never CRITICAL.
+    assert "segmentation-indeterminate" in kinds
+    assert "segmentation-violation" not in kinds

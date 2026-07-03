@@ -380,5 +380,29 @@ def test_main_bad_fail_on_is_usage_error(tmp_path):
     assert gate.main([p, "--fail-on", "bogus"]) == 2
 
 
+def test_main_unknown_vendor_is_usage_error(tmp_path, capsys):
+    """A --vendor typo must error out (exit 2), never silently fall back to
+    the ios-asa parser and audit under the wrong grammar."""
+    p = _write(str(tmp_path), "edge.acl", _CISCO)
+    assert gate.main([p, "--vendor", "cisc0"]) == 2
+    err = capsys.readouterr().err
+    assert "unknown --vendor" in err and "cisc0" in err
+    # The error should teach the full vendor list, including nxos/eos.
+    assert "nxos" in err and "eos" in err
+
+
+def test_main_known_vendor_aliases_accepted(tmp_path, capsys):
+    """Every alias in _VENDORS (and 'auto', any case) passes validation.
+
+    A forced vendor on a mismatched file may still exit 2 via the fail-closed
+    no_rules_parsed path — that is correct — so we assert on the *reason*:
+    no 'unknown --vendor' usage error may appear for a valid alias."""
+    p = _write(str(tmp_path), "clean.acl", _CLEAN)
+    for v in list(gate._VENDORS) + ["auto", "IOS", "Arista"]:
+        gate.main([p, "--vendor", v, "-q"])
+        assert "unknown --vendor" not in capsys.readouterr().err, \
+            f"valid vendor {v!r} rejected as unknown"
+
+
 def test_main_no_match_is_error(tmp_path):
     assert gate.main([os.path.join(str(tmp_path), "nope-*.acl")]) == 2

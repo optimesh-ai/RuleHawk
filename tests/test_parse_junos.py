@@ -220,6 +220,309 @@ def test_unparsed_address_value_marks_imprecise():
     assert any("not-an-ip" in n and "imprecise" in n for n in notes)
 
 
+# ── apply-groups inside a filter must never become an invisible hole ──────────
+# Junos configuration groups inject inherited terms (BEFORE local terms) that a
+# pasted snippet does not show. Before the fix, `apply-groups G;` in a filter
+# body was silently skipped: the missing inherited permit fell to the implicit
+# default deny and segcheck printed PASS for a flow the device actually allows —
+# a false PASS with zero notes. The fix: note + one leading opaque ACE (permit
+# ip any->any, imprecise) so evaluation is INDETERMINATE, never default-deny.
+
+_APPLY_GROUPS_FILTER = """
+firewall { family inet { filter PCI-EDGE {
+    apply-groups SEC-BOILERPLATE;
+    term DEFAULT { then discard; }
+} } }
+"""
+
+
+def test_apply_groups_in_filter_injects_leading_opaque_ace():
+    aces, notes = parse_junos(_APPLY_GROUPS_FILTER)
+    assert len(aces) == 2
+    opaque = aces[0]                       # inherited terms precede local terms
+    assert opaque.seq == 1
+    assert opaque.action == "permit" and opaque.proto == "ip"
+    assert opaque.src_any and opaque.dst_any
+    assert opaque.imprecise is True
+    assert "apply-groups" in opaque.raw
+    assert aces[1].action == "deny"        # the literal DEFAULT term still parses
+    assert any("apply-groups" in n and "SEC-BOILERPLATE" in n for n in notes)
+
+
+def test_apply_groups_filter_yields_indeterminate_not_false_pass():
+    # The trust-breaking case: only literal term is a discard, so pre-fix the
+    # forbidden flow fell to default deny -> PASS. It must now be indeterminate.
+    aces, _ = parse_junos(_APPLY_GROUPS_FILTER)
+    kinds = {f.kind for f in check_segmentation(aces, _POLICY)}
+    assert "segmentation-indeterminate" in kinds
+    assert "segmentation-ok" not in kinds, (
+        "a filter with apply-groups (invisible inherited terms) must never "
+        "PASS a segmentation assertion")
+    assert "segmentation-violation" not in kinds  # opaque never proves a leak
+
+
+def test_apply_groups_opaque_never_proves_deadness_or_any_any():
+    # The injected opaque ACE is imprecise: it must not shadow the literal terms
+    # (no intent-inversion) and must not fire permit-any-any on itself.
+    aces, _ = parse_junos(_APPLY_GROUPS_FILTER)
+    kinds = {f.kind for f in _analyze_aces(aces)}
+    assert "intent-inversion-deny-dead" not in kinds
+    assert "permit-any-any" not in kinds
+
+
+def test_apply_groups_except_in_filter_also_fails_closed():
+    cfg = """
+    firewall { family inet { filter F {
+        apply-groups-except [ G1 G2 ];
+        term DEFAULT { then discard; }
+    } } }
+    """
+    aces, notes = parse_junos(cfg)
+    assert aces[0].imprecise is True and aces[0].src_any and aces[0].dst_any
+    assert any("apply-groups-except" in n and "G1 G2" in n for n in notes)
+
+
+def test_top_level_apply_groups_is_surfaced_as_note_only():
+    # apply-groups OUTSIDE a filter body (the ubiquitous top-of-config form)
+    # can't be attributed to one filter: it is surfaced as a note, and the
+    # literal filters keep their exact model (no opaque ACE injected).
+    cfg = """
+    apply-groups [ re0 re1 ];
+    firewall { family inet { filter F {
+        term BLOCK { from { protocol tcp; destination-port 445; } then discard; }
+        term DEFAULT { then discard; }
+    } } }
+    """
+    aces, notes = parse_junos(cfg)
+    assert len(aces) == 2                       # no opaque ACE injected
+    assert all(a.imprecise is False for a in aces)
+    assert any("apply-groups re0 re1" in n and "outside a filter body" in n
+               for n in notes)
+
+
+def test_harmless_filter_statement_skipped_without_note():
+    cfg = """
+    firewall { family inet { filter F {
+        interface-specific;
+        term T { from { protocol tcp; destination-port 22; } then accept; }
+    } } }
+    """
+    aces, notes = parse_junos(cfg)
+    assert len(aces) == 1 and aces[0].action == "permit"
+    assert not any("interface-specific" in n for n in notes)
+
+
+def test_unknown_filter_statement_gets_note_terms_still_parse():
+    cfg = """
+    firewall { family inet { filter F {
+        frobnicate-mode strict;
+        term T { from { protocol tcp; destination-port 22; } then accept; }
+    } } }
+    """
+    aces, notes = parse_junos(cfg)
+    assert len(aces) == 1 and aces[0].action == "permit"
+    assert aces[0].imprecise is False           # note-only; term model stays exact
+    assert any("frobnicate-mode" in n for n in notes)
+
+
+def test_inactive_term_is_skipped_with_note():
+    # `inactive: term X` is NOT evaluated on the device — modeling it as live
+    # (the old token-skip behavior) could let a deactivated deny falsely block
+    # a witness. It must be skipped and surfaced.
+    cfg = """
+    firewall { family inet { filter F {
+        inactive: term BLOCK {
+            from { protocol tcp; destination-port 445; } then discard;
+        }
+        term ALLOW-ALL { then accept; }
+    } } }
+    """
+    aces, notes = parse_junos(cfg)
+    assert len(aces) == 1 and aces[0].action == "permit"
+    assert any("inactive:" in n and "BLOCK" in n for n in notes)
+
+
+# ── family inet6: v4 any-fallbacks made v6 permits invisible (false PASS) ─────
+# Before the fix the parser ignored the `family` keyword: an inet6 term with a
+# missing src/dst fell back to 0.0.0.0/0. Mixed IP versions never intersect
+# (segcheck._intersect returns None; `v6addr in v4net` is False), so the emitted
+# ACE could never match a v6 witness — real inet6 permits were INVISIBLE and
+# segcheck printed PASS on assertions the device actually violates, silently
+# (no note, imprecise=False). These tests pin the fail-closed v6 behavior.
+
+_POLICY6 = {
+    "zones": {"BAD6": ["2001:db8:bad::/48"], "DB6": ["2001:db8:db::/48"]},
+    "must_not_reach": [{"src": "BAD6", "dst": "DB6"}],
+}
+
+_V6_LEAK = """
+firewall { family inet6 { filter V6-EDGE {
+    term allow-db {
+        from { source-address 2001:db8:bad::/48; }
+        then accept;
+    }
+} } }
+"""
+
+
+def test_inet6_missing_dst_falls_back_to_v6_any_not_v4():
+    # The exact reproduction: an inet6 term with no destination-address matches
+    # ALL of v6 on the device — the emitted ACE must say ::/0, not 0.0.0.0/0.
+    aces, _ = parse_junos(_V6_LEAK)
+    assert len(aces) == 1
+    a = aces[0]
+    assert str(a.src) == "2001:db8:bad::/48"
+    assert a.dst.version == 6 and str(a.dst) == "::/0"
+    assert a.dst_any
+    assert a.imprecise is False                 # the v6 space is exact
+
+
+def test_inet6_segmentation_violation_no_longer_false_passes():
+    # Pre-fix: dst fell back to 0.0.0.0/0, the v6 witness never matched, and the
+    # assertion PASSed while the real device permits the flow. Must be CRITICAL.
+    aces, _ = parse_junos(_V6_LEAK)
+    findings = check_segmentation(aces, _POLICY6)
+    kinds = {f.kind for f in findings}
+    assert "segmentation-ok" not in kinds, (
+        "an inet6 permit the device enforces must never false-PASS a v6 "
+        "segmentation assertion")
+    viol = [f for f in findings if f.kind == "segmentation-violation"]
+    assert viol and viol[0].severity == "critical"
+    assert "2001:db8:bad" in viol[0].witness
+
+
+def test_inet6_default_term_and_earlier_discard_still_sound():
+    # An inet6 discard of the forbidden flow before a broad accept must PASS —
+    # the deny fallback nets are v6 too, so first-match still blocks the witness.
+    cfg = """
+    firewall { family inet6 { filter SAFE6 {
+        term BLOCK {
+            from { source-address 2001:db8:bad::/48;
+                   destination-address 2001:db8:db::/48; }
+            then discard;
+        }
+        term ALLOW-ALL { then accept; }
+    } } }
+    """
+    aces, _ = parse_junos(cfg)
+    assert all(a.src.version == 6 and a.dst.version == 6 for a in aces)
+    kinds = {f.kind for f in check_segmentation(aces, _POLICY6)}
+    assert "segmentation-violation" not in kinds
+    assert "segmentation-ok" in kinds
+
+
+def test_inet6_apply_groups_opaque_is_v6_fail_closed():
+    # Pre-fix the apply-groups fail-closed opaque ACE was v4 any/any: it never
+    # matched a v6 witness, so the guard failed OPEN for inet6 filters (the
+    # invisible inherited permit fell to default deny -> false PASS).
+    cfg = """
+    firewall { family inet6 { filter PCI6 {
+        apply-groups SEC-BOILERPLATE;
+        term DEFAULT { then discard; }
+    } } }
+    """
+    aces, notes = parse_junos(cfg)
+    opaque = aces[0]
+    assert opaque.imprecise is True
+    assert opaque.src.version == 6 and str(opaque.src) == "::/0"
+    assert opaque.dst.version == 6 and str(opaque.dst) == "::/0"
+    kinds = {f.kind for f in check_segmentation(aces, _POLICY6)}
+    assert "segmentation-indeterminate" in kinds
+    assert "segmentation-ok" not in kinds
+    assert any("apply-groups" in n for n in notes)
+
+
+def test_inet6_unresolved_remainder_opaque_is_v6():
+    # Partial precision in an inet6 filter: the opaque remainder for the
+    # unresolved named address must be ::/0 (a v4 remainder can never keep a
+    # v6 assertion indeterminate — it would fail open).
+    cfg = """
+    firewall { family inet6 { filter F6 {
+        term T {
+            from {
+                source-address { 2001:db8:bad::/48; web-servers-v6; }
+                destination-address 2001:db8:db::/48;
+            }
+            then accept;
+        }
+    } } }
+    """
+    aces, notes = parse_junos(cfg)
+    assert len(aces) == 2
+    exact, opaque = aces
+    assert exact.imprecise is False and str(exact.src) == "2001:db8:bad::/48"
+    assert opaque.imprecise is True
+    assert opaque.src.version == 6 and opaque.dst.version == 6
+    assert any("partially resolved" in n for n in notes)
+
+
+def test_family_inferred_inet6_without_family_block():
+    # A filter pasted WITHOUT its enclosing family block but holding v6
+    # addresses is modeled as inet6 (fail toward the v6 any), with a note.
+    cfg = """
+    filter BARE6 {
+        term allow { from { source-address 2001:db8:bad::/48; } then accept; }
+        term DEFAULT { then discard; }
+    }
+    """
+    aces, notes = parse_junos(cfg)
+    assert len(aces) == 2
+    assert aces[0].dst.version == 6            # allow: missing dst -> ::/0
+    assert aces[1].src.version == 6            # DEFAULT: both fallbacks -> ::/0
+    assert aces[1].dst.version == 6
+    assert any("inet6" in n and "BARE6" in n for n in notes)
+    kinds = {f.kind for f in check_segmentation(aces, _POLICY6)}
+    assert "segmentation-violation" in kinds
+
+
+def test_family_less_v4_filter_behavior_unchanged():
+    # Pure-v4 filter outside a family block: v4 fallbacks, no inference note.
+    cfg = """
+    filter BARE4 {
+        term allow { from { source-address 10.20.0.0/16; } then accept; }
+    }
+    """
+    aces, notes = parse_junos(cfg)
+    assert len(aces) == 1
+    assert str(aces[0].dst) == "0.0.0.0/0"
+    assert not any("inet6" in n for n in notes)
+
+
+def test_one_sided_fallback_matches_the_given_sides_version():
+    # Even with no family context at all per-term, the missing side must take
+    # the IP version of the given side (never a cross-version dead ACE).
+    cfg = """
+    firewall {
+        family inet6 { filter A6 {
+            term t { from { destination-address 2001:db8:db::/48; } then accept; }
+        } }
+        family inet { filter A4 {
+            term t { from { destination-address 10.10.0.0/16; } then accept; }
+        } }
+    }
+    """
+    aces, _ = parse_junos(cfg)
+    by_acl = {a.acl: a for a in aces}
+    assert str(by_acl["A6"].src) == "::/0"
+    assert str(by_acl["A4"].src) == "0.0.0.0/0"
+
+
+def test_bare_v6_host_address_is_slash_128_not_v6_slash_32():
+    # A bare v6 address is a HOST match: appending the v4 "/32" would widen it
+    # to a v6 /32 (2^96 addresses) — an over-approximation that could mint a
+    # false CRITICAL from a permit that matches only one host.
+    cfg = """
+    firewall { family inet6 { filter H {
+        term t { from { source-address 2001:db8:bad::1;
+                        destination-address 2001:db8:db::7; } then accept; }
+    } } }
+    """
+    aces, _ = parse_junos(cfg)
+    assert len(aces) == 1
+    assert str(aces[0].src) == "2001:db8:bad::1/128"
+    assert str(aces[0].dst) == "2001:db8:db::7/128"
+
+
 def test_unparsed_port_does_not_falsely_kill_later_deny():
     # The actual harm: an imprecise all-ANY permit must NOT prove a real later
     # deny on 445 dead. Before the fix this emitted a false CRITICAL.

@@ -64,15 +64,27 @@ json.dumps({"report_json": json.loads(to_json(findings, notes, len(aces))),
 
 let pyReady = null;
 
+// Additive boot-progress posts: the page maps these to honest staged status text
+// so the multi-second first load (multi-MB runtime download) never looks hung.
+// Pages that don't know the 'progress' type ignore it (index.html's onmessage
+// drops unknown types), so this changes nothing for the ready/error/result flow.
+function progress(stage, loaded, total) {
+  try { self.postMessage({ type: "progress", stage, loaded, total }); } catch (_) {}
+}
+
 async function boot() {
+  progress("runtime");                       // downloading the Pyodide runtime (the big one)
   importScripts("https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js");
   const pyodide = await loadPyodide();
   pyodide.FS.mkdir("rulehawk");
-  for (const m of ENGINE_MODULES) {
+  for (let i = 0; i < ENGINE_MODULES.length; i++) {
+    const m = ENGINE_MODULES[i];
+    progress("engine", i, ENGINE_MODULES.length);   // loading engine module i+1 of N
     const r = await fetch(`./rulehawk/${m}.py`, { cache: "no-cache" });
     if (!r.ok) throw new Error(`could not load engine module ${m}.py (${r.status})`);
     pyodide.FS.writeFile(`rulehawk/${m}.py`, await r.text());
   }
+  progress("start");                         // warm-up import of the engine
   pyodide.runPython("import sys; sys.path.insert(0, '.'); "
     + "import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, "
     + "rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, "

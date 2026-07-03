@@ -23,7 +23,7 @@ inputs:
     required: false
     default: 'high'
   vendor:
-    description: 'Force a vendor for every file: auto | ios | junos | panos | iptables'
+    description: 'Force a vendor for every file: auto | ios | junos | panos | iptables | nxos | eos'
     required: false
     default: 'auto'
   comment:

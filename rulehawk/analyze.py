@@ -10,6 +10,9 @@ Per ACL (entries in match order):
        - redundant                    (same action) -> safe to delete (low).
   * OVERLY-PERMISSIVE     — permit ip any any (critical) and broad any (high).
   * DANGEROUS-EXPOSURE    — a permit exposing a sensitive service to `any` src.
+  * SOURCE-PORT-TRUST     — a permit gated ONLY by the attacker-controlled
+                            SOURCE port (e.g. `permit tcp any eq 53 any`): the
+                            pre-`established` return-traffic anti-pattern.
 Only EXACT earlier rules can prove a later rule dead (see model.covers): an
 `imprecise` (neq / bad mask) or `stateful` (established) rule never covers,
 so we never recommend deleting a load-bearing rule.
@@ -225,6 +228,23 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
                     f"{', '.join(hits)}.", b.raw,
                     fix="restrict the source, or remove if unused",
                     line=b.line))
+        # Source-port-only trust: `permit tcp any eq 53 any` admits traffic to
+        # EVERY destination port on the strength of a port the ATTACKER sets —
+        # the classic pre-`established` return-traffic anti-pattern. Genuine
+        # `established` return permits were exempted above (stateful continue),
+        # and an imprecise (over-approximated) space is never judged.
+        if (b.proto in ("tcp", "udp") and not b.imprecise
+                and not b.src_port.is_any() and b.dst_port.is_any()):
+            findings.append(Finding(
+                _id(b), "source-port-trust", "high",
+                f"permit relies only on the SOURCE port ({b.src_port}) — "
+                f"source ports are attacker-controlled; this admits {b.proto} "
+                f"traffic to every destination port.",
+                b.raw,
+                fix=(f"match the destination port instead, or add "
+                     f"`established` if this is return traffic"
+                     f"{_line_sfx(b.line)}"),
+                line=b.line))
     return findings
 
 

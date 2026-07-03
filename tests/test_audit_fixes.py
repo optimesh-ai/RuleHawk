@@ -189,3 +189,99 @@ def test_within_acl_earlier_deny_still_blocks():
         " permit ip any any\n")
     kinds = _seg_kinds(aces)
     assert "segmentation-ok" in kinds and "segmentation-violation" not in kinds
+
+
+# === Unknown trailing tokens (2026-W27): tcp flags / unresolvable eq names ===
+# `deny tcp ... eq 445 syn` used to parse as an exact FULL-WIDTH deny — but the
+# device only blocks SYN-flagged packets, so segcheck "proved" isolation the
+# device does not enforce (false PASS). Likewise `eq www exec` silently dropped
+# the unresolvable `exec` port with no flag. Unknown trailing tokens now fail
+# closed: imprecise + a note.
+
+
+def test_tcp_flag_deny_does_not_false_pass_segmentation():
+    # Mutation guard: stop flagging unknown trailing tokens -> the syn-narrowed
+    # deny reverts to an exact full-width deny -> segmentation-ok (FALSE PASS).
+    aces, notes = parse_acls(
+        "ip access-list extended OUT\n"
+        " deny tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq 445 syn\n"
+        " permit ip any any\n")
+    assert aces[0].action == "deny" and aces[0].imprecise is True
+    assert any("unrecognized trailing qualifier syn" in n for n in notes)
+    kinds = _seg_kinds(aces)
+    assert "segmentation-ok" not in kinds, \
+        "FALSE PASS: syn-narrowed deny treated as full-width"
+    assert "segmentation-indeterminate" in kinds
+
+
+def test_unknown_eq_service_name_marks_imprecise():
+    # `exec` (512) is outside the named-port table; the device permits it but the
+    # model kept only port 80 with NO flag — an under-modeled permit. Now the
+    # modeled port stays exact-shaped but the ACE is imprecise + noted.
+    aces, notes = parse_acls(
+        "ip access-list extended T\n permit tcp any any eq www exec\n")
+    assert len(aces) == 1
+    assert (aces[0].dst_port.lo, aces[0].dst_port.hi) == (80, 80)
+    assert aces[0].imprecise is True
+    assert any("unrecognized trailing qualifier exec" in n for n in notes)
+
+
+def test_unknown_eq_service_name_does_not_false_pass_segmentation():
+    # The unresolvable name could be ANY port (including the forbidden one), so
+    # the assertion must come back indeterminate, never PASS.
+    aces, _ = parse_acls(
+        "ip access-list extended OUT\n"
+        " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq www exec\n")
+    kinds = _seg_kinds(aces)
+    assert "segmentation-ok" not in kinds
+    assert "segmentation-indeterminate" in kinds
+
+
+def test_log_and_asa_log_arguments_stay_exact():
+    # `log` never narrows the match; ASA log arguments ([level] [interval N] |
+    # disable | default) must be consumed, not mistaken for unknown qualifiers.
+    aces, notes = parse_acls(
+        "access-list OUT extended permit tcp any any eq 443 log 6 interval 300\n"
+        "access-list OUT extended deny ip any any log disable\n"
+        "access-list OUT extended permit tcp any any eq 80 log default\n"
+        "access-list OUT extended permit tcp any any eq 22 log-input\n")
+    assert len(aces) == 4
+    assert all(not a.imprecise for a in aces)
+    assert not any("unrecognized" in n for n in notes)
+
+
+def test_icmp_type_slot_still_exact_and_extra_token_flags():
+    # The first free trailing token on an icmp ACE is the (modeled) ICMP type —
+    # it must stay exact. Any FURTHER free token is unknown -> imprecise.
+    aces, notes = parse_acls(
+        "ip access-list extended T\n"
+        " permit icmp any any echo\n"
+        " permit icmp any any echo bogus-qual\n")
+    assert aces[0].icmp_type == "echo" and aces[0].imprecise is False
+    assert aces[1].icmp_type == "echo" and aces[1].imprecise is True
+    assert any("unrecognized trailing qualifier bogus-qual" in n for n in notes)
+
+
+def test_object_group_resolved_deny_with_tcp_flag_fails_closed():
+    # Same hazard through the object-group resolver: a syn-narrowed deny whose
+    # addresses resolve exactly must still be imprecise (never prove isolation).
+    aces, notes = parse_acls(
+        "object-group network CORP_NET\n network-object 10.20.0.0 255.255.0.0\n"
+        "ip access-list extended OUT\n"
+        " deny tcp object-group CORP_NET 10.10.0.0 0.0.255.255 eq 445 syn\n"
+        " permit ip any any\n")
+    denies = [a for a in aces if a.action == "deny"]
+    assert denies and all(a.imprecise for a in denies)
+    assert any("unrecognized trailing qualifier syn" in n for n in notes)
+    kinds = _seg_kinds(aces)
+    assert "segmentation-ok" not in kinds
+
+
+def test_show_access_list_hitcnt_residue_fails_closed():
+    # Pasted `show access-list` output carries trailing hitcnt/hash tokens; they
+    # must never be silently ignored on an exact ACE (fail closed -> imprecise).
+    aces, notes = parse_acls(
+        "access-list OUT line 1 extended permit tcp any any eq 80 "
+        "(hitcnt=1234) 0xabcd1234\n")
+    assert len(aces) == 1 and aces[0].imprecise is True
+    assert any("unrecognized trailing qualifier" in n for n in notes)

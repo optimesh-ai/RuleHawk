@@ -44,3 +44,52 @@ def test_text_report_elides_with_explicit_pointer_past_cap():
     text = to_text([], notes, 0)
     assert "and " in text and "more not shown" in text
     assert "--json" in text  # tells the user how to get the complete list
+
+
+# --- Segmentation witness packet in the CLI text report ------------------
+# The witness is the concrete provable packet (segcheck's whole promise:
+# "every violation is a real packet an auditor can verify"). Every other
+# surface (JSON, SARIF, step summary, PR comment) shows it; the day-1 CLI
+# text report must too.
+
+from rulehawk.analyze import Finding  # noqa: E402
+
+
+def _seg_finding(**kw):
+    base = dict(
+        rule_id="ACL:10",
+        kind="segmentation",
+        severity="critical",
+        message=("SEGMENTATION VIOLATION: policy forbids guest -> pci, but "
+                 "rule PERMITS 10.20.0.1 -> 10.10.0.1:445"),
+        rule="permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq 445",
+        cited="policy: deny guest -> pci",
+        fix="deny tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq 445",
+        witness="10.20.0.1 -> 10.10.0.1:445 (tcp)",
+        line=12,
+    )
+    base.update(kw)
+    return Finding(**base)
+
+
+def test_text_report_shows_witness_packet():
+    text = to_text([_seg_finding()], [], 5)
+    assert "   pkt  : 10.20.0.1 -> 10.10.0.1:445 (tcp)" in text
+    # It must sit alongside the rest of the finding block, not replace anything.
+    assert "   rule : " in text
+    assert "   cause: " in text
+    assert "   why  : " in text
+    assert "   fix  : " in text
+
+
+def test_text_report_omits_pkt_line_when_no_witness():
+    # Non-segmentation findings (witness == "") must not grow an empty pkt line.
+    text = to_text([_seg_finding(witness="", kind="shadowed", severity="high")],
+                   [], 5)
+    assert "pkt  :" not in text
+
+
+def test_json_still_carries_witness():
+    # Guard the existing JSON surface: additive change must not regress it.
+    doc = json.loads(to_json([_seg_finding()], [], 5))
+    assert doc["findings"][0]["witness"] == "10.20.0.1 -> 10.10.0.1:445 (tcp)"
