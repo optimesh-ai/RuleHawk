@@ -95,6 +95,39 @@ def test_jump_nonported_proto_child_wildcard_any_ports():
     assert any("resolved precisely" in n and "ICMPCTL" in n for n in notes)
 
 
+def test_jump_narrow_proto_prunes_disjoint_proto_child():
+    """A `-p tcp` jump into a chain holding BOTH a udp child and a tcp child:
+    the udp child must be pruned at the disjoint-protocol branch (neither the
+    jump proto nor the child proto is a wildcard, and they differ), so exactly
+    ONE FORWARD ACE resolves — the tcp child's — and NOTHING derived from the
+    udp rule. If that pruning branch fell through instead of dropping the child,
+    the udp rule would be injected into FORWARD as a spurious TCP ACE, corrupting
+    the first-match stream segcheck/shadow analysis evaluate → false verdicts."""
+    cfg = (
+        "*filter\n"
+        ":FORWARD DROP [0:0]\n"
+        ":SEG - [0:0]\n"
+        "-A FORWARD -p tcp -j SEG\n"
+        "-A SEG -p udp -d 10.10.0.0/16 -j ACCEPT\n"
+        "-A SEG -p tcp -d 10.20.0.0/16 --dport 22 -j ACCEPT\n"
+        "COMMIT\n"
+    )
+    aces, notes = parse_iptables(cfg)
+    fwd = _fwd_non_policy(aces)
+    assert len(fwd) == 1, "only the tcp child survives; the udp child is pruned"
+    ace = fwd[0]
+    # The one surviving ACE is the tcp child — never a proto-mismatched spurion.
+    assert ace.action == "permit"
+    assert ace.proto == "tcp"
+    assert str(ace.dst) == "10.20.0.0/16"
+    assert ace.dst_port.lo == 22 and ace.dst_port.hi == 22
+    assert ace.imprecise is False and ace.transit is True
+    # Zero ACEs may carry the udp child's dst (10.10/16) or lack a dport — proof
+    # the disjoint-proto child was dropped, not fabricated as a tcp ACE.
+    assert not any(str(a.dst) == "10.10.0.0/16" for a in fwd)
+    assert any("resolved precisely" in n and "SEG" in n for n in notes)
+
+
 # ── (2) disjoint address spaces → zero resolved ACEs (fall-through) ───────────
 
 def test_disjoint_src_spaces_resolve_to_zero_aces_fall_through():

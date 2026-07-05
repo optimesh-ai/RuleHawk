@@ -17,10 +17,19 @@ Policy (JSON):
 from __future__ import annotations
 
 import ipaddress
+from functools import lru_cache
 from typing import List, Optional, Tuple
 
 from .analyze import Finding
 from .model import ACE, PORT_MAX, PORT_MIN, _WILDCARD_PROTO, _IPNet
+
+# Witness src/dst strings come from _witness_host (a bounded set per run) and get
+# re-parsed once per candidate rule inside _rule_matches, so a large PASS audit
+# re-parses the SAME two strings n times per witness -> O(n^2) ipaddress parsing.
+# Memoize the pure str->address parse. ip_address(str) is a pure function of the
+# string, so results are byte-identical; maxsize bounds memory in the long-running
+# hosted process (witness strings are a small bounded set).
+_addr = lru_cache(maxsize=4096)(ipaddress.ip_address)
 
 
 def _net(s: str) -> _IPNet:
@@ -51,7 +60,7 @@ def _rule_matches(r: ACE, proto: str, src: str, dst: str, port: Optional[int]):
     # specific probe (tcp/udp/icmp) requires the rule's proto to match.
     if proto not in _WILDCARD_PROTO and not (r.proto in _WILDCARD_PROTO or r.proto == proto):
         return False
-    s, d = ipaddress.ip_address(src), ipaddress.ip_address(dst)
+    s, d = _addr(src), _addr(dst)
     if s not in r.src or d not in r.dst:
         return False
     if r.imprecise:
@@ -148,6 +157,30 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
         proto = (assertion.get("proto") or "ip").lower()
         ports = assertion.get("ports") or [None]
         label = f"{sname}!->{dname}" + (f"/{proto}" if proto != "ip" else "")
+        # Fail closed on an assertion that names a zone we can't resolve. A null
+        # (omitted key) or misspelled/undefined src/dst would make the witness
+        # search below iterate over zones.get(name, []) == [] and silently emit
+        # a "segmentation-ok" PASS — a fabricated bill of health for a check that
+        # never ran. The whole point of RuleHawk is to NOT hand back false
+        # assurance, so an unresolvable zone is an ERROR (the assertion could not
+        # be evaluated), never a PASS.
+        _defined = sorted(zones.keys())
+        _unknown = [role for role, nm in (("src", sname), ("dst", dname))
+                    if nm is None or nm not in zones]
+        if _unknown:
+            _detail = "; ".join(
+                (f"missing {role} zone" if (sname if role == "src" else dname) is None
+                 else f"unknown {role} zone "
+                      f"'{sname if role == 'src' else dname}'")
+                for role in _unknown)
+            findings.append(Finding(
+                label, "segmentation-error", "high",
+                f"CANNOT EVALUATE ({sname} must not reach {dname}): {_detail}. "
+                f"Defined zones: {', '.join(_defined) or '(none)'}. "
+                f"This assertion was NOT checked — no isolation is proven.", "",
+                fix=("define the named zone(s) in policy 'zones', or fix the "
+                     "typo so src/dst reference existing zones")))
+            continue
         reported = False
         for sa in zones.get(sname, []):
             for db in zones.get(dname, []):

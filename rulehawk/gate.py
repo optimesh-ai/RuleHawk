@@ -384,7 +384,17 @@ def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
                 },
             }],
             "partialFingerprints": {
-                "ruleHawk/v1": f"{_sarif_uri(fr.path)}:{f.rule_id}:{f.kind}",
+                # The witness is the per-finding discriminator: for a
+                # segmentation violation `rule_id` is the offending ACL rule
+                # ({acl}:{seq}), which is IDENTICAL across every zone pair the
+                # one permissive rule breaches — so keying on rule_id+kind alone
+                # lets GitHub code scanning collapse distinct boundary breaches
+                # into a single alert, hiding real isolation failures. The
+                # witness encodes the concrete src/dst hosts and port, so it is
+                # unique per (zone-pair, proto, ports) finding and keeps each
+                # genuine violation as its own alert. Empty for non-segmentation
+                # findings (unchanged: those already differ by rule_id).
+                "ruleHawk/v1": f"{_sarif_uri(fr.path)}:{f.rule_id}:{f.kind}:{f.witness}",
             },
         })
     # Fail-closed: a file that parsed to zero rules (or could not be read) must

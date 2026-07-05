@@ -294,6 +294,41 @@ def test_sarif_shape_levels_and_lines(tmp_path):
     assert paa_rule["properties"]["security-severity"] == "9.5"
 
 
+def test_sarif_fingerprints_distinct_per_zone_pair():
+    """One permissive rule that breaches several boundaries yields several
+    segmentation-violation Findings that SHARE rule_id ({acl}:{seq}), kind, and
+    startLine — differing only in their witness. Their SARIF partialFingerprints
+    must stay DISTINCT so GitHub code scanning keeps each real breach as its own
+    alert instead of collapsing them into one (which would hide genuine
+    isolation failures — the engine's 'never a false bill of health' promise)."""
+    from rulehawk.analyze import Finding
+    # `permit ip any any` at seq 30 breaching CORP->PCI, DMZ->PCI, CORP->DB:
+    # identical rule_id / kind / line, three different witnesses.
+    findings = [
+        Finding("EDGE:30", "segmentation-violation", "critical",
+                "CORP must not reach PCI", "permit ip any any",
+                witness="10.1.0.1 -> 10.9.0.1 (ip)", line=30),
+        Finding("EDGE:30", "segmentation-violation", "critical",
+                "DMZ must not reach PCI", "permit ip any any",
+                witness="10.2.0.1 -> 10.9.0.1 (ip)", line=30),
+        Finding("EDGE:30", "segmentation-violation", "critical",
+                "CORP must not reach DB", "permit ip any any",
+                witness="10.1.0.1 -> 10.8.0.1 (ip)", line=30),
+    ]
+    fr = gate.FileResult("edge.acl", "ios-asa", "ok", 1,
+                         findings=findings, line_by_id={("EDGE", 30): 30})
+    g = gate.GateResult([fr], "high")
+    s = json.loads(gate.to_sarif(g))
+    results = s["runs"][0]["results"]
+    assert len(results) == 3
+    fps = [r["partialFingerprints"]["ruleHawk/v1"] for r in results]
+    # All three genuine breaches must be uniquely fingerprinted.
+    assert len(set(fps)) == 3, fps
+    # And the witness must be what disambiguates them.
+    for f, fp in zip(findings, fps):
+        assert fp.endswith(f.witness)
+
+
 # --------------------------------------------------------------------------- #
 # JSON aggregate + markdown + console
 # --------------------------------------------------------------------------- #

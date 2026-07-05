@@ -58,6 +58,8 @@
   #config{min-height:200px}
   #policy{min-height:96px}
   .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px}
+  .row.samples{margin-top:9px;gap:6px}
+  .samples-label{font-size:12px;color:var(--muted);margin-right:2px}
   button{font:inherit;font-size:13.5px;font-weight:500;cursor:pointer;border-radius:4px;
     padding:9px 15px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text);
     transition:background .12s ease,border-color .12s ease}
@@ -208,10 +210,16 @@
     <div class="row">
       <button class="primary" id="audit" disabled>Audit</button>
       <button id="upload">Upload file</button>
-      <button id="sample">Load sample</button>
       <button id="clear">Clear</button>
       <button id="cancel" style="display:none">Cancel</button>
       <span class="status" id="status"><span class="spin"></span>Loading analysis engine…</span>
+    </div>
+    <div class="row samples" role="group" aria-label="Load a sample config">
+      <span class="samples-label">No config handy? Load a sample:</span>
+      <button class="small" data-sample="ios">Cisco IOS/ASA</button>
+      <button class="small" data-sample="junos">Juniper Junos</button>
+      <button class="small" data-sample="iptables">Linux iptables</button>
+      <button class="small" data-sample="nxos">Cisco NX-OS</button>
     </div>
     <details class="adv">
       <summary>Segmentation policy (optional) — prove zones can't reach each other</summary>
@@ -252,6 +260,85 @@ const SAMPLE_POLICY = `{
     {"src": "DMZ",  "dst": "PCI", "proto": "ip"}
   ]
 }`;
+// ---- multi-vendor demo gallery -----------------------------------------------
+// The page advertises six vendors; these give a first-time visitor with no config
+// of their own a one-click way to watch the OTHER parsers work, not just IOS.
+// Each sample is paired with SAMPLE_POLICY so the flagship witness-packet proof
+// (CORP -> PCI on 445) fires, and each also carries a second standalone hygiene
+// finding. Every caption below was verified against the real engine (auto-detect
+// routes each to its parser; findings emitted are exactly as described) — never
+// ship a sample whose caption promises a finding the parser does not emit.
+
+// Juniper Junos brace-form firewall filter. ALLOW-WEB permits CORP->PCI incl. 445
+// (segmentation violation + witness); term NEVER-REACHED sits after the default
+// `discard`, so it is a shadowed/dead permit. Adapted from tests/test_parse_junos.py.
+const SAMPLE_JUNOS = `firewall {
+    family inet {
+        filter PCI-EDGE {
+            term ALLOW-WEB {
+                from {
+                    source-address 10.20.0.0/16;
+                    destination-address 10.10.0.0/16;
+                    protocol tcp;
+                    destination-port [ 80 443 445 ];
+                }
+                then accept;
+            }
+            term DEFAULT {
+                then discard;
+            }
+            term NEVER-REACHED {
+                from {
+                    source-address 10.30.0.0/16;
+                    protocol tcp;
+                    destination-port 22;
+                }
+                then accept;
+            }
+        }
+    }
+}`;
+
+// Cisco NX-OS numbered ACL (version-parens + feature marker route it to the NX-OS
+// parser, not IOS). Entry 10 leaks CORP->PCI on 445 (violation + witness); entry 30
+// is dead — the deny-any at 20 already drops it. Adapted from tests/test_parse_nxos.py.
+const SAMPLE_NXOS = `version 9.3(10)
+feature interface-vlan
+
+ip access-list PCI-EDGE
+  statistics per-entry
+  10 permit tcp 10.20.0.0/16 10.10.0.0/16 eq 445
+  20 deny ip any any
+  30 permit tcp 10.20.0.0/16 10.10.0.0/16 eq 3389`;
+
+// Linux iptables-save (filter table) — verbatim copy of samples/iptables_save.txt.
+// The FORWARD chain leaks CORP (10.20/16) into PCI (10.10/16) on SMB/445, and the
+// OUTPUT default-ACCEPT policy is flagged permit-any-any.
+const SAMPLE_IPTABLES = `# iptables-save (filter table) — host/forwarding firewall for a segmented estate.
+# Audit with:  rulehawk samples/iptables_save.txt --policy samples/policy.json
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -s 10.0.0.0/8 -p tcp --dport 22 -j ACCEPT
+-A INPUT -p tcp -m multiport --dports 80,443 -j ACCEPT
+# A FORWARD allow that leaks CORP (10.20/16) into PCI (10.10/16) on SMB/445:
+-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 445 -j ACCEPT
+COMMIT`;
+
+// key -> {config, policy, one-line finding story}. IOS stays the default sample.
+const SAMPLES = {
+  ios:      { cfg: SAMPLE_ACL,      pol: SAMPLE_POLICY,
+    msg: "Cisco IOS/ASA sample + PCI policy loaded — Audit to see permit-any-any, shadowed rules, and the CORP→PCI:445 witness packet." },
+  junos:    { cfg: SAMPLE_JUNOS,    pol: SAMPLE_POLICY,
+    msg: "Juniper Junos filter + PCI policy loaded — Audit to prove CORP reaches PCI on 445 (witness packet) and see a term shadowed by the default discard." },
+  iptables: { cfg: SAMPLE_IPTABLES, pol: SAMPLE_POLICY,
+    msg: "Linux iptables-save + PCI policy loaded — Audit to see the FORWARD chain leak CORP→PCI on 445 (witness packet)." },
+  nxos:     { cfg: SAMPLE_NXOS,     pol: SAMPLE_POLICY,
+    msg: "Cisco NX-OS ACL + PCI policy loaded — Audit to prove CORP reaches PCI on 445 (witness packet) and see a permit killed by an earlier deny-any." },
+};
 const ENGINE_MODULES = ["__init__","model","parse","parse_junos","parse_panos","parse_iptables","parse_nxos","parse_eos","analyze","report","segcheck","pathground"];
 const PYODIDE_VER = "v0.26.4";
 // Fallback (main-thread) analysis stays synchronous, so cap it; the worker path has no cap.
@@ -418,7 +505,7 @@ function ready(){
 function audit(){
   if(auditBtn.disabled && !cancelBtn.style.display) return;
   const cfg = $("config").value;
-  if(!cfg.trim()){ setStatus("Paste or upload a config first (or click “Load sample”).", true); return; }
+  if(!cfg.trim()){ setStatus("Paste or upload a config first (or load a sample below).", true); return; }
   const policy = $("policy").value || "";
   setStatus('<span class="spin"></span>Analyzing…');
   auditBtn.disabled = true;
@@ -701,17 +788,22 @@ $("audit").addEventListener("click", audit);
 $("cancel").addEventListener("click", cancel);
 $("upload").addEventListener("click", () => $("file").click());
 $("file").addEventListener("change", e => loadFile(e.target.files[0]));
-$("sample").addEventListener("click", () => {
-  // The sample is the demo: pre-fill BOTH the config and the segmentation policy
-  // so a first-time visitor's very first Audit shows the witness-packet proof
-  // (the flagship differentiator) instead of leaving it hidden in the collapsed
-  // panel. The standalone "load sample policy" button below stays unchanged.
-  $("config").value = SAMPLE_ACL;
-  $("policy").value = SAMPLE_POLICY;
-  $("policy").closest("details").open = true;
-  $("results").style.display="none";
-  if(!auditBtn.disabled) setStatus("Sample config + PCI segmentation policy loaded — click Audit to prove CORP can reach PCI on 445 and see the witness packet.");
-});
+// The gallery is the demo: each button pre-fills BOTH the config and the
+// segmentation policy so a first-time visitor's very first Audit shows the
+// witness-packet proof (the flagship differentiator) — for the vendor they
+// actually run — instead of leaving it hidden in the collapsed panel and
+// instead of only ever showing Cisco IOS. The standalone "load sample policy"
+// button below stays unchanged.
+function loadSample(key){
+  const s = SAMPLES[key]; if(!s) return;
+  $("config").value = s.cfg;
+  $("policy").value = s.pol || "";
+  if(s.pol) $("policy").closest("details").open = true;
+  $("results").style.display = "none";
+  if(!auditBtn.disabled) setStatus(s.msg);
+}
+document.querySelectorAll("[data-sample]").forEach(b =>
+  b.addEventListener("click", () => loadSample(b.dataset.sample)));
 $("clear").addEventListener("click", () => { $("config").value=""; $("results").style.display="none"; });
 $("samplePolicy").addEventListener("click", () => { $("policy").value = SAMPLE_POLICY; $("policy").closest("details").open = true; });
 document.addEventListener("keydown", e => { if((e.metaKey||e.ctrlKey) && e.key==="Enter" && !auditBtn.disabled) audit(); });

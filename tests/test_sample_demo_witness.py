@@ -64,21 +64,29 @@ def _handler(html: str, elem_id: str) -> str:
 # 1. UI wiring: the sample flow assembles the whole demo
 # --------------------------------------------------------------------------- #
 def test_load_sample_prefills_policy_and_opens_panel():
-    body = _handler(_read_index(), "sample")
-    assert "SAMPLE_ACL" in body, "sample no longer loads the config"
-    assert "SAMPLE_POLICY" in body, (
-        "Load sample must also pre-fill the segmentation policy — otherwise the "
-        "witness-packet story is undiscoverable from the primary demo flow")
-    assert '$("policy").value' in body
+    html = _read_index()
+    # The gallery's loadSample() helper fills BOTH textareas and opens the panel.
+    m = re.search(r"function loadSample\(key\)\{(.*?)\n\}", html, re.S)
+    assert m, "loadSample() gallery helper not found in index.html"
+    body = m.group(1)
+    assert '$("config").value' in body and '$("policy").value' in body, (
+        "loadSample must pre-fill both the config and the segmentation policy — "
+        "otherwise the witness-packet story is undiscoverable from the demo flow")
     assert re.search(r'\.open\s*=\s*true', body), (
-        "Load sample must open the collapsed policy <details> so the user can "
+        "loadSample must open the collapsed policy <details> so the user can "
         "see what was loaded")
+    # The default IOS entry still carries BOTH the config and the policy.
+    ios = re.search(r"ios:\s*\{\s*cfg:\s*(\w+),\s*pol:\s*(\w+)", html)
+    assert ios and ios.group(1) == "SAMPLE_ACL" and ios.group(2) == "SAMPLE_POLICY"
 
 
 def test_load_sample_status_mentions_witness_story():
-    body = _handler(_read_index(), "sample")
-    assert "witness packet" in body, (
-        "the sample-loaded status line should tell the user what Audit will prove")
+    html = _read_index()
+    block = re.search(r"const SAMPLES\s*=\s*\{(.*?)\n\};", html, re.S).group(1)
+    msgs = re.findall(r'msg:\s*"([^"]*)"', block)
+    assert len(msgs) == 4, f"expected 4 gallery status lines, found {len(msgs)}"
+    # Every sample's status line tells the user what Audit will prove.
+    assert all("witness packet" in m for m in msgs), msgs
 
 
 def test_standalone_sample_policy_button_unchanged():
@@ -91,11 +99,11 @@ def test_standalone_sample_policy_button_unchanged():
 def test_sample_button_is_outside_collapsed_details():
     """The entry point to the demo must be visible without expanding anything."""
     html = _read_index()
-    sample_at = html.index('id="sample"')
+    sample_at = html.index("data-sample=")
     details_at = html.index("<details")
     assert sample_at < details_at, (
-        '#sample ("Load sample") must live in the always-visible row, not inside '
-        "the collapsed advanced panel")
+        'the sample gallery ("Load a sample") must live in the always-visible '
+        "row, not inside the collapsed advanced panel")
     # ...while the policy textarea itself stays in the collapsible panel.
     assert details_at < html.index('id="policy"')
 

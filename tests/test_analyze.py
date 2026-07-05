@@ -50,6 +50,39 @@ def test_different_specific_ports_do_not_cover():
     assert not covers(a, b)
 
 
+def test_narrow_src_port_does_not_cover_any_src_port():
+    # Pins model.covers() lines 136-137 (the src_port gate): a rule that only
+    # permits a NARROW source-port range must NOT be proven to cover a rule with
+    # ANY source port on the same net/proto/dst-port. If that branch regressed,
+    # analyze() would emit an unsound "SHADOWED / DEAD — safe to delete" verdict
+    # on a load-bearing rule (the false-positive-deletion failure model.py's own
+    # docstring warns against). The reverse (any src-port covers a narrow one)
+    # must stay True so the gate is proven not to be a blanket False.
+    narrow = _ace("permit tcp any range 1024 2048 host 10.0.0.1 eq 443")
+    wide = _ace("permit tcp any host 10.0.0.1 eq 443", seq=2)
+    assert (narrow.src_port.lo, narrow.src_port.hi) == (1024, 2048)
+    assert wide.src_port.is_any()
+    assert not covers(narrow, wide)
+    assert covers(wide, narrow)
+
+
+def test_narrow_src_port_rule_not_reported_dead_end_to_end():
+    # Integration: the narrow-src-port gate through parse -> analyze. An earlier
+    # rule that only matches source ports 1024-2048 must NOT make a later
+    # any-source-port rule (broader) report as dead/shadowed/redundant.
+    text = ("ip access-list extended S\n"
+            " permit tcp any range 1024 2048 host 10.0.0.1 eq 443\n"
+            " permit tcp any host 10.0.0.1 eq 443\n")
+    k = _kinds(text)
+    assert not any(rid == "S:2" for rid, _ in k)
+    # Sanity of the harness (guards against the gate silently short-circuiting):
+    # reverse the order and the narrow rule IS redundant under the wide one.
+    text_rev = ("ip access-list extended S\n"
+                " permit tcp any host 10.0.0.1 eq 443\n"
+                " permit tcp any range 1024 2048 host 10.0.0.1 eq 443\n")
+    assert ("S:2", "redundant") in _kinds(text_rev)
+
+
 # --- intent inversions (the scary ones) ----------------------------------
 
 def test_earlier_deny_kills_later_permit_is_high():

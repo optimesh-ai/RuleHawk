@@ -11,7 +11,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from rulehawk import parse_acls  # noqa: E402
+import ipaddress  # noqa: E402
+
+from rulehawk import parse_acls, parse_iptables  # noqa: E402
 from rulehawk.segcheck import check_segmentation  # noqa: E402
 
 _POLICY = {
@@ -287,6 +289,71 @@ def test_ported_assertion_behavior_unchanged_by_portless_path():
            " deny tcp any any eq 445\n"
            " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255\n")
     kinds = {k for k, _ in _kinds(acl)}          # _POLICY asserts ports=[445]
+    assert "segmentation-violation" not in kinds
+    assert "segmentation-ok" in kinds
+
+
+# ---------------------------------------------------------------------------
+# IPv6 / dual-stack segmentation. RuleHawk's headline value is v6-capable
+# (parse_iptables handles ip6tables: _is_v6, icmpv6, _ANY6), but the segcheck
+# witness path (_witness_host over v6 net.hosts(), _eval_acl on v6 addresses)
+# and the mixed-family intersect guard (segcheck.py `_intersect`: version
+# mismatch -> None) were entirely UNtested. A v6 network is increasingly the
+# norm, and a regression here would either crash a v6 audit or FALSE-PASS a
+# real v6 CORP->PCI leak with no test to catch it. These pin both.
+# ---------------------------------------------------------------------------
+
+# `:FORWARD DROP` default policy + an explicit v6 permit of the forbidden flow.
+_V6_FORWARD_PERMIT = ("*filter\n"
+                      ":FORWARD DROP [0:0]\n"
+                      "-A FORWARD -s fd20::/32 -d fd10::/32 -p tcp "
+                      "--dport 445 -j ACCEPT\n"
+                      "COMMIT\n")
+
+_V6_POLICY = {
+    "zones": {"PCI": ["fd10::/32"], "CORP": ["fd20::/32"]},
+    "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp",
+                        "ports": [445]}],
+}
+
+
+def test_ipv6_segmentation_violation_has_concrete_v6_witness():
+    # v6 zones over an ip6tables FORWARD config that permits the forbidden flow:
+    # a critical violation whose witness is a REAL v6 packet an auditor can
+    # replay (fd20::1 -> fd10::1:445), not a v4 address or an abstract one.
+    aces, _ = parse_iptables(_V6_FORWARD_PERMIT)
+    f = check_segmentation(aces, _V6_POLICY)
+    kinds = {x.kind for x in f}
+    assert "segmentation-violation" in kinds
+    assert "segmentation-ok" not in kinds          # never a false PASS on a leak
+    viol = next(x for x in f if x.kind == "segmentation-violation")
+    assert viol.severity == "critical"
+    # Witness is inside the forbidden v6 space and carries the forbidden port.
+    swit, rest = viol.witness.split(" -> ", 1)
+    # rest == "fd10::1:445 (tcp)"; the port is the final :N (v6 addrs have
+    # their own colons, so strip the "(tcp)" suffix then rsplit once).
+    dwit = rest.split(" ")[0].rsplit(":", 1)[0]
+    assert ipaddress.ip_address(swit).version == 6
+    assert ipaddress.ip_address(dwit).version == 6
+    assert ipaddress.ip_address(swit) in ipaddress.ip_network("fd20::/32")
+    assert ipaddress.ip_address(dwit) in ipaddress.ip_network("fd10::/32")
+    assert ":445 (tcp)" in viol.witness
+
+
+def test_v4_zones_over_v6_only_config_pass_no_exception():
+    # v4 zones evaluated against the SAME v6-only config: the permit's src/dst
+    # are v6, so the mixed-family intersect guard (`_intersect` version check)
+    # skips the candidate -> a genuine PASS with NO exception raised. If that
+    # guard were inverted or raised, this would crash or false-alarm; it pins
+    # the v4-vs-v6 non-interference the guard exists to provide.
+    aces, _ = parse_iptables(_V6_FORWARD_PERMIT)
+    v4_policy = {
+        "zones": {"PCI": ["10.10.0.0/16"], "CORP": ["10.20.0.0/16"]},
+        "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp",
+                            "ports": [445]}],
+    }
+    f = check_segmentation(aces, v4_policy)   # must not raise
+    kinds = {x.kind for x in f}
     assert "segmentation-violation" not in kinds
     assert "segmentation-ok" in kinds
 
