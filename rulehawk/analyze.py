@@ -103,14 +103,27 @@ def _union_shadow(b: ACE, earlier: List[ACE]) -> Optional[Tuple[str, str, List[A
     return ("union-shadowed-permit-dead", "high", chosen)
 
 
+# Message key: kind, plus "+mixed" when the covering union mixes permits AND
+# denies. A mixed union still proves the rule dead, but only PART of its traffic
+# gets the opposite action — the message must not claim ALL of it does.
 _UNION_MSG = {
     "union-shadowed-deny-dead": (
         "This deny NEVER takes effect — earlier rules {seqs} cumulatively "
         "already allow the same traffic. The traffic you meant to block is ALLOWED.",
         "make the deny match only traffic not already permitted, or move it above rules {seqs}"),
+    "union-shadowed-deny-dead+mixed": (
+        "This deny NEVER takes effect — earlier rules {seqs} cumulatively "
+        "match all of its traffic first. The part matched by the earlier "
+        "permit(s) is ALLOWED despite this deny.",
+        "make the deny match only traffic not already permitted, or move it above rules {seqs}"),
     "union-shadowed-permit-dead": (
         "This permit NEVER takes effect — earlier rules {seqs} cumulatively "
         "already drop the same traffic. Likely a silent connectivity loss.",
+        "move rule {seq} above rules {seqs}, or narrow them"),
+    "union-shadowed-permit-dead+mixed": (
+        "This permit NEVER takes effect — earlier rules {seqs} cumulatively "
+        "match all of its traffic first. The part matched by the earlier "
+        "deny(s) is silently DROPPED.",
         "move rule {seq} above rules {seqs}, or narrow them"),
     "union-redundant": (
         "Rule is redundant — its traffic is already fully handled by earlier "
@@ -157,7 +170,8 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
             if u:
                 kind, sev, chosen = u
                 seqs = ", ".join(str(a.seq) for a in sorted(chosen, key=lambda x: x.seq))
-                msg, fix = _UNION_MSG[kind]
+                mixed = len({a.action for a in chosen}) > 1
+                msg, fix = _UNION_MSG[kind + "+mixed" if mixed else kind]
                 findings.append(Finding(
                     _id(b), kind, sev,
                     msg.format(seqs=seqs, seq=b.seq), b.raw,

@@ -36,7 +36,12 @@ jobs:
 
   action-selftest:
     name: Dogfood the Action (composite, end-to-end)
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # macOS runs bash 3.2 for `shell: bash` — it caught the empty-array
+        # `set -u` expansion bug ubuntu (bash 5) never would.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       # Use the action from this very checkout (local `./`). A clean sample +
@@ -50,3 +55,41 @@ jobs:
           fail-on: high
           upload-sarif: false      # no code-scanning dependency in the self-test
           comment: false
+      # No-policy run exercises the empty POLICY_ARGS path (the bash-3.2 trap).
+      - name: RuleHawk gate (expect PASS, no policy input)
+        uses: ./
+        with:
+          configs: samples/adv_realistic.txt
+          fail-on: high
+          upload-sarif: false
+          comment: false
+
+  action-selftest-fail-path:
+    name: Dogfood the Action (FAIL verdict is enforced)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The rc-file -> Enforce re-raise plumbing must actually turn the check
+      # red: run the gate on a sample with known critical findings and assert
+      # the step FAILS and the outputs carry the verdict.
+      - name: RuleHawk gate (expect FAIL on a dirty sample)
+        id: dirty
+        continue-on-error: true
+        uses: ./
+        with:
+          configs: samples/ios_acl.txt
+          policy: samples/policy.json
+          fail-on: high
+          upload-sarif: false
+          comment: false
+      - name: Assert the gate went red with the right outputs
+        env:
+          OUTCOME: ${{ steps.dirty.outcome }}
+          PASSED: ${{ steps.dirty.outputs.passed }}
+          WORST: ${{ steps.dirty.outputs.worst-severity }}
+        run: |
+          set -euo pipefail
+          [ "${OUTCOME}" = "failure" ] || { echo "::error::gate did not fail on a dirty sample"; exit 1; }
+          [ "${PASSED}" = "false" ]    || { echo "::error::outputs.passed should be false, got '${PASSED}'"; exit 1; }
+          [ "${WORST}" = "critical" ]  || { echo "::error::outputs.worst-severity should be critical, got '${WORST}'"; exit 1; }
+          echo "FAIL path verified: outcome=${OUTCOME}, passed=${PASSED}, worst=${WORST}"

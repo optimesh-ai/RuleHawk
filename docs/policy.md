@@ -112,16 +112,23 @@ that protocol.
   guess "isolated."
 - **`segmentation-ok`** (info) — proven isolated: no permitted witness flow exists.
   This is a positive attestation, not just the absence of a finding.
+- **`segmentation-policy-error`** (high) — the policy itself is invalid: a
+  `src`/`dst` naming a zone that isn't defined, an unparseable CIDR in `zones`,
+  or an unusable `ports` value. RuleHawk **fails closed**: the affected
+  assertion is never given a PASS until the policy is fixed (a typo must not
+  certify isolation over an empty search space).
 
 ## Gotchas
 
 - **Zone names must match exactly.** A `src`/`dst` that isn't a key in `zones`
-  contributes no networks to test, so the assertion vacuously "passes." Keep the
-  policy and your zone inventory in sync (the worked example pairs the policy with
-  `docs/architecture.md` for this reason).
-- **`proto` and port values are not validated** — an unknown protocol simply won't
-  match any rule (effectively a vacuous pass). Stick to the protocols above.
-- **`ports` apply to `tcp`/`udp`.** With `proto: "ip"`, ports are ignored (all
-  traffic is forbidden, which is the point).
+  raises `segmentation-policy-error` (high) — it can never vacuously "pass."
+- **Ports may be integers or numeric strings** (`[445]` and `["445"]` both
+  work); anything else is a `segmentation-policy-error`. There is **no range
+  syntax** in the policy.
+- **`ports` with `proto: "ip"`** restricts the check to port-carrying protocols
+  (tcp/udp/sctp/...). Omit `ports` for total isolation.
+- An unknown `proto` value is probed as-written: only wildcard (`ip`-proto)
+  rules can match it, so a `permit ip any any` still trips it, but a typo like
+  `"tpc"` will not match your tcp rules — stick to the protocols listed above.
 - The policy declares **forbidden** flows. Everything not forbidden is allowed by
   the policy; the configs decide what is actually permitted.

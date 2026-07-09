@@ -66,7 +66,7 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 |---|---|
 | `0` | Clean — no finding at/above `fail-on`, every file parsed. |
 | `1` | One or more findings at/above `fail-on`. |
-| `2` | **Fail-closed** — a file parsed to *zero* rules or could not be read. RuleHawk will not certify isolation it could not verify; check the vendor/format or set `vendor`. (Suppressed only by `fail-on: none`.) |
+| `2` | **Fail-closed** — a file parsed to *zero* rules or could not be read (suppressed only by `fail-on: none`), a `configs` pattern matched **no files** (a typo'd path must not mean "never audited, green check"), an unknown `vendor`/flag, or an unwritable output path. RuleHawk will not certify isolation it could not verify. |
 
 The Action maps both `1` and `2` to a red check. Even on failure it still uploads
 SARIF and posts the comment first, so the gate always reports its value.

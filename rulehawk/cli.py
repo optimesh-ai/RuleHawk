@@ -25,6 +25,20 @@ from .report import to_json, to_text
 from .segcheck import check_segmentation
 
 
+_USAGE = """rulehawk — firewall/ACL hygiene & segmentation auditor
+
+usage:
+  rulehawk <config-file | -> [--json] [--junos|--panos|--iptables]
+           [--policy policy.json]
+  rulehawk gate <file-or-glob>... [options]     (see `rulehawk gate --help`)
+
+Vendor is auto-detected (Cisco IOS/ASA, Junos, PAN-OS, iptables); the flags
+force one. Reads stdin when the file is omitted or `-`.
+Exit: 0 clean · 1 critical/high finding · 2 error or zero rules parsed
+(fail-closed — never a clean bill of health for input it could not read).
+"""
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Subcommand: `rulehawk gate ...` runs the multi-file CI gate (SARIF, PR
@@ -32,6 +46,9 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "gate":
         from .gate import main as gate_main
         return gate_main(argv[1:])
+    if "-h" in argv or "--help" in argv:
+        print(_USAGE)
+        return 0
     as_json = "--json" in argv
     force_junos = "--junos" in argv
     force_panos = "--panos" in argv
@@ -46,6 +63,17 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         policy_path = argv[k + 1]
         del argv[k:k + 2]
+    # A leftover flag-shaped token is a typo'd option; silently reading it as a
+    # config FILENAME (or ignoring it) would run a different audit than asked.
+    unknown = [a for a in argv if a.startswith("-") and a != "-"]
+    if unknown:
+        print(f"rulehawk: unknown option(s): {' '.join(unknown)}", file=sys.stderr)
+        print(_USAGE, file=sys.stderr)
+        return 2
+    if len(argv) > 1:
+        print(f"rulehawk: expected one config file, got {len(argv)} "
+              f"(use `rulehawk gate` for multi-file audits)", file=sys.stderr)
+        return 2
     if argv and argv[0] != "-":
         try:
             text = open(argv[0], encoding="utf-8", errors="replace").read()
@@ -76,6 +104,10 @@ def main(argv: list[str] | None = None) -> int:
         print(to_json(findings, notes, len(aces)))
     else:
         print(to_text(findings, notes, len(aces)))
+    if not aces:
+        # Fail closed, same contract as `rulehawk gate`: zero parsed rules is
+        # NOT a clean bill of health — a garbled config must not exit 0 in CI.
+        return 2
     # Non-zero exit when a critical/high issue is present, so it's CI-usable.
     return 1 if any(f.severity in ("critical", "high") for f in findings) else 0
 

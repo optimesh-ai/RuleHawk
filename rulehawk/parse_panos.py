@@ -44,7 +44,7 @@ import re
 import shlex
 from typing import Dict, List, Optional, Tuple
 
-from .model import ACE, ANY_PORTS, PortRange, _IPNet
+from .model import ACE, ANY_PORTS, _PORTED, PortRange, _IPNet
 from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
 
 _ANY_NET: _IPNet = ipaddress.ip_network("0.0.0.0/0")
@@ -54,9 +54,11 @@ _ANY_NET: _IPNet = ipaddress.ip_network("0.0.0.0/0")
 _ACTION = {"allow": "permit", "deny": "deny", "drop": "deny",
            "reset-client": "deny", "reset-server": "deny", "reset-both": "deny"}
 
-# Built-in PAN-OS predefined services with well-known L4 ports.
+# Built-in PAN-OS predefined services with well-known L4 ports. The predefined
+# service-http is tcp 80 AND 8080 (both ports, per PAN-OS) — modeling only 80
+# would hide an 8080 leak.
 _BUILTIN_SERVICES: Dict[str, Tuple[str, List[PortRange], List[PortRange]]] = {
-    "service-http": ("tcp", [PortRange(80, 80)], [ANY_PORTS]),
+    "service-http": ("tcp", [PortRange(80, 80), PortRange(8080, 8080)], [ANY_PORTS]),
     "service-https": ("tcp", [PortRange(443, 443)], [ANY_PORTS]),
 }
 
@@ -74,8 +76,8 @@ _RULE_FIELDS = frozenset({
 })
 
 # Cap the cartesian expansion of one rule so a pathological config can't blow up;
-# beyond it we model the first value per dimension and mark the entry imprecise
-# (+ a note), never silently dropping the rest (mirrors the Junos frontend).
+# beyond it we widen every dimension to ANY (a superset) and mark the entry
+# imprecise (+ a note) — never truncate to a subset (mirrors the Junos frontend).
 _MAX_EXPAND = 256
 
 
@@ -186,9 +188,10 @@ def _collect_objects(lines: List[List[str]], notes: List[str]) -> Tuple[
                 rest = toks[k + 3:]
                 if kind == "ip-netmask" and rest:
                     try:
-                        v = rest[0]
+                        # ip_network() on a bare address yields the host route
+                        # (/32 for v4, /128 for v6) — never widen v6 to a /32.
                         addresses[name] = ([ipaddress.ip_network(
-                            v if "/" in v else f"{v}/32", strict=False)], False)
+                            rest[0], strict=False)], False)
                     except ValueError:
                         addresses[name] = None
                         notes.append(f"unparsed PAN-OS address '{name}' "
@@ -214,8 +217,16 @@ def _collect_objects(lines: List[List[str]], notes: List[str]) -> Tuple[
             if k + 2 < len(toks):
                 name = toks[k + 1]
                 if toks[k + 2] == "static":
+                    # Repeated `set address-group G static ...` lines APPEND
+                    # (exports commonly emit one member per line); overwriting
+                    # would model a subset of the group. A group already marked
+                    # unresolvable (None) stays unresolvable (superset).
                     members = [t for t in toks[k + 3:] if t not in ("[", "]")]
-                    addr_groups[name] = members
+                    prev = addr_groups.get(name)
+                    if isinstance(prev, list):
+                        prev.extend(members)
+                    elif name not in addr_groups:
+                        addr_groups[name] = members
                 else:                                  # dynamic
                     addr_groups[name] = None
                     notes.append(f"unmodeled PAN-OS dynamic address-group "
@@ -294,8 +305,9 @@ def _resolve_name(name: str,
             imp |= e
         return nets, imp
     try:
-        v = name if "/" in name else f"{name}/32"
-        return [ipaddress.ip_network(v, strict=False)], False
+        # ip_network() on a bare address yields the host route (/32 for v4,
+        # /128 for v6) — never widen a bare v6 literal to a /32.
+        return [ipaddress.ip_network(name, strict=False)], False
     except ValueError:
         notes.append(f"unresolved PAN-OS address object/value '{name}' in "
                      f"{label} {dim} (marked imprecise — verify manually)")
@@ -317,7 +329,15 @@ def _resolve_addrs(vals: List[str],
                                 label, dim, notes)
         nets += ns
         imprecise |= imp
-    if not nets:                                   # all unresolved -> widen to ANY
+    if imprecise:
+        # ANY unresolvable member poisons the union: keeping only the resolved
+        # part would model a SUBSET of the true space -> widen the whole
+        # dimension to ANY (superset), per the parser contract.
+        if nets:
+            notes.append(f"PAN-OS {label} {dim} has unresolvable member(s) — "
+                         f"dimension widened to ANY (marked imprecise)")
+        nets = [_ANY_NET]
+    elif not nets:
         nets = [_ANY_NET]
     return nets, imprecise
 
@@ -345,9 +365,18 @@ def _resolve_service(vals: List[str],
                          f"L7-derived ports not modeled (marked imprecise)")
         elif v in services and services[v] is not None:
             proto, dports, sports = services[v]
-            for sp in sports:
-                for dp in dports:
-                    combos.append((proto, sp, dp))
+            if proto not in _PORTED and any(not p.is_any() for p in dports + sports):
+                # covers()/segcheck ignore ports on a non-port-carrying protocol,
+                # so the ACE would claim an exact all-ports space: widen + flag.
+                imprecise = True
+                combos.append((proto, ANY_PORTS, ANY_PORTS))
+                notes.append(f"PAN-OS service '{v}' puts ports on non-port-carrying "
+                             f"protocol '{proto}' in {label} — ports widened to ANY "
+                             f"(marked imprecise — verify manually)")
+            else:
+                for sp in sports:
+                    for dp in dports:
+                        combos.append((proto, sp, dp))
         else:
             imprecise = True
             combos.append(("ip", ANY_PORTS, ANY_PORTS))
@@ -373,7 +402,8 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
                 entries: List[ACE], notes: List[str], line: int = 0) -> int:
     label = f"security/{name}"
 
-    if fields.get("disabled", []) and fields["disabled"][0].lower() == "yes":
+    # Scalar fields set on several lines follow `set` semantics: last wins.
+    if fields.get("disabled", []) and fields["disabled"][-1].lower() == "yes":
         notes.append(f"PAN-OS rule {label} is disabled — skipped (not enforced)")
         return seq
 
@@ -381,9 +411,9 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
     if not act_vals:
         notes.append(f"PAN-OS rule {label} has no action — skipped")
         return seq
-    action = _ACTION.get(act_vals[0].lower())
+    action = _ACTION.get(act_vals[-1].lower())
     if action is None:
-        notes.append(f"unmodeled PAN-OS action '{act_vals[0]}' in {label} — skipped")
+        notes.append(f"unmodeled PAN-OS action '{act_vals[-1]}' in {label} — skipped")
         return seq
 
     imprecise = False
@@ -419,13 +449,17 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
     imprecise = imprecise or imp_s or imp_d or imp_v
 
     if len(srcs) * len(dsts) * len(combos) > _MAX_EXPAND:
-        notes.append(f"PAN-OS rule {label} expands to >{_MAX_EXPAND} ACEs; modeled "
-                     f"the first value per dimension and marked imprecise — verify manually")
-        srcs, dsts, combos = srcs[:1], dsts[:1], combos[:1]
+        # Truncating to the first value per dimension would model a SUBSET
+        # (dropped members become invisible holes): widen everything instead.
+        notes.append(f"PAN-OS rule {label} expands to >{_MAX_EXPAND} ACEs; widened "
+                     f"to a single any/any ACE (superset) and marked imprecise "
+                     f"— verify manually")
+        srcs, dsts = [_ANY_NET], [_ANY_NET]
+        combos = [("ip", ANY_PORTS, ANY_PORTS)]
         imprecise = True
 
     for proto, sp, dp in combos:
-        ported = proto in ("tcp", "udp")
+        ported = proto in _PORTED
         for s in srcs:
             for d in dsts:
                 seq += 1

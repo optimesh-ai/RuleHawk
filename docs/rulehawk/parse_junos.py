@@ -4,7 +4,7 @@ Why Junos is the next vendor (RH-3): the engine downstream of parsing
 (`analyze.py`, `segcheck.py`, `model.ACE`) is built around ORDERED, first-match,
 `permit`/`deny` rules over an (proto, src-net, dst-net, src-port, dst-port)
 packet space — see `analyze._analyze_one_acl` (shadowing/intent-inversion needs
-both permit AND deny in match order), `segcheck._eval_acl` (first-match,
+both permit AND deny in match order), `segcheck._search` (first-match,
 honoring earlier denies), and `model.ACE`. Junos firewall filters map onto this
 *exactly*: a `filter` is an ordered list of `term`s, each `term` has a `from`
 (the match) and a `then` (accept -> permit, discard/reject -> deny), evaluated
@@ -37,7 +37,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from .model import ACE, ANY_PORTS, PortRange, _IPNet
+from .model import ACE, ANY_PORTS, _PORTED, PortRange, _IPNet
 from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
 
 _ANY_NET: _IPNet = ipaddress.ip_network("0.0.0.0/0")
@@ -58,8 +58,8 @@ _PROTO_NUM = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6",
               "47": "gre", "50": "esp", "51": "ah", "89": "ospf"}
 
 # Cap the cartesian expansion of one term so a pathological filter can't blow up;
-# beyond it we model the first value per dimension and mark the entry imprecise
-# (+ a note), never silently dropping the rest.
+# beyond it we widen every dimension to ANY (a superset) and mark the entry
+# imprecise (+ a note) — never truncate to a subset of the values.
 _MAX_EXPAND = 256
 
 
@@ -155,27 +155,38 @@ def _proto(v: str) -> str:
 def _addrs(vals: List[str], label: str, notes: List[str]) -> Tuple[List[_IPNet], bool]:
     """Parse a Junos address set. Returns (nets, imprecise).
 
-    `except` (set exclusion, e.g. `10/8 except 10.1/16`) can't be a single
-    rectangle, so we keep the broader prefix and mark the entry imprecise (it may
-    over-approximate but never under-approximate) — surfaced via a note."""
+    `except` EXCLUDES the prefix it follows: that prefix must never appear as
+    matched space, so it is dropped and the remaining prefixes — the exclusion
+    left un-subtracted — are a sound superset, marked imprecise. An unparseable
+    value widens the whole dimension to ANY: skipping just that member would
+    model a SUBSET of the term's true space (the parser-contract breaker)."""
     nets: List[_IPNet] = []
     imprecise = False
+    widen = False
+    prev_ok = False
     for v in vals:
         if v == "except":
+            if prev_ok and nets:
+                nets.pop()                    # the preceding prefix is excluded
             imprecise = True
-            notes.append(f"unmodeled Junos 'except' address exclusion in {label} "
-                         f"(kept the broader prefix, marked imprecise — verify manually)")
+            prev_ok = False
+            notes.append(f"Junos 'except' address exclusion in {label} — excluded "
+                         f"prefix removed from the match; remainder kept "
+                         f"un-subtracted (marked imprecise — verify manually)")
             continue
         try:
-            nets.append(ipaddress.ip_network(v if "/" in v else f"{v}/32", strict=False))
+            # ip_network() on a bare address yields the host route (/32 for v4,
+            # /128 for v6) — never widen a bare v6 address to a /32.
+            nets.append(ipaddress.ip_network(v, strict=False))
+            prev_ok = True
         except ValueError:
-            # Can't parse this address. Skipping it alone would let an all-bad
-            # set fall back to ANY and over-approximate, which could falsely
-            # prove a later deny dead. Mark imprecise so this ACE is never used
-            # to prove another rule dead (trust > coverage).
+            widen = True
             imprecise = True
+            prev_ok = False
             notes.append(f"unparsed Junos address '{v}' in {label} "
-                         f"(marked imprecise — verify manually)")
+                         f"(dimension widened to ANY, marked imprecise — verify manually)")
+    if widen:
+        nets = [_ANY_NET]
     return nets, imprecise
 
 
@@ -183,30 +194,30 @@ def _ports(vals: List[str], label: str, key: str,
            notes: List[str]) -> Tuple[List[PortRange], bool]:
     """Parse a Junos port set. Returns (ranges, imprecise).
 
-    A value we cannot parse is skipped with a note AND flips imprecise: an
-    all-unparsed port set otherwise falls back to ANY (in _parse_term) and
-    could falsely prove a later deny rule dead — the trust-breaking case."""
+    The whole token is tried as a named/numeric port FIRST — `ftp-data` is
+    port 20, not a range — and only then split as lo-hi (each side may itself
+    be a service name). An unparseable value widens the whole dimension to ANY:
+    skipping just that member would model a SUBSET of the term's true space,
+    and a narrowed deny can be falsely proven dead."""
     ranges: List[PortRange] = []
-    imprecise = False
+    widen = False
     for v in vals:
+        p = _port_num(v)
+        if p >= 0:
+            ranges.append(PortRange(p, p))
+            continue
         if "-" in v and not v.startswith("-"):
             lo, hi = v.split("-", 1)
             ln, hn = _port_num(lo), _port_num(hi)
-            if ln < 0 or hn < 0:
-                imprecise = True
-                notes.append(f"unparsed Junos {key} '{v}' in {label} "
-                             f"(marked imprecise — verify manually)")
+            if ln >= 0 and hn >= 0:
+                ranges.append(PortRange(min(ln, hn), max(ln, hn)))
                 continue
-            ranges.append(PortRange(min(ln, hn), max(ln, hn)))
-        else:
-            p = _port_num(v)
-            if p < 0:
-                imprecise = True
-                notes.append(f"unparsed Junos {key} '{v}' in {label} "
-                             f"(marked imprecise — verify manually)")
-                continue
-            ranges.append(PortRange(p, p))
-    return ranges, imprecise
+        widen = True
+        notes.append(f"unparsed Junos {key} '{v}' in {label} "
+                     f"(dimension widened to ANY, marked imprecise — verify manually)")
+    if widen:
+        ranges = [ANY_PORTS]
+    return ranges, widen
 
 
 @dataclass
@@ -241,11 +252,18 @@ def _parse_from(from_toks: List[str], label: str, notes: List[str]) -> _Match:
             pr, imp = _ports(vals, label, key, notes)
             m.dports += pr
             m.imprecise |= imp
-        elif key in ("tcp-established", "tcp-flags", "tcp-initial"):
-            # return-traffic / flag match — like Cisco `established`: not a new flow.
+        elif key in ("tcp-established", "established"):
+            # return-traffic only — like Cisco `established`: not a new flow.
             m.stateful = True
             notes.append(f"Junos '{key}' in {label} modeled as stateful "
                          f"(return-traffic only; never used to prove a rule dead)")
+        elif key in ("tcp-flags", "tcp-initial"):
+            # A generic flag match CAN match new-flow SYNs — modeling it as
+            # stateful would hide the term from the segmentation witness search
+            # (false PASS). It narrows an unmodeled dimension: over-approximate.
+            m.imprecise = True
+            notes.append(f"Junos '{key}' in {label} not modeled — flag restriction "
+                         f"ignored (over-approximated, marked imprecise)")
         elif key in ("address", "port", "icmp-type", "icmp-code"):
             # direction-agnostic / typed matches we can't place in the rectangle:
             # over-approximate (mark imprecise) so it's never used to prove deadness.
@@ -332,20 +350,27 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
     dports = m.dports or [ANY_PORTS]
     imprecise = m.imprecise
 
+    if (m.sports or m.dports) and any(p not in _PORTED for p in protos):
+        # covers()/segcheck ignore ports on a non-port-carrying protocol
+        # (including an omitted protocol -> "ip"), so those ACEs would claim an
+        # exact all-ports space: widen the ports (superset) and flag imprecise.
+        imprecise = True
+        notes.append(f"Junos term {label}: port match on a non-port-carrying "
+                     f"protocol — ports widened to ANY for those protocols "
+                     f"(marked imprecise — verify manually)")
+
     if len(srcs) * len(dsts) * len(protos) * len(sports) * len(dports) > _MAX_EXPAND:
-        notes.append(f"Junos term {label} expands to >{_MAX_EXPAND} rules; modeled "
-                     f"the first value per match and marked imprecise — verify manually")
-        srcs, dsts, protos = srcs[:1], dsts[:1], protos[:1]
-        sports, dports = sports[:1], dports[:1]
+        # Truncating to the first value per dimension would model a SUBSET
+        # (dropped members become invisible holes): widen everything instead.
+        notes.append(f"Junos term {label} expands to >{_MAX_EXPAND} rules; widened "
+                     f"to a single any/any rule (superset) and marked imprecise "
+                     f"— verify manually")
+        srcs, dsts, protos = [_ANY_NET], [_ANY_NET], ["ip"]
+        sports, dports = [ANY_PORTS], [ANY_PORTS]
         imprecise = True
 
-    if (any(p not in ("tcp", "udp") for p in protos)
-            and (m.sports or m.dports)):
-        notes.append(f"Junos term {label}: port match on a non-tcp/udp protocol — "
-                     f"ports ignored for those protocols (verify manually)")
-
     for proto in protos:
-        ported = proto in ("tcp", "udp")
+        ported = proto in _PORTED
         for s in srcs:
             for d in dsts:
                 for sp in (sports if ported else [ANY_PORTS]):
@@ -365,7 +390,15 @@ def _parse_filter(fname: str, body: List[str], entries: List[ACE],
     seq = 0
     i, n = 0, len(body)
     while i < n:
-        if body[i] == "term" and i + 2 < n and body[i + 2] == "{":
+        if (body[i] == "inactive:" and i + 3 < n and body[i + 1] == "term"
+                and body[i + 3] == "{"):
+            # `inactive: term NAME { ... }` is deactivated — NOT enforced. Parsing
+            # it would let a deactivated deny block the witness (false PASS).
+            tname = body[i + 2]
+            _, i = _read_block(body, i + 3)
+            notes.append(f"Junos term {fname}/{tname} is inactive (deactivated) — "
+                         f"not enforced; skipped")
+        elif body[i] == "term" and i + 2 < n and body[i + 2] == "{":
             tname = body[i + 1]
             tbody, i = _read_block(body, i + 2)
             seq = _parse_term(fname, tname, tbody, seq, entries, notes,
@@ -405,8 +438,15 @@ def parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
     while i < n:
         # A filter DEFINITION is `filter NAME {`. An *applied* filter
         # (`filter input NAME;` on an interface) is not followed by `{`, so the
-        # guard below skips it.
-        if toks[i] == "filter" and i + 2 < n and toks[i + 2] == "{":
+        # guard below skips it. An `inactive:`-marked filter is deactivated —
+        # none of its terms are enforced.
+        if (toks[i] == "inactive:" and i + 3 < n and toks[i + 1] == "filter"
+                and toks[i + 3] == "{"):
+            fname = toks[i + 2]
+            _, i = _read_block(toks, i + 3)
+            notes.append(f"Junos filter {fname} is inactive (deactivated) — "
+                         f"not enforced; skipped")
+        elif toks[i] == "filter" and i + 2 < n and toks[i + 2] == "{":
             fname = toks[i + 1]
             fbody, i = _read_block(toks, i + 2)
             _parse_filter(fname, fbody, entries, notes, term_lines)

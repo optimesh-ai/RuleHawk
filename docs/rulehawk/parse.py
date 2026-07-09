@@ -1,4 +1,5 @@
-"""Parse Cisco IOS extended ACLs and Cisco ASA access-lists into `ACE`s.
+"""Parse Cisco IOS extended/standard ACLs, IPv6 ACLs and Cisco ASA access-lists
+into `ACE`s.
 
 Address operand forms: `any` | `host A.B.C.D` | `A.B.C.D/len` | `A.B.C.D MASK`.
 The `A.B.C.D MASK` form is the tricky one: IOS uses an INVERSE wildcard
@@ -34,10 +35,26 @@ _NAMED_PORTS = {
     "postgres": 5432, "postgresql": 5432, "redis": 6379, "rtsp": 554,
     "vnc": 5900, "sip": 5060, "elasticsearch": 9200, "mongodb": 27017,
     "memcached": 11211, "nfs": 2049, "winrm": 5985,
+    "bootps": 67, "bootpc": 68, "imap4": 143, "imap": 143, "sunrpc": 111,
+    "nntp": 119, "lpd": 515, "non500-isakmp": 4500, "tacacs": 49, "time": 37,
+    "whois": 43, "finger": 79, "gopher": 70, "echo": 7, "discard": 9,
+    "chargen": 19, "ident": 113, "irc": 194, "klogin": 543, "kshell": 544,
+    "exec": 512, "login": 513, "cmd": 514, "talk": 517, "uucp": 540,
+    "pim-auto-rp": 496, "xdmcp": 177, "radius": 1812, "radius-acct": 1813,
 }
 _ACTIONS = ("permit", "deny")
-_TRAILING_NONTYPE = {"log", "log-input", "established", "fragments", "ttl",
-                     "dscp", "time-range", "tos", "precedence"}
+# ACE trailer keyword -> argument token count. _NARROWING_TRAILERS restrict the
+# true match space in a dimension the model does not carry (time window, DSCP,
+# TTL, ...): the emitted ACE keeps the full L3/L4 space (a superset) and is
+# marked imprecise. `inactive` (ASA) disables the rule on the device entirely.
+_TRAILER_ARGC = {"log": 0, "log-input": 0, "established": 0, "inactive": 0,
+                 "fragments": 0, "time-range": 1, "dscp": 1, "tos": 1,
+                 "precedence": 1, "ttl": 2}
+_NARROWING_TRAILERS = frozenset(
+    {"time-range", "fragments", "dscp", "tos", "precedence", "ttl"})
+
+_ANY_NET = ipaddress.ip_network("0.0.0.0/0")
+_ANY6_NET = ipaddress.ip_network("::/0")
 
 
 def _port_num(tok: str) -> int:
@@ -68,30 +85,42 @@ def _classify_mask(mask: str) -> Tuple[int, str]:
     wildcard = (1 << pc) - 1
     is_nm, is_wc = (bits == netmask), (bits == wildcard)
     if is_nm and is_wc:
-        # Only 0.0.0.0 or 255.255.255.255 satisfy both readings. In real ACLs an
-        # address paired with one of these denotes a single host (/32) — "any" is
-        # written as `any`, not `0.0.0.0 255.255.255.255` in this operand slot.
-        # Resolve to an EXACT host so it never widens to /0 (which would falsely
-        # trip the over-permissive checks) and isn't needlessly marked imprecise.
+        # Only 0.0.0.0 or 255.255.255.255 satisfy both readings. With a nonzero
+        # address these denote a single host (/32): the IOS wildcard-0.0.0.0 /
+        # ASA /32-netmask idioms. (_parse_addr special-cases address 0.0.0.0,
+        # where both real-world idioms mean "any".)
         return 32, "host"
     if is_nm:
         return pc, "netmask"
     if is_wc:
         return 32 - pc, "wildcard"
-    return 32 - pc, "noncontiguous"     # best-effort; caller marks imprecise
+    # Non-contiguous (a legal IOS wildcard, e.g. 0.255.0.255): the COVERING
+    # prefix is the mask's leading-zero run — every matched address differs from
+    # the base only in mask-1 bits, all of which lie below that run, so the
+    # prefix is a guaranteed superset. (A popcount-derived length was a SUBSET:
+    # real matches spilled outside it.) Caller marks imprecise.
+    return 32 - bits.bit_length(), "noncontiguous"
 
 
-def _parse_addr(tokens: List[str], i: int) -> Tuple[_IPNet, int, bool]:
-    """Parse an address operand; return (net, next_i, imprecise)."""
+def _parse_addr(tokens: List[str], i: int, v6: bool = False) -> Tuple[_IPNet, int, bool]:
+    """Parse an address operand; return (net, next_i, imprecise). `v6` is the
+    enclosing ACL's family (`ipv6 access-list`) — it sizes `any`; `host` sizes
+    itself from the address (/32 v4, /128 v6)."""
     t = tokens[i]
     if t == "any":
-        return ipaddress.ip_network("0.0.0.0/0"), i + 1, False
+        return (_ANY6_NET if v6 else _ANY_NET), i + 1, False
     if t == "host":
-        return ipaddress.ip_network(f"{tokens[i + 1]}/32", strict=False), i + 2, False
+        return _host_net(tokens[i + 1]), i + 2, False
     if "/" in t:
         return ipaddress.ip_network(t, strict=False), i + 1, False
     addr, mask = tokens[i], tokens[i + 1]
     plen, kind = _classify_mask(mask)
+    if kind == "host" and addr == "0.0.0.0":
+        # `0.0.0.0 0.0.0.0` (ASA netmask) and `0.0.0.0 255.255.255.255` (IOS
+        # wildcard) are both real-world spellings of "any"; the competing
+        # host-0.0.0.0 readings never occur in practice. Exact ANY — reading it
+        # as host 0.0.0.0/32 narrowed the space and false-PASSed segcheck.
+        return _ANY_NET, i + 2, False
     imprecise = kind in ("ambiguous", "noncontiguous")
     return ipaddress.ip_network(f"{addr}/{plen}", strict=False), i + 2, imprecise
 
@@ -158,15 +187,47 @@ def _parse_port_op(tokens: List[str], i: int) -> Tuple[List[PortRange], int, boo
     return [ANY_PORTS], i, False, 0
 
 
+def _scan_trailer(rest: List[str], capture_icmp: bool):
+    """Walk an ACE's trailing tokens; return (icmp_type, stateful, narrowed,
+    inactive). Each trailer keyword is skipped together with its argument(s), so
+    an argument (`time-range WORK`) is never misread as an ICMP type. A numeric
+    ICMP type followed by a numeric code is stored as "TYPE/CODE" — distinct
+    codes must never compare equal (covers() uses string equality)."""
+    icmp_type: Optional[str] = None
+    stateful = inactive = False
+    narrowed: List[str] = []
+    j = 0
+    while j < len(rest):
+        t = rest[j].lower()
+        if t in _TRAILER_ARGC:
+            if t == "established":
+                stateful = True
+            elif t == "inactive":
+                inactive = True
+            elif t in _NARROWING_TRAILERS and t not in narrowed:
+                narrowed.append(t)
+            j += 1 + _TRAILER_ARGC[t]
+            continue
+        if capture_icmp and icmp_type is None:
+            if rest[j].isdigit() and j + 1 < len(rest) and rest[j + 1].isdigit():
+                icmp_type = f"{rest[j]}/{rest[j + 1]}"       # type + code
+                j += 1
+            else:
+                icmp_type = rest[j]
+        j += 1
+    return icmp_type, stateful, narrowed, inactive
+
+
 def _entry_tokens(line: str) -> List[str]:
     s = line.strip()
     s = re.sub(r"^\d+\s+", "", s)                                  # IOS seq num
-    # ASA prefix: name, optional `line N` (from `show access-list`), optional `extended`.
-    s = re.sub(r"(?i)^access-list\s+\S+\s+(?:line\s+\d+\s+)?(?:extended\s+)?", "", s)
+    # ASA prefix: name, optional `line N` (from `show access-list`), optional
+    # `extended`/`standard` (parse_acls has already noted which one it was).
+    s = re.sub(r"(?i)^access-list\s+\S+\s+(?:line\s+\d+\s+)?(?:extended\s+|standard\s+)?",
+               "", s)
     return s.split()
 
 
-_ANY_NET = ipaddress.ip_network("0.0.0.0/0")
 # Lines we recognize as an ACE (start with permit/deny) but cannot reduce to an
 # L3/L4 rectangle: object-group / object / service-object references, or an
 # unparseable operand. Matched on the original line.
@@ -270,8 +331,8 @@ def _obj_net_members(rest: List[str]) -> List[Tuple]:
             hi = ipaddress.ip_address(rest[2])
             return [("net", n) for n in ipaddress.summarize_address_range(lo, hi)]
         return [("bad",)]                    # fqdn / unsupported -> fail closed
-    except (ValueError, IndexError):
-        return [("bad",)]
+    except (ValueError, IndexError, TypeError):
+        return [("bad",)]                    # TypeError: mixed v4/v6 range
 
 
 def _expand_proto(p: Optional[str]) -> Optional[List[str]]:
@@ -389,10 +450,12 @@ def _collect_defs(text: str) -> _Defs:
         if kw == "network-object" and ctype == "ng":
             defs.net_groups[name].append(_net_member(toks[1:]))
         elif kw == "group-object":
+            # bare `group-object` (no name) is a malformed member -> fail closed
+            mem = (ctype, toks[1]) if len(toks) >= 2 else ("bad",)
             if ctype == "ng":
-                defs.net_groups[name].append(("ng", toks[1]))
+                defs.net_groups[name].append(mem)
             elif ctype == "sg":
-                defs.svc_groups[name].append(("sg", toks[1]))
+                defs.svc_groups[name].append(mem)
         elif kw in ("service-object", "port-object") and ctype == "sg":
             defs.svc_groups[name].extend(_svc_members(toks[1:], header_proto))
         elif kw in ("host", "subnet", "range") and ctype == "no":
@@ -450,7 +513,7 @@ def _resolve_svcs(defs: _Defs, kind: str, name: str, seen: frozenset):
     return out or None
 
 
-def _operand_addr(toks: List[str], i: int, defs: _Defs):
+def _operand_addr(toks: List[str], i: int, defs: _Defs, v6: bool = False):
     """Parse a src/dst address operand, resolving object(-group) refs.
     Returns (nets|None, next_i, imprecise). None nets -> caller fails closed."""
     t = toks[i].lower()
@@ -458,7 +521,7 @@ def _operand_addr(toks: List[str], i: int, defs: _Defs):
         return _resolve_nets(defs, "ng", toks[i + 1], frozenset()), i + 2, False
     if t == "object":
         return _resolve_nets(defs, "no", toks[i + 1], frozenset()), i + 2, False
-    net, ni, imp = _parse_addr(toks, i)
+    net, ni, imp = _parse_addr(toks, i, v6)
     return [net], ni, imp
 
 
@@ -471,7 +534,7 @@ def _is_svc_ref(toks: List[str], i: int, defs: _Defs) -> bool:
 
 
 def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
-                   line: int = 0):
+                   line: int = 0, v6: bool = False):
     """Pass 2: expand one object-referencing ACE to the exact union of member
     ACEs, or return None to fall back to the fail-closed opaque ACE."""
     action = toks[0].lower()
@@ -493,7 +556,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     if i >= n:
         return None
 
-    srcs, i, imp_s = _operand_addr(toks, i, defs)
+    srcs, i, imp_s = _operand_addr(toks, i, defs, v6)
     if srcs is None:
         return None
     imprecise = imp_s
@@ -510,7 +573,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
 
     if i >= n:
         return None
-    dsts, i, imp_d = _operand_addr(toks, i, defs)
+    dsts, i, imp_d = _operand_addr(toks, i, defs, v6)
     if dsts is None:
         return None
     imprecise = imprecise or imp_d
@@ -519,7 +582,13 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     combos: List[Tuple[str, PortRange]] = []
     if proto_combos is not None:             # service group set proto + dst port
         combos = list(proto_combos)
-    elif i < n and _is_svc_ref(toks, i, defs):
+    elif i < n and toks[i].lower() in ("object-group", "object"):
+        if not _is_svc_ref(toks, i, defs):
+            # The name in the service slot does not resolve as a service set
+            # (undefined, or an icmp-type/protocol group we don't model).
+            # Treating it as an inert trailer claimed exact ANY ports/types — a
+            # narrowing. Fail closed (opaque ACE -> INDETERMINATE).
+            return None
         kind = "sg" if toks[i].lower() == "object-group" else "so"
         svcs = _resolve_svcs(defs, kind, toks[i + 1], frozenset())
         if svcs is None:
@@ -541,7 +610,12 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
         return None                          # over-cap -> fail closed (one opaque ACE)
 
     rest = toks[i:]
-    stateful = any(t.lower() == "established" for t in rest)
+    icmp_type, stateful, narrowed, inactive = _scan_trailer(rest, proto == "icmp")
+    if inactive:
+        # ASA `inactive`: the rule is DISABLED on the device — its true match
+        # space is empty, so emitting no ACE is exact (not a narrowing).
+        return [], [f"inactive (disabled on device, not enforced) -> skipped: {raw}"]
+    imprecise = imprecise or bool(narrowed)
     aces: List[ACE] = []
     m = seq
     for s in srcs:
@@ -551,11 +625,15 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
                     m += 1
                     aces.append(ACE(
                         seq=m, action=action, proto=cproto, src=s, dst=d,
-                        src_port=sp, dst_port=dp, stateful=stateful,
-                        imprecise=imprecise, raw=raw, acl=acl, line=line))
-    note = (f"resolved object-group/object reference to {len(aces)} exact "
-            f"ACE(s): {raw}")
-    return aces, [note]
+                        src_port=sp, dst_port=dp, icmp_type=icmp_type,
+                        stateful=stateful, imprecise=imprecise, raw=raw,
+                        acl=acl, line=line))
+    notes = [f"resolved object-group/object reference to {len(aces)} exact "
+             f"ACE(s): {raw}"]
+    if narrowed:
+        notes.append(f"match space narrowed by unmodeled {'/'.join(narrowed)} "
+                     f"(kept as a superset, imprecise): {raw}")
+    return aces, notes
 
 
 def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
@@ -568,19 +646,30 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     notes: List[str] = []
     defs = _collect_defs(text)               # pass 1: object-group / object defs
     current_acl = "(unnamed)"
+    cur_v6 = cur_std = False                 # family/kind of the current named ACL
     seq = 0
     for lineno, raw in enumerate(text.splitlines(), 1):
         stripped = raw.strip()
         if not stripped or stripped.startswith("!"):
             continue
-        m = re.match(r"(?i)^ip(?:v6)?\s+access-list\s+(?:extended\s+|standard\s+)?(\S+)",
+        m = re.match(r"(?i)^(ip|ipv6)\s+access-list\s+(?:(extended|standard)\s+)?(\S+)",
                      stripped)
         if m:
-            current_acl, seq = m.group(1), 0
+            current_acl, seq = m.group(3), 0
+            cur_v6 = m.group(1).lower() == "ipv6"
+            cur_std = (m.group(2) or "").lower() == "standard"
             continue
-        m = re.match(r"(?i)^access-list\s+(\S+)\s+", stripped)
+        line_v6, line_std = cur_v6, cur_std
+        m = re.match(r"(?i)^access-list\s+(\S+)\s+(?:line\s+\d+\s+)?(standard\s+)?",
+                     stripped)
         if m and re.search(r"(?i)\b(permit|deny)\b", stripped):
             current_acl = m.group(1)
+            # Flat `access-list` lines (ASA / IOS numbered) carry their own IPv4
+            # context; standard = the explicit keyword, or an IOS standard number.
+            line_v6 = False
+            nm = m.group(1)
+            line_std = bool(m.group(2)) or (nm.isdigit() and (
+                1 <= int(nm) <= 99 or 1300 <= int(nm) <= 1999))
         if not re.search(r"(?i)\b(permit|deny)\b", stripped):
             continue
         toks = _entry_tokens(raw.strip())
@@ -589,6 +678,20 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
                 notes.append(f"unparsed: {stripped}")
             continue
         action = toks[0].lower()
+        if line_std:
+            try:
+                aces, enotes = _parse_std_entry(toks, seq, current_acl, stripped,
+                                                lineno)
+            except (IndexError, ValueError, ipaddress.AddressValueError):
+                notes.append(f"unparsed (kept fail-closed): {stripped}")
+                seq += 1
+                entries.append(_opaque_ace(action, seq, current_acl, stripped,
+                                           lineno))
+                continue
+            seq += len(aces)
+            entries.extend(aces)
+            notes.extend(enotes)
+            continue
         # Object-group / object references expand a permit in ways we don't model.
         # DROPPING such a line let segcheck FALSE-PASS a real leak hidden behind
         # the group (the line carries an action on the transit path). Fail closed:
@@ -601,7 +704,7 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             resolved = None
             try:
                 resolved = _resolve_entry(toks, defs, seq, current_acl, stripped,
-                                          lineno)
+                                          lineno, line_v6)
             except (IndexError, ValueError, ipaddress.AddressValueError):
                 resolved = None
             if resolved is not None:
@@ -615,7 +718,8 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             entries.append(_opaque_ace(action, seq, current_acl, stripped, lineno))
             continue
         try:
-            aces, enotes = _parse_entry(toks, seq, current_acl, stripped, lineno)
+            aces, enotes = _parse_entry(toks, seq, current_acl, stripped, lineno,
+                                        line_v6)
         except (IndexError, ValueError, ipaddress.AddressValueError):
             # Recognized as an ACE but unparseable — fail closed rather than drop,
             # so an unreadable permit can't be silently treated as isolated.
@@ -629,7 +733,8 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     return entries, notes
 
 
-def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0):
+def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0,
+                 v6: bool = False):
     """Parse one ACE line into a LIST of ACEs (a multi-port `eq` expands to the
     exact union of per-port rules). ACEs are numbered seq+1, seq+2, ...; the
     caller advances its counter by len(result)."""
@@ -638,28 +743,29 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0):
     ported = proto in ("tcp", "udp")
     i = 2
     extra_sp = extra_dp = 0
-    src, i, imp_s = _parse_addr(toks, i)
+    src, i, imp_s = _parse_addr(toks, i, v6)
     if ported:
         src_ports, i, imp_sp, extra_sp = _parse_port_op(toks, i)
     else:
         src_ports, imp_sp = [ANY_PORTS], False
-    dst, i, imp_d = _parse_addr(toks, i)
+    dst, i, imp_d = _parse_addr(toks, i, v6)
     if ported:
         dst_ports, i, imp_dp, extra_dp = _parse_port_op(toks, i)
     else:
         dst_ports, imp_dp = [ANY_PORTS], False
     rest = toks[i:]
-    stateful = any(t.lower() == "established" for t in rest)
-    icmp_type = None
-    if proto == "icmp":
-        for t in rest:
-            if t.lower() not in _TRAILING_NONTYPE:
-                icmp_type = t
-                break
-    imprecise = imp_s or imp_d or imp_sp or imp_dp
+    icmp_type, stateful, narrowed, inactive = _scan_trailer(rest, proto == "icmp")
+    if inactive:
+        # ASA `inactive`: the rule is DISABLED on the device — its true match
+        # space is empty, so emitting no ACE is exact (not a narrowing).
+        return [], [f"inactive (disabled on device, not enforced) -> skipped: {raw}"]
+    imprecise = imp_s or imp_d or imp_sp or imp_dp or bool(narrowed)
     notes: List[str] = []
     if imp_s or imp_d:
         notes.append(f"imprecise mask (treated conservatively): {raw}")
+    if narrowed:
+        notes.append(f"match space narrowed by unmodeled {'/'.join(narrowed)} "
+                     f"(kept as a superset, imprecise): {raw}")
     if extra_sp or extra_dp:
         notes.append("multi-port `eq` expanded to the exact union of per-port "
                      f"rules ({extra_sp + extra_dp} extra port(s) now modeled, "
@@ -674,3 +780,31 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0):
                             stateful=stateful, imprecise=imprecise, raw=raw,
                             acl=acl, line=line))
     return aces, notes
+
+
+def _is_v4(tok: str) -> bool:
+    try:
+        ipaddress.IPv4Address(tok)
+        return True
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+
+
+def _parse_std_entry(toks: List[str], seq: int, acl: str, raw: str,
+                     line: int = 0):
+    """Parse one STANDARD ACL entry (IOS numbered 1-99/1300-1999, `ip access-list
+    standard`, ASA `access-list N standard`): action + SOURCE operand only; the
+    destination is implicitly any and the protocol ip. Source forms: `any` |
+    `host A` | `A` (bare = host) | `A MASK` (IOS wildcard / ASA netmask,
+    auto-detected by _classify_mask like extended operands)."""
+    action = toks[0].lower()
+    t = toks[1].lower()
+    if t in ("any", "host") or "/" in toks[1]:
+        src, _, imp = _parse_addr(toks, 1)
+    elif len(toks) > 2 and _is_v4(toks[2]):
+        src, _, imp = _parse_addr(toks, 1)   # A MASK
+    else:
+        src, imp = _host_net(toks[1]), False  # bare address == host
+    notes = [f"imprecise mask (treated conservatively): {raw}"] if imp else []
+    return [ACE(seq=seq + 1, action=action, proto="ip", src=src, dst=_ANY_NET,
+                imprecise=imp, raw=raw, acl=acl, line=line)], notes

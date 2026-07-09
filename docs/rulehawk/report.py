@@ -52,8 +52,8 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int) -> str:
                "=" * 64,
                "",
                " Nothing was analyzed (this is NOT a clean bill of health).",
-               " Check the input is a Cisco IOS extended ACL, ASA access-list,"
-               " or Juniper Junos firewall filter."]
+               " Check the input is a Cisco IOS/ASA ACL, Juniper Junos filter,"
+               " Palo Alto PAN-OS set-config, or iptables/ip6tables rules."]
         if notes:
             out.append("")
             out.append(f" Parse notes ({len(notes)}):")
@@ -96,7 +96,13 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int) -> str:
 
 
 def _sorted(findings: List[Finding]) -> List[Finding]:
-    return sorted(findings, key=lambda f: (_ORDER.get(f.severity, 9), f.rule_id))
+    # Numeric-aware within a severity: `EDGE:10` sorts after `EDGE:2`.
+    def key(f: Finding):
+        acl, _, seq = f.rule_id.rpartition(":")
+        if seq.isdigit():
+            return (_ORDER.get(f.severity, 9), acl, int(seq))
+        return (_ORDER.get(f.severity, 9), f.rule_id, 0)
+    return sorted(findings, key=key)
 
 
 def _counts(findings: List[Finding]) -> Dict[str, int]:

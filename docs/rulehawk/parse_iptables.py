@@ -93,9 +93,21 @@ def detect(text: str) -> bool:
 
 
 def _is_v6(text: str) -> bool:
-    """File-level default family: ip6tables (and no iptables) => IPv6."""
-    return bool(re.search(r"(?m)^\s*ip6tables\b", text)) and not re.search(
-        r"(?m)^\s*iptables\b", text)
+    """File-level default family. Command tokens decide when present; genuine
+    ip6tables-save output has NO command token, so fall back to v6 payload
+    evidence (icmpv6 proto or an IPv6 literal in an address argument) — else the
+    chain default policies would be emitted as 0.0.0.0/0 and no v6 flow could
+    ever match them (false PASS)."""
+    if re.search(r"(?m)^\s*ip6tables\b", text):
+        return not re.search(r"(?m)^\s*iptables\b", text)
+    if re.search(r"(?m)^\s*iptables\b", text):
+        return False
+    if re.search(r"-p\s+(?:ipv6-icmp|icmpv6|58)\b", text):
+        return True
+    if re.search(r"(?:^|\s)(?:-s|-d|--source|--destination|--src|--dst)\s+\S*:\S*",
+                 text):
+        return True
+    return False
 
 
 def _net(tok: str) -> _IPNet:
@@ -141,7 +153,7 @@ class _Rule:
 
     __slots__ = ("src", "dst", "proto", "sports", "dports", "stateful",
                  "imprecise", "icmp_type", "action", "skip_note", "modules",
-                 "jump_custom")
+                 "jump_custom", "base_return")
 
     def __init__(self) -> None:
         self.src: Optional[_IPNet] = None
@@ -156,10 +168,31 @@ class _Rule:
         self.skip_note: Optional[str] = None   # set => rule emits no ACE (surfaced)
         self.modules: List[str] = []
         self.jump_custom: Optional[str] = None  # target name of an unmodeled custom-chain jump
+        self.base_return = False               # `-j RETURN` (fail-closed in a base transit chain)
 
 
 _PROTO_NUM = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6",
               "47": "gre", "50": "esp", "51": "ah", "89": "ospf", "132": "sctp"}
+
+# `-m` modules known NOT to restrict the match space by themselves (their
+# narrowing options, if any, are parsed or surfaced separately). Anything else
+# (`limit`, `recent`, `time`, `owner`, ...) restricts by default -> imprecise.
+_NEUTRAL_MODULES = frozenset({"tcp", "udp", "icmp", "icmp6", "icmpv6", "sctp",
+                              "dccp", "udplite", "comment", "multiport",
+                              "state", "conntrack", "set", "ah", "esp"})
+
+# Options that consume a value token. A truncated line (option with no value)
+# must surface + mark imprecise, never crash mid-parse.
+_VALUE_OPTS = frozenset({
+    "-s", "--source", "--src", "-d", "--destination", "--dst",
+    "-p", "--protocol",
+    "--dport", "--destination-port", "--sport", "--source-port",
+    "--dports", "--destination-ports", "--sports", "--source-ports",
+    "--state", "--ctstate", "--match-set",
+    "-i", "--in-interface", "-o", "--out-interface",
+    "--icmp-type", "--icmpv6-type", "-m", "--match",
+    "-j", "--jump", "-g", "--goto", "--reject-with",
+})
 
 
 def _norm_proto(v: str) -> str:
@@ -184,6 +217,12 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
             i += 1
             continue
         nxt = toks[i + 1] if i + 1 < n else None
+        if nxt is None and t in _VALUE_OPTS:
+            # Truncated option (value missing): surface + imprecise, never crash.
+            r.imprecise = True
+            notes.append(f"truncated iptables option `{t}` in {label} — value "
+                         f"missing (marked imprecise — verify manually)")
+            break
         if t in ("-s", "--source", "--src"):
             if negate:
                 r.imprecise = True
@@ -192,7 +231,7 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
             else:
                 try:
                     r.src = _net(nxt)
-                except ValueError:
+                except (TypeError, ValueError):
                     r.imprecise = True
                     notes.append(f"unparsed iptables source '{nxt}' in {label} "
                                  f"(marked imprecise — verify manually)")
@@ -205,45 +244,65 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
             else:
                 try:
                     r.dst = _net(nxt)
-                except ValueError:
+                except (TypeError, ValueError):
                     r.imprecise = True
                     notes.append(f"unparsed iptables destination '{nxt}' in {label} "
                                  f"(marked imprecise — verify manually)")
             i += 2
         elif t in ("-p", "--protocol"):
-            r.proto = _norm_proto(nxt)
+            # Negated proto: the complement isn't one proto — keep "ip" (superset).
             if negate:
                 r.imprecise = True
-                notes.append(f"negated protocol (`! -p {nxt}`) in {label} "
-                             f"(marked imprecise — verify manually)")
+                notes.append(f"negated protocol (`! -p {nxt}`) in {label} — "
+                             f"over-approximated to all protocols (marked "
+                             f"imprecise — verify manually)")
+            else:
+                r.proto = _norm_proto(nxt)
             i += 2
         elif t in ("--dport", "--destination-port"):
-            pr, imp = _ports(nxt, label, "--dport", notes)
-            r.dports += pr
-            r.imprecise |= imp or negate
+            # Negated port: the complement isn't these ranges — keep ANY (superset).
             if negate:
-                notes.append(f"negated --dport in {label} (marked imprecise — verify)")
+                r.imprecise = True
+                notes.append(f"negated --dport {nxt} in {label} — over-approximated "
+                             f"to ANY ports (marked imprecise — verify)")
+            else:
+                pr, imp = _ports(nxt, label, "--dport", notes)
+                r.dports += pr
+                r.imprecise |= imp
             i += 2
         elif t in ("--sport", "--source-port"):
-            pr, imp = _ports(nxt, label, "--sport", notes)
-            r.sports += pr
-            r.imprecise |= imp or negate
             if negate:
-                notes.append(f"negated --sport in {label} (marked imprecise — verify)")
+                r.imprecise = True
+                notes.append(f"negated --sport {nxt} in {label} — over-approximated "
+                             f"to ANY ports (marked imprecise — verify)")
+            else:
+                pr, imp = _ports(nxt, label, "--sport", notes)
+                r.sports += pr
+                r.imprecise |= imp
             i += 2
         elif t in ("--dports", "--destination-ports"):   # multiport (exact union)
-            pr, imp = _ports(nxt, label, "--dports", notes)
-            r.dports += pr
-            r.imprecise |= imp or negate
-            notes.append(f"iptables multiport --dports '{nxt}' in {label} expanded to "
-                         f"{len(pr)} exact per-port rule(s)")
+            if negate:
+                r.imprecise = True
+                notes.append(f"negated --dports {nxt} in {label} — over-approximated "
+                             f"to ANY ports (marked imprecise — verify)")
+            else:
+                pr, imp = _ports(nxt, label, "--dports", notes)
+                r.dports += pr
+                r.imprecise |= imp
+                notes.append(f"iptables multiport --dports '{nxt}' in {label} expanded "
+                             f"to {len(pr)} exact per-port rule(s)")
             i += 2
         elif t in ("--sports", "--source-ports"):
-            pr, imp = _ports(nxt, label, "--sports", notes)
-            r.sports += pr
-            r.imprecise |= imp or negate
-            notes.append(f"iptables multiport --sports '{nxt}' in {label} expanded to "
-                         f"{len(pr)} exact per-port rule(s)")
+            if negate:
+                r.imprecise = True
+                notes.append(f"negated --sports {nxt} in {label} — over-approximated "
+                             f"to ANY ports (marked imprecise — verify)")
+            else:
+                pr, imp = _ports(nxt, label, "--sports", notes)
+                r.sports += pr
+                r.imprecise |= imp
+                notes.append(f"iptables multiport --sports '{nxt}' in {label} expanded "
+                             f"to {len(pr)} exact per-port rule(s)")
             i += 2
         elif t in ("--state", "--ctstate"):
             states = {s.strip().upper() for s in (nxt or "").split(",") if s.strip()}
@@ -272,13 +331,29 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                          f"conservatively)")
             i += 2
         elif t == "--icmp-type" or t == "--icmpv6-type":
-            r.icmp_type = nxt
+            # Negated type: the complement isn't one type — keep None (all types).
+            if negate:
+                r.imprecise = True
+                notes.append(f"negated ICMP type (`! {t} {nxt}`) in {label} — "
+                             f"over-approximated to all types (marked imprecise "
+                             f"— verify)")
+            else:
+                r.icmp_type = nxt
             i += 2
         elif t in ("-m", "--match"):
-            r.modules.append(nxt or "")
+            mod = nxt or ""
+            r.modules.append(mod)
+            # A non-neutral module (limit, recent, time, owner, ...) restricts
+            # the space by its mere presence/defaults — over-approximate.
+            if mod not in _NEUTRAL_MODULES:
+                r.imprecise = True
+                notes.append(f"match module `-m {mod}` in {label} not modeled — "
+                             f"marked imprecise (verify manually)")
             i += 2
         elif t in ("-j", "--jump", "-g", "--goto"):
-            target = (nxt or "").upper()
+            # Targets are case-sensitive: builtins are uppercase; `-j accept`
+            # names a user chain, never the ACCEPT verdict.
+            target = nxt or ""
             if target in _TERMINATING:
                 r.action = _TERMINATING[target]
             elif target in _NONTERMINATING:
@@ -286,8 +361,15 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                                f"— matching packets continue to the next rule (no "
                                f"decision modeled)")
             elif target == "RETURN":
-                r.skip_note = (f"iptables `-j RETURN` in {label} returns to the calling "
-                               f"chain/policy (no terminating decision modeled)")
+                # In a BASE chain the default policy applies immediately; in a
+                # custom chain the caller resumes. add_rule fails the transit
+                # base-chain case closed (imprecise marker) — a policy-ACCEPT
+                # RETURN must never FALSE-PASS as isolated.
+                r.base_return = True
+                r.skip_note = (f"iptables `-j RETURN` in {label} applies the calling "
+                               f"chain / default policy at this point — modeled "
+                               f"fail-closed on the transit path (verify the "
+                               f"fall-through manually)")
             elif target in ("MASQUERADE", "SNAT", "DNAT", "REDIRECT", "NETMAP"):
                 r.skip_note = (f"iptables NAT target `-j {nxt}` in {label} — address "
                                f"rewriting is not modeled (filter-space only; verify "
@@ -302,6 +384,10 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                 r.skip_note = (f"iptables jump to custom chain `-j {nxt}` in {label} — "
                                f"sub-chain effect not modeled (no decision emitted; "
                                f"flatten or verify the chain manually)")
+            i += 2
+        elif t == "--reject-with":
+            # REJECT flavor only (iptables-save always writes it) — selects the
+            # refusal packet, never narrows the match space. Stays precise.
             i += 2
         elif t == "-f" or t == "--fragment":
             r.imprecise = True
@@ -344,7 +430,7 @@ def _expand(chain: str, r: _Rule, seq: int, entries: List[ACE],
     any_net = _ANY6 if v6 else _ANY4
     src = r.src if r.src is not None else any_net
     dst = r.dst if r.dst is not None else any_net
-    ported = r.proto in ("tcp", "udp", "sctp")
+    ported = r.proto in ("tcp", "udp", "sctp", "dccp", "udplite")
     sports = (r.sports or [ANY_PORTS]) if ported else [ANY_PORTS]
     dports = (r.dports or [ANY_PORTS]) if ported else [ANY_PORTS]
     transit = _is_transit(chain)
@@ -416,6 +502,14 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                 r.action = "permit"
                 r.imprecise = True
                 seqs[ch] = _expand(ch, r, seqs[ch], by_chain[ch], default6, line)
+            # `-j RETURN` in a BASE chain applies the chain default policy
+            # immediately; a policy-ACCEPT RETURN skipped here would let a later
+            # DROP falsely prove the flow blocked (FALSE PASS). Same fail-closed
+            # marker as the custom-chain jump, on the transit path only.
+            elif r.base_return and ch in _BASE_CHAINS and _is_transit(ch):
+                r.action = "permit"
+                r.imprecise = True
+                seqs[ch] = _expand(ch, r, seqs[ch], by_chain[ch], default6, line)
             return
         if r.action is None:
             notes.append(f"iptables rule in {ch} has no terminating target "
@@ -478,8 +572,10 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                     notes.append(f"iptables '{tbl}' table rule present — not modeled "
                                  f"(filter-space only; review manually)")
                 continue
-        elif cmd is not None and not table_is_filter:
-            # A bare command line inside a non-filter save block (rare) — skip.
+        elif not table_is_filter:
+            # ANY rule line (save-form `-A ...` or command form) inside a
+            # *nat/*mangle/*raw block: the `*table` header already surfaced the
+            # block — skip; a nat ACCEPT must never become a filter permit.
             continue
 
         # Dispatch the action verb.
@@ -505,11 +601,46 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             k = toks.index("-P") if "-P" in toks else toks.index("--policy")
             if k + 2 < len(toks):
                 set_policy(toks[k + 1], toks[k + 2], lineno)
+        elif "-R" in toks or "--replace" in toks:
+            # Replace: modeled as append (like -I) — position math not modeled.
+            k = toks.index("-R") if "-R" in toks else toks.index("--replace")
+            if k + 1 < len(toks):
+                ch = toks[k + 1]
+                args = toks[k + 2:]
+                if args and args[0].isdigit():
+                    args = args[1:]
+                notes.append(f"iptables `-R {ch}` replace position not modeled "
+                             f"(verify) — rule appended at end for analysis")
+                add_rule(ch, args, lineno)
+        elif "-D" in toks or "--delete" in toks:
+            # Delete: removal not modeled — the deleted rule (if parsed earlier)
+            # stays in the analysis. Surfaced, never silent.
+            k = toks.index("-D") if "-D" in toks else toks.index("--delete")
+            ch = toks[k + 1] if k + 1 < len(toks) else "?"
+            notes.append(f"iptables `-D {ch}` delete not modeled — the deleted "
+                         f"rule may still appear in the analysis (verify manually)")
+        elif "-F" in toks or "--flush" in toks:
+            # Flush: an ignored mid-script flush could let a flushed earlier rule
+            # falsely prove a later rule dead — clear the accumulated rules.
+            k = toks.index("-F") if "-F" in toks else toks.index("--flush")
+            ch = toks[k + 1] if k + 1 < len(toks) else None
+            if ch is not None:
+                if ch in by_chain:
+                    by_chain[ch] = []
+                    seqs[ch] = 0
+                notes.append(f"iptables `-F {ch}` flush — rules accumulated for "
+                             f"{ch} before this point cleared from the analysis")
+            else:
+                for c in by_chain:
+                    by_chain[c] = []
+                    seqs[c] = 0
+                notes.append("iptables `-F` flush — all rules accumulated before "
+                             "this point cleared from the analysis")
         elif "-N" in toks or "--new-chain" in toks:
             k = toks.index("-N") if "-N" in toks else toks.index("--new-chain")
             if k + 1 < len(toks):
                 ensure_chain(toks[k + 1])
-        # -F/-X/-Z and others: no rule contribution; ignored.
+        # -X/-Z and others: no rule contribution; ignored.
 
     # Append each chain's default policy as the implicit trailing rule. A missing
     # policy on a base chain that carries rules is surfaced (we must not silently

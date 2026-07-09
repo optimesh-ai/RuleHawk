@@ -65,9 +65,10 @@ def test_discover_expands_globs_dedups_and_sorts(tmp_path):
     d = str(tmp_path)
     _write(d, "b.acl", _CLEAN)
     _write(d, "a.acl", _CLEAN)
-    found = gate.discover([os.path.join(d, "*.acl"),
-                           os.path.join(d, "a.acl")])     # overlap -> de-duped
+    found, unmatched = gate.discover([os.path.join(d, "*.acl"),
+                                      os.path.join(d, "a.acl")])  # overlap -> de-duped
     assert found == [os.path.join(d, "a.acl"), os.path.join(d, "b.acl")]
+    assert unmatched == []
 
 
 def test_discover_recursive_globstar(tmp_path):
@@ -75,8 +76,9 @@ def test_discover_recursive_globstar(tmp_path):
     sub = os.path.join(d, "fw")
     os.makedirs(sub)
     _write(sub, "edge.acl", _CLEAN)
-    found = gate.discover([os.path.join(d, "**", "*.acl")])
+    found, unmatched = gate.discover([os.path.join(d, "**", "*.acl")])
     assert found == [os.path.join(sub, "edge.acl")]
+    assert unmatched == []
 
 
 def test_discover_walks_a_bare_directory(tmp_path):
@@ -86,9 +88,19 @@ def test_discover_walks_a_bare_directory(tmp_path):
     os.makedirs(sub)
     _write(os.path.join(d, "firewall"), "edge.acl", _CLEAN)
     _write(sub, "core.acl", _CLEAN)
-    found = gate.discover([os.path.join(d, "firewall")])
+    found, unmatched = gate.discover([os.path.join(d, "firewall")])
     assert found == [os.path.join(d, "firewall", "edge.acl"),
                      os.path.join(sub, "core.acl")]
+    assert unmatched == []
+
+
+def test_discover_reports_unmatched_patterns(tmp_path):
+    d = str(tmp_path)
+    _write(d, "a.acl", _CLEAN)
+    found, unmatched = gate.discover([os.path.join(d, "a.acl"),
+                                      os.path.join(d, "typo-*.acl")])
+    assert found == [os.path.join(d, "a.acl")]
+    assert unmatched == [os.path.join(d, "typo-*.acl")]
 
 
 # --------------------------------------------------------------------------- #
@@ -332,3 +344,100 @@ def test_main_bad_fail_on_is_usage_error(tmp_path):
 
 def test_main_no_match_is_error(tmp_path):
     assert gate.main([os.path.join(str(tmp_path), "nope-*.acl")]) == 2
+
+
+def test_main_partial_pattern_miss_fails_closed(tmp_path):
+    # One good file + one typo'd pattern: the gate must refuse to run a partial
+    # audit and call it green (the typo'd firewall would never be audited).
+    p = _write(str(tmp_path), "clean.acl", _CLEAN)
+    assert gate.main([p, os.path.join(str(tmp_path), "typo-*.acl"), "-q"]) == 2
+
+
+def test_main_unknown_vendor_is_usage_error(tmp_path):
+    p = _write(str(tmp_path), "edge.acl", _CISCO)
+    assert gate.main([p, "--vendor", "iptable", "-q"]) == 2   # typo'd vendor
+
+
+def test_main_unknown_flag_is_usage_error(tmp_path):
+    # `--fail-onn low` used to be silently dropped (default threshold kept,
+    # `low` treated as a file pattern) — the user's intent ignored twice.
+    p = _write(str(tmp_path), "edge.acl", _CISCO)
+    assert gate.main([p, "--fail-onn", "low", "-q"]) == 2
+
+
+def test_main_unwritable_output_is_error_not_traceback(tmp_path):
+    p = _write(str(tmp_path), "clean.acl", _CLEAN)
+    bad = os.path.join(str(tmp_path), "no-such-dir", "out.sarif")
+    assert gate.main([p, "--sarif", bad, "-q"]) == 2
+
+
+def test_main_semantically_bad_policy_fails_closed(tmp_path):
+    # Valid JSON, invalid content (bad CIDR): must be a policy-error finding
+    # that blocks at the default threshold — never a traceback, never a PASS.
+    d = str(tmp_path)
+    p = _write(d, "clean.acl", _CLEAN)
+    pol = _write(d, "policy.json", json.dumps(
+        {"zones": {"PCI": ["10.10.0.0/33"], "CORP": ["10.20.0.0/16"]},
+         "must_not_reach": [{"src": "CORP", "dst": "PCI"}]}))
+    assert gate.main([p, "--policy", pol, "-q"]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# SARIF fingerprint stability + URI anchoring
+# --------------------------------------------------------------------------- #
+def _fingerprints(g):
+    s = json.loads(gate.to_sarif(g))
+    return {r["ruleId"]: r["partialFingerprints"]["ruleHawk/v2"]
+            for r in s["runs"][0]["results"]}
+
+
+def test_fingerprints_survive_unrelated_insertion(tmp_path):
+    # Inserting an unrelated rule ABOVE shifts every seq; the alert identity
+    # (content-based fingerprint) must not change, or code scanning would
+    # close-and-reopen every downstream alert on each PR.
+    d = str(tmp_path)
+    p = _write(d, "edge.acl", _CISCO)
+    before = _fingerprints(gate.run_gate([p], _POLICY, "high"))
+    inserted = _CISCO.replace(
+        " permit tcp any host 203.0.113.10 eq 443\n",
+        " permit udp host 192.0.2.9 host 203.0.113.9 eq 53\n"
+        " permit tcp any host 203.0.113.10 eq 443\n")
+    p2 = _write(d, "edge.acl", inserted)
+    after = _fingerprints(gate.run_gate([p2], _POLICY, "high"))
+    for kind, fp in before.items():
+        assert after.get(kind) == fp, f"fingerprint churn for {kind}"
+
+
+def test_distinct_violations_on_one_rule_get_distinct_fingerprints(tmp_path):
+    # Two breached boundaries via the SAME permit must stay two alerts.
+    d = str(tmp_path)
+    p = _write(d, "edge.acl", _CISCO)
+    pol = {
+        "zones": {"PCI": ["10.10.0.0/16"], "CORP": ["10.20.0.0/16"],
+                  "DMZ": ["10.30.0.0/16"]},
+        "must_not_reach": [
+            {"src": "CORP", "dst": "PCI", "proto": "tcp", "ports": [445]},
+            {"src": "DMZ", "dst": "PCI", "proto": "tcp", "ports": [445]},
+        ],
+    }
+    s = json.loads(gate.to_sarif(gate.run_gate([p], pol, "high")))
+    fps = [r["partialFingerprints"]["ruleHawk/v2"]
+           for r in s["runs"][0]["results"]
+           if r["ruleId"] == "segmentation-violation"]
+    assert len(fps) == 2 and len(set(fps)) == 2
+
+
+def test_sarif_uri_is_workspace_relative(tmp_path, monkeypatch):
+    # With working-directory below the checkout root, the URI must still be
+    # repo-root-relative or GitHub attaches annotations to a nonexistent path.
+    d = str(tmp_path)
+    sub = os.path.join(d, "network")
+    os.makedirs(sub)
+    p = _write(sub, "edge.acl", _CISCO)
+    monkeypatch.setenv("GITHUB_WORKSPACE", d)
+    monkeypatch.chdir(sub)
+    s = json.loads(gate.to_sarif(gate.run_gate(["edge.acl"], None, "high")))
+    uris = {r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+            for r in s["runs"][0]["results"]}
+    assert uris == {"network/edge.acl"}
+    assert p  # silence lint

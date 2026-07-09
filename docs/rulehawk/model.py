@@ -15,6 +15,17 @@ covering rule:
   * `stateful`   — `established` matches only return traffic (ACK/RST), so it
                    does not "cover" a new-flow rule.
 `covers()` returns False whenever `a` is imprecise or stateful.
+
+PARSER CONTRACT (load-bearing for every frontend): an ACE's modeled space must
+be a SUPERSET of the rule's true match space — parsers must WIDEN, never narrow.
+An `imprecise` ACE may safely BE covered (real ⊆ modeled ⊆ coverer) and segcheck
+treats any imprecise match as indeterminate, but both of those are sound ONLY
+under the superset guarantee. A frontend that narrows a dimension (dropping a
+negation's complement, truncating a member list, skipping an unresolvable
+member) breaks it: `covers()` would then prove a live rule dead and segcheck
+would false-PASS a witness that lives in the dropped part. When a construct
+can't be modeled exactly, over-approximate that dimension to ANY and set
+`imprecise` — never emit a subset.
 """
 
 from __future__ import annotations
@@ -26,8 +37,13 @@ from typing import Optional, Union
 _IPNet = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
 PORT_MIN, PORT_MAX = 0, 65535
-_PORTED = frozenset({"tcp", "udp"})
+# Protocols whose ACEs carry meaningful port ranges. sctp/dccp/udplite are here
+# because iptables matches ports on them; a proto in this set gets its ports
+# COMPARED by covers() — omitting one would let "permit sctp :5000" falsely
+# cover "deny sctp :9".
+_PORTED = frozenset({"tcp", "udp", "sctp", "dccp", "udplite"})
 _WILDCARD_PROTO = frozenset({"ip", "any", "ipv4", "ipv6"})
+_ICMP_PROTOS = frozenset({"icmp", "icmpv6"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -110,9 +126,9 @@ def covers(a: ACE, b: ACE) -> bool:
         return False
     if not _proto_covers(a.proto, b.proto):
         return False
-    # ICMP type: an exact-typed rule only covers the same type; a typeless icmp
-    # rule (or an ip/any wildcard) covers all types.
-    if a.proto == "icmp" and b.proto == "icmp":
+    # ICMP/ICMPv6 type: an exact-typed rule only covers the same type; a typeless
+    # icmp rule (or an ip/any wildcard) covers all types.
+    if a.proto in _ICMP_PROTOS and a.proto == b.proto:
         if a.icmp_type is not None and a.icmp_type != b.icmp_type:
             return False
     if not _net_covers(a.src, b.src):
@@ -166,7 +182,7 @@ def _compatible_coverer(a: ACE, b: ACE) -> bool:
         return False
     if not _proto_covers(a.proto, b.proto):
         return False
-    if a.proto == "icmp" and b.proto == "icmp":
+    if a.proto in _ICMP_PROTOS and a.proto == b.proto:
         if a.icmp_type is not None and a.icmp_type != b.icmp_type:
             return False
     if b.proto in _PORTED:

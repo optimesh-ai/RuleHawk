@@ -288,14 +288,9 @@ if _pol:
         findings = findings + check_segmentation(aces, json.loads(_pol))
     except Exception as e:
         notes = notes + ["segmentation policy error: " + str(e)]
-_lines = cfg.split("\\n")
-_rl, _cur = {}, 0
-for a in aces:
-    for _i in range(_cur, len(_lines)):
-        if _lines[_i].strip() == a.raw.strip():
-            _rl[a.acl + ":" + str(a.seq)] = _i + 1
-            _cur = _i + 1
-            break
+# Parsers stamp every ACE with its exact 1-based source line (model.ACE.line),
+# including all ACEs expanded from one object-group line. 0 = unknown -> no jump.
+_rl = {a.acl + ":" + str(a.seq): a.line for a in aces if a.line}
 json.dumps({"report_json": json.loads(to_json(findings, notes, len(aces))),
             "report_text": to_text(findings, notes, len(aces)),
             "rule_lines": _rl, "vendor": vendor})
