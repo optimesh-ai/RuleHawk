@@ -267,10 +267,14 @@ def test_multiline_address_group_members_accumulate():
     assert "segmentation-violation" in kinds    # the first-line member leaks
 
 
-def test_mixed_static_group_widens_dimension_to_any():
-    # P5: one unresolvable member (fqdn) poisons the union — keeping only the
-    # resolvable subset FALSE-PASSED flows through the unresolvable member. The
-    # whole dimension widens to ANY: indeterminate, never PASS.
+def test_mixed_static_group_unresolved_member_never_false_passes():
+    # P5: one unresolvable member (fqdn) means the resolved subset alone is NOT
+    # the rule's match space — keeping only the resolvable subset FALSE-PASSED
+    # flows through the unresolvable member. Partial precision now emits the
+    # resolved member as an EXACT ACE plus one opaque any/any imprecise ACE
+    # covering the unresolved remainder. The sound outcome is unchanged: the
+    # assertion can never PASS (the fqdn may cover CORP) and no false CRITICAL
+    # is invented (the resolved 192.168.5.0/24 is outside CORP).
     cfg = """
     set address good ip-netmask 192.168.5.0/24
     set address evil fqdn evil.example.com
@@ -279,11 +283,15 @@ def test_mixed_static_group_widens_dimension_to_any():
     set rulebase security rules r from any to any source grp destination 10.10.0.0/16 application any service svc-smb action allow
     """
     aces, notes = parse_panos(cfg)
-    assert len(aces) == 1
-    assert aces[0].src_any and aces[0].imprecise is True
-    assert any("widened to ANY" in n for n in notes)
+    precise = [a for a in aces if not a.imprecise]
+    opaque = [a for a in aces if a.imprecise]
+    assert len(precise) == 1 and str(precise[0].src) == "192.168.5.0/24"
+    assert len(opaque) == 1
+    assert opaque[0].src_any and opaque[0].dst_any   # marker covers the remainder
+    assert any("partially resolved" in n for n in notes)
     kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-ok" not in kinds            # never a false PASS
+    assert "segmentation-violation" not in kinds     # never a false CRITICAL
     assert "segmentation-indeterminate" in kinds
 
 
@@ -353,3 +361,63 @@ def test_ports_on_unported_protocol_widen_and_flag():
     assert aces[0].proto == "gre" and aces[0].dst_port.is_any()
     assert aces[0].imprecise is True
     assert any("non-port-carrying" in n for n in notes)
+
+
+# ── negate-source/destination soundness (false-PASS regression) ───────────────
+# `negate-source yes` means the rule matches the COMPLEMENT of the listed set.
+# Modeling the LISTED nets (even marked imprecise) UNDER-approximates: segcheck
+# skips any ACE whose modeled src doesn't contain the probe, so a probe outside
+# the listed set never sees the permit and the audit prints a false PASS. The
+# negated dimension must widen to ANY (⊇ complement), imprecise=True — the same
+# discipline parse_iptables applies to `! -s` (src left at ANY).
+
+def test_negate_source_widens_to_any_not_listed_nets():
+    cfg = """
+    set address corp-net ip-netmask 10.99.0.0/16
+    set rulebase security rules allow-except from any to any source [ corp-net ] negate-source yes destination 10.10.0.0/16 application any service any action allow
+    """
+    aces, notes = parse_panos(cfg)
+    assert len(aces) == 1
+    a = aces[0]
+    # The real match is everything EXCEPT 10.99.0.0/16 — the modeled src must be
+    # ANY (a superset), never the listed 10.99.0.0/16 (a disjoint set).
+    assert str(a.src) == "0.0.0.0/0"
+    assert str(a.dst) == "10.10.0.0/16"       # non-negated dim stays exact
+    assert a.imprecise is True                # ANY over-approximates -> no proofs
+    assert any("negate-source" in n and "widened to any" in n for n in notes)
+
+
+def test_negate_destination_widens_to_any_not_listed_nets():
+    cfg = """
+    set address dmz-net ip-netmask 192.0.2.0/24
+    set rulebase security rules allow-except from any to any source 10.20.0.0/16 destination [ dmz-net ] negate-destination yes application any service any action allow
+    """
+    aces, notes = parse_panos(cfg)
+    assert len(aces) == 1
+    a = aces[0]
+    assert str(a.dst) == "0.0.0.0/0"          # complement -> widened to ANY
+    assert str(a.src) == "10.20.0.0/16"       # non-negated dim stays exact
+    assert a.imprecise is True
+    assert any("negate-destination" in n and "widened to any" in n for n in notes)
+
+
+def test_negate_source_repro_indeterminate_not_pass():
+    # The live repro: 'source [ CORP-NET(10.99/16) ] negate-source yes action
+    # allow' + default deny. The real firewall PERMITS 10.20.0.0/16 -> PCI
+    # (10.20/16 is outside the negated set), so a green "PASS: CORP cannot reach
+    # PCI" is a false compliance claim. The honest verdict is INDETERMINATE.
+    cfg = """
+    set address corp-net ip-netmask 10.99.0.0/16
+    set rulebase security rules allow-except from any to any source [ corp-net ] negate-source yes destination any application any service any action allow
+    set rulebase security rules default-deny from any to any source any destination any application any service any action deny
+    """
+    aces, _ = parse_panos(cfg)
+    findings = check_segmentation(aces, _SEG_POLICY)
+    kinds = {f.kind for f in findings}
+    assert "segmentation-ok" not in kinds, (
+        "FALSE PASS: negate-source permit modeled as the listed net — the real "
+        "firewall permits CORP->PCI (CORP is outside the negated set)")
+    # Fail-closed, not fail-wrong: no concrete witness exists in the modeled
+    # space, so it must be INDETERMINATE (review manually), never CRITICAL.
+    assert "segmentation-indeterminate" in kinds
+    assert "segmentation-violation" not in kinds

@@ -4,20 +4,23 @@ Declare zones (named CIDR sets) and `must_not_reach` assertions, e.g. "CORP must
 not reach PCI on tcp/445,3389". For each assertion we search the forbidden
 packet space EXACTLY under first-match semantics: walking each ACL in order,
 an exact deny SUBTRACTS its slice of the space and the search continues on the
-remainder, so an earlier deny that blocks only part of the space can never hide
-a permit that leaks the rest (and a deny that blocks all of it produces no false
-alarm). A violation is reported with a CONCRETE WITNESS packet the ACL provably
-permits; any imprecise (over-approximated) rule the search touches yields an
-honest "indeterminate / review manually" instead of a possibly-wrong verdict.
+remainder, so an earlier deny that blocks only part of the space (one host, one
+port range, one source-port band, one ICMP type) can never hide a permit that
+leaks the rest — and a deny that blocks all of it produces no false alarm. A
+violation is reported with a CONCRETE WITNESS packet the ACL provably permits
+(port included, even for portless assertions); any imprecise (over-approximated)
+rule the search touches yields an honest "indeterminate / review manually"
+instead of a possibly-wrong verdict.
 
 A wildcard assertion (`proto: "ip"`) is probed per concrete protocol: a
 tcp-only deny must not be allowed to "block" the udp/icmp part of the space.
 ICMP-typed rules keep their type as a search dimension: a `deny icmp echo`
 does not block an `echo-reply` witness.
 
-Policy errors (unknown zone name, bad CIDR, bad port) FAIL CLOSED: they emit a
-`segmentation-policy-error` finding and the affected assertion is never given a
-PASS — a typo'd zone must not certify isolation over an empty search space.
+Policy errors (unknown/omitted zone name, bad CIDR, bad port) FAIL CLOSED: they
+emit a high-severity `segmentation-error` finding and the affected assertion is
+never given a PASS — a typo'd zone must not certify isolation over an empty
+search space.
 
 Policy (JSON):
   {"zones": {"PCI": ["10.10.0.0/16"], "CORP": ["10.20.0.0/16"]},
@@ -28,16 +31,19 @@ Policy (JSON):
 from __future__ import annotations
 
 import ipaddress
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from .analyze import Finding
 from .model import (ACE, ANY_PORTS, _ICMP_PROTOS, _IPNet, _PORTED,
                     _WILDCARD_PROTO, PortRange)
 
 # Rule-visit budget per (assertion x zone-pair x port x probe x ACL) search.
-# Exhaustion returns an INDETERMINATE (fail-closed), never a PASS. Generous:
-# real configs use a tiny fraction; only an adversarial deny-lattice hits it.
-_MAX_VISITS = 50_000
+# Exhaustion returns an INDETERMINATE (fail-closed), never a PASS. Sized for
+# the expensive direction — PROVING a PASS on a large ACL of partial denies
+# subdivides the space (~rules x pieces x rules visits; a 400-deny wall needs
+# ~1.3M); a violation exits early and never approaches it. Each visit is a few
+# integer compares, so the worst case stays low single-digit seconds.
+_MAX_VISITS = 5_000_000
 
 # The search space is a 5-rectangle: (src-net, dst-net, src-ports, dst-ports,
 # icmp-type). The icmp-type dimension is symbolic: ("eq", t) = exactly type t,
@@ -118,6 +124,12 @@ def _witness_host(net: _IPNet) -> str:
     return str(next(iter(net.hosts()), net.network_address))
 
 
+def _witness_port(dpr: PortRange) -> int:
+    """A concrete, preferably ordinary representative of the leaking port range
+    (0 reads as degenerate to auditors — avoid it when the range allows)."""
+    return dpr.lo if dpr.lo > 0 else min(1, dpr.hi)
+
+
 class _Budget:
     __slots__ = ("left",)
 
@@ -153,57 +165,67 @@ def _rect_minus(rect, r: ACE, typed: bool):
     return pieces
 
 
-def _search(aces: List[ACE], i: int, probe: str, rect, budget: _Budget):
-    """First-match search for a permitted (or undecidable) packet inside `rect`
-    over aces[i:]. Returns ("permit"|"indeterminate", sub_rect, rule) or None
-    (= every packet in rect is denied, incl. the implicit default deny)."""
+def _search(aces: List[ACE], i0: int, probe: str, rect0, budget: _Budget):
+    """First-match search for a permitted (or undecidable) packet inside `rect0`
+    over aces[i0:]. Returns ("permit"|"indeterminate", sub_rect, rule) or None
+    (= every packet in the rectangle is denied, incl. the implicit default deny).
+
+    Iterative DFS over (rule-index, rectangle) — an exact deny splits the
+    rectangle into disjoint remainder pieces that each continue against the
+    REST of the ACL. A worklist (not recursion) so a config that is one long
+    wall of partial denies cannot hit the interpreter recursion limit."""
     typed = probe in _ICMP_PROTOS
-    while i < len(aces):
-        if not budget.spend():
-            return ("indeterminate", rect, None)   # too complex -> fail closed
-        r = aces[i]
-        i += 1
-        if r.stateful:
-            continue        # matches only return traffic; can't open a new flow
-        if not _proto_matches(r.proto, probe):
-            continue
-        si, di = _intersect(rect[0], r.src), _intersect(rect[1], r.dst)
-        if si is None or di is None:
-            continue
-        spi, dpi = _pr_intersect(rect[2], r.src_port), _pr_intersect(rect[3], r.dst_port)
-        if spi is None or dpi is None:
-            continue
-        iti = _it_intersect(rect[4], r.icmp_type) if typed else rect[4]
-        if iti is None:
-            continue
-        sub = (si, di, spi, dpi, iti)
-        if r.imprecise:
-            # Over-approximated space intersects the rectangle -> can't decide
-            # that part either way. Fail closed.
-            return ("indeterminate", sub, r)
-        if r.action == "permit":
-            return ("permit", sub, r)
-        # Exact deny: it kills exactly its slice. Search the remainder pieces
-        # against the REST of the ACL (each piece is disjoint from the slice).
-        for piece in _rect_minus(rect, r, typed):
-            res = _search(aces, i, probe, piece, budget)
-            if res is not None:
-                return res
-        return None
+    stack = [(i0, rect0)]
+    while stack:
+        i, rect = stack.pop()
+        while i < len(aces):
+            if not budget.spend():
+                return ("indeterminate", rect, None)   # too complex -> fail closed
+            r = aces[i]
+            i += 1
+            if r.stateful:
+                continue    # matches only return traffic; can't open a new flow
+            if not _proto_matches(r.proto, probe):
+                continue
+            si, di = _intersect(rect[0], r.src), _intersect(rect[1], r.dst)
+            if si is None or di is None:
+                continue
+            if r.imprecise:
+                # Fail closed BEFORE the port/type intersection: an imprecise
+                # ACE's port range may be the under-approximated part (e.g.
+                # `eq www <unknown-service>` keeps the known port exact and
+                # flags imprecise for the unknown one), so "its ports don't
+                # overlap the probe" proves nothing.
+                return ("indeterminate",
+                        (si, di, rect[2], rect[3], rect[4]), r)
+            spi, dpi = _pr_intersect(rect[2], r.src_port), _pr_intersect(rect[3], r.dst_port)
+            if spi is None or dpi is None:
+                continue
+            iti = _it_intersect(rect[4], r.icmp_type) if typed else rect[4]
+            if iti is None:
+                continue
+            sub = (si, di, spi, dpi, iti)
+            if r.action == "permit":
+                return ("permit", sub, r)
+            # Exact deny: it kills exactly its slice. Continue with the first
+            # remainder piece inline; queue the rest at the same rule index.
+            pieces = _rect_minus(rect, r, typed)
+            if not pieces:
+                break                     # rect fully denied by r
+            rect = pieces[0]
+            for piece in reversed(pieces[1:]):
+                stack.append((i, piece))
+        # inner loop exhausted the ACL: this rectangle falls to implicit deny
     return None
 
 
-def _policy_error(msg: str) -> Finding:
-    return Finding(
-        "policy", "segmentation-policy-error", "high",
-        f"SEGMENTATION POLICY ERROR: {msg} — fail-closed: the affected "
-        f"assertion gets no PASS until the policy is fixed.",
-        "", fix="fix the segmentation policy file")
+def _policy_error(rule_id: str, msg: str, fix: str) -> Finding:
+    return Finding(rule_id, "segmentation-error", "high", msg, "", fix=fix)
 
 
 def _coerce_ports(raw) -> Optional[List[Optional[int]]]:
     """[445, "3389"] -> [445, 3389]; None/[] -> [None] (= any port);
-    anything unusable -> None (caller emits a policy error)."""
+    anything unusable -> None (caller emits a segmentation-error)."""
     if not raw:
         return [None]
     if not isinstance(raw, (list, tuple)):
@@ -223,16 +245,19 @@ def _coerce_ports(raw) -> Optional[List[Optional[int]]]:
 def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
     findings: List[Finding] = []
     if not isinstance(policy, dict):
-        return [_policy_error("policy must be a JSON object with 'zones' and "
-                              "'must_not_reach'")]
+        return [_policy_error(
+            "policy",
+            "CANNOT EVALUATE: policy must be a JSON object with 'zones' and "
+            "'must_not_reach'. No assertion was checked — no isolation is proven.",
+            "fix the segmentation policy file")]
 
     # Inter-zone (transit) segmentation is decided ONLY by ACEs that govern
-    # forwarded traffic — iptables INPUT/OUTPUT host hooks never see a transit
-    # packet and are flagged transit=False by the frontend (all other vendors
-    # leave transit=True). Each ACL is an INDEPENDENT first-match context
-    # (its own interface + direction): one ACL's catch-all deny must never
-    # shadow a permit in a DIFFERENT ACL, so every context is searched on its
-    # own and a violation in any one of them is a real leak.
+    # forwarded traffic — iptables INPUT/OUTPUT are host in/out hooks that never
+    # see a transit packet and are flagged transit=False by the frontend (all
+    # other vendors leave transit=True). Each ACL is an INDEPENDENT first-match
+    # context (its own interface + direction): one ACL's catch-all deny must
+    # never shadow a permit in a DIFFERENT ACL, so every context is searched on
+    # its own and a violation in any one of them is a real leak.
     aces = [a for a in aces if a.transit]
     by_acl: Dict[str, List[ACE]] = {}
     for a in aces:
@@ -242,8 +267,10 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
     bad_zones = set()
     zdef = policy.get("zones") or {}
     if not isinstance(zdef, dict):
-        findings.append(_policy_error("'zones' must be an object of "
-                                      "name -> [CIDR, ...]"))
+        findings.append(_policy_error(
+            "policy", "SEGMENTATION POLICY ERROR: 'zones' must be an object of "
+            "name -> [CIDR, ...] — fail-closed: no assertion gets a PASS until "
+            "the policy is fixed.", "fix the segmentation policy file"))
         zdef = {}
     for name, cidrs in zdef.items():
         if not isinstance(cidrs, (list, tuple)):
@@ -253,41 +280,71 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
             try:
                 nets.append(_net(str(c)))
             except ValueError:
-                findings.append(_policy_error(f"zone '{name}': invalid CIDR '{c}'"))
+                findings.append(_policy_error(
+                    "policy",
+                    f"SEGMENTATION POLICY ERROR: zone '{name}': invalid CIDR "
+                    f"'{c}' — fail-closed: assertions over this zone get no "
+                    f"PASS until the policy is fixed.",
+                    "fix the segmentation policy file"))
                 bad_zones.add(name)
         zones[name] = nets
 
     for assertion in (policy.get("must_not_reach") or []):
         if not isinstance(assertion, dict):
-            findings.append(_policy_error(f"must_not_reach entry is not an "
-                                          f"object: {assertion!r}"))
+            findings.append(_policy_error(
+                "policy", f"SEGMENTATION POLICY ERROR: must_not_reach entry is "
+                f"not an object: {assertion!r} — this assertion was NOT checked.",
+                "fix the segmentation policy file"))
             continue
         sname, dname = assertion.get("src"), assertion.get("dst")
         proto = str(assertion.get("proto") or "ip").lower()
         if proto == "any":
             proto = "ip"
+        label = f"{sname}!->{dname}" + (f"/{proto}" if proto != "ip" else "")
+        # Fail closed on an assertion that names a zone we can't resolve. A null
+        # (omitted key) or misspelled/undefined src/dst would make the witness
+        # search iterate over an EMPTY zone and silently emit a
+        # "segmentation-ok" PASS — a fabricated bill of health for a check that
+        # never ran.
+        _defined = sorted(zones.keys())
+        _unknown = [role for role, nm in (("src", sname), ("dst", dname))
+                    if nm is None or nm not in zones]
+        if _unknown:
+            _detail = "; ".join(
+                (f"missing {role} zone" if (sname if role == "src" else dname) is None
+                 else f"unknown {role} zone "
+                      f"'{sname if role == 'src' else dname}'")
+                for role in _unknown)
+            findings.append(_policy_error(
+                label,
+                f"CANNOT EVALUATE ({sname} must not reach {dname}): {_detail}. "
+                f"Defined zones: {', '.join(_defined) or '(none)'}. "
+                f"This assertion was NOT checked — no isolation is proven.",
+                ("define the named zone(s) in policy 'zones', or fix the "
+                 "typo so src/dst reference existing zones")))
+            continue
         ports = _coerce_ports(assertion.get("ports"))
         if ports is None:
             findings.append(_policy_error(
-                f"assertion {sname}->{dname}: 'ports' must be integers in "
-                f"0-65535 (got {assertion.get('ports')!r})"))
-            continue
-        if sname not in zones or dname not in zones:
-            missing = ", ".join(repr(z) for z in (sname, dname) if z not in zones)
-            findings.append(_policy_error(
-                f"assertion {sname!r}->{dname!r} references undefined zone(s) "
-                f"{missing} — an empty zone would falsely certify isolation"))
+                label,
+                f"SEGMENTATION POLICY ERROR: assertion {sname}->{dname}: "
+                f"'ports' must be integers in 0-65535 "
+                f"(got {assertion.get('ports')!r}) — this assertion was NOT "
+                f"checked.", "fix the segmentation policy file"))
             continue
 
         # Probe protocols. A wildcard assertion must be checked per concrete
         # protocol — a tcp-only deny does not block the udp/icmp space — plus
-        # the "ip" probe for protocols only wildcard rules match. A
-        # port-constrained wildcard assertion is about ported protocols.
+        # the "ip" probe for protocols only wildcard rules match. The "ip"
+        # probe goes FIRST: when a `permit ip` rule leaks the boundary, the
+        # strongest witness is the any-protocol one, not whichever concrete
+        # protocol happens to sort first. A port-constrained wildcard
+        # assertion is about ported protocols.
         if proto not in _WILDCARD_PROTO:
             probes = [proto]
         else:
-            probes = sorted({a.proto for a in aces
-                             if a.proto not in _WILDCARD_PROTO}) + ["ip"]
+            probes = ["ip"] + sorted({a.proto for a in aces
+                                      if a.proto not in _WILDCARD_PROTO})
             if ports != [None]:
                 probes = [p for p in probes if p in _PORTED] or ["tcp", "udp"]
 
@@ -324,15 +381,28 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
         if violation:
             sub, rule, probe, port = violation
             swit, dwit = _witness_host(sub[0]), _witness_host(sub[1])
-            portsfx = f":{port}" if port is not None else ""
+            # The witness must be a REAL packet, concrete in the port dimension
+            # too: for a portless ported assertion, pick a representative from
+            # the sub-rectangle the search PROVED permitted.
+            wport = port
+            if wport is None and probe in _PORTED:
+                wport = _witness_port(sub[3])
+            portsfx = f":{wport}" if wport is not None else ""
+            # Paste-ready fix: the actual intersecting CIDRs (engine-proven,
+            # sub ⊆ zone ∩ rule), scoped to the ASSERTED ports — a portless
+            # assertion forbids EVERY port, so the deny must be portless too.
+            _port_part = f" port {port}" if port is not None else ""
+            _line_part = f" (line {rule.line})" if rule.line else ""
             findings.append(Finding(
                 f"{rule.acl}:{rule.seq}", "segmentation-violation", "critical",
                 f"SEGMENTATION VIOLATION ({sname} must not reach {dname}): "
                 f"the ACL PERMITS {swit} -> {dwit}{portsfx} ({probe}) via "
                 f"rule {rule.seq}.",
                 rule.raw,
-                fix=f"deny {sname}->{dname}{portsfx} before rule {rule.seq}",
-                witness=f"{swit} -> {dwit}{portsfx} ({probe})"))
+                fix=(f"deny {sub[0]} -> {sub[1]}{_port_part} "
+                     f"before rule {rule.seq}{_line_part}"),
+                witness=f"{swit} -> {dwit}{portsfx} ({probe})",
+                line=rule.line))
             continue
         if indet:
             sub, rule, acl_name = indet
@@ -343,7 +413,8 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                     f"Cannot prove {sname} is isolated from {dname} — "
                     f"rule {rule.seq} uses an unmodeled form "
                     f"(neq/complex mask); review manually.",
-                    rule.raw, fix="rewrite the rule with explicit ports/masks"))
+                    rule.raw, fix="rewrite the rule with explicit ports/masks",
+                    line=rule.line))
             else:
                 findings.append(Finding(
                     acl_name, "segmentation-indeterminate", "medium",
@@ -356,17 +427,19 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
             # Part of the zone definition was dropped as invalid — a PASS over
             # the remaining subnets would be a false bill of health.
             findings.append(_policy_error(
-                f"assertion {sname}->{dname}: zone definition has invalid "
-                f"CIDR(s), isolation cannot be certified"))
+                label,
+                f"SEGMENTATION POLICY ERROR: assertion {sname}->{dname}: zone "
+                f"definition has invalid CIDR(s), isolation cannot be certified.",
+                "fix the segmentation policy file"))
             continue
-        label = f"{sname}!->{dname}" + (f"/{proto}" if proto != "ip" else "")
-        real_ports = [p for p in ports if p is not None]
+        # Portless assertions cover EVERY port, so say "on tcp" (any port),
+        # not the abstract "on tcp/[None]".
         scope = ""
         if proto != "ip":
-            scope = f" on {proto}" + (f"/{real_ports}" if real_ports else "")
+            scope = f" on {proto}" + ("" if ports == [None] else f"/{ports}")
         findings.append(Finding(
             label, "segmentation-ok", "info",
             f"PASS: {sname} cannot reach {dname}{scope}"
-            " (no permitted witness flow found).", "",
+            + " (no permitted witness flow found).", "",
             fix=""))
     return findings

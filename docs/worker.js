@@ -8,15 +8,16 @@
 // can never be audited, and the UI must never claim it. tests/test_hosted_
 // parity.py fails the build if this list, the dispatch, or the engine drift apart.
 const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
-                        "parse_iptables", "analyze", "report", "segcheck"];
+                        "parse_iptables", "parse_nxos", "parse_eos", "analyze", "report",
+                        "segcheck", "pathground"];
 
 // Build the report envelope: structured JSON + human-readable text + a
 // rule_id -> source-line map so the UI can jump from a finding to its rule.
 //
-// Vendor auto-detection mirrors the CLI (rulehawk/cli.py): the SAME detect()
-// gates in the SAME order (Junos -> PAN-OS -> iptables -> Cisco IOS/ASA
-// fallback), calling the SAME parsers the CLI runs — so the hosted tool's
-// verdicts are the CLI's, fail-closed soundness included, never a browser
+// Vendor auto-detection mirrors the CLI (rulehawk/gate.py _pick_parser): the SAME
+// detect() gates in the SAME order (Junos -> PAN-OS -> iptables -> NX-OS -> EOS ->
+// Cisco IOS/ASA fallback), calling the SAME parsers the CLI runs — so the hosted
+// tool's verdicts are the CLI's, fail-closed soundness included, never a browser
 // reimplementation that could diverge into a false PASS.
 const ANALYZE_PY = `
 import json
@@ -24,6 +25,8 @@ from rulehawk.parse import parse_acls
 from rulehawk.parse_junos import detect as detect_junos, parse_junos
 from rulehawk.parse_panos import detect as detect_panos, parse_panos
 from rulehawk.parse_iptables import detect as detect_iptables, parse_iptables
+from rulehawk.parse_nxos import detect as detect_nxos, parse_nxos
+from rulehawk.parse_eos import detect as detect_eos, parse_eos
 from rulehawk.analyze import analyze
 from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
@@ -33,6 +36,10 @@ elif detect_panos(cfg):
     vendor, (aces, notes) = "Palo Alto PAN-OS", parse_panos(cfg)
 elif detect_iptables(cfg):
     vendor, (aces, notes) = "Linux iptables", parse_iptables(cfg)
+elif detect_nxos(cfg):
+    vendor, (aces, notes) = "Cisco NX-OS", parse_nxos(cfg)
+elif detect_eos(cfg):
+    vendor, (aces, notes) = "Arista EOS", parse_eos(cfg)
 else:
     vendor, (aces, notes) = "Cisco IOS / ASA", parse_acls(cfg)
 findings = analyze(aces)
@@ -52,18 +59,31 @@ json.dumps({"report_json": json.loads(to_json(findings, notes, len(aces))),
 
 let pyReady = null;
 
+// Additive boot-progress posts: the page maps these to honest staged status text
+// so the multi-second first load (multi-MB runtime download) never looks hung.
+// Pages that don't know the 'progress' type ignore it (index.html's onmessage
+// drops unknown types), so this changes nothing for the ready/error/result flow.
+function progress(stage, loaded, total) {
+  try { self.postMessage({ type: "progress", stage, loaded, total }); } catch (_) {}
+}
+
 async function boot() {
+  progress("runtime");                       // downloading the Pyodide runtime (the big one)
   importScripts("https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js");
   const pyodide = await loadPyodide();
   pyodide.FS.mkdir("rulehawk");
-  for (const m of ENGINE_MODULES) {
+  for (let i = 0; i < ENGINE_MODULES.length; i++) {
+    const m = ENGINE_MODULES[i];
+    progress("engine", i, ENGINE_MODULES.length);   // loading engine module i+1 of N
     const r = await fetch(`./rulehawk/${m}.py`, { cache: "no-cache" });
     if (!r.ok) throw new Error(`could not load engine module ${m}.py (${r.status})`);
     pyodide.FS.writeFile(`rulehawk/${m}.py`, await r.text());
   }
+  progress("start");                         // warm-up import of the engine
   pyodide.runPython("import sys; sys.path.insert(0, '.'); "
     + "import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, "
-    + "rulehawk.parse_iptables, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
+    + "rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, "
+    + "rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
   return pyodide;
 }
 

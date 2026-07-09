@@ -15,6 +15,15 @@ one ACE per sub-range, so it stays exact, never widened). `established` ->
 stateful. ICMP type qualifiers are captured so `echo` and `echo-reply` aren't
 treated as the same packet space.
 Unmodeled lines (object-group, etc.) are surfaced as notes, never silently dropped.
+Match-narrowing trailing qualifiers (`fragments`, `time-range`, `dscp`, `tos`,
+`precedence`, `ttl`) restrict what an ACE matches on a real device; they are not
+modeled, so the ACE is marked `imprecise` (fail closed) — a narrowed deny can
+never silently prove a segment isolated, and a narrowed permit can never assert
+a concrete violation. Any OTHER unrecognized trailing token (a TCP flag such as
+`syn`/`ack`, an `eq`-list service name outside the named-port table, pasted
+`show access-list` residue) also marks the ACE `imprecise` with a note — never
+silently ignored. `log`/`log-input` (including ASA log arguments) never narrow
+and stay exact.
 """
 
 from __future__ import annotations
@@ -39,22 +48,102 @@ _NAMED_PORTS = {
     "nntp": 119, "lpd": 515, "non500-isakmp": 4500, "tacacs": 49, "time": 37,
     "whois": 43, "finger": 79, "gopher": 70, "echo": 7, "discard": 9,
     "chargen": 19, "ident": 113, "irc": 194, "klogin": 543, "kshell": 544,
-    "exec": 512, "login": 513, "cmd": 514, "talk": 517, "uucp": 540,
+    "login": 513, "cmd": 514, "talk": 517, "uucp": 540,
     "pim-auto-rp": 496, "xdmcp": 177, "radius": 1812, "radius-acct": 1813,
 }
 _ACTIONS = ("permit", "deny")
-# ACE trailer keyword -> argument token count. _NARROWING_TRAILERS restrict the
-# true match space in a dimension the model does not carry (time window, DSCP,
-# TTL, ...): the emitted ACE keeps the full L3/L4 space (a superset) and is
-# marked imprecise. `inactive` (ASA) disables the rule on the device entirely.
-_TRAILER_ARGC = {"log": 0, "log-input": 0, "established": 0, "inactive": 0,
-                 "fragments": 0, "time-range": 1, "dscp": 1, "tos": 1,
-                 "precedence": 1, "ttl": 2}
-_NARROWING_TRAILERS = frozenset(
-    {"time-range", "fragments", "dscp", "tos", "precedence", "ttl"})
+# Match-NARROWING trailing qualifiers: on a real device each of these RESTRICTS
+# the packets the ACE matches (`fragments` -> non-initial fragments only,
+# `time-range` -> only inside the named window, dscp/tos/precedence/ttl -> only
+# matching-marked packets). Modeling such an ACE full-width is unsound: a
+# narrowed DENY evaluated full-width shadows a later broad permit and lets
+# segcheck FALSE-PASS a real leak. We don't model the narrowing itself; we mark
+# the ACE `imprecise` so downstream checks fail closed (indeterminate), exactly
+# like the iptables frontend does for `-f`/unknown options. `log`/`log-input`
+# do NOT narrow (stay exact); `established` is modeled exactly via `stateful`;
+# `inactive` (ASA) disables the rule on the device entirely (caller skips it).
+_NARROWING_QUALS = {"fragments", "time-range", "dscp", "tos", "precedence",
+                    "ttl"}
+# Trailing keywords that CONSUME following argument token(s), so the argument is
+# never mistaken for an ICMP type (`time-range WORKHOURS` is not type
+# "WORKHOURS"). `ttl` takes an operator plus value(s) and is handled inline.
+_QUAL_ARGC = {"time-range": 1, "dscp": 1, "tos": 1, "precedence": 1}
 
 _ANY_NET = ipaddress.ip_network("0.0.0.0/0")
 _ANY6_NET = ipaddress.ip_network("::/0")
+
+
+def _scan_trailer(rest: List[str]
+                  ) -> Tuple[List[str], Optional[str], List[str], bool, bool]:
+    """Scan an ACE's trailing tokens. Returns (narrowing, first_type_token,
+    extra_unknown, stateful, inactive): `narrowing` lists the match-narrowing
+    qualifiers present (caller marks the ACE imprecise), `first_type_token` is
+    the first token that is neither a known trailing keyword nor a consumed
+    keyword argument (the ICMP type slot for icmp ACEs), and `extra_unknown`
+    lists every FURTHER such token. Unrecognized trailing tokens are a
+    false-PASS hazard: a TCP flag (`syn`/`ack`/`rst`/`match-any`), an `eq`-list
+    service name outside our table, or pasted `show access-list` residue all
+    NARROW or EXTEND what the device really matches, so the caller must treat
+    them as unknown (fail closed -> imprecise), never silently ignore them. ASA
+    `log` arguments ([level] [interval N] | disable | default) are consumed so
+    an exact logged ACE is not falsely flagged. `established` -> stateful;
+    `inactive` (ASA) -> the rule is disabled on the device (caller skips it).
+    A numeric type token immediately followed by a numeric code is paired as
+    "TYPE/CODE" — distinct ICMP codes must never compare equal (covers() uses
+    string equality)."""
+    narrowing: List[str] = []
+    first_type: Optional[str] = None
+    extra_unknown: List[str] = []
+    stateful = inactive = False
+    j = 0
+    while j < len(rest):
+        t = rest[j].lower()
+        if t in _NARROWING_QUALS:
+            narrowing.append(t)
+            if t == "ttl":
+                # ttl OP V [V2]: consume the operator and one value (two for
+                # `range`).
+                j += 1
+                if j < len(rest):
+                    op = rest[j].lower()
+                    j += 1 + (2 if op == "range" else 1)
+                continue
+            j += 1 + _QUAL_ARGC.get(t, 0)
+            continue
+        if t in ("log", "log-input"):
+            # ASA log arguments: `log [level] [interval N]` or `log disable` /
+            # `log default`. Consume them so a logged-but-exact ACE stays exact
+            # (log never narrows the match).
+            j += 1
+            if j < len(rest) and rest[j].isdigit() and 0 <= int(rest[j]) <= 7:
+                j += 1                       # syslog level 0-7
+            while j < len(rest):
+                a = rest[j].lower()
+                if a == "interval" and j + 1 < len(rest) and rest[j + 1].isdigit():
+                    j += 2
+                elif a in ("disable", "default"):
+                    j += 1
+                else:
+                    break
+            continue
+        if t == "established":
+            stateful = True
+            j += 1
+            continue
+        if t == "inactive":
+            inactive = True
+            j += 1
+            continue
+        if first_type is None:
+            if rest[j].isdigit() and j + 1 < len(rest) and rest[j + 1].isdigit():
+                first_type = f"{rest[j]}/{rest[j + 1]}"      # type + code
+                j += 1
+            else:
+                first_type = rest[j]
+        else:
+            extra_unknown.append(rest[j])
+        j += 1
+    return narrowing, first_type, extra_unknown, stateful, inactive
 
 
 def _port_num(tok: str) -> int:
@@ -187,37 +276,6 @@ def _parse_port_op(tokens: List[str], i: int) -> Tuple[List[PortRange], int, boo
     return [ANY_PORTS], i, False, 0
 
 
-def _scan_trailer(rest: List[str], capture_icmp: bool):
-    """Walk an ACE's trailing tokens; return (icmp_type, stateful, narrowed,
-    inactive). Each trailer keyword is skipped together with its argument(s), so
-    an argument (`time-range WORK`) is never misread as an ICMP type. A numeric
-    ICMP type followed by a numeric code is stored as "TYPE/CODE" — distinct
-    codes must never compare equal (covers() uses string equality)."""
-    icmp_type: Optional[str] = None
-    stateful = inactive = False
-    narrowed: List[str] = []
-    j = 0
-    while j < len(rest):
-        t = rest[j].lower()
-        if t in _TRAILER_ARGC:
-            if t == "established":
-                stateful = True
-            elif t == "inactive":
-                inactive = True
-            elif t in _NARROWING_TRAILERS and t not in narrowed:
-                narrowed.append(t)
-            j += 1 + _TRAILER_ARGC[t]
-            continue
-        if capture_icmp and icmp_type is None:
-            if rest[j].isdigit() and j + 1 < len(rest) and rest[j + 1].isdigit():
-                icmp_type = f"{rest[j]}/{rest[j + 1]}"       # type + code
-                j += 1
-            else:
-                icmp_type = rest[j]
-        j += 1
-    return icmp_type, stateful, narrowed, inactive
-
-
 def _entry_tokens(line: str) -> List[str]:
     s = line.strip()
     s = re.sub(r"^\d+\s+", "", s)                                  # IOS seq num
@@ -270,6 +328,8 @@ _PORT_OPS = frozenset({"eq", "range", "neq", "lt", "gt"})
 
 # Net members:  ("net", _IPNet) | ("ng", name) | ("no", name) | ("bad",)
 # Svc members:  ("svc", proto, PortRange) | ("sg", name) | ("so", name) | ("bad",)
+# ("malformed",) marks a corrupt DEFINITION line (bare `group-object`): the
+# containing group fails closed entirely, even under partial resolution.
 
 
 class _Defs:
@@ -450,8 +510,10 @@ def _collect_defs(text: str) -> _Defs:
         if kw == "network-object" and ctype == "ng":
             defs.net_groups[name].append(_net_member(toks[1:]))
         elif kw == "group-object":
-            # bare `group-object` (no name) is a malformed member -> fail closed
-            mem = (ctype, toks[1]) if len(toks) >= 2 else ("bad",)
+            # bare `group-object` (no name) is a MALFORMED definition line (not
+            # merely an unmodelable member): the whole group fails closed, even
+            # under partial resolution — we cannot trust a corrupt definition.
+            mem = (ctype, toks[1]) if len(toks) >= 2 else ("malformed",)
             if ctype == "ng":
                 defs.net_groups[name].append(mem)
             elif ctype == "sg":
@@ -489,6 +551,44 @@ def _resolve_nets(defs: _Defs, kind: str, name: str, seen: frozenset):
     return out or None                               # empty group -> fail closed
 
 
+def _resolve_nets_partial(defs: _Defs, kind: str, name: str, seen: frozenset
+                          ) -> Tuple[Optional[List[_IPNet]], bool]:
+    """Like _resolve_nets but tolerates bad members instead of failing on the first.
+
+    Returns ``(resolved, has_unresolved)``.
+
+    * ``(None, True)``  — the group is entirely unresolvable (undefined, cycle,
+      or all members bad / empty); caller must still fail closed.
+    * ``(nets, False)`` — all members resolved exactly (same as _resolve_nets).
+    * ``(nets, True)``  — *some* members resolved (returned in *nets*) and at
+      least one member could not be resolved.  The caller can emit precise ACEs
+      for the resolved subset PLUS one opaque ACE for the remainder.
+
+    Used only from _operand_addr in partial mode."""
+    key = (kind, name)
+    if key in seen:
+        return None, True                       # cycle -> fail closed
+    members = (defs.net_groups if kind == "ng" else defs.net_objs).get(name)
+    if members is None:
+        return None, True                       # undefined -> fail closed
+    seen = seen | {key}
+    out: List[_IPNet] = []
+    has_unresolved = False
+    for mem in members:
+        if mem[0] == "net":
+            out.append(mem[1])
+        elif mem[0] in ("ng", "no"):
+            sub, sub_unres = _resolve_nets_partial(defs, mem[0], mem[1], seen)
+            if sub is not None:
+                out.extend(sub)
+            has_unresolved = has_unresolved or sub_unres
+        elif mem[0] == "malformed":
+            return None, True                   # corrupt definition -> all fail closed
+        else:                                   # ("bad",)
+            has_unresolved = True
+    return (out if out else None), has_unresolved
+
+
 def _resolve_svcs(defs: _Defs, kind: str, name: str, seen: frozenset):
     """Resolve a service group/object to an EXACT list of (proto, PortRange), or
     None (fail-closed) on undefined / unparseable member / cycle / empty."""
@@ -513,16 +613,67 @@ def _resolve_svcs(defs: _Defs, kind: str, name: str, seen: frozenset):
     return out or None
 
 
-def _operand_addr(toks: List[str], i: int, defs: _Defs, v6: bool = False):
+def _resolve_svcs_partial(defs: _Defs, kind: str, name: str, seen: frozenset
+                          ) -> Tuple[Optional[List[Tuple[str, PortRange]]], bool]:
+    """Like _resolve_svcs but tolerates bad members instead of failing on the first.
+
+    Returns ``(resolved, has_unresolved)``.
+
+    * ``(None, True)``  — the group is entirely unresolvable (undefined, cycle,
+      or all members bad / empty); caller must still fail closed.
+    * ``(svcs, False)`` — all members resolved exactly (same as _resolve_svcs).
+    * ``(svcs, True)``  — *some* members resolved (returned in *svcs*) and at
+      least one member could not be resolved.  The caller can emit precise ACEs
+      for the resolved subset PLUS one opaque ACE for the remainder.
+
+    Used only from _resolve_entry in partial mode."""
+    key = (kind, name)
+    if key in seen:
+        return None, True                       # cycle -> fail closed
+    members = (defs.svc_groups if kind == "sg" else defs.svc_objs).get(name)
+    if members is None:
+        return None, True                       # undefined -> fail closed
+    seen = seen | {key}
+    out: List[Tuple[str, PortRange]] = []
+    has_unresolved = False
+    for mem in members:
+        if mem[0] == "svc":
+            out.append((mem[1], mem[2]))
+        elif mem[0] in ("sg", "so"):
+            sub, sub_unres = _resolve_svcs_partial(defs, mem[0], mem[1], seen)
+            if sub is not None:
+                out.extend(sub)
+            has_unresolved = has_unresolved or sub_unres
+        elif mem[0] == "malformed":
+            return None, True                   # corrupt definition -> all fail closed
+        else:                                   # ("bad",)
+            has_unresolved = True
+    return (out if out else None), has_unresolved
+
+
+def _operand_addr(toks: List[str], i: int, defs: _Defs, v6: bool = False,
+                  partial: bool = False) -> Tuple:
     """Parse a src/dst address operand, resolving object(-group) refs.
-    Returns (nets|None, next_i, imprecise). None nets -> caller fails closed."""
+    Returns (nets|None, next_i, imprecise, has_unresolved).
+    None nets means the caller must fail closed. `v6` is the enclosing ACL's
+    family (sizes a literal `any`). has_unresolved is True only
+    when partial=True and the group has members that could not be resolved
+    (the returned nets cover only the resolvable subset)."""
     t = toks[i].lower()
     if t == "object-group":
-        return _resolve_nets(defs, "ng", toks[i + 1], frozenset()), i + 2, False
+        if partial:
+            nets, has_unres = _resolve_nets_partial(defs, "ng", toks[i + 1], frozenset())
+        else:
+            nets, has_unres = _resolve_nets(defs, "ng", toks[i + 1], frozenset()), False
+        return nets, i + 2, False, has_unres
     if t == "object":
-        return _resolve_nets(defs, "no", toks[i + 1], frozenset()), i + 2, False
+        if partial:
+            nets, has_unres = _resolve_nets_partial(defs, "no", toks[i + 1], frozenset())
+        else:
+            nets, has_unres = _resolve_nets(defs, "no", toks[i + 1], frozenset()), False
+        return nets, i + 2, False, has_unres
     net, ni, imp = _parse_addr(toks, i, v6)
-    return [net], ni, imp
+    return [net], ni, imp, False
 
 
 def _is_svc_ref(toks: List[str], i: int, defs: _Defs) -> bool:
@@ -534,17 +685,30 @@ def _is_svc_ref(toks: List[str], i: int, defs: _Defs) -> bool:
 
 
 def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
-                   line: int = 0, v6: bool = False):
+                   line: int = 0, v6: bool = False, partial: bool = False):
     """Pass 2: expand one object-referencing ACE to the exact union of member
-    ACEs, or return None to fall back to the fail-closed opaque ACE."""
+    ACEs, or return None to fall back to the fail-closed opaque ACE.
+
+    When *partial* is True, address operands are resolved via
+    _resolve_nets_partial AND service operands via _resolve_svcs_partial: if
+    some group members are unresolvable the returned list contains precise ACEs
+    for the resolved subset PLUS one opaque (any/any, imprecise) ACE for the
+    unresolved remainder.  This is SOUND: the proven-reachable subset is modeled
+    exactly (never widened), and the unresolved remainder stays INDETERMINATE —
+    never silently PASS."""
     action = toks[0].lower()
     n = len(toks)
     i = 1
     proto: Optional[str] = None
     proto_combos = None                      # service group occupying the proto slot
+    has_unres_svc = False
     if i < n and _is_svc_ref(toks, i, defs):
         kind = "sg" if toks[i].lower() == "object-group" else "so"
-        proto_combos = _resolve_svcs(defs, kind, toks[i + 1], frozenset())
+        if partial:
+            proto_combos, has_unres_svc = _resolve_svcs_partial(
+                defs, kind, toks[i + 1], frozenset())
+        else:
+            proto_combos = _resolve_svcs(defs, kind, toks[i + 1], frozenset())
         if proto_combos is None:
             return None
         i += 2
@@ -556,7 +720,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     if i >= n:
         return None
 
-    srcs, i, imp_s = _operand_addr(toks, i, defs, v6)
+    srcs, i, imp_s, has_unres_s = _operand_addr(toks, i, defs, v6, partial)
     if srcs is None:
         return None
     imprecise = imp_s
@@ -573,7 +737,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
 
     if i >= n:
         return None
-    dsts, i, imp_d = _operand_addr(toks, i, defs, v6)
+    dsts, i, imp_d, has_unres_d = _operand_addr(toks, i, defs, v6, partial)
     if dsts is None:
         return None
     imprecise = imprecise or imp_d
@@ -590,7 +754,11 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
             # narrowing. Fail closed (opaque ACE -> INDETERMINATE).
             return None
         kind = "sg" if toks[i].lower() == "object-group" else "so"
-        svcs = _resolve_svcs(defs, kind, toks[i + 1], frozenset())
+        if partial:
+            svcs, _unres_dst = _resolve_svcs_partial(defs, kind, toks[i + 1], frozenset())
+            has_unres_svc = has_unres_svc or _unres_dst
+        else:
+            svcs = _resolve_svcs(defs, kind, toks[i + 1], frozenset())
         if svcs is None:
             return None
         i += 2
@@ -610,12 +778,36 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
         return None                          # over-cap -> fail closed (one opaque ACE)
 
     rest = toks[i:]
-    icmp_type, stateful, narrowed, inactive = _scan_trailer(rest, proto == "icmp")
+    narrowing, type_tok, extra_unknown, stateful, inactive = _scan_trailer(rest)
     if inactive:
         # ASA `inactive`: the rule is DISABLED on the device — its true match
         # space is empty, so emitting no ACE is exact (not a narrowing).
         return [], [f"inactive (disabled on device, not enforced) -> skipped: {raw}"]
-    imprecise = imprecise or bool(narrowed)
+    # For an icmp ACE the first free trailing token is the (modeled) ICMP type —
+    # it stays exact and threads into the emitted ACEs. When a service group
+    # occupies the proto slot (`proto` is None) there is no icmp context, so the
+    # token stays unknown (fail closed below).
+    icmp_type = type_tok if proto == "icmp" else None
+    rnotes: List[str] = []
+    if narrowing:
+        # Same soundness rule as _parse_entry: a narrowed ACE modeled full-width
+        # could shadow a real leak (deny) or fake one (permit) — fail closed.
+        imprecise = True
+        rnotes.append("match-narrowing qualifier "
+                      + "/".join(sorted(set(narrowing)))
+                      + " not modeled — match space narrowed, kept as a "
+                      + f"superset (imprecise), verify manually: {raw}")
+    # Any OTHER unknown trailing token fails closed: a TCP flag (`syn`), an
+    # unresolvable service name, or `show access-list` residue narrows or
+    # extends the match unmodeled — the same hazard as in _parse_entry.
+    unknown = list(extra_unknown)
+    if type_tok is not None and icmp_type is None:
+        unknown.insert(0, type_tok)
+    if unknown:
+        imprecise = True
+        rnotes.append("unrecognized trailing qualifier "
+                      + "/".join(unknown)
+                      + f" — marked imprecise, verify manually: {raw}")
     aces: List[ACE] = []
     m = seq
     for s in srcs:
@@ -628,12 +820,22 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
                         src_port=sp, dst_port=dp, icmp_type=icmp_type,
                         stateful=stateful, imprecise=imprecise, raw=raw,
                         acl=acl, line=line))
-    notes = [f"resolved object-group/object reference to {len(aces)} exact "
-             f"ACE(s): {raw}"]
-    if narrowed:
-        notes.append(f"match space narrowed by unmodeled {'/'.join(narrowed)} "
-                     f"(kept as a superset, imprecise): {raw}")
-    return aces, notes
+    note = (f"resolved object-group/object reference to {len(aces)} exact "
+            f"ACE(s): {raw}")
+
+    # Partial-resolution mode: if any address operand or service group had
+    # unresolvable members, append one opaque (any/any, imprecise) ACE for the
+    # unresolved remainder so those members stay INDETERMINATE and never silently
+    # PASS.
+    if partial and (has_unres_s or has_unres_d or has_unres_svc):
+        m += 1
+        aces.append(_opaque_ace(action, m, acl, raw, line))
+        note = (
+            f"partially resolved object-group/object reference: "
+            f"{len(aces) - 1} exact ACE(s) + 1 opaque (unresolved members): {raw}"
+        )
+
+    return aces, rnotes + [note]
 
 
 def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
@@ -700,13 +902,27 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             # Pass 2: try to expand the reference precisely from the collected
             # definitions. Only a FULLY-exact resolution is accepted; anything
             # else (undefined / unparseable member / cycle / over-cap) returns
-            # None and we keep the fail-closed opaque ACE (INDETERMINATE).
+            # None and we try partial resolution next.
             resolved = None
             try:
                 resolved = _resolve_entry(toks, defs, seq, current_acl, stripped,
                                           lineno, line_v6)
             except (IndexError, ValueError, ipaddress.AddressValueError):
                 resolved = None
+            if resolved is None:
+                # Partial-resolution pass: resolved address-group members emit
+                # precise ACEs; unresolved members get one trailing opaque ACE
+                # (any/any, imprecise -> INDETERMINATE, never silently PASS).
+                # This lets a proven leak via a resolved member be reported as
+                # CRITICAL instead of INDETERMINATE (soundness: the resolved
+                # member's space is exact; adding unresolved members can only
+                # EXPAND reachability, never remove the already-proven leak).
+                try:
+                    resolved = _resolve_entry(toks, defs, seq, current_acl,
+                                              stripped, lineno, line_v6,
+                                              partial=True)
+                except (IndexError, ValueError, ipaddress.AddressValueError):
+                    resolved = None
             if resolved is not None:
                 races, rnotes = resolved
                 seq += len(races)
@@ -754,18 +970,37 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0,
     else:
         dst_ports, imp_dp = [ANY_PORTS], False
     rest = toks[i:]
-    icmp_type, stateful, narrowed, inactive = _scan_trailer(rest, proto == "icmp")
+    narrowing, type_tok, extra_unknown, stateful, inactive = _scan_trailer(rest)
     if inactive:
         # ASA `inactive`: the rule is DISABLED on the device — its true match
         # space is empty, so emitting no ACE is exact (not a narrowing).
         return [], [f"inactive (disabled on device, not enforced) -> skipped: {raw}"]
-    imprecise = imp_s or imp_d or imp_sp or imp_dp or bool(narrowed)
+    icmp_type = type_tok if proto == "icmp" else None
+    # Unknown trailing tokens: for icmp the first free token is the (modeled)
+    # ICMP type; every other free token — and for non-icmp protos the first one
+    # too — is an unrecognized qualifier (a TCP flag like `syn`, an `eq`-list
+    # service name outside our table, pasted `show access-list` residue). Such
+    # a token changes what the device really matches in a way we don't model,
+    # so silently ignoring it is a false-PASS path (a `syn`-narrowed deny can
+    # "prove" isolation the device doesn't enforce; a dropped `exec` port can
+    # hide a real leak). Fail closed: mark imprecise and surface a note.
+    unknown = list(extra_unknown)
+    if type_tok is not None and proto != "icmp":
+        unknown.insert(0, type_tok)
+    imprecise = (imp_s or imp_d or imp_sp or imp_dp or bool(narrowing)
+                 or bool(unknown))
     notes: List[str] = []
     if imp_s or imp_d:
         notes.append(f"imprecise mask (treated conservatively): {raw}")
-    if narrowed:
-        notes.append(f"match space narrowed by unmodeled {'/'.join(narrowed)} "
-                     f"(kept as a superset, imprecise): {raw}")
+    if narrowing:
+        notes.append("match-narrowing qualifier "
+                     + "/".join(sorted(set(narrowing)))
+                     + " not modeled — match space narrowed, kept as a "
+                     + f"superset (imprecise), verify manually: {raw}")
+    if unknown:
+        notes.append("unrecognized trailing qualifier "
+                     + "/".join(unknown)
+                     + f" — marked imprecise, verify manually: {raw}")
     if extra_sp or extra_dp:
         notes.append("multi-port `eq` expanded to the exact union of per-port "
                      f"rules ({extra_sp + extra_dp} extra port(s) now modeled, "

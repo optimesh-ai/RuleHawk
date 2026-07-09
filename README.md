@@ -62,6 +62,23 @@ rule we can't model exactly (neq/complex mask) is flagged "indeterminate, review
 rather than a false pass. See `samples/policy.json` for an example and
 [`docs/policy.md`](docs/policy.md) for the full policy schema.
 
+### Path-grounded segmentation (Hammerhead)
+If you have a [Hammerhead](https://github.com/optimesh-ai/hammerhead) snapshot of
+the network, RuleHawk can verify each segmentation-violation witness against
+Hammerhead's forwarding model (`hammerhead reachability`), so violations on
+routing paths that can't actually deliver the packet are suppressed to
+informational, while confirmed leaks are stamped **path-confirmed**:
+
+```
+rulehawk config.txt --policy policy.json --hh-snapshot DIR --hh-from DEVICE
+```
+
+`DIR` is the Hammerhead snapshot directory and `DEVICE` is the source device the
+witness packet originates from. **Soundness rule:** only a deterministic,
+NAT-free "not delivered" verdict ever downgrades a finding — NAT on the path, an
+oracle error, or an unknown device all **fail closed** and the violation is kept
+(see `rulehawk/pathground.py`).
+
 ## What it finds (today)
 - **Intent inversions** — a `permit` that never fires because an earlier `deny`
   covers it (silent connectivity loss), or a `deny` that never fires because an
@@ -73,10 +90,11 @@ rather than a false pass. See `samples/policy.json` for an example and
 - A hygiene **score** and an exportable **JSON** report.
 
 ## Vendors today
-Cisco IOS extended ACLs, Cisco ASA access-lists (with object-group resolution),
-Juniper Junos firewall filters (brace form), Palo Alto PAN-OS security policy (set
-format), and Linux iptables/ip6tables filter rules — vendor auto-detected.
-(Roadmap: NX-OS, FortiGate, AWS Security Groups/NACLs, nftables.)
+Cisco IOS extended ACLs, Cisco NX-OS access-lists, Cisco ASA access-lists (with
+object-group resolution), Arista EOS access-lists, Juniper Junos firewall filters
+(brace form), Palo Alto PAN-OS security policy (set format), and Linux
+iptables/ip6tables filter rules — vendor auto-detected.
+(Roadmap: FortiGate, AWS Security Groups/NACLs, nftables.)
 
 ## Scope & limits (what it does *not* model)
 RuleHawk is a fast, sound **config-change gate**, not a network-wide reachability
@@ -137,11 +155,30 @@ Apache-2.0 — see `LICENSE`.
 ## Layout
 - `rulehawk/model.py` — normalized ACE + `covers()` (packet-space containment).
 - `rulehawk/parse.py` — IOS/ASA parser (unmodeled lines are surfaced, not dropped).
-- `rulehawk/parse_junos.py` / `parse_panos.py` / `parse_iptables.py` — vendor frontends.
+- `rulehawk/parse_nxos.py` / `parse_eos.py` / `parse_junos.py` / `parse_panos.py` / `parse_iptables.py` — vendor frontends.
 - `rulehawk/analyze.py` — the rule-space analysis engine (the core IP).
 - `rulehawk/segcheck.py` — segmentation-intent proof (witness packets).
+- `rulehawk/pathground.py` — Hammerhead path-grounding of segmentation witnesses (`--hh-snapshot`/`--hh-from`).
 - `rulehawk/report.py` — text + JSON reports.
 - `rulehawk/gate.py` — the CI gate: multi-file audit → SARIF + PR comment + summary.
 - `rulehawk/cli.py` — `python -m rulehawk` (+ the `gate` subcommand).
 - `action.yml` — the composite GitHub Action (see `docs/github-action.md`).
 - `tests/` — correctness tests for the analysis engine and the gate.
+- `scripts/check_vendor_sync.py` — stdlib-only sync guard (called by the test suite).
+
+## Contributing — keeping the hosted tool in sync
+
+`docs/rulehawk/` is a vendored copy of the canonical engine (`rulehawk/`) that
+the public hosted tool loads client-side via Pyodide.  **These two trees must
+remain byte-identical at all times.**  If they drift the hosted page silently
+serves a stale parser while the CLI is already fixed — this has happened before.
+
+**Workflow:**
+
+1. Edit the engine under `rulehawk/` (never edit `docs/rulehawk/` directly).
+2. Re-sync the vendored copy: `make sync-web`
+3. Confirm byte-identity: `make check-vendor-sync` (exits 0 if in sync).
+4. Commit both `rulehawk/` and `docs/rulehawk/` changes together.
+
+CI enforces this automatically: `tests/test_vendor_sync.py` runs on every
+`python -m pytest` invocation and will fail the build if any `.py` file drifts.

@@ -112,7 +112,7 @@ that protocol.
   guess "isolated."
 - **`segmentation-ok`** (info) — proven isolated: no permitted witness flow exists.
   This is a positive attestation, not just the absence of a finding.
-- **`segmentation-policy-error`** (high) — the policy itself is invalid: a
+- **`segmentation-error`** (high) — the policy itself is invalid: a
   `src`/`dst` naming a zone that isn't defined, an unparseable CIDR in `zones`,
   or an unusable `ports` value. RuleHawk **fails closed**: the affected
   assertion is never given a PASS until the policy is fixed (a typo must not
@@ -121,9 +121,9 @@ that protocol.
 ## Gotchas
 
 - **Zone names must match exactly.** A `src`/`dst` that isn't a key in `zones`
-  raises `segmentation-policy-error` (high) — it can never vacuously "pass."
+  raises `segmentation-error` (high) — it can never vacuously "pass."
 - **Ports may be integers or numeric strings** (`[445]` and `["445"]` both
-  work); anything else is a `segmentation-policy-error`. There is **no range
+  work); anything else is a `segmentation-error`. There is **no range
   syntax** in the policy.
 - **`ports` with `proto: "ip"`** restricts the check to port-carrying protocols
   (tcp/udp/sctp/...). Omit `ports` for total isolation.

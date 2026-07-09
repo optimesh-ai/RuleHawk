@@ -228,6 +228,56 @@ def test_segmentation_ok_is_info_not_a_violation(tmp_path):
 # --------------------------------------------------------------------------- #
 # SARIF 2.1.0 well-formedness
 # --------------------------------------------------------------------------- #
+def test_sarif_startline_exact_values(tmp_path):
+    """SARIF physicalLocation.region.startLine must equal the ACE's source-file
+    line number — not the rule sequence number and not a default 1.
+
+    Pins the full path: ACE.line -> line_by_id / Finding.line -> line_of ->
+    SARIF region.  The existing shape test only asserts startLine >= 1; this
+    test asserts the exact values so a regression (e.g. seq number emitted
+    instead of file line) is caught immediately."""
+    p = _write(str(tmp_path), "edge.acl", _CISCO)
+    g = gate.run_gate([p], _POLICY, "high")
+    s = json.loads(gate.to_sarif(g))
+    by_kind = {r["ruleId"]: r["locations"][0]["physicalLocation"]["region"]["startLine"]
+               for r in s["runs"][0]["results"]}
+    # _CISCO layout: line 1 = ACL header; lines 2-5 = rules in order.
+    assert by_kind["permit-any-any"] == 5        # `permit ip any any`     (seq 4)
+    assert by_kind["segmentation-violation"] == 4 # `permit tcp any any eq 445` (seq 3)
+    assert by_kind["redundant"] == 3              # the covered permit       (seq 2)
+
+
+def test_line_of_falls_back_to_finding_line():
+    """line_of must consult Finding.line when line_by_id cannot give a positive
+    line number.  Two concrete cases:
+
+      A. The entry in line_by_id exists but is 0 (parser did not track the line).
+         Finding.line (set by analyze / segcheck) is the authoritative fallback.
+      B. The rule_id is a zone-pair label (not acl:seq), so line_by_id has no
+         entry.  Finding.line is the only source of truth.
+      C. Both are absent/zero: hard minimum 1."""
+    from rulehawk.analyze import Finding
+
+    # Case A: line_by_id entry is 0, Finding.line carries the real line.
+    f_a = Finding("EDGE:3", "permit-any-any", "critical", "msg", "r", line=9)
+    fr_a = gate.FileResult("x.acl", "ios-asa", "ok", 1,
+                           findings=[f_a], line_by_id={("EDGE", 3): 0})
+    assert fr_a.line_of(f_a) == 9
+
+    # Case B: zone-pair rule_id — no acl:seq parse possible, line_by_id empty.
+    f_b = Finding("CORP!->PCI/tcp", "segmentation-indeterminate", "medium",
+                  "msg", "", line=7)
+    fr_b = gate.FileResult("x.acl", "ios-asa", "ok", 1,
+                           findings=[f_b], line_by_id={})
+    assert fr_b.line_of(f_b) == 7
+
+    # Case C: both unknown — sentinel 1 (SARIF lower-bound).
+    f_c = Finding("ZONE", "segmentation-ok", "info", "msg", "", line=0)
+    fr_c = gate.FileResult("x.acl", "ios-asa", "ok", 1,
+                           findings=[f_c], line_by_id={})
+    assert fr_c.line_of(f_c) == 1
+
+
 def test_sarif_shape_levels_and_lines(tmp_path):
     p = _write(str(tmp_path), "edge.acl", _CISCO)
     g = gate.run_gate([p], _POLICY, "high")
@@ -254,6 +304,45 @@ def test_sarif_shape_levels_and_lines(tmp_path):
     # security-severity band present for code-scanning sorting.
     paa_rule = next(r for r in drv["rules"] if r["id"] == "permit-any-any")
     assert paa_rule["properties"]["security-severity"] == "9.5"
+
+
+def test_sarif_fingerprints_distinct_per_zone_pair():
+    """One permissive rule that breaches several boundaries yields several
+    segmentation-violation Findings that SHARE rule_id ({acl}:{seq}), kind, and
+    startLine — differing only in their witness. Their SARIF partialFingerprints
+    must stay DISTINCT so GitHub code scanning keeps each real breach as its own
+    alert instead of collapsing them into one (which would hide genuine
+    isolation failures — the engine's 'never a false bill of health' promise)."""
+    from rulehawk.analyze import Finding
+    # `permit ip any any` at seq 30 breaching CORP->PCI, DMZ->PCI, CORP->DB:
+    # identical rule_id / kind / line, three different witnesses.
+    findings = [
+        Finding("EDGE:30", "segmentation-violation", "critical",
+                "CORP must not reach PCI", "permit ip any any",
+                witness="10.1.0.1 -> 10.9.0.1 (ip)", line=30),
+        Finding("EDGE:30", "segmentation-violation", "critical",
+                "DMZ must not reach PCI", "permit ip any any",
+                witness="10.2.0.1 -> 10.9.0.1 (ip)", line=30),
+        Finding("EDGE:30", "segmentation-violation", "critical",
+                "CORP must not reach DB", "permit ip any any",
+                witness="10.1.0.1 -> 10.8.0.1 (ip)", line=30),
+    ]
+    fr = gate.FileResult("edge.acl", "ios-asa", "ok", 1,
+                         findings=findings, line_by_id={("EDGE", 30): 30})
+    g = gate.GateResult([fr], "high")
+    s = json.loads(gate.to_sarif(g))
+    results = s["runs"][0]["results"]
+    assert len(results) == 3
+    fps = [r["partialFingerprints"]["ruleHawk/v2"] for r in results]
+    # All three genuine breaches must be uniquely fingerprinted.
+    assert len(set(fps)) == 3, fps
+    # And the witness must be what disambiguates them: the same finding with
+    # only the witness changed hashes differently; an identical twin does not.
+    base, other = findings[0], findings[1]
+    assert gate._fingerprint("edge.acl", base) != gate._fingerprint("edge.acl", other)
+    twin = Finding("EDGE:30", "segmentation-violation", "critical",
+                   base.message, base.rule, witness=base.witness, line=30)
+    assert gate._fingerprint("edge.acl", twin) == gate._fingerprint("edge.acl", base)
 
 
 # --------------------------------------------------------------------------- #
@@ -340,6 +429,30 @@ def test_main_writes_github_step_summary_env(tmp_path, monkeypatch):
 def test_main_bad_fail_on_is_usage_error(tmp_path):
     p = _write(str(tmp_path), "edge.acl", _CISCO)
     assert gate.main([p, "--fail-on", "bogus"]) == 2
+
+
+def test_main_unknown_vendor_is_usage_error(tmp_path, capsys):
+    """A --vendor typo must error out (exit 2), never silently fall back to
+    the ios-asa parser and audit under the wrong grammar."""
+    p = _write(str(tmp_path), "edge.acl", _CISCO)
+    assert gate.main([p, "--vendor", "cisc0"]) == 2
+    err = capsys.readouterr().err
+    assert "unknown --vendor" in err and "cisc0" in err
+    # The error should teach the full vendor list, including nxos/eos.
+    assert "nxos" in err and "eos" in err
+
+
+def test_main_known_vendor_aliases_accepted(tmp_path, capsys):
+    """Every alias in _VENDORS (and 'auto', any case) passes validation.
+
+    A forced vendor on a mismatched file may still exit 2 via the fail-closed
+    no_rules_parsed path — that is correct — so we assert on the *reason*:
+    no 'unknown --vendor' usage error may appear for a valid alias."""
+    p = _write(str(tmp_path), "clean.acl", _CLEAN)
+    for v in list(gate._VENDORS) + ["auto", "IOS", "Arista"]:
+        gate.main([p, "--vendor", v, "-q"])
+        assert "unknown --vendor" not in capsys.readouterr().err, \
+            f"valid vendor {v!r} rejected as unknown"
 
 
 def test_main_no_match_is_error(tmp_path):

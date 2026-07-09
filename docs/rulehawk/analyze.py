@@ -10,6 +10,9 @@ Per ACL (entries in match order):
        - redundant                    (same action) -> safe to delete (low).
   * OVERLY-PERMISSIVE     — permit ip any any (critical) and broad any (high).
   * DANGEROUS-EXPOSURE    — a permit exposing a sensitive service to `any` src.
+  * SOURCE-PORT-TRUST     — a permit gated ONLY by the attacker-controlled
+                            SOURCE port (e.g. `permit tcp any eq 53 any`): the
+                            pre-`established` return-traffic anti-pattern.
 Only EXACT earlier rules can prove a later rule dead (see model.covers): an
 `imprecise` (neq / bad mask) or `stateful` (established) rule never covers,
 so we never recommend deleting a load-bearing rule.
@@ -28,6 +31,16 @@ from .model import (ACE, _WILDCARD_PROTO, _compatible_coverer, covered_dimension
 _UNION_K = 64
 
 _SEV_WEIGHT = {"critical": 25, "high": 10, "medium": 4, "low": 1, "info": 0}
+
+
+def _line_sfx(line: int) -> str:
+    """Return ' (line N)' when line is non-zero, else empty string.
+
+    Used to annotate fix strings with source-file line numbers so a network
+    engineer can jump directly to the offending rule.  Never emits '(line 0)'
+    — line=0 means unknown, not line zero.
+    """
+    return f" (line {line})" if line else ""
 
 # Sensitive services that should not be reachable from `any`. SSH is separated:
 # bastion/management SSH-from-any is common, so it's MEDIUM, not HIGH like telnet.
@@ -52,6 +65,7 @@ class Finding:
     cited: str = ""
     fix: str = ""
     witness: str = ""   # segmentation: the concrete packet, e.g. "10.20.0.1 -> 10.10.0.1:445 (tcp)"
+    line: int = 0       # 1-based source-file line of the offending rule (0 = unknown).
 
 
 def _id(a: ACE) -> str:
@@ -145,7 +159,9 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
                     _id(b), "redundant", "low",
                     f"Rule is redundant — fully covered by an earlier "
                     f"{a.action} (rule {a.seq}); safe to remove.",
-                    b.raw, a.raw, fix=f"remove rule {b.seq}"))
+                    b.raw, a.raw,
+                    fix=f"remove rule {b.seq}{_line_sfx(b.line)}",
+                    line=b.line))
             elif b.action == "permit":
                 findings.append(Finding(
                     _id(b), "intent-inversion-permit-dead", "high",
@@ -153,14 +169,20 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
                     f"(rule {a.seq}) already drops the same traffic. "
                     f"Likely a silent connectivity loss.",
                     b.raw, a.raw,
-                    fix=f"move rule {b.seq} above rule {a.seq}, or narrow rule {a.seq}"))
+                    fix=(f"move rule {b.seq}{_line_sfx(b.line)} above "
+                         f"rule {a.seq}{_line_sfx(a.line)}, "
+                         f"or narrow rule {a.seq}"),
+                    line=b.line))
             else:
                 findings.append(Finding(
                     _id(b), "intent-inversion-deny-dead", "critical",
                     f"This deny NEVER takes effect — an earlier permit "
                     f"(rule {a.seq}) already allows the same traffic. The "
                     f"traffic you meant to block is ALLOWED.",
-                    b.raw, a.raw, fix=f"move rule {b.seq} above rule {a.seq}"))
+                    b.raw, a.raw,
+                    fix=(f"move rule {b.seq}{_line_sfx(b.line)} above "
+                         f"rule {a.seq}{_line_sfx(a.line)}"),
+                    line=b.line))
             shadowed = True
             break
 
@@ -170,13 +192,20 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
             if u:
                 kind, sev, chosen = u
                 seqs = ", ".join(str(a.seq) for a in sorted(chosen, key=lambda x: x.seq))
+                # A mixed union (permits AND denies) must not over-claim what
+                # happens to the traffic — pick the "+mixed" message variant.
                 mixed = len({a.action for a in chosen}) > 1
-                msg, fix = _UNION_MSG[kind + "+mixed" if mixed else kind]
+                msg, fix_tmpl = _UNION_MSG[kind + "+mixed" if mixed else kind]
+                # Annotate the covered rule's seq reference with its file line when
+                # known — the {seq} placeholder in the template refers to b.
+                seq_with_line = f"{b.seq}{_line_sfx(b.line)}"
+                fix_str = fix_tmpl.format(seqs=seqs, seq=seq_with_line)
                 findings.append(Finding(
                     _id(b), kind, sev,
                     msg.format(seqs=seqs, seq=b.seq), b.raw,
                     cited=f"rules {seqs} (cumulative)",
-                    fix=fix.format(seqs=seqs, seq=b.seq)))
+                    fix=fix_str,
+                    line=b.line))
 
         if b.action != "permit" or b.stateful:
             # `established` permits are return-traffic — not an over-permission.
@@ -188,12 +217,15 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
                 findings.append(Finding(
                     _id(b), "permit-any-any", "critical",
                     f"permit {b.proto} any any — allows ALL traffic; defeats the ACL.",
-                    b.raw, fix="replace with least-privilege permits + a default deny"))
+                    b.raw, fix="replace with least-privilege permits + a default deny",
+                    line=b.line))
             else:
                 findings.append(Finding(
                     _id(b), "broad-any-any", "high",
                     f"permit {b.proto} any any — very broad; allows all {b.proto} "
-                    f"between any hosts.", b.raw, fix="scope the source and/or destination"))
+                    f"between any hosts.", b.raw,
+                    fix="scope the source and/or destination",
+                    line=b.line))
         # Dangerous services exposed to any source (skip imprecise port spaces).
         if b.src_any and b.proto in ("tcp", "udp") and not b.imprecise:
             hits = sorted({name for port, name in _DANGEROUS_PORTS.items()
@@ -203,13 +235,32 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
                     _id(b), "ssh-exposure", "medium",
                     "SSH (port 22) is permitted from ANY source — fine for a "
                     "bastion, risky otherwise; confirm it's intended.",
-                    b.raw, fix="restrict the source for SSH if not a jump host"))
+                    b.raw, fix="restrict the source for SSH if not a jump host",
+                    line=b.line))
             if hits:
                 findings.append(Finding(
                     _id(b), "dangerous-exposure", "high",
                     f"Sensitive service(s) permitted from ANY source: "
                     f"{', '.join(hits)}.", b.raw,
-                    fix="restrict the source, or remove if unused"))
+                    fix="restrict the source, or remove if unused",
+                    line=b.line))
+        # Source-port-only trust: `permit tcp any eq 53 any` admits traffic to
+        # EVERY destination port on the strength of a port the ATTACKER sets —
+        # the classic pre-`established` return-traffic anti-pattern. Genuine
+        # `established` return permits were exempted above (stateful continue),
+        # and an imprecise (over-approximated) space is never judged.
+        if (b.proto in ("tcp", "udp") and not b.imprecise
+                and not b.src_port.is_any() and b.dst_port.is_any()):
+            findings.append(Finding(
+                _id(b), "source-port-trust", "high",
+                f"permit relies only on the SOURCE port ({b.src_port}) — "
+                f"source ports are attacker-controlled; this admits {b.proto} "
+                f"traffic to every destination port.",
+                b.raw,
+                fix=(f"match the destination port instead, or add "
+                     f"`established` if this is return traffic"
+                     f"{_line_sfx(b.line)}"),
+                line=b.line))
     return findings
 
 

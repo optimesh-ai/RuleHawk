@@ -28,6 +28,20 @@ possibly-wrong verdict. Rules expressed purely in L3/L4 terms (any zones, any
 application, concrete addresses + a concrete service) get RuleHawk's full
 shadow/segmentation analysis. Nothing is ever silently dropped.
 
+PARTIAL PRECISION (the Junos/objgroup pattern, applied to PAN-OS addresses).
+A source/destination list mixing resolved members (address objects, static
+groups, literal CIDRs) with unresolvable ones (fqdn, ip-wildcard, dynamic
+groups, undefined names) must NOT collapse to "the resolved subset, marked
+imprecise": the modeled space would be a SUBSET of the real match, breaking the
+over-approximation invariant above (a segmentation PASS could be false). When
+the ONLY imprecision source is unresolved src/dst names, the rule is expanded
+into EXACT ACEs for the resolved members (they can prove a CRITICAL) plus ONE
+trailing opaque any/any imprecise ACE covering the unresolved remainder (it
+keeps the remainder INDETERMINATE — never PASS, never a false CRITICAL). Any
+other imprecision source (zones, application, negate-*, service) taints every
+combo, so the whole rule stays imprecise as before — with the unresolved
+dimension widened to ANY (superset), never kept as the resolved subset.
+
 Scope (minimal but correct): the `set`-display form (`set ... rulebase security
 rules NAME ...`, fields possibly split across lines), with `set address` /
 `set address-group static` / `set service` object resolution. Modeled rule
@@ -278,68 +292,74 @@ def _resolve_name(name: str,
                   addresses: Dict[str, Optional[Tuple[List[_IPNet], bool]]],
                   addr_groups: Dict[str, Optional[List[str]]],
                   seen: frozenset, label: str, dim: str,
-                  notes: List[str]) -> Tuple[List[_IPNet], bool]:
-    """Resolve one source/destination token to (nets, imprecise).
+                  notes: List[str]) -> Tuple[List[_IPNet], bool, bool]:
+    """Resolve one source/destination token to (nets, imprecise, has_unresolved).
 
     Objects and static groups (unioned, recursively) resolve exactly; anything
-    unresolved over-approximates and flips imprecise — surfaced, never dropped."""
+    unresolved over-approximates and flips imprecise — surfaced, never dropped.
+
+    *has_unresolved* is True ONLY when the value (or a group member) could not
+    be reduced to concrete nets — fqdn/ip-wildcard/dynamic-group/undefined name/
+    circular group. The caller uses it to apply the partial-precision pattern
+    (exact ACEs for resolved members + one opaque ACE for the unresolved
+    remainder), mirroring parse_junos._addrs."""
     if name in seen:
         notes.append(f"circular PAN-OS address-group '{name}' in {label} {dim} "
                      f"(marked imprecise)")
-        return [], True
+        return [], True, True
     if name in addresses:
         e = addresses[name]
         if e is None:
-            return [], True                        # known-but-inexact (note already emitted)
-        return list(e[0]), e[1]
+            return [], True, True                  # known-but-inexact (note already emitted)
+        return list(e[0]), e[1], False
     if name in addr_groups:
         members = addr_groups[name]
         if members is None:
-            return [], True                        # dynamic group (note already emitted)
+            return [], True, True                  # dynamic group (note already emitted)
         nets: List[_IPNet] = []
         imp = False
+        unres = False
         for m in members:
-            ns, e = _resolve_name(m, addresses, addr_groups, seen | {name},
-                                  label, dim, notes)
+            ns, e, u = _resolve_name(m, addresses, addr_groups, seen | {name},
+                                     label, dim, notes)
             nets += ns
             imp |= e
-        return nets, imp
+            unres |= u
+        return nets, imp, unres
     try:
         # ip_network() on a bare address yields the host route (/32 for v4,
         # /128 for v6) — never widen a bare v6 literal to a /32.
-        return [ipaddress.ip_network(name, strict=False)], False
+        return [ipaddress.ip_network(name, strict=False)], False, False
     except ValueError:
         notes.append(f"unresolved PAN-OS address object/value '{name}' in "
                      f"{label} {dim} (marked imprecise — verify manually)")
-        return [], True
+        return [], True, True
 
 
 def _resolve_addrs(vals: List[str],
                    addresses: Dict[str, Optional[Tuple[List[_IPNet], bool]]],
                    addr_groups: Dict[str, Optional[List[str]]],
                    label: str, dim: str,
-                   notes: List[str]) -> Tuple[List[_IPNet], bool]:
+                   notes: List[str]) -> Tuple[List[_IPNet], bool, bool]:
+    """Resolve a source/destination value list to (nets, imprecise, has_unresolved).
+
+    Returns the RAW resolved nets (possibly empty when everything was
+    unresolved); the caller widens an empty list to ANY. Keeping the raw list
+    lets `_build_rule` distinguish "some members resolved" (partial precision
+    applies) from "nothing resolved" (any-net fallback, fully imprecise)."""
     nets: List[_IPNet] = []
     imprecise = False
+    has_unresolved = False
     for v in vals:
         if v == "any":
             nets.append(_ANY_NET)
             continue
-        ns, imp = _resolve_name(v, addresses, addr_groups, frozenset(),
-                                label, dim, notes)
+        ns, imp, unres = _resolve_name(v, addresses, addr_groups, frozenset(),
+                                       label, dim, notes)
         nets += ns
         imprecise |= imp
-    if imprecise:
-        # ANY unresolvable member poisons the union: keeping only the resolved
-        # part would model a SUBSET of the true space -> widen the whole
-        # dimension to ANY (superset), per the parser contract.
-        if nets:
-            notes.append(f"PAN-OS {label} {dim} has unresolvable member(s) — "
-                         f"dimension widened to ANY (marked imprecise)")
-        nets = [_ANY_NET]
-    elif not nets:
-        nets = [_ANY_NET]
-    return nets, imprecise
+        has_unresolved |= unres
+    return nets, imprecise, has_unresolved
 
 
 # --- service resolution ----------------------------------------------------
@@ -435,19 +455,50 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
         notes.append(f"PAN-OS application {[a for a in app_vals if a != 'any']} "
                      f"in {label} not modeled (L7 match — marked imprecise)")
 
+    negate_src = negate_dst = False
     for nk in ("negate-source", "negate-destination"):
-        if fields.get(nk, []) and fields[nk][0].lower() == "yes":
+        if fields.get(nk, []) and fields[nk][-1].lower() == "yes":
             imprecise = True
-            notes.append(f"PAN-OS '{nk}' in {label} — negated set is not a single "
-                         f"rectangle (marked imprecise)")
+            if nk == "negate-source":
+                negate_src = True
+            else:
+                negate_dst = True
+            notes.append(f"PAN-OS '{nk}' in {label} — rule matches the COMPLEMENT "
+                         f"of the listed set; widened to any (marked imprecise)")
 
-    srcs, imp_s = _resolve_addrs(fields.get("source", ["any"]) or ["any"],
-                                 addresses, addr_groups, label, "source", notes)
-    dsts, imp_d = _resolve_addrs(fields.get("destination", ["any"]) or ["any"],
-                                 addresses, addr_groups, label, "destination", notes)
+    srcs, imp_s, unres_s = _resolve_addrs(fields.get("source", ["any"]) or ["any"],
+                                          addresses, addr_groups, label, "source", notes)
+    dsts, imp_d, unres_d = _resolve_addrs(fields.get("destination", ["any"]) or ["any"],
+                                          addresses, addr_groups, label, "destination", notes)
+
+    # negate-source/destination: the rule matches the COMPLEMENT of the listed
+    # set, so the listed nets are NOT a superset of the real match — keeping
+    # them would UNDER-approximate and segcheck could skip the permit for a
+    # probe outside the listed set (a false PASS). Widen the negated dimension
+    # to ANY (ANY ⊇ complement restores the over-approximation invariant);
+    # imprecise=True (set above) already blocks any false CRITICAL/deadness
+    # proof. Mirrors parse_iptables, which leaves src/dst at ANY on `! -s/-d`.
+    if negate_src:
+        srcs, imp_s, unres_s = [_ANY_NET], False, False
+    if negate_dst:
+        dsts, imp_d, unres_d = [_ANY_NET], False, False
     combos, imp_v = _resolve_service(fields.get("service", []), services, label, notes)
+
+    # Imprecision from ANY source other than unresolved src/dst names (zones,
+    # application, negate-*, service, an over-approximated address entry) taints
+    # every expanded combo, so partial precision is blocked — mirrors
+    # parse_junos._Match.other_imprecise.
+    other_imprecise = (imprecise or imp_v
+                       or (imp_s and not unres_s) or (imp_d and not unres_d))
     imprecise = imprecise or imp_s or imp_d or imp_v
 
+    has_resolved_src, has_resolved_dst = bool(srcs), bool(dsts)
+    if not srcs:                                   # all unresolved -> widen to ANY
+        srcs = [_ANY_NET]
+    if not dsts:
+        dsts = [_ANY_NET]
+
+    cap_exceeded = False
     if len(srcs) * len(dsts) * len(combos) > _MAX_EXPAND:
         # Truncating to the first value per dimension would model a SUBSET
         # (dropped members become invisible holes): widen everything instead.
@@ -457,7 +508,71 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
         srcs, dsts = [_ANY_NET], [_ANY_NET]
         combos = [("ip", ANY_PORTS, ANY_PORTS)]
         imprecise = True
+        cap_exceeded = True
 
+    # --- Partial-precision path (the parse_junos._parse_term pattern) ----------
+    # When ≥1 source/destination value was unresolvable AND no other imprecision
+    # source is present, emit EXACT ACEs for the resolved member combos PLUS one
+    # opaque (any/any, imprecise=True) ACE for the unresolved remainder.
+    #
+    # Soundness contract (mirrors parse_junos / parse.py _resolve_nets_partial):
+    #   (1) Resolved-member ACEs carry imprecise=False — their match space is
+    #       EXACT and can prove a CRITICAL verdict.
+    #   (2) Unresolved members can only EXPAND the rule's real match, never
+    #       shrink it, so a CRITICAL proven from the resolved subset is correct.
+    #   (3) The trailing opaque ACE keeps the unresolved portion INDETERMINATE —
+    #       it can never produce a false PASS (it is never skipped as a
+    #       candidate) nor a false CRITICAL (imprecise ⇒ no witness).
+    #   (4) All-unresolved in a dimension: partial emission is blocked — the
+    #       any-net fallback over-approximates and could invent a false CRITICAL.
+    _do_partial = (
+        (unres_s or unres_d)                       # at least one unresolved name
+        and not other_imprecise                    # no other approximation source
+        and not cap_exceeded                       # _MAX_EXPAND cap not hit
+        and (not unres_s or has_resolved_src)      # partial src: resolved srcs exist
+        and (not unres_d or has_resolved_dst)      # partial dst: resolved dsts exist
+    )
+    if _do_partial:
+        n_precise = 0
+        for proto, sp, dp in combos:
+            ported = proto in _PORTED
+            for s in srcs:
+                for d in dsts:
+                    seq += 1
+                    n_precise += 1
+                    entries.append(ACE(
+                        seq=seq, action=action, proto=proto, src=s, dst=d,
+                        src_port=sp if ported else ANY_PORTS,
+                        dst_port=dp if ported else ANY_PORTS, icmp_type=None,
+                        stateful=False, imprecise=False,
+                        raw=_raw(name, action, proto, s, d,
+                                 sp if ported else ANY_PORTS,
+                                 dp if ported else ANY_PORTS),
+                        acl="security", line=line))
+        # Trailing opaque ACE covers the unresolved-name remainder.
+        seq += 1
+        entries.append(ACE(
+            seq=seq, action=action, proto="ip",
+            src=_ANY_NET, dst=_ANY_NET, imprecise=True,
+            raw=f"rule {name}: {action} ip any -> any (unresolved address remainder)",
+            acl="security", line=line))
+        notes.append(
+            f"PAN-OS rule {label}: partially resolved address references — "
+            f"{n_precise} exact ACE(s) + 1 opaque for unresolved names"
+        )
+        return seq
+
+    # Normal (non-partial) path. A dimension that contains unresolved names but
+    # could not take the partial path (another imprecision source, the expansion
+    # cap, or nothing resolved) is widened to ANY: keeping only the resolved
+    # subset would UNDER-approximate the rule's real match (the unresolved
+    # members add unknown space) and segcheck could skip the permit entirely —
+    # a false PASS. ANY ⊇ real match restores the over-approximation invariant;
+    # the rule is imprecise here, so ANY can never prove a violation or deadness.
+    if unres_s:
+        srcs = [_ANY_NET]
+    if unres_d:
+        dsts = [_ANY_NET]
     for proto, sp, dp in combos:
         ported = proto in _PORTED
         for s in srcs:

@@ -112,6 +112,64 @@ def test_conntrack_state_modeled_stateful_and_surfaced():
     assert any("stateful" in n and ("conntrack" in n or "state" in n) for n in notes)
 
 
+def test_negated_ctstate_marks_imprecise_not_stateful():
+    """`! --ctstate INVALID -j ACCEPT` matches the COMPLEMENT of INVALID — i.e.
+    everything else, INCLUDING NEW flows. It must NOT be modeled as a stateful
+    (return-traffic-only) rule; that direction FALSE-PASSes segmentation. The
+    complement isn't modeled, so it must be marked imprecise and surfaced."""
+    cfg = ("*filter\n:FORWARD DROP [0:0]\n"
+           "-A FORWARD -m conntrack ! --ctstate INVALID -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.stateful is False, (
+        "negated ctstate modeled as stateful — unsound (permits NEW flows)")
+    assert rule.imprecise is True
+    assert any("negated conntrack state" in n and "imprecise" in n for n in notes)
+
+
+def test_negated_state_module_form_also_imprecise():
+    """Same soundness rule for the legacy `-m state ! --state` spelling."""
+    cfg = ("*filter\n:FORWARD DROP [0:0]\n"
+           "-A FORWARD -m state ! --state INVALID,UNTRACKED -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.stateful is False and rule.imprecise is True
+    assert any("negated conntrack state" in n for n in notes)
+
+
+def test_negated_ctstate_repro_indeterminate_not_pass():
+    """The live repro from the finding: `:FORWARD DROP` + the common hygiene rule
+    `! --ctstate INVALID -j ACCEPT` used to yield a clean `segmentation-ok`
+    (FALSE PASS) for a CORP->PCI tcp/445 must_not_reach assertion, while the real
+    firewall ACCEPTs all non-INVALID traffic including NEW cross-zone flows.
+    The imprecise permit must fail closed to segmentation-INDETERMINATE."""
+    cfg = ("*filter\n:FORWARD DROP [0:0]\n"
+           "-A FORWARD -m conntrack ! --ctstate INVALID -j ACCEPT\nCOMMIT\n")
+    aces, _ = parse_iptables(cfg)
+    findings = check_segmentation(aces, _SEG_POLICY)
+    kinds = {f.kind for f in findings}
+    assert "segmentation-ok" not in kinds, (
+        "FALSE PASS: negated-ctstate ACCEPT hidden as stateful — CORP->PCI:445 "
+        "reported isolated while the rule permits NEW flows")
+    assert "segmentation-indeterminate" in kinds
+
+
+def test_non_negated_ctstate_still_stateful_no_regression():
+    """The straight (non-negated) return-traffic idiom keeps its precise stateful
+    model — no over-blocking regression from the negation fix."""
+    cfg = ("*filter\n:FORWARD DROP [0:0]\n"
+           "-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n"
+           "COMMIT\n")
+    aces, _ = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.stateful is True and rule.imprecise is False
+    # Stateful-only permit never opens a NEW flow -> the isolation check PASSes.
+    kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
+    assert "segmentation-ok" in kinds
+    assert "segmentation-violation" not in kinds
+    assert "segmentation-indeterminate" not in kinds
+
+
 def test_interface_match_marks_imprecise_and_surfaced():
     cfg = ("*filter\n:FORWARD DROP [0:0]\n"
            "-A FORWARD -i eth0 -s 10.0.0.0/8 -p tcp --dport 22 -j ACCEPT\nCOMMIT\n")
@@ -254,31 +312,42 @@ _CUSTOM_JUMP_LEAK = (
 
 
 def test_custom_chain_jump_on_transit_path_is_indeterminate_not_ok():
-    """The residual false PASS: a leak inside a custom chain reached via a FORWARD
-    jump must fail CLOSED — a violation (the engine searches the custom chain as
-    its own context) or indeterminate (the imprecise jump marker), NEVER
-    segmentation-ok. Mutation guard: deleting the fail-closed handling reverts
-    this to a segmentation-ok FALSE PASS."""
+    """When the jumped custom chain IS fully modeled, precision resolution turns
+    the former INDETERMINATE into a precise CRITICAL verdict. CROSSZONE contains a
+    concrete ACCEPT for CORP->PCI:445 with no RETURN rules and no imprecise ACEs,
+    so the resolved permit ACE is emitted in FORWARD and segcheck flags CRITICAL.
+    Mutation guard: if resolution is disabled this reverts to INDETERMINATE or
+    FALSE-PASS — both wrong."""
     aces, notes = parse_iptables(_CUSTOM_JUMP_LEAK)
     findings = check_segmentation(aces, _MULTI_CHAIN_POLICY)
-    corp = [f for f in findings if "CORP" in (f.rule_id or "") or "CORP" in f.message]
-    # CORP->PCI:445 (the hidden leak) must NOT be reported as isolated.
+    # Fully-modeled CROSSZONE ACCEPT → precise CRITICAL, NOT INDETERMINATE
+    viol = [f for f in findings if f.kind == "segmentation-violation"]
+    assert viol, ("CORP->PCI:445 leak via fully-modeled CROSSZONE must surface "
+                  "as CRITICAL (precision resolution)")
+    assert viol[0].severity == "critical"
     assert not [f for f in findings
                 if f.kind == "segmentation-ok" and "CORP" in (f.rule_id or "")], \
-        "CORP->PCI must not FALSE-PASS when the leak hides in a jumped custom chain"
-    assert any(f.kind in ("segmentation-indeterminate", "segmentation-violation")
-               for f in corp), \
-        "an unmodeled transit jump must fail closed (violation or indeterminate)"
-    # The jump is still surfaced as a parse note (never an invisible hole).
+        "CORP->PCI must not FALSE-PASS"
+    # Precision resolution note must be present
+    assert any("resolved precisely" in n and "CROSSZONE" in n for n in notes)
+    # Original jump surface note must still be present (never an invisible hole)
     assert any("custom chain" in n and "CROSSZONE" in n for n in notes)
 
 
 def test_custom_chain_jump_emits_imprecise_transit_marker():
-    """Mechanism check: the FORWARD jump produces an imprecise transit ACE that
-    sits before the chain default policy; the custom chain itself stays transit."""
+    """Mechanism check: when CROSSZONE is fully modeled, the FORWARD jump
+    placeholder is replaced with a PRECISE transit ACE (permit tcp CORP->PCI:445).
+    The resolved ACE is non-imprecise — it represents a real, auditable permit."""
     aces, _ = parse_iptables(_CUSTOM_JUMP_LEAK)
     fwd = [a for a in aces if a.acl == "FORWARD" and "policy" not in a.raw]
-    assert fwd and all(a.imprecise and a.transit for a in fwd)
+    assert fwd, "FORWARD must have at least one non-policy ACE (the resolved jump)"
+    # Resolved ACE must be precise (not imprecise) and transit-eligible
+    assert all(not a.imprecise and a.transit for a in fwd), \
+        "resolved jump ACEs must be precise and transit=True"
+    # Must represent the CROSSZONE ACCEPT: permit tcp CORP->PCI dport 445
+    assert any(a.action == "permit" and a.proto == "tcp"
+               and a.dst_port.lo == 445 and a.dst_port.hi == 445
+               for a in fwd)
 
 
 def test_custom_chain_jump_on_input_stays_surface_only():
@@ -595,8 +664,12 @@ def test_reject_with_stays_precise():
 
 def test_lowercase_jump_accept_is_a_custom_chain_not_builtin():
     # Targets are case-sensitive: `-j accept` names a user chain, never the
-    # ACCEPT verdict. On the transit path it gets the fail-closed marker.
-    cfg = ("*filter\n:FORWARD DROP [0:0]\n:accept - [0:0]\n"
+    # ACCEPT verdict. The chain is deliberately NOT declared here, so the
+    # precision-resolution pass fails closed (absent chain) and the transit
+    # jump keeps the fail-closed imprecise marker. Mutation guard: an
+    # `.upper()` regression would turn this into a precise ACCEPT permit
+    # (violation, non-imprecise ACE) and fail every assertion below.
+    cfg = ("*filter\n:FORWARD DROP [0:0]\n"
            "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 445 -j accept\n"
            "COMMIT\n")
     aces, notes = parse_iptables(cfg)
@@ -624,3 +697,402 @@ def test_numeric_protocol_normalized():
     aces, _ = parse_iptables(cfg)
     rule = next(a for a in aces if a.action == "permit")
     assert rule.proto == "tcp" and rule.dst_port.lo == 22
+
+
+# ── RH-iptables-precision: custom-chain jump precision resolution ─────────────
+# When the jumped chain IS fully modeled (all rules precise, no RETURN/NAT),
+# the imprecise placeholder is replaced with exact ACEs. The five tests below
+# cover: (a) drop → PASS, (b) accept → CRITICAL, (c) absent chain → INDETERMINATE,
+# (d) fall-through / implicit RETURN → parent rule fires, (e) cycle → fail closed.
+
+# Shared policy for (a)(b)(c)(d)(e) tests
+_PREC_POLICY = {
+    "zones": {"PCI": ["10.10.0.0/16"], "CORP": ["10.20.0.0/16"]},
+    "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp", "ports": [445]}],
+}
+
+
+def test_precision_modeled_chain_drop_gives_pass():
+    """(a) Transit jump to a fully-modeled chain that DROPs the forbidden flow.
+
+    ZONE_FILTER only contains an explicit DROP for tcp/445. Resolution replaces
+    the imprecise placeholder with a precise deny ACE. Segcheck must yield
+    segmentation-ok (PASS), never INDETERMINATE or CRITICAL."""
+    cfg = (
+        "*filter\n"
+        ":FORWARD DROP [0:0]\n"
+        ":ZONE_FILTER - [0:0]\n"
+        "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -j ZONE_FILTER\n"
+        "-A ZONE_FILTER -p tcp --dport 445 -j DROP\n"
+        "COMMIT\n"
+    )
+    aces, notes = parse_iptables(cfg)
+    findings = check_segmentation(aces, _PREC_POLICY)
+    kinds = {f.kind for f in findings}
+    assert "segmentation-ok" in kinds, \
+        "DROP in fully-modeled chain must give precise PASS"
+    assert "segmentation-indeterminate" not in kinds, \
+        "fully-modeled chain must not remain INDETERMINATE"
+    assert "segmentation-violation" not in kinds, \
+        "DROP must not give CRITICAL"
+    # Mechanism: FORWARD has a precise deny ACE for tcp/445
+    fwd_non_policy = [a for a in aces
+                      if a.acl == "FORWARD" and "policy" not in a.raw]
+    assert any(a.action == "deny" and not a.imprecise
+               and a.proto == "tcp" and a.dst_port.lo == 445
+               for a in fwd_non_policy), \
+        "resolved deny for tcp/445 must be a precise ACE in FORWARD"
+    assert any("resolved precisely" in n and "ZONE_FILTER" in n for n in notes)
+
+
+def test_precision_modeled_chain_accept_gives_critical():
+    """(b) Transit jump to a fully-modeled chain that ACCEPTs the forbidden flow.
+
+    The jump rule narrows src only (-s CORP); the custom chain further narrows
+    dst and proto (tcp/445 ACCEPT). Resolution computes the intersection and
+    emits a precise permit ACE → segcheck must report CRITICAL."""
+    cfg = (
+        "*filter\n"
+        ":FORWARD DROP [0:0]\n"
+        ":XZONE - [0:0]\n"
+        # Jump rule matches CORP source only (no dst/proto restriction here)
+        "-A FORWARD -s 10.20.0.0/16 -j XZONE\n"
+        # Subchain adds dst+proto restriction and ACCEPTs
+        "-A XZONE -d 10.10.0.0/16 -p tcp --dport 445 -j ACCEPT\n"
+        "COMMIT\n"
+    )
+    aces, notes = parse_iptables(cfg)
+    findings = check_segmentation(aces, _PREC_POLICY)
+    viol = [f for f in findings if f.kind == "segmentation-violation"]
+    assert viol, "ACCEPT in fully-modeled chain must give precise CRITICAL"
+    assert viol[0].severity == "critical"
+    assert ":445" in viol[0].witness
+    assert "10.20" in viol[0].message and "10.10" in viol[0].message
+    # The resolved FORWARD ACE must be precise (not imprecise)
+    fwd_non_policy = [a for a in aces
+                      if a.acl == "FORWARD" and "policy" not in a.raw]
+    assert any(a.action == "permit" and not a.imprecise
+               and a.proto == "tcp" and a.dst_port.lo == 445
+               for a in fwd_non_policy)
+    assert any("resolved precisely" in n and "XZONE" in n for n in notes)
+
+
+def test_precision_absent_chain_stays_indeterminate():
+    """(c) Transit jump to a chain that is never defined in this config.
+
+    The target MISSING_CHAIN is absent from by_chain → precision resolution
+    fails closed. The imprecise placeholder stays → segmentation-INDETERMINATE.
+    Never a false PASS."""
+    cfg = (
+        "*filter\n"
+        ":FORWARD DROP [0:0]\n"
+        # MISSING_CHAIN is referenced but never declared or populated
+        "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -j MISSING_CHAIN\n"
+        "COMMIT\n"
+    )
+    aces, notes = parse_iptables(cfg)
+    findings = check_segmentation(aces, _PREC_POLICY)
+    kinds = {f.kind for f in findings}
+    assert "segmentation-indeterminate" in kinds, \
+        "absent chain must keep imprecise placeholder → INDETERMINATE (fail closed)"
+    assert "segmentation-ok" not in kinds, \
+        "must not FALSE-PASS when target chain is absent"
+    # Jump must still be surfaced as a note (never an invisible hole)
+    assert any("custom chain" in n and "MISSING_CHAIN" in n for n in notes)
+    assert not any("resolved precisely" in n for n in notes)
+
+
+def test_precision_fallthrough_return_parent_rule_fires():
+    """(d) Fall-through / implicit RETURN path: precise resolution for matched
+    space, parent chain fires for unmatched space.
+
+    PORTCHECK only DROPs tcp/445. For the forbidden tcp/445 flow the custom chain
+    provides a precise deny → PASS (no violation). For all other traffic the custom
+    chain has no matching rule, so it falls through (implicit RETURN) and the next
+    FORWARD rule handles it — the FORWARD DROP policy then catches anything else."""
+    cfg = (
+        "*filter\n"
+        ":FORWARD DROP [0:0]\n"
+        ":PORTCHECK - [0:0]\n"
+        # Jump rule narrows to CORP→PCI space
+        "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -j PORTCHECK\n"
+        # Next FORWARD rule — fires for traffic that PORTCHECK does NOT terminate
+        "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 443 -j ACCEPT\n"
+        # PORTCHECK drops 445 only; 443 traffic falls through to parent
+        "-A PORTCHECK -p tcp --dport 445 -j DROP\n"
+        "COMMIT\n"
+    )
+    aces, notes = parse_iptables(cfg)
+
+    # tcp/445 must be blocked by the resolved deny → PASS (no isolation violation)
+    findings_445 = check_segmentation(aces, _PREC_POLICY)
+    kinds_445 = {f.kind for f in findings_445}
+    assert "segmentation-ok" in kinds_445, \
+        "tcp/445 must be precisely denied → PASS for isolation"
+    assert "segmentation-indeterminate" not in kinds_445, \
+        "fully-modeled PORTCHECK must not remain INDETERMINATE"
+
+    # The FORWARD rule for tcp/443 must still be present after renumbering
+    fwd_non_policy = [a for a in aces if a.acl == "FORWARD" and "policy" not in a.raw]
+    assert any(a.action == "permit" and a.proto == "tcp" and a.dst_port.lo == 443
+               for a in fwd_non_policy), \
+        "parent chain ACCEPT for tcp/443 must survive chain renumbering"
+
+    # Resolved deny for 445 must be precise
+    assert any(a.action == "deny" and not a.imprecise
+               and a.proto == "tcp" and a.dst_port.lo == 445
+               for a in fwd_non_policy)
+    assert any("resolved precisely" in n and "PORTCHECK" in n for n in notes)
+
+
+def test_precision_chain_cycle_fails_closed_no_hang():
+    """(e) Mutually-recursive chain cycle → fail closed, no infinite loop.
+
+    CHAIN_A jumps to CHAIN_B; CHAIN_B jumps back to CHAIN_A. Each sub-chain
+    jump emits an imprecise placeholder ACE in the respective chain. When
+    FORWARD→CHAIN_A is resolved, CHAIN_A has an imprecise ACE (from its own
+    sub-jump) → the "no imprecise ACE in subchain" gate fires → fail closed.
+    Result: INDETERMINATE. No hang. No false PASS."""
+    cfg = (
+        "*filter\n"
+        ":FORWARD DROP [0:0]\n"
+        ":CHAIN_A - [0:0]\n"
+        ":CHAIN_B - [0:0]\n"
+        "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -j CHAIN_A\n"
+        "-A CHAIN_A -j CHAIN_B\n"
+        "-A CHAIN_B -j CHAIN_A\n"
+        "COMMIT\n"
+    )
+    aces, notes = parse_iptables(cfg)
+    findings = check_segmentation(aces, _PREC_POLICY)
+    kinds = {f.kind for f in findings}
+    assert "segmentation-indeterminate" in kinds, \
+        "chain cycle must fail closed to INDETERMINATE (not hang, not FALSE-PASS)"
+    assert "segmentation-ok" not in kinds, \
+        "must not FALSE-PASS on a cyclic chain structure"
+    # Resolution was NOT applied (cycle blocked by imprecise-ACE gate)
+    assert not any("resolved precisely" in n for n in notes)
+
+
+# ── RH-iptables soundness regression: icmpv6 type ignored by covers() ─────────
+# covers() gated the icmp_type comparison on proto == "icmp" only, so typed
+# ip6tables `--icmpv6-type` rules (proto "icmpv6") compared as if typeless: an
+# RA-accept (type 134) "covered" the NS/NA accepts (135/136) and analyze()
+# told the user rules 2-3 were shadowed/redundant — deleting them breaks IPv6
+# neighbor discovery. The type dimension must bind for BOTH ICMP families.
+
+def _mk_icmp6(icmp_type, seq=1, action="permit"):
+    import ipaddress
+    from rulehawk.model import ACE
+    any6 = ipaddress.ip_network("::/0")
+    return ACE(seq=seq, action=action, proto="icmpv6", src=any6, dst=any6,
+               icmp_type=icmp_type)
+
+
+def test_covers_respects_icmpv6_type():
+    """A typed icmpv6 rule must NOT cover a differently-typed (or untyped) one —
+    exactly the v4 icmp semantics."""
+    from rulehawk.model import covers
+    ra, ns, na = _mk_icmp6("134"), _mk_icmp6("135"), _mk_icmp6("136")
+    untyped = _mk_icmp6(None)
+    assert covers(ra, ns) is False, "type 134 must not cover type 135"
+    assert covers(ra, na) is False, "type 134 must not cover type 136"
+    # Typed-vs-untyped fails closed (an untyped rule spans MORE than one type).
+    assert covers(ra, untyped) is False
+    # A typeless icmpv6 rule still covers every type; same type still covers.
+    assert covers(untyped, ns) is True
+    assert covers(_mk_icmp6("135"), ns) is True
+
+
+def test_union_coverer_respects_icmpv6_type():
+    """The union-shadowing path mirrors covers()'s gates — same fix required."""
+    from rulehawk.model import _compatible_coverer
+    ra, ns = _mk_icmp6("134"), _mk_icmp6("135")
+    assert _compatible_coverer(ra, ns) is False
+    assert _compatible_coverer(_mk_icmp6(None), ns) is True
+    assert _compatible_coverer(_mk_icmp6("135"), ns) is True
+
+
+# The standard IPv6 ND/RA hygiene block: RA (134), NS (135), NA (136).
+_ND_HYGIENE_V6 = (
+    "ip6tables -P INPUT DROP\n"
+    "ip6tables -A INPUT -p icmpv6 --icmpv6-type 134 -j ACCEPT\n"
+    "ip6tables -A INPUT -p icmpv6 --icmpv6-type 135 -j ACCEPT\n"
+    "ip6tables -A INPUT -p icmpv6 --icmpv6-type 136 -j ACCEPT\n"
+)
+
+_SHADOW_KINDS = {"redundant", "intent-inversion-permit-dead",
+                 "intent-inversion-deny-dead", "union-shadowed-permit-dead",
+                 "union-shadowed-deny-dead"}
+
+
+def test_ip6tables_nd_hygiene_block_not_falsely_shadowed():
+    """End-to-end repro from the finding: the three typed icmpv6 accepts are
+    distinct match-spaces — analyze() must NOT call any of them shadowed,
+    redundant, or dead (that advice, followed, breaks neighbor discovery)."""
+    aces, _ = parse_iptables(_ND_HYGIENE_V6)
+    typed = sorted((a for a in aces if a.proto == "icmpv6"), key=lambda a: a.seq)
+    assert [a.icmp_type for a in typed] == ["134", "135", "136"]
+    assert all(a.src.version == 6 for a in typed), "ip6tables => v6 any nets"
+    findings = _analyze_aces(aces)
+    bad = [f for f in findings if f.kind in _SHADOW_KINDS]
+    assert not bad, (
+        "typed icmpv6 rules falsely reported shadowed/redundant: "
+        + "; ".join(f"{f.kind}: {f.message}" for f in bad))
+
+
+def test_ip6tables_true_duplicate_icmpv6_rule_still_flagged():
+    """No over-relaxation: an ACTUAL duplicate typed icmpv6 rule (same type)
+    must still be reported redundant, and an untyped icmpv6 accept must still
+    shadow a later typed one."""
+    cfg = (
+        "ip6tables -P INPUT DROP\n"
+        "ip6tables -A INPUT -p icmpv6 --icmpv6-type 134 -j ACCEPT\n"
+        "ip6tables -A INPUT -p icmpv6 --icmpv6-type 134 -j ACCEPT\n"
+    )
+    aces, _ = parse_iptables(cfg)
+    findings = _analyze_aces(aces)
+    assert any(f.kind == "redundant" for f in findings), \
+        "identical typed icmpv6 rule must still be flagged redundant"
+
+    cfg2 = (
+        "ip6tables -P INPUT DROP\n"
+        "ip6tables -A INPUT -p icmpv6 -j ACCEPT\n"
+        "ip6tables -A INPUT -p icmpv6 --icmpv6-type 135 -j ACCEPT\n"
+    )
+    aces2, _ = parse_iptables(cfg2)
+    findings2 = _analyze_aces(aces2)
+    assert any(f.kind == "redundant" for f in findings2), \
+        "typeless icmpv6 accept covers every type — later typed rule is redundant"
+
+
+# ── RH-iptables imprecise-marking coverage (fail-closed branches) ──────────────
+# Coverage showed the guards that set `imprecise=True` — the ONLY mechanism
+# preventing an unmodeled/narrowed match from producing a false segmentation
+# PASS — were never executed by any test: negated -d / -p, unparsed -s / -d,
+# --sport (whole branch), --sports multiport, lo:hi / open-ended port ranges,
+# an unparsable range component, -f fragments, and the unknown-option catch-all.
+# If a refactor dropped `imprecise = True` on any of these branches, RuleHawk
+# would certify isolation over a rule it modeled too narrowly — a false clean
+# bill of health. These tests pin each branch: (a) the imprecise flag, (b) the
+# exact port range where parseable, and (c) the user-visible "marked imprecise"
+# note (it appears verbatim in the PR comment, so its wording is contract).
+
+import pytest  # noqa: E402
+
+
+class TestImpreciseMarkingBranches:
+    """Each unmodeled/narrowing construct MUST flip imprecise + emit a note."""
+
+    def _one_forward_rule(self, rule_args):
+        cfg = f"*filter\n:FORWARD DROP [0:0]\n-A FORWARD {rule_args}\nCOMMIT\n"
+        aces, notes = parse_iptables(cfg)
+        non_policy = [a for a in aces if a.acl == "FORWARD"
+                      and "policy" not in a.raw]
+        return non_policy, notes
+
+    # (rule args, note fragment that must appear alongside 'imprecise')
+    _IMPRECISE_CASES = [
+        ("! -d 10.0.0.0/8 -j ACCEPT", "negated destination"),
+        ("! -p tcp -j ACCEPT", "negated protocol"),
+        ("-s bogus -p tcp --dport 22 -j ACCEPT", "unparsed iptables source 'bogus'"),
+        ("-d bogus -p tcp --dport 22 -j ACCEPT",
+         "unparsed iptables destination 'bogus'"),
+        ("-p tcp --sport bogus -j ACCEPT", "unparsed iptables --sport 'bogus'"),
+        ("-p tcp --dport 1000:foo -j ACCEPT",
+         "unparsed iptables --dport '1000:foo'"),
+        ("-p tcp ! --dport 445 -j ACCEPT", "negated --dport"),
+        ("-p tcp ! --sport 1024 -j ACCEPT", "negated --sport"),
+        ("-f -j ACCEPT", "fragment match (`-f`)"),
+        ("-p tcp --tcp-flags SYN,ACK SYN -j ACCEPT",
+         "unmodeled iptables option `--tcp-flags"),
+    ]
+
+    @pytest.mark.parametrize("rule_args,note_frag",
+                             [pytest.param(r, f, id=r) for r, f in _IMPRECISE_CASES])
+    def test_branch_marks_imprecise_and_surfaces_note(self, rule_args, note_frag):
+        rules, notes = self._one_forward_rule(rule_args)
+        assert rules, f"rule `{rule_args}` must still emit an ACE (over-approximated)"
+        assert all(a.imprecise for a in rules), (
+            f"`{rule_args}` narrows in an unmodeled dimension — its ACE must be "
+            f"imprecise or segcheck can FALSE-PASS over it")
+        assert any(note_frag in n for n in notes), (
+            f"expected a note containing {note_frag!r}; got: {notes}")
+        assert any(note_frag in n and "imprecise" in n for n in notes), (
+            "the note must carry the 'marked imprecise' wording users see")
+
+    # ── exact port-range parsing (parseable specs stay PRECISE) ────────────────
+
+    @pytest.mark.parametrize("rule_args,attr,lo,hi", [
+        ("-p tcp --dport 1000:2000 -j ACCEPT", "dst_port", 1000, 2000),
+        ("-p tcp --dport :1024 -j ACCEPT", "dst_port", 0, 1024),
+        ("-p tcp --sport 1024: -j ACCEPT", "src_port", 1024, 65535),
+        ("-p tcp --sport 5000:6000 -j ACCEPT", "src_port", 5000, 6000),
+    ], ids=["dport-lo:hi", "dport-:hi-open-low", "sport-lo:-open-high",
+            "sport-lo:hi"])
+    def test_port_range_exact_and_precise(self, rule_args, attr, lo, hi):
+        rules, _ = self._one_forward_rule(rule_args)
+        assert len(rules) == 1
+        pr = getattr(rules[0], attr)
+        assert (pr.lo, pr.hi) == (lo, hi), (
+            f"`{rule_args}` must parse to the EXACT range {lo}-{hi}, got {pr}")
+        assert rules[0].imprecise is False, (
+            "a fully-parsed port range is exact — must NOT be imprecise "
+            "(over-flagging erodes the signal)")
+
+    def test_sports_multiport_expands_exactly(self):
+        rules, notes = self._one_forward_rule(
+            "-p tcp -m multiport --sports 22,80,443 -j ACCEPT")
+        got = sorted((a.src_port.lo, a.src_port.hi) for a in rules)
+        assert got == [(22, 22), (80, 80), (443, 443)], (
+            "--sports must expand to the exact union of per-port ACEs")
+        assert all(a.imprecise is False for a in rules)
+        assert any("--sports" in n and "expanded to 3" in n for n in notes)
+
+    def test_unparsable_range_component_keeps_parsed_siblings(self):
+        # The documented RH-3 lesson inside _ports: an unparsable component in a
+        # multiport list flips imprecise but the parseable siblings stay exact —
+        # never a silent widen-to-ANY.
+        rules, notes = self._one_forward_rule(
+            "-p tcp -m multiport --dports 22,bogus,443 -j ACCEPT")
+        got = sorted(a.dst_port.lo for a in rules)
+        assert got == [22, 443]
+        assert all(a.imprecise for a in rules), (
+            "an unparsable component in the SAME spec must taint the rule "
+            "imprecise — it matched more than we modeled")
+        assert any("unparsed iptables --dports 'bogus'" in n
+                   and "marked imprecise" in n for n in notes)
+
+    def test_ctstate_with_new_modeled_as_new_flow_not_stateful(self):
+        rules, notes = self._one_forward_rule(
+            "-m conntrack --ctstate NEW,ESTABLISHED -p tcp --dport 22 -j ACCEPT")
+        assert len(rules) == 1
+        assert rules[0].stateful is False, (
+            "NEW present — the connection-opening packet IS allowed, so modeling "
+            "it stateful would hide real reachability")
+        assert rules[0].imprecise is False
+        assert any("NEW present" in n and "new-flow" in n for n in notes)
+
+    def test_rule_without_terminating_target_skipped_with_note(self):
+        rules, notes = self._one_forward_rule("-p tcp --dport 22")
+        assert rules == [], "a rule with no -j ACCEPT/DROP/REJECT decides nothing"
+        assert any("no terminating target" in n and "skipped" in n for n in notes)
+
+    # ── end-to-end: an imprecise permit fails closed, never a false PASS ───────
+
+    def test_negated_dst_accept_yields_indeterminate_not_ok(self):
+        """The user-facing stake: `! -d` ACCEPT on the transit path could carry
+        the forbidden CORP->PCI:445 flow (10.10/16 is outside the negated 10.0/8?
+        no — we can't know, the complement isn't one rectangle). Segcheck must
+        return segmentation-INDETERMINATE, never certify isolation."""
+        cfg = ("*filter\n:FORWARD DROP [0:0]\n"
+               "-A FORWARD ! -d 192.0.2.0/24 -j ACCEPT\n"
+               "COMMIT\n")
+        aces, notes = parse_iptables(cfg)
+        findings = check_segmentation(aces, _SEG_POLICY)
+        kinds = {f.kind for f in findings}
+        assert "segmentation-ok" not in kinds, (
+            "FALSE PASS: a negated-dst ACCEPT was modeled as dst ANY without the "
+            "imprecise flag — RuleHawk certified isolation it cannot prove")
+        assert "segmentation-indeterminate" in kinds
+        assert any("negated destination" in n and "imprecise" in n for n in notes)

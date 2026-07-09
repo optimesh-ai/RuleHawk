@@ -4,6 +4,7 @@ explainable (cite the contributing rules)."""
 
 from rulehawk.analyze import analyze
 from rulehawk.parse import parse_acls
+from rulehawk.report import to_text
 
 
 def _findings(cfg):
@@ -85,6 +86,45 @@ def test_uniform_union_message_still_claims_full_inversion():
     f = _by_kind(cfg).get("union-shadowed-deny-dead")
     assert f is not None
     assert "The traffic you meant to block is ALLOWED" in f.message
+
+
+def test_union_redundant_appears_in_cleanup_plan_with_line():
+    # The Cleanup plan is the copy-into-ticket section: a union-redundant rule
+    # is proven safe to remove, so it MUST be listed there, with its config
+    # file line so the operator can apply the deletion without grepping.
+    cfg = (
+        "ip access-list extended U3\n"
+        " permit tcp 10.0.0.0 0.0.0.255 any eq 443\n"
+        " permit tcp 10.0.1.0 0.0.0.255 any eq 443\n"
+        " permit tcp 10.0.0.0 0.0.1.255 any eq 443\n")
+    aces, notes = parse_acls(cfg)
+    findings = analyze(aces)
+    f = {x.kind: x for x in findings}["union-redundant"]
+    assert f.line == 4                       # the covered rule's file line
+    text = to_text(findings, notes, len(aces))
+    assert "Cleanup plan: 1 redundant rule(s) safe to remove:" in text
+    plan = text.split("Cleanup plan")[1]
+    assert f"- {f.rule_id} (line 4): {f.rule}" in plan
+
+
+def test_cleanup_plan_counts_both_redundant_kinds_with_lines():
+    # One single-rule redundant + one union-redundant -> both in the plan.
+    cfg = (
+        "ip access-list extended MIX\n"
+        " permit tcp 10.0.0.0 0.0.0.255 any eq 443\n"
+        " permit tcp 10.0.0.0 0.0.0.255 any eq 443\n"   # exact dup -> redundant
+        " permit tcp 10.0.1.0 0.0.0.255 any eq 443\n"
+        " permit tcp 10.0.0.0 0.0.1.255 any eq 443\n")  # union of 2+4 -> union-redundant
+    aces, notes = parse_acls(cfg)
+    findings = analyze(aces)
+    kinds = {x.kind for x in findings}
+    assert {"redundant", "union-redundant"} <= kinds
+    text = to_text(findings, notes, len(aces))
+    assert "Cleanup plan: 2 redundant rule(s) safe to remove:" in text
+    plan = text.split("Cleanup plan")[1]
+    for x in findings:
+        if x.kind in ("redundant", "union-redundant"):
+            assert f"- {x.rule_id} (line {x.line}): {x.rule}" in plan
 
 
 def test_partial_union_stays_clean_no_false_positive():

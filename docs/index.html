@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>RuleHawk — firewall &amp; segmentation auditor</title>
-<meta name="description" content="Paste or upload a Cisco IOS / ASA, Juniper Junos, Palo Alto PAN-OS, or Linux iptables config and get a ranked list of dead, shadowed, redundant, and dangerously-permissive rules in seconds. Vendor is auto-detected. Runs entirely in your browser — your config never leaves your machine." />
+<meta name="description" content="Paste or upload a Cisco IOS / ASA, Cisco NX-OS, Juniper Junos, Palo Alto PAN-OS, Linux iptables, or Arista EOS config and get a ranked list of dead, shadowed, redundant, and dangerously-permissive rules in seconds. Vendor is auto-detected. Runs entirely in your browser — your config never leaves your machine." />
 <!--
   RuleHawk web tool — 100% client-side.
   The engine under docs/rulehawk/ is a VENDORED copy of the top-level rulehawk/
@@ -58,6 +58,8 @@
   #config{min-height:200px}
   #policy{min-height:96px}
   .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px}
+  .row.samples{margin-top:9px;gap:6px}
+  .samples-label{font-size:12px;color:var(--muted);margin-right:2px}
   button{font:inherit;font-size:13.5px;font-weight:500;cursor:pointer;border-radius:4px;
     padding:9px 15px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text);
     transition:background .12s ease,border-color .12s ease}
@@ -76,12 +78,26 @@
   .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--border-strong);
     border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px;margin-right:7px}
   @keyframes sp{to{transform:rotate(360deg)}}
-  /* results */
+
+  /* ---- results ---- */
   #results{display:none}
-  .results-actions{display:flex;gap:8px;flex-wrap:wrap;margin:-2px 0 18px;padding-bottom:16px;border-bottom:1px solid var(--border)}
-  .scorebar{display:flex;align-items:baseline;gap:20px;flex-wrap:wrap;margin-bottom:6px}
-  .score{font-family:var(--mono);font-size:30px;font-weight:500;letter-spacing:-.01em;color:var(--text)}
-  .score small{font-size:14px;color:var(--faint)}
+
+  /* verdict block: at-a-glance audit header */
+  .verdict{display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap;
+    border:1px solid var(--border);border-top:3px solid var(--verdict-accent,var(--border-strong));
+    border-radius:6px;padding:18px 20px;margin-bottom:16px;background:var(--surface)}
+  .score-ring{width:74px;height:74px;border-radius:50%;flex:0 0 auto;
+    border:4px solid var(--verdict-accent,var(--border-strong));
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px}
+  .score-ring .s-val{font-family:var(--mono);font-size:23px;font-weight:600;
+    line-height:1;color:var(--verdict-accent,var(--text))}
+  .score-ring .s-max{font-size:10px;color:var(--faint);line-height:1}
+  .verdict-body{flex:1;min-width:160px}
+  .verdict-chips{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px}
+  .verdict-meta{font-size:12px;color:var(--faint);margin-bottom:11px;line-height:1.5}
+  .verdict-actions{display:flex;gap:6px;flex-wrap:wrap}
+
+  /* finding cards */
   .chips{display:flex;gap:6px;flex-wrap:wrap}
   .chip{font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:3px;border:1px solid;font-family:var(--mono)}
   .chip.c{color:var(--crit);background:var(--crit-bg);border-color:var(--crit-bd)}
@@ -89,12 +105,12 @@
   .chip.m{color:var(--med);background:var(--med-bg);border-color:var(--med-bd)}
   .chip.l{color:var(--low);background:var(--low-bg);border-color:var(--low-bd)}
   .chip.zero{color:var(--faint);background:var(--surface);border-color:var(--border)}
-  .meta{font-size:12.5px;color:var(--faint);margin-bottom:4px}
-  .finding{border:1px solid var(--border);border-left:3px solid var(--low);border-radius:4px;padding:13px 15px;margin-top:10px}
+  .finding{border:1px solid var(--border);border-left:4px solid var(--low);
+    border-radius:4px;padding:14px 16px;margin-top:8px;background:var(--surface)}
   .finding.critical{border-left-color:var(--crit)} .finding.high{border-left-color:var(--high)}
   .finding.medium{border-left-color:var(--med)} .finding.low{border-left-color:var(--low)}
   .finding.info{border-left-color:var(--border-strong)}
-  .fhead{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:7px}
+  .fhead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
   .sev{font-size:10.5px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;padding:2px 7px;border-radius:3px;border:1px solid}
   .sev.critical{color:var(--crit);background:var(--crit-bg);border-color:var(--crit-bd)}
   .sev.high{color:var(--high);background:var(--high-bg);border-color:var(--high-bd)}
@@ -104,11 +120,19 @@
   .kind{font-size:13px;font-weight:600;font-family:var(--mono)}
   .rid{font-size:12px;color:var(--accent);font-family:var(--mono);background:none;border:0;padding:0;cursor:pointer}
   .rid:hover{background:none;text-decoration:underline}
-  .frule{font-family:var(--mono);font-size:12px;background:var(--panel);border:1px solid var(--border);border-radius:3px;padding:6px 9px;margin:6px 0;overflow-x:auto;color:var(--text)}
-  .frow{font-size:13px;margin:4px 0;color:var(--text)} .frow b{color:var(--muted);font-weight:600}
-  .cause{color:var(--muted)} .fix{color:var(--ok)}
+  .frule{font-family:var(--mono);font-size:12px;background:var(--panel);border:1px solid var(--border);
+    border-radius:3px;padding:7px 10px;margin:6px 0 8px;overflow-x:auto;color:var(--text);line-height:1.5}
+  .frow{font-size:13px;margin:5px 0;color:var(--text)}
+  /* inline label badges (WHY / FIX / witness / caused by) */
+  .flabel{display:inline-flex;align-items:center;font-size:9.5px;font-weight:700;
+    letter-spacing:.07em;text-transform:uppercase;border-radius:3px;
+    padding:1px 5px;margin-right:5px;vertical-align:2px;white-space:nowrap}
+  .flabel-why{background:var(--panel);color:var(--muted);border:1px solid var(--border)}
+  .flabel-fix{background:var(--ok-bg);color:var(--ok);border:1px solid var(--ok-bd)}
+  .frow.fix{color:var(--ok)}
   .witness{font-family:var(--mono);font-size:12.5px;background:var(--crit-bg);border:1px solid var(--crit-bd);
     border-radius:3px;padding:6px 10px;margin:5px 0;display:inline-block;color:var(--crit)}
+
   /* segmentation panel */
   .segpanel{border:1px solid var(--border);border-radius:6px;padding:16px;margin-bottom:18px;background:var(--panel)}
   .seghdr{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);margin-bottom:9px}
@@ -118,13 +142,26 @@
   .segbanner.warn{background:var(--med-bg);color:var(--med);border-color:var(--med-bd)}
   .policyerr{background:var(--crit-bg);border:1px solid var(--crit-bd);color:var(--crit);
     border-radius:4px;padding:10px 12px;margin-bottom:16px;font-size:13px}
+
+  /* no-rules-parsed warning (fail-closed, not success-green) */
+  .norules{display:flex;gap:12px;align-items:flex-start;
+    padding:14px 16px;background:var(--high-bg);border:1px solid var(--high-bd);
+    border-left:4px solid var(--high);border-radius:4px;color:var(--high);font-size:13.5px}
+  .norules-icon{flex:0 0 auto;margin-top:2px;color:var(--high)}
+  .norules-body b{display:block;margin-bottom:3px;color:var(--high)}
+  .norules-body{font-size:13.5px}
+
+  /* all-clear: no issues found */
+  .all-clear{display:flex;gap:10px;align-items:center;
+    padding:13px 16px;background:var(--ok-bg);border:1px solid var(--ok-bd);
+    border-radius:4px;color:var(--ok);font-size:14px;font-weight:600;margin-top:10px}
+
   .notes{margin-top:18px;font-size:12px;color:var(--muted)}
   .notes code{font-family:var(--mono);background:var(--panel);border:1px solid var(--border);padding:1px 4px;border-radius:3px}
-  .empty{padding:16px 0;color:var(--ok);font-weight:600;font-size:14px}
-  .norules{padding:13px;background:var(--high-bg);border:1px solid var(--high-bd);border-radius:4px;color:var(--high);font-size:13.5px}
   footer{margin-top:14px;font-size:12.5px;color:var(--muted)}
   footer code{font-family:var(--mono);background:var(--surface);border:1px solid var(--border);padding:2px 6px;border-radius:3px;font-size:12px}
   footer .cli{background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:12px 14px;margin:8px 0}
+
   /* results call-to-action (the free tool → product funnel) */
   .cta{margin-top:22px;border:1px solid var(--border);border-top:3px solid var(--accent);
     border-radius:6px;padding:18px 20px;background:var(--surface)}
@@ -144,7 +181,9 @@
     .wrap{padding:24px 16px 48px}
     header.top{flex-wrap:wrap}
     .ghlink{margin-left:0;order:3}
-    .scorebar{gap:12px}
+    .verdict{gap:14px}
+    .score-ring{width:60px;height:60px}
+    .score-ring .s-val{font-size:19px}
   }
 </style>
 </head>
@@ -165,16 +204,22 @@
   </div>
 
   <div class="card" id="config-card">
-    <label class="fld" for="config">Firewall / ACL config <span class="hint">— Cisco IOS/ASA, Juniper Junos, Palo Alto PAN-OS, or Linux iptables · vendor auto-detected · paste, drag &amp; drop a file, or upload</span></label>
+    <label class="fld" for="config">Firewall / ACL config <span class="hint">— Cisco IOS/ASA, Cisco NX-OS, Juniper Junos, Palo Alto PAN-OS, Linux iptables, or Arista EOS · vendor auto-detected · paste, drag &amp; drop a file, or upload</span></label>
     <textarea id="config" spellcheck="false" placeholder="ip access-list extended EDGE_IN&#10; permit tcp any host 203.0.113.10 eq 443&#10; ...&#10;&#10;…or drag a config file onto this box."></textarea>
     <input type="file" id="file" accept=".txt,.cfg,.conf,.acl,.lst,.log,text/plain" style="display:none" />
     <div class="row">
       <button class="primary" id="audit" disabled>Audit</button>
       <button id="upload">Upload file</button>
-      <button id="sample">Load sample</button>
       <button id="clear">Clear</button>
       <button id="cancel" style="display:none">Cancel</button>
       <span class="status" id="status"><span class="spin"></span>Loading analysis engine…</span>
+    </div>
+    <div class="row samples" role="group" aria-label="Load a sample config">
+      <span class="samples-label">No config handy? Load a sample:</span>
+      <button class="small" data-sample="ios">Cisco IOS/ASA</button>
+      <button class="small" data-sample="junos">Juniper Junos</button>
+      <button class="small" data-sample="iptables">Linux iptables</button>
+      <button class="small" data-sample="nxos">Cisco NX-OS</button>
     </div>
     <details class="adv">
       <summary>Segmentation policy (optional) — prove zones can't reach each other</summary>
@@ -215,7 +260,86 @@ const SAMPLE_POLICY = `{
     {"src": "DMZ",  "dst": "PCI", "proto": "ip"}
   ]
 }`;
-const ENGINE_MODULES = ["__init__","model","parse","parse_junos","parse_panos","parse_iptables","analyze","report","segcheck"];
+// ---- multi-vendor demo gallery -----------------------------------------------
+// The page advertises six vendors; these give a first-time visitor with no config
+// of their own a one-click way to watch the OTHER parsers work, not just IOS.
+// Each sample is paired with SAMPLE_POLICY so the flagship witness-packet proof
+// (CORP -> PCI on 445) fires, and each also carries a second standalone hygiene
+// finding. Every caption below was verified against the real engine (auto-detect
+// routes each to its parser; findings emitted are exactly as described) — never
+// ship a sample whose caption promises a finding the parser does not emit.
+
+// Juniper Junos brace-form firewall filter. ALLOW-WEB permits CORP->PCI incl. 445
+// (segmentation violation + witness); term NEVER-REACHED sits after the default
+// `discard`, so it is a shadowed/dead permit. Adapted from tests/test_parse_junos.py.
+const SAMPLE_JUNOS = `firewall {
+    family inet {
+        filter PCI-EDGE {
+            term ALLOW-WEB {
+                from {
+                    source-address 10.20.0.0/16;
+                    destination-address 10.10.0.0/16;
+                    protocol tcp;
+                    destination-port [ 80 443 445 ];
+                }
+                then accept;
+            }
+            term DEFAULT {
+                then discard;
+            }
+            term NEVER-REACHED {
+                from {
+                    source-address 10.30.0.0/16;
+                    protocol tcp;
+                    destination-port 22;
+                }
+                then accept;
+            }
+        }
+    }
+}`;
+
+// Cisco NX-OS numbered ACL (version-parens + feature marker route it to the NX-OS
+// parser, not IOS). Entry 10 leaks CORP->PCI on 445 (violation + witness); entry 30
+// is dead — the deny-any at 20 already drops it. Adapted from tests/test_parse_nxos.py.
+const SAMPLE_NXOS = `version 9.3(10)
+feature interface-vlan
+
+ip access-list PCI-EDGE
+  statistics per-entry
+  10 permit tcp 10.20.0.0/16 10.10.0.0/16 eq 445
+  20 deny ip any any
+  30 permit tcp 10.20.0.0/16 10.10.0.0/16 eq 3389`;
+
+// Linux iptables-save (filter table) — verbatim copy of samples/iptables_save.txt.
+// The FORWARD chain leaks CORP (10.20/16) into PCI (10.10/16) on SMB/445, and the
+// OUTPUT default-ACCEPT policy is flagged permit-any-any.
+const SAMPLE_IPTABLES = `# iptables-save (filter table) — host/forwarding firewall for a segmented estate.
+# Audit with:  rulehawk samples/iptables_save.txt --policy samples/policy.json
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -s 10.0.0.0/8 -p tcp --dport 22 -j ACCEPT
+-A INPUT -p tcp -m multiport --dports 80,443 -j ACCEPT
+# A FORWARD allow that leaks CORP (10.20/16) into PCI (10.10/16) on SMB/445:
+-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 445 -j ACCEPT
+COMMIT`;
+
+// key -> {config, policy, one-line finding story}. IOS stays the default sample.
+const SAMPLES = {
+  ios:      { cfg: SAMPLE_ACL,      pol: SAMPLE_POLICY,
+    msg: "Cisco IOS/ASA sample + PCI policy loaded — Audit to see permit-any-any, shadowed rules, and the CORP→PCI:445 witness packet." },
+  junos:    { cfg: SAMPLE_JUNOS,    pol: SAMPLE_POLICY,
+    msg: "Juniper Junos filter + PCI policy loaded — Audit to prove CORP reaches PCI on 445 (witness packet) and see a term shadowed by the default discard." },
+  iptables: { cfg: SAMPLE_IPTABLES, pol: SAMPLE_POLICY,
+    msg: "Linux iptables-save + PCI policy loaded — Audit to see the FORWARD chain leak CORP→PCI on 445 (witness packet)." },
+  nxos:     { cfg: SAMPLE_NXOS,     pol: SAMPLE_POLICY,
+    msg: "Cisco NX-OS ACL + PCI policy loaded — Audit to prove CORP reaches PCI on 445 (witness packet) and see a permit killed by an earlier deny-any." },
+};
+const ENGINE_MODULES = ["__init__","model","parse","parse_junos","parse_panos","parse_iptables","parse_nxos","parse_eos","analyze","report","segcheck","pathground"];
 const PYODIDE_VER = "v0.26.4";
 // Fallback (main-thread) analysis stays synchronous, so cap it; the worker path has no cap.
 const FALLBACK_MAX_LINES = 4000;
@@ -262,14 +386,16 @@ function track(event, props){
 }
 
 // Same Python the worker runs — used only by the main-thread fallback. Keep the
-// vendor dispatch identical to worker.js (and to rulehawk/cli.py) so the fallback
-// path can never audit a different vendor set than the worker path.
+// vendor dispatch identical to worker.js (and to rulehawk/gate.py _pick_parser) so
+// the fallback path can never audit a different vendor set than the worker path.
 const ANALYZE_PY = `
 import json
 from rulehawk.parse import parse_acls
 from rulehawk.parse_junos import detect as detect_junos, parse_junos
 from rulehawk.parse_panos import detect as detect_panos, parse_panos
 from rulehawk.parse_iptables import detect as detect_iptables, parse_iptables
+from rulehawk.parse_nxos import detect as detect_nxos, parse_nxos
+from rulehawk.parse_eos import detect as detect_eos, parse_eos
 from rulehawk.analyze import analyze
 from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
@@ -279,6 +405,10 @@ elif detect_panos(cfg):
     vendor, (aces, notes) = "Palo Alto PAN-OS", parse_panos(cfg)
 elif detect_iptables(cfg):
     vendor, (aces, notes) = "Linux iptables", parse_iptables(cfg)
+elif detect_nxos(cfg):
+    vendor, (aces, notes) = "Cisco NX-OS", parse_nxos(cfg)
+elif detect_eos(cfg):
+    vendor, (aces, notes) = "Arista EOS", parse_eos(cfg)
 else:
     vendor, (aces, notes) = "Cisco IOS / ASA", parse_acls(cfg)
 findings = analyze(aces)
@@ -308,12 +438,27 @@ let reqId = 0;            // matches worker responses to requests
 let lastResult = { text:"", jsonStr:"", ruleLines:{} };
 
 // ---- engine boot: prefer Web Worker, fall back to main thread ----
+// Map the worker's additive {type:'progress'} boot posts (and bootMain's own
+// staged points) to honest status text, so the multi-second first load shows
+// what is actually happening instead of one static spinner.
+function bootProgressHtml(m){
+  m = m || {};
+  if(m.stage === "runtime") return '<span class="spin"></span>Downloading analysis runtime (one-time, ~10 MB)…';
+  if(m.stage === "engine"){
+    const total = (+m.total > 0) ? +m.total : ENGINE_MODULES.length;
+    const n = Math.min((+m.loaded || 0) + 1, total);
+    return '<span class="spin"></span>Loading RuleHawk engine (' + n + '/' + total + ')…';
+  }
+  if(m.stage === "start") return '<span class="spin"></span>Starting engine…';
+  return '<span class="spin"></span>Loading analysis engine…';
+}
 function makeWorker(){
   const w = new Worker("worker.js");
   w.onmessage = (e) => {
     const m = e.data || {};
     if(m.type === "ready"){ mode = "worker"; ready(); }
     else if(m.type === "error"){ console.warn("worker engine failed:", m.message); bootMain(); }
+    else if(m.type === "progress"){ if(mode !== "main") setStatus(bootProgressHtml(m)); }
     else if(m.type === "result"){ onResult(m); }
   };
   w.onerror = () => { console.warn("worker errored; falling back"); try{w.terminate()}catch(_){} worker=null; bootMain(); };
@@ -323,14 +468,18 @@ async function bootMain(){
   if(mode === "main") return;
   try{
     if(typeof loadPyodide === "undefined") throw new Error("Pyodide loader unavailable");
+    setStatus(bootProgressHtml({stage:"runtime"}));   // same staged points as the worker
     pyodide = await loadPyodide();
     pyodide.FS.mkdir("rulehawk");
-    for(const m of ENGINE_MODULES){
+    for(let i = 0; i < ENGINE_MODULES.length; i++){
+      const m = ENGINE_MODULES[i];
+      setStatus(bootProgressHtml({stage:"engine", loaded:i, total:ENGINE_MODULES.length}));
       const r = await fetch(`./rulehawk/${m}.py`, {cache:"no-cache"});
       if(!r.ok) throw new Error(`could not load engine module ${m}.py (${r.status})`);
       pyodide.FS.writeFile(`rulehawk/${m}.py`, await r.text());
     }
-    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
+    setStatus(bootProgressHtml({stage:"start"}));
+    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
     mode = "main"; ready();
   }catch(e){
     setStatus("Failed to load the engine: " + esc(e.message||e), true);
@@ -351,7 +500,7 @@ function ready(){
 function audit(){
   if(auditBtn.disabled && !cancelBtn.style.display) return;
   const cfg = $("config").value;
-  if(!cfg.trim()){ setStatus("Paste or upload a config first (or click “Load sample”).", true); return; }
+  if(!cfg.trim()){ setStatus("Paste or upload a config first (or load a sample below).", true); return; }
   const policy = $("policy").value || "";
   setStatus('<span class="spin"></span>Analyzing…');
   auditBtn.disabled = true;
@@ -387,7 +536,7 @@ function onResult(m, isMain){
   try{ env = JSON.parse(m.envelope); }
   catch(e){ setStatus("Could not read analysis result: " + esc(e.message||e), true); return; }
   lastResult = { text: env.report_text, jsonStr: JSON.stringify(env.report_json, null, 2), ruleLines: env.rule_lines || {} };
-  render(env.report_json);
+  render(env.report_json, env.vendor || "");
   const vlabel = env.vendor ? ` (detected ${esc(env.vendor)})` : "";
   setStatus(`Done — analyzed ${env.report_json.rules_analyzed} rules locally${vlabel}.`);
   // anonymous: that a scan ran, how big (bucketed), whether a policy was used.
@@ -438,8 +587,45 @@ function locateRule(ruleId){
   ta.scrollIntoView({behavior:"smooth", block:"center"});
 }
 
-// ---- render ----
+// ---- verdict block helpers ----
+// Pick an accent color for the ring and top border based on worst severity / score.
+function scoreColor(d){
+  const c = d.findings_by_severity || {};
+  if((c.critical||0) > 0) return "var(--crit)";
+  if((c.high||0) > 0)     return "var(--high)";
+  if((c.medium||0) > 0)   return "var(--med)";
+  if((d.score||0) >= 90)  return "var(--ok)";
+  return "var(--faint)";
+}
+
+// At-a-glance audit header: score ring, severity chips, meta, export buttons.
 const SEVS = [["critical","c"],["high","h"],["medium","m"],["low","l"]];
+function verdictBlock(d, vendor){
+  const col = scoreColor(d);
+  const c = d.findings_by_severity || {};
+  const chips = SEVS.map(([k,cls]) => {
+    const n = c[k] || 0;
+    return `<span class="chip ${n ? cls : 'zero'}">${n}&nbsp;${k}</span>`;
+  }).join("");
+  const vendorLine = vendor ? `${esc(vendor)} &middot; ` : "";
+  return `<div class="verdict" style="--verdict-accent:${col}">
+    <div class="score-ring">
+      <span class="s-val">${d.score}</span>
+      <span class="s-max">/100</span>
+    </div>
+    <div class="verdict-body">
+      <div class="verdict-chips">${chips}</div>
+      <div class="verdict-meta">${vendorLine}${d.rules_analyzed} rules analyzed &middot; ${d.findings_total} finding${d.findings_total===1?'':'s'}</div>
+      <div class="verdict-actions">
+        <button class="small" data-act="copy">Copy report</button>
+        <button class="small" data-act="json">Download JSON</button>
+        <button class="small" data-act="txt">Download .txt</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ---- render a single finding card ----
 function findingHTML(f){
   const loc = (lastResult.ruleLines||{})[f.rule_id]
     ? `<button class="rid" data-rid="${esc(f.rule_id)}" title="Jump to this rule in the config">${esc(f.rule_id)}</button>`
@@ -449,16 +635,18 @@ function findingHTML(f){
       <span class="sev ${f.severity}">${f.severity}</span>
       <span class="kind">${esc(f.kind)}</span>
       ${loc}
+      ${f.line ? `<span class="chip zero" title="Source file line">line&nbsp;${esc(String(f.line))}</span>` : ""}
     </div>
-    ${f.rule?`<div class="frule">${esc(f.rule)}</div>`:""}
-    ${f.witness?`<div class="frow"><b>witness packet</b></div><div class="witness">${esc(f.witness)}</div>`:""}
-    ${f.cited?`<div class="frow cause"><b>caused by:</b> <span style="font-family:var(--mono)">${esc(f.cited)}</span></div>`:""}
-    <div class="frow"><b>why:</b> ${esc(f.message)}</div>
-    ${f.fix?`<div class="frow fix"><b>fix:</b> ${esc(f.fix)}</div>`:""}
+    ${f.rule ? `<div class="frule">${esc(f.rule)}</div>` : ""}
+    ${f.witness ? `<div class="frow"><span class="flabel flabel-why">witness</span></div><div class="witness">${esc(f.witness)}</div>` : ""}
+    ${f.cited ? `<div class="frow"><span class="flabel flabel-why">caused by</span> <span style="font-family:var(--mono);font-size:12px">${esc(f.cited)}</span></div>` : ""}
+    <div class="frow"><span class="flabel flabel-why">WHY</span> ${esc(f.message)}</div>
+    ${f.fix ? `<div class="frow fix"><span class="flabel flabel-fix">FIX</span> ${esc(f.fix)}</div>` : ""}
   </div>`;
 }
 
-function render(d){
+// ---- render ----
+function render(d, vendor){
   const box = $("results");
   box.style.display = "block";
 
@@ -466,10 +654,13 @@ function render(d){
   const policyErr = (d.parse_notes||[]).filter(n => n.indexOf("segmentation policy error:") === 0);
 
   if(d.status === "no_rules_parsed"){
-    box.innerHTML = (policyErr.length?`<div class="policyerr"><b>Policy error.</b> ${esc(policyErr[0])}</div>`:"")
-      + `<div class="norules"><b>No ACL rules parsed.</b> This is <i>not</i> a clean bill of health —
-      check the input is a supported config (Cisco IOS/ASA, Juniper Junos,
-      Palo Alto PAN-OS, or Linux iptables).</div>` + notesHTML(d.parse_notes, true);
+    box.innerHTML = (policyErr.length ? `<div class="policyerr"><b>Policy error.</b> ${esc(policyErr[0])}</div>` : "")
+      + `<div class="norules">
+        <svg class="norules-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <div class="norules-body"><b>No ACL rules parsed.</b> This is <i>not</i> a clean bill of health —
+        check the input is a supported config (Cisco IOS/ASA, Cisco NX-OS, Juniper Junos,
+        Palo Alto PAN-OS, Linux iptables, or Arista EOS).</div>
+      </div>` + notesHTML(d.parse_notes, true);
     box.scrollIntoView({behavior:"smooth",block:"nearest"}); return;
   }
 
@@ -477,11 +668,8 @@ function render(d){
   const seg = d.findings.filter(f => f.kind.indexOf("segmentation-") === 0);
   const rest = d.findings.filter(f => f.kind.indexOf("segmentation-") !== 0);
 
-  let html = `<div class="results-actions">
-      <button class="small" data-act="copy">Copy report</button>
-      <button class="small" data-act="json">Download JSON</button>
-      <button class="small" data-act="txt">Download .txt</button>
-    </div>`;
+  // lead with the at-a-glance verdict block
+  let html = verdictBlock(d, vendor);
 
   if(policyErr.length) html += `<div class="policyerr"><b>Policy error.</b> ${esc(policyErr[0])}</div>`;
 
@@ -498,15 +686,11 @@ function render(d){
       + seg.map(findingHTML).join("") + `</div>`;
   }
 
-  let chips = SEVS.map(([k,cls]) => `<span class="chip ${c[k]?cls:'zero'}">${c[k]} ${k}</span>`).join("");
-  html += `<div class="scorebar">
-      <div class="score">${d.score}<small>/100</small></div>
-      <div class="chips">${chips}</div>
-    </div>
-    <div class="meta">${d.rules_analyzed} rules analyzed · ${d.findings_total} finding${d.findings_total===1?'':'s'}</div>`;
-
   if(!rest.length && !seg.length){
-    html += `<div class="empty">No issues found.</div>`;
+    html += `<div class="all-clear">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
+      No issues found — all rules analyzed, nothing flagged.
+    </div>`;
   } else {
     html += rest.map(findingHTML).join("");
   }
@@ -558,10 +742,10 @@ function ctaHTML(){
   }
   return `<div class="cta">
     <div class="cta-h">RuleHawk audits one config, once.</div>
-    <div class="cta-b">This tool audits Cisco IOS/ASA, Juniper Junos, Palo Alto PAN-OS and Linux iptables
-      today. Want continuous monitoring across every change, still more vendors (NX-OS, AWS
-      Security Groups), and exportable audit evidence for PCI / CMMC? That's what
-      OptiMesh is building on top of this engine.</div>
+    <div class="cta-b">This tool audits Cisco IOS/ASA, Cisco NX-OS, Juniper Junos, Palo Alto PAN-OS,
+      Linux iptables, and Arista EOS today. Want continuous monitoring across every change,
+      still more vendors (AWS Security Groups, FortiOS), and exportable audit evidence for
+      PCI / CMMC? That’s what OptiMesh is building on top of this engine.</div>
     <div class="cta-row">${row}</div>
   </div>`;
 }
@@ -599,7 +783,22 @@ $("audit").addEventListener("click", audit);
 $("cancel").addEventListener("click", cancel);
 $("upload").addEventListener("click", () => $("file").click());
 $("file").addEventListener("change", e => loadFile(e.target.files[0]));
-$("sample").addEventListener("click", () => { $("config").value = SAMPLE_ACL; $("results").style.display="none"; });
+// The gallery is the demo: each button pre-fills BOTH the config and the
+// segmentation policy so a first-time visitor's very first Audit shows the
+// witness-packet proof (the flagship differentiator) — for the vendor they
+// actually run — instead of leaving it hidden in the collapsed panel and
+// instead of only ever showing Cisco IOS. The standalone "load sample policy"
+// button below stays unchanged.
+function loadSample(key){
+  const s = SAMPLES[key]; if(!s) return;
+  $("config").value = s.cfg;
+  $("policy").value = s.pol || "";
+  if(s.pol) $("policy").closest("details").open = true;
+  $("results").style.display = "none";
+  if(!auditBtn.disabled) setStatus(s.msg);
+}
+document.querySelectorAll("[data-sample]").forEach(b =>
+  b.addEventListener("click", () => loadSample(b.dataset.sample)));
 $("clear").addEventListener("click", () => { $("config").value=""; $("results").style.display="none"; });
 $("samplePolicy").addEventListener("click", () => { $("policy").value = SAMPLE_POLICY; $("policy").closest("details").open = true; });
 document.addEventListener("keydown", e => { if((e.metaKey||e.ctrlKey) && e.key==="Enter" && !auditBtn.disabled) audit(); });

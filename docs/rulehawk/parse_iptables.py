@@ -28,9 +28,15 @@ another rule dead (`covers()` refuses it) and segmentation yields an honest
 "indeterminate / review manually" instead of a possibly-wrong verdict.
 `conntrack`/`state` ESTABLISHED,RELATED matches are return-traffic only and map
 to `stateful` (like Cisco `established`). `multiport` is expanded to the exact
-union of per-port ACEs (sound, not imprecise). NAT/custom-chain jumps and other
-tables are surfaced, never silently dropped (an unmodeled line must never become
-an invisible hole).
+union of per-port ACEs (sound, not imprecise). NAT targets and other tables are
+surfaced, never silently dropped (an unmodeled line must never become an
+invisible hole). Transit-path jumps to custom chains ARE modeled when they can
+be proven: if the target chain is fully modeled (present, no imprecise rules,
+no RETURN/NAT control flow) the jump is resolved to precise ACEs by
+intersecting the jump's match space with each sub-chain rule; a jump that
+cannot be proven (absent chain, RETURN/NAT inside, imprecise sub-rules) fails
+closed as an imprecise, surfaced placeholder — indeterminate, never a silent
+hole. Host-hook (INPUT/OUTPUT) jumps are surfaced only (no transit decision).
 
 Scope (minimal but correct): both the `iptables-save` form (`*filter` ... `-A
 CHAIN ...` ... `COMMIT`) and the command form (`iptables -A CHAIN ...`), for the
@@ -39,6 +45,7 @@ CHAIN ...` ... `COMMIT`) and the command form (`iptables -A CHAIN ...`), for the
 
 from __future__ import annotations
 
+import dataclasses
 import ipaddress
 import re
 import shlex
@@ -306,7 +313,19 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
             i += 2
         elif t in ("--state", "--ctstate"):
             states = {s.strip().upper() for s in (nxt or "").split(",") if s.strip()}
-            if states and states <= {"ESTABLISHED", "RELATED", "INVALID", "UNTRACKED"}:
+            if negate:
+                # `! --ctstate X` matches the COMPLEMENT of X. The common hygiene
+                # idiom `! --ctstate INVALID -j ACCEPT` therefore accepts all
+                # non-INVALID traffic INCLUDING NEW cross-zone flows — modeling
+                # it as stateful (return-traffic only) would FALSE-PASS a
+                # segmentation assertion. The complement of a state set isn't
+                # modeled, so fail closed: mark imprecise (segcheck turns an
+                # imprecise permit into segmentation-indeterminate, never PASS).
+                r.imprecise = True
+                notes.append(f"negated conntrack state (`! {t} {nxt}`) in {label} "
+                             f"— complement not modeled, marked imprecise — "
+                             f"verify manually")
+            elif states and states <= {"ESTABLISHED", "RELATED", "INVALID", "UNTRACKED"}:
                 # No NEW: return-traffic only -> stateful (never proves a flow open).
                 r.stateful = True
                 notes.append(f"iptables conntrack/state {sorted(states)} in {label} "
@@ -375,15 +394,18 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                                f"rewriting is not modeled (filter-space only; verify "
                                f"the NAT table manually)")
             else:
-                # A jump to a user-defined chain: its effect (accept/drop/return)
-                # is indeterminate in this flat model -> surface, emit no decision.
-                # In a TRANSIT chain we ALSO emit an imprecise marker (see add_rule)
-                # so the FORWARD verdict fails closed instead of FALSE-PASSing a leak
-                # hidden inside the sub-chain.
+                # A jump to a user-defined chain. On the TRANSIT path we emit an
+                # imprecise placeholder (see add_rule) so the FORWARD verdict
+                # fails closed, then a post-parse pass replaces it with precise
+                # ACEs when the target chain is fully modeled (see the precision
+                # resolution pass in parse_iptables). Host hooks (INPUT/OUTPUT)
+                # surface the jump only — no decision emitted.
                 r.jump_custom = nxt or ""
                 r.skip_note = (f"iptables jump to custom chain `-j {nxt}` in {label} — "
-                               f"sub-chain effect not modeled (no decision emitted; "
-                               f"flatten or verify the chain manually)")
+                               f"transit-path jumps are resolved to precise ACEs "
+                               f"below if the chain is fully modeled, otherwise "
+                               f"kept indeterminate (fail-closed); host "
+                               f"INPUT/OUTPUT jumps are surfaced only")
             i += 2
         elif t == "--reject-with":
             # REJECT flavor only (iptables-save always writes it) — selects the
@@ -446,6 +468,139 @@ def _expand(chain: str, r: _Rule, seq: int, entries: List[ACE],
     return seq
 
 
+def _ip_intersect(a: _IPNet, b: _IPNet) -> Optional[_IPNet]:
+    """Return the narrower of two IP networks (their intersection), or None if
+    they are disjoint or of different address families."""
+    if a.version != b.version:
+        return None
+    try:
+        if a.subnet_of(b):
+            return a
+        if b.subnet_of(a):
+            return b
+    except TypeError:
+        pass
+    return None
+
+
+def _port_intersect(a: PortRange, b: PortRange) -> Optional[PortRange]:
+    """Return the intersection of two port ranges, or None if disjoint."""
+    lo, hi = max(a.lo, b.lo), min(a.hi, b.hi)
+    return PortRange(lo, hi) if lo <= hi else None
+
+
+def _resolve_transit_jump(
+    jump_src: Optional[_IPNet],
+    jump_dst: Optional[_IPNet],
+    jump_proto: str,
+    jump_sports: List[PortRange],
+    jump_dports: List[PortRange],
+    target_chain: str,
+    parent_chain: str,
+    by_chain: Dict[str, List[ACE]],
+    default6: bool,
+    base_lineno: int,
+) -> Optional[List[ACE]]:
+    """Resolve a transit custom-chain jump to precise ACEs.
+
+    Iterates the target chain's ACEs and intersects each one's match space with
+    the jump rule's own match space, emitting a precise ACE for each terminal
+    (ACCEPT/DROP) hit. Packets that fall through (no terminal match in the
+    subchain) return to the parent — modeled implicitly by the absence of an ACE
+    at the jump position for that space.
+
+    Returns a (possibly empty) list of precise ACEs on success, or None to
+    signal fail-closed (caller keeps the imprecise placeholder).
+
+    Pre-conditions (caller guarantees before calling):
+      - target chain is present in by_chain
+      - no ACE in target chain is imprecise
+      - target chain is not in chains_with_return
+    """
+    subchain_aces = by_chain.get(target_chain)
+    if subchain_aces is None:
+        return None
+
+    any_net: _IPNet = _ANY6 if default6 else _ANY4
+    p_src: _IPNet = jump_src if jump_src is not None else any_net
+    p_dst: _IPNet = jump_dst if jump_dst is not None else any_net
+    p_sports: List[PortRange] = jump_sports if jump_sports else [ANY_PORTS]
+    p_dports: List[PortRange] = jump_dports if jump_dports else [ANY_PORTS]
+    transit = _is_transit(parent_chain)
+
+    result: List[ACE] = []
+    seq = 0  # placeholder; caller renumbers the whole parent chain
+
+    for child in subchain_aces:
+        if child.imprecise:
+            return None  # subchain has over-approximations — fail closed
+        if child.action not in ("permit", "deny"):
+            return None  # unexpected action — fail closed
+
+        # ── Proto intersection ───────────────────────────────────────────────
+        _WILD = ("ip", "any")
+        if jump_proto in _WILD or jump_proto == child.proto:
+            r_proto = child.proto if jump_proto in _WILD else jump_proto
+        elif child.proto in _WILD:
+            r_proto = jump_proto
+        else:
+            continue  # disjoint protocols — no overlap
+
+        # ── Address intersection ─────────────────────────────────────────────
+        r_src = _ip_intersect(p_src, child.src)
+        if r_src is None:
+            continue  # disjoint src address spaces
+
+        r_dst = _ip_intersect(p_dst, child.dst)
+        if r_dst is None:
+            continue  # disjoint dst address spaces
+
+        # ── Port intersection (ported protocols only; same set as _expand) ──
+        ported = r_proto in ("tcp", "udp", "sctp", "dccp", "udplite")
+        if ported:
+            r_sports: List[PortRange] = []
+            for ps in p_sports:
+                pr = _port_intersect(ps, child.src_port)
+                if pr is not None:
+                    r_sports.append(pr)
+            if not r_sports:
+                continue  # disjoint src-port ranges
+
+            r_dports: List[PortRange] = []
+            for pd in p_dports:
+                pr = _port_intersect(pd, child.dst_port)
+                if pr is not None:
+                    r_dports.append(pr)
+            if not r_dports:
+                continue  # disjoint dst-port ranges
+        else:
+            r_sports = [ANY_PORTS]
+            r_dports = [ANY_PORTS]
+
+        for sp in r_sports:
+            for dp in r_dports:
+                seq += 1
+                result.append(ACE(
+                    seq=seq,  # will be renumbered by caller
+                    action=child.action,
+                    proto=r_proto,
+                    src=r_src,
+                    dst=r_dst,
+                    src_port=sp,
+                    dst_port=dp,
+                    icmp_type=child.icmp_type,
+                    stateful=child.stateful,
+                    imprecise=False,
+                    raw=(f"{parent_chain}: resolved jump to {target_chain}: "
+                         f"{child.raw}"),
+                    acl=parent_chain,
+                    line=base_lineno,
+                    transit=transit,
+                ))
+
+    return result  # empty = chain matched nothing → all traffic falls through
+
+
 def _strip_command(line: str) -> Optional[str]:
     """For the command form, drop a leading `iptables`/`ip6tables` (and `sudo`).
     Return the remaining args string, or None if the line isn't an ip(6)tables
@@ -474,6 +629,14 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     table = "filter"                             # iptables-save default before *table
     table_is_filter = True
     other_tables_noted: set = set()
+    # Chains that contain RETURN or NAT targets — their control flow cannot be
+    # fully modeled, so any jump TO them must fail closed (stay INDETERMINATE).
+    chains_with_return: set = set()
+    # Pending transit jumps to resolve after all chains are parsed.
+    # Each entry: (parent_chain, ph_start, ph_end, target_chain,
+    #              jump_src, jump_dst, jump_proto, jump_sports, jump_dports,
+    #              lineno, jump_unresolvable)
+    pending_jumps: list = []
 
     def ensure_chain(ch: str) -> None:
         if ch not in by_chain:
@@ -487,29 +650,55 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
         r = _parse_rule(args, label, notes)
         if r.skip_note is not None:
             notes.append(r.skip_note)
-            # SOUNDNESS / fail-closed: a jump to an unmodeled custom chain on the
-            # TRANSIT path can carry a forbidden inter-zone flow we don't model
-            # (the leak lives inside the sub-chain). Emitting no ACE let the
-            # FORWARD default-deny shadow the real permit and FALSE-PASS the leak.
-            # Instead, emit an IMPRECISE permit covering the jump rule's matched
-            # space, positioned where the jump fires (before the chain's default
-            # policy). The engine already turns an imprecise match into
-            # segmentation-INDETERMINATE, so segcheck can no longer conclude a
-            # clean PASS for any flow the sub-chain could touch. Non-transit hooks
-            # (INPUT/OUTPUT) don't decide inter-zone reachability, so they keep the
-            # surface-only behavior (no synthetic ACE).
             if r.jump_custom is not None and _is_transit(ch):
+                # SOUNDNESS / fail-closed: a jump to a custom chain on the
+                # TRANSIT path. Save the jump's match-space snapshot and emit
+                # an IMPRECISE placeholder (fail-closed fallback). A post-parse
+                # resolution pass below replaces this placeholder with precise
+                # ACEs when the target chain is fully modeled. Non-transit hooks
+                # (INPUT/OUTPUT) keep the surface-only behavior (no ACE at all).
+                j_src = r.src
+                j_dst = r.dst
+                j_proto = r.proto
+                j_sports = list(r.sports)
+                j_dports = list(r.dports)
+                # Constraints the resolution pass cannot reproduce on resolved
+                # ACEs (its intersection covers src/dst/proto/ports only). A
+                # jump rule that is itself imprecise (negation, unmodeled
+                # module, ...), stateful, or ICMP-typed must KEEP the
+                # fail-closed placeholder — resolving it would silently widen
+                # the jump's true match space into "precise" ACEs (a resolved
+                # DENY wider than reality can FALSE-PASS a leak).
+                j_unresolvable = (r.imprecise or r.stateful
+                                  or r.icmp_type is not None)
                 r.action = "permit"
                 r.imprecise = True
+                ph_start = len(by_chain[ch])
                 seqs[ch] = _expand(ch, r, seqs[ch], by_chain[ch], default6, line)
-            # `-j RETURN` in a BASE chain applies the chain default policy
-            # immediately; a policy-ACCEPT RETURN skipped here would let a later
-            # DROP falsely prove the flow blocked (FALSE PASS). Same fail-closed
-            # marker as the custom-chain jump, on the transit path only.
-            elif r.base_return and ch in _BASE_CHAINS and _is_transit(ch):
-                r.action = "permit"
-                r.imprecise = True
-                seqs[ch] = _expand(ch, r, seqs[ch], by_chain[ch], default6, line)
+                ph_end = len(by_chain[ch])
+                pending_jumps.append((ch, ph_start, ph_end,
+                                      r.jump_custom, j_src, j_dst, j_proto,
+                                      j_sports, j_dports, line,
+                                      j_unresolvable))
+            elif r.jump_custom is None:
+                # RETURN or NAT target: records that this chain uses control-
+                # flow constructs that prevent full precision modeling of any
+                # parent chain that jumps here. Non-terminating decorators
+                # (LOG/AUDIT) don't alter routing and are safe to skip.
+                if r.base_return or "NAT target" in r.skip_note:
+                    chains_with_return.add(ch)
+                # `-j RETURN` in a BASE chain applies the chain default policy
+                # immediately; a policy-ACCEPT RETURN skipped here would let a
+                # later DROP falsely prove the flow blocked (FALSE PASS). Same
+                # fail-closed marker as the custom-chain jump, on the transit
+                # path only (a RETURN inside a CUSTOM chain resumes the caller
+                # instead — handled by the chains_with_return gate above, which
+                # keeps any jump to that chain indeterminate).
+                if r.base_return and ch in _BASE_CHAINS and _is_transit(ch):
+                    r.action = "permit"
+                    r.imprecise = True
+                    seqs[ch] = _expand(ch, r, seqs[ch], by_chain[ch],
+                                       default6, line)
             return
         if r.action is None:
             notes.append(f"iptables rule in {ch} has no terminating target "
@@ -628,12 +817,17 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                 if ch in by_chain:
                     by_chain[ch] = []
                     seqs[ch] = 0
+                # Jump placeholders recorded for this chain were flushed with
+                # it — drop their pending entries (the stored indices are stale;
+                # resolving them would resurrect flushed rules).
+                pending_jumps[:] = [pj for pj in pending_jumps if pj[0] != ch]
                 notes.append(f"iptables `-F {ch}` flush — rules accumulated for "
                              f"{ch} before this point cleared from the analysis")
             else:
                 for c in by_chain:
                     by_chain[c] = []
                     seqs[c] = 0
+                pending_jumps[:] = []
                 notes.append("iptables `-F` flush — all rules accumulated before "
                              "this point cleared from the analysis")
         elif "-N" in toks or "--new-chain" in toks:
@@ -641,6 +835,58 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             if k + 1 < len(toks):
                 ensure_chain(toks[k + 1])
         # -X/-Z and others: no rule contribution; ignored.
+
+    # ── Precision resolution: replace imprecise transit-jump placeholders ────
+    # For each pending transit jump, if the target chain is FULLY modeled
+    # (present in by_chain, contains no imprecise ACEs, and has no RETURN/NAT
+    # control-flow rules), replace the imprecise placeholder ACE(s) with precise
+    # resolved ACEs computed by intersecting the jump's match space with each
+    # rule in the target chain.
+    #
+    # SOUNDNESS guarantee: the check is STRICTLY CONJUNCTIVE — all four gates
+    # must pass, or the placeholder stays imprecise (INDETERMINATE):
+    #   0. The jump rule ITSELF carries constraints the intersection cannot
+    #      reproduce (imprecise/negated match, stateful, ICMP type) → fail
+    #      closed (resolving would widen the jump space without the imprecise
+    #      marker — a widened resolved DENY could FALSE-PASS a real leak).
+    #   1. Target chain absent → fail closed (unknown effect).
+    #   2. Target chain in chains_with_return → fail closed (RETURN would
+    #      cause some packets to bypass subsequent rules in the subchain; we
+    #      cannot safely attribute their fate without space subtraction).
+    #   3. Any ACE in the target chain is imprecise → fail closed (an over-
+    #      approximated subchain rule could over-widen the resolved permit and
+    #      produce a false PASS). Gate 3 also catches transitive chain cycles:
+    #      a subchain that itself jumps to another custom chain gets an imprecise
+    #      placeholder ACE during parsing, which triggers this gate.
+    for (pch, ph_start, ph_end, tgt,
+         j_src, j_dst, j_proto, j_sports, j_dports, jline,
+         j_unresolvable) in pending_jumps:
+        if j_unresolvable:
+            continue                        # jump rule imprecise/stateful/ICMP-
+                                            # typed — keep imprecise (gate 0)
+        if tgt not in by_chain:
+            continue                        # absent chain — keep imprecise
+        if tgt in chains_with_return:
+            continue                        # RETURN/NAT present — keep imprecise
+        if any(a.imprecise for a in by_chain[tgt]):
+            continue                        # subchain not fully precise — keep imprecise
+
+        resolved = _resolve_transit_jump(
+            j_src, j_dst, j_proto, j_sports, j_dports,
+            tgt, pch, by_chain, default6, jline)
+        if resolved is None:
+            continue                        # internal error in resolution — keep imprecise
+
+        # Replace the placeholder ACE(s) with the resolved ones and renumber
+        # the parent chain 1..N in list order so seqs stay coherent.
+        chain_list = by_chain[pch]
+        chain_list[ph_start:ph_end] = resolved
+        for idx in range(len(chain_list)):
+            chain_list[idx] = dataclasses.replace(chain_list[idx], seq=idx + 1)
+        seqs[pch] = len(chain_list)
+        notes.append(
+            f"iptables transit jump to custom chain `{tgt}` in {pch} resolved "
+            f"precisely — {len(resolved)} ACE(s) emitted ({tgt} is fully modeled).")
 
     # Append each chain's default policy as the implicit trailing rule. A missing
     # policy on a base chain that carries rules is surfaced (we must not silently

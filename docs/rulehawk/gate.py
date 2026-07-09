@@ -44,6 +44,8 @@ from .parse import parse_acls
 from .parse_iptables import detect as detect_iptables, parse_iptables
 from .parse_junos import detect as detect_junos, parse_junos
 from .parse_panos import detect as detect_panos, parse_panos
+from .parse_nxos import detect as detect_nxos, parse_nxos
+from .parse_eos import detect as detect_eos, parse_eos
 from .segcheck import check_segmentation
 
 # Severity ordering shared by the threshold logic, SARIF level mapping, and the
@@ -93,6 +95,11 @@ _KIND_HELP: Dict[str, str] = {
         "A sensitive service (telnet/SMB/RDP/DB/...) permitted from ANY source.",
     "ssh-exposure":
         "SSH permitted from ANY source — fine for a bastion, risky otherwise.",
+    "source-port-trust":
+        "A permit that matches only the SOURCE port (e.g. `permit tcp any eq "
+        "53 any`) — source ports are attacker-controlled, so the rule admits "
+        "traffic to every destination port. Match the destination port, or "
+        "add `established` if it is return traffic.",
     "segmentation-violation":
         "A declared zone isolation (must_not_reach) is broken: the config "
         "permits a concrete witness packet across the forbidden boundary.",
@@ -101,7 +108,7 @@ _KIND_HELP: Dict[str, str] = {
         "(neq / complex mask / unresolved group). Review manually.",
     "segmentation-ok":
         "A declared zone isolation holds: no permitted witness flow exists.",
-    "segmentation-policy-error":
+    "segmentation-error":
         "The segmentation policy itself is invalid (unknown zone, bad CIDR or "
         "port) — fail-closed: the affected assertion gets no PASS until fixed.",
 }
@@ -111,7 +118,7 @@ _KIND_HELP: Dict[str, str] = {
 class FileResult:
     """The audit of one config file."""
     path: str                       # path as given (used in SARIF/locations)
-    vendor: str                     # ios-asa | junos | panos | iptables
+    vendor: str                     # ios-asa | junos | panos | iptables | nxos | eos
     status: str                     # ok | no_rules_parsed | error
     n_rules: int
     findings: List[Finding] = field(default_factory=list)
@@ -125,14 +132,25 @@ class FileResult:
         return score(self.findings) if self.n_rules else None
 
     def line_of(self, f: Finding) -> int:
-        """Best-effort 1-based source line for a finding's rule, via its
-        `acl:seq` rule_id (info findings like segmentation-ok carry a zone label
-        instead and fall back to line 1)."""
+        """Best-effort 1-based source line for a finding's rule.
+
+        Lookup order:
+          1. line_by_id[(acl, seq)]  — preferred; built from ACE.line at parse time.
+          2. Finding.line             — direct fallback when line_by_id misses or
+                                       returns 0 (parser did not record a line) or
+                                       the rule_id is a zone-pair label rather than
+                                       an acl:seq (e.g. segmentation-ok).
+          3. 1                        — hard minimum; SARIF requires startLine >= 1.
+
+        Info findings (segmentation-ok) carry zone-pair rule_ids and are excluded
+        from SARIF by real_findings, so their fallback is safe."""
         acl_seq = _split_rule_id(f.rule_id)
         if acl_seq is not None and acl_seq in self.line_by_id:
             ln = self.line_by_id[acl_seq]
             if ln > 0:
                 return ln
+        if f.line > 0:
+            return f.line
         return 1
 
 
@@ -155,6 +173,8 @@ _VENDORS = {
     "junos": "junos", "juniper": "junos",
     "panos": "panos", "paloalto": "panos", "palo-alto": "panos",
     "iptables": "iptables", "netfilter": "iptables",
+    "nxos": "nxos", "nx-os": "nxos", "nexus": "nxos",
+    "eos": "eos", "arista": "eos",
 }
 
 
@@ -169,6 +189,10 @@ def _pick_parser(text: str, vendor: str):
             return "panos", parse_panos
         if v == "iptables":
             return "iptables", parse_iptables
+        if v == "nxos":
+            return "nxos", parse_nxos
+        if v == "eos":
+            return "eos", parse_eos
         return "ios-asa", parse_acls
     if detect_junos(text):
         return "junos", parse_junos
@@ -176,6 +200,10 @@ def _pick_parser(text: str, vendor: str):
         return "panos", parse_panos
     if detect_iptables(text):
         return "iptables", parse_iptables
+    if detect_nxos(text):
+        return "nxos", parse_nxos
+    if detect_eos(text):
+        return "eos", parse_eos
     return "ios-asa", parse_acls
 
 
@@ -400,6 +428,11 @@ def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
                 },
             }],
             "partialFingerprints": {
+                # Content-based (see _fingerprint): keyed on file/ACL/kind/rule
+                # text/witness — never the match-order seq, which shifts on any
+                # insertion above and would churn every downstream alert. The
+                # witness keeps distinct boundary breaches via the SAME rule as
+                # separate alerts (rule_id+kind alone would collapse them).
                 "ruleHawk/v2": fp,
             },
         })
@@ -682,7 +715,8 @@ options:
   --fail-on LEVEL      fail the gate at this severity or worse:
                        critical | high | medium | low | none   (default: high)
   --vendor V           force a vendor for every file:
-                       auto | ios | junos | panos | iptables   (default: auto)
+                       auto | ios | junos | panos | iptables | nxos | eos
+                       (default: auto)
   --sarif PATH         write a SARIF 2.1.0 report (for code scanning)
   --summary PATH       write the markdown report ('-' for stdout); defaults to
                        $GITHUB_STEP_SUMMARY when that env var is set
@@ -728,8 +762,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"rulehawk gate: bad --fail-on {fail_on!r}", file=sys.stderr)
         return 2
     if vendor != "auto" and vendor not in _VENDORS:
-        print(f"rulehawk gate: unknown --vendor {vendor!r} (expected auto | "
-              f"{' | '.join(sorted(set(_VENDORS)))})", file=sys.stderr)
+        print(f"rulehawk gate: unknown --vendor {vendor!r} "
+              "(choose: auto | ios | junos | panos | iptables | nxos | eos)",
+              file=sys.stderr)
         return 2
 
     # Anything still flag-shaped is an unknown option. Silently dropping it made

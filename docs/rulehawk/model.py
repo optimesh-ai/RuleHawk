@@ -43,6 +43,11 @@ PORT_MIN, PORT_MAX = 0, 65535
 # cover "deny sctp :9".
 _PORTED = frozenset({"tcp", "udp", "sctp", "dccp", "udplite"})
 _WILDCARD_PROTO = frozenset({"ip", "any", "ipv4", "ipv6"})
+# Protocols that carry an ICMP type dimension. covers() must respect icmp_type
+# for BOTH families: ip6tables `--icmpv6-type` rules (proto "icmpv6") are typed
+# exactly like v4 `--icmp-type` rules, and ignoring the type would let e.g. an
+# RA-accept (type 134) falsely shadow the NS/NA rules (135/136) IPv6 neighbor
+# discovery depends on.
 _ICMP_PROTOS = frozenset({"icmp", "icmpv6"})
 
 
@@ -111,12 +116,18 @@ def _proto_covers(a: str, b: str) -> bool:
 
 
 def _net_covers(a: _IPNet, b: _IPNet) -> bool:
+    # Exact integer containment check: b ⊆ a iff a's [network, broadcast]
+    # integer range encloses b's. Semantically identical to `b.subnet_of(a)`
+    # for same-version networks (fuzz-verified over random v4/v6 pairs), but
+    # avoids stdlib subnet_of's total_ordering comparison shims — this is the
+    # hottest call in analyze() on large ACLs. Mixed versions never cover
+    # (subnet_of would raise TypeError there; we keep the explicit False).
     if a.version != b.version:
         return False
-    try:
-        return b.subnet_of(a)
-    except (TypeError, ValueError):
-        return False
+    return (
+        int(a.network_address) <= int(b.network_address)
+        and int(b.broadcast_address) <= int(a.broadcast_address)
+    )
 
 
 def covers(a: ACE, b: ACE) -> bool:
@@ -126,9 +137,10 @@ def covers(a: ACE, b: ACE) -> bool:
         return False
     if not _proto_covers(a.proto, b.proto):
         return False
-    # ICMP/ICMPv6 type: an exact-typed rule only covers the same type; a typeless
-    # icmp rule (or an ip/any wildcard) covers all types.
-    if a.proto in _ICMP_PROTOS and a.proto == b.proto:
+    # ICMP type: an exact-typed rule only covers the same type; a typeless icmp
+    # rule (or an ip/any wildcard) covers all types. Applies to both ICMP
+    # families (v4 "icmp" and ip6tables "icmpv6").
+    if a.proto in _ICMP_PROTOS and b.proto == a.proto:
         if a.icmp_type is not None and a.icmp_type != b.icmp_type:
             return False
     if not _net_covers(a.src, b.src):
@@ -182,7 +194,7 @@ def _compatible_coverer(a: ACE, b: ACE) -> bool:
         return False
     if not _proto_covers(a.proto, b.proto):
         return False
-    if a.proto in _ICMP_PROTOS and a.proto == b.proto:
+    if a.proto in _ICMP_PROTOS and b.proto == a.proto:
         if a.icmp_type is not None and a.icmp_type != b.icmp_type:
             return False
     if b.proto in _PORTED:

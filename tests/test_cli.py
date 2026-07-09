@@ -87,7 +87,7 @@ def test_semantically_bad_policy_fails_closed(tmp_path, capsys):
         {"zones": {"PCI": ["10.10.0.0/16"]},
          "must_not_reach": [{"src": "CROP", "dst": "PCI"}]}))
     assert cli.main([p, "--policy", pol]) == 1
-    assert "POLICY ERROR" in capsys.readouterr().out
+    assert "CANNOT EVALUATE" in capsys.readouterr().out
 
 
 def test_help_exits_0(capsys):
