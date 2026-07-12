@@ -73,7 +73,8 @@ def test_happy_path_save_form_maps_to_aces():
     assert web.imprecise is False
 
     icmp = next(a for a in inp if a.proto == "icmp")
-    assert icmp.icmp_type == "echo-request"
+    # canonicalized: iptables `echo-request` == Cisco `echo` == type 8.
+    assert icmp.icmp_type == "echo"
 
     # The default policy is the LAST rule of the chain and is a deny any/any.
     last = sorted(inp, key=lambda a: a.seq)[-1]

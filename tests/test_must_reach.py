@@ -89,7 +89,7 @@ def test_multi_port_partial_permit_is_not_a_false_ok():
         " deny ip any any\n")
     f_ok = _run(acl_ok, pol)
     assert [x.kind for x in f_ok] == ["connectivity-ok"]
-    assert "all 2 flow combination(s)" in f_ok[0].message
+    assert "ENTIRE flow space" in f_ok[0].message
 
 
 def test_every_zone_subnet_pair_is_required():
@@ -104,7 +104,7 @@ def test_every_zone_subnet_pair_is_required():
            " deny ip any any\n")
     f = _run(acl, pol)
     assert [x.kind for x in f] == ["connectivity-broken"]
-    assert "104.129.192.0/20" in f[0].message
+    assert "104.129.192" in f[0].message      # a concrete hole in the unreached range
 
 
 def test_empty_zone_list_fails_closed_both_directions():
@@ -161,13 +161,17 @@ def test_both_directions_coexist_in_one_policy():
     assert kinds == ["connectivity-ok", "segmentation-ok"]
 
 
-def test_portless_must_reach_witness_is_concrete():
+def test_portless_must_reach_requires_every_tcp_port():
+    # A portless tcp must_reach is a claim about the WHOLE tcp port space, so a
+    # permit that only covers a port RANGE leaves a hole -> broken (conservative:
+    # for a specific-port precheck, list the ports). Full any-port permit -> ok.
     pol = {"zones": _POLICY["zones"],
            "must_reach": [{"src": "USERS", "dst": "PROXY", "proto": "tcp"}]}
-    acl = ("ip access-list extended EGRESS\n"
-           " permit tcp 10.20.0.0 0.0.255.255 185.46.212.0 0.0.1.255 range 80 443\n")
-    f = _run(acl, pol)
+    ranged = ("ip access-list extended EGRESS\n"
+              " permit tcp 10.20.0.0 0.0.255.255 185.46.212.0 0.0.1.255 range 80 443\n")
+    assert [x.kind for x in _run(ranged, pol)] == ["connectivity-broken"]
+    full = ("ip access-list extended EGRESS\n"
+            " permit tcp 10.20.0.0 0.0.255.255 185.46.212.0 0.0.1.255\n")
+    f = _run(full, pol)
     assert [x.kind for x in f] == ["connectivity-ok"]
     assert "None" not in f[0].witness
-    port = int(f[0].witness.split(" -> ")[1].split(" ")[0].rsplit(":", 1)[1])
-    assert 80 <= port <= 443

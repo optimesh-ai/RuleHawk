@@ -204,8 +204,41 @@ def test_icmp_type_code_pairs_are_distinct():
         "ip access-list extended T\n"
         " permit icmp any any 3 1\n"
         " deny icmp any any 3 4\n")
-    assert aces[0].icmp_type == "3/1" and aces[1].icmp_type == "3/4"
+    # type 3 canonicalizes to "unreachable"; distinct codes stay distinct.
+    assert aces[0].icmp_type == "unreachable/1"
+    assert aces[1].icmp_type == "unreachable/4"
+    assert aces[0].icmp_type != aces[1].icmp_type
     assert "intent-inversion-deny-dead" not in _kinds(aces)
+
+
+def test_icmp_named_and_numeric_type_are_the_same_space():
+    # `deny icmp ... echo` fully covers `permit icmp ... 8` (echo == type 8):
+    # the permit is dead, and CORP cannot ping PCI. Neither spelling may be
+    # treated as a distinct type (that was a false connectivity-ok).
+    from rulehawk.segcheck import check_segmentation
+    aces, _ = parse_acls(
+        "ip access-list extended T\n"
+        " deny icmp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 echo\n"
+        " permit icmp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 8\n"
+        " deny ip any any\n")
+    assert aces[0].icmp_type == aces[1].icmp_type == "echo"
+    pol = {"zones": {"C": ["10.20.0.0/16"], "P": ["10.10.0.0/16"]},
+           "must_reach": [{"src": "C", "dst": "P", "proto": "icmp"}]}
+    assert [f.kind for f in check_segmentation(aces, pol)] == ["connectivity-broken"]
+
+
+def test_numeric_protocol_matches_named_assertion():
+    # `permit 17` == permit udp on the device; a udp must_not_reach must catch
+    # the leak (was a false segmentation-ok), and `permit 47` == gre.
+    from rulehawk.segcheck import check_segmentation
+    aces, _ = parse_acls(
+        "ip access-list extended T\n"
+        " permit 17 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255\n"
+        " deny ip any any\n")
+    assert aces[0].proto == "udp"
+    pol = {"zones": {"C": ["10.20.0.0/16"], "P": ["10.10.0.0/16"]},
+           "must_not_reach": [{"src": "C", "dst": "P", "proto": "udp", "ports": [53]}]}
+    assert "segmentation-ok" not in {f.kind for f in check_segmentation(aces, pol)}
 
 
 # --- standard ACLs (ASA named, IOS numbered, IOS named) ---------------------

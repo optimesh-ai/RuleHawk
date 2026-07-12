@@ -165,19 +165,31 @@ def _rect_minus(rect, r: ACE, typed: bool):
     return pieces
 
 
-def _search(aces: List[ACE], i0: int, probe: str, rect0, budget: _Budget):
-    """First-match search for a permitted (or undecidable) packet inside `rect0`
-    over aces[i0:]. Returns ("permit"|"indeterminate", sub_rect, rule) or None
-    (= every packet in the rectangle is denied, incl. the implicit default deny).
+def _search(aces: List[ACE], i0: int, probe: str, rect0, budget: _Budget,
+            want: str = "permit"):
+    """First-match search over aces[i0:] for a packet in `rect0` whose verdict
+    is `want` ("permit" or "deny").
 
-    Iterative DFS over (rule-index, rectangle) — an exact deny splits the
-    rectangle into disjoint remainder pieces that each continue against the
-    REST of the ACL. A worklist (not recursion) so a config that is one long
-    wall of partial denies cannot hit the interpreter recursion limit."""
+    want="permit" (isolation): find any PERMITTED packet — a leak. A deny
+    subtracts its slice and the remainder continues; if the whole rectangle
+    falls to the implicit default-deny, there is no leak -> None.
+    want="deny" (connectivity): find any DENIED packet — a HOLE in a required
+    flow. A permit subtracts its slice; a rectangle that reaches the end of the
+    ACL uncovered by any permit falls to the implicit default-deny and IS a
+    hole (returned with rule=None). This makes must_reach an EXHAUSTIVE proof
+    over the whole flow space, not a single-witness sample: a permit covering
+    only PART of the source/destination zone leaves the rest as a reported hole.
+
+    Either way an imprecise rule intersecting the rectangle fails closed
+    (indeterminate). Iterative DFS over (rule-index, rectangle) with a worklist
+    (not recursion) so a long wall of partial rules cannot hit the recursion
+    limit."""
     typed = probe in _ICMP_PROTOS
+    passes = "deny" if want == "permit" else "permit"   # the action that subtracts
     stack = [(i0, rect0)]
     while stack:
         i, rect = stack.pop()
+        fell_through = True
         while i < len(aces):
             if not budget.spend():
                 return ("indeterminate", rect, None)   # too complex -> fail closed
@@ -205,17 +217,23 @@ def _search(aces: List[ACE], i0: int, probe: str, rect0, budget: _Budget):
             if iti is None:
                 continue
             sub = (si, di, spi, dpi, iti)
-            if r.action == "permit":
-                return ("permit", sub, r)
-            # Exact deny: it kills exactly its slice. Continue with the first
-            # remainder piece inline; queue the rest at the same rule index.
+            if r.action == want:
+                return (want, sub, r)
+            # r is the passing action: it decides its slice the safe way, so
+            # subtract that slice and continue searching the remainder pieces.
             pieces = _rect_minus(rect, r, typed)
             if not pieces:
-                break                     # rect fully denied by r
+                fell_through = False
+                break                     # rect fully decided by r
             rect = pieces[0]
             for piece in reversed(pieces[1:]):
                 stack.append((i, piece))
-        # inner loop exhausted the ACL: this rectangle falls to implicit deny
+        else:
+            fell_through = True           # ran off the end of the ACL
+        if fell_through and want == "deny":
+            # This rectangle reached the implicit default-deny uncovered by any
+            # permit — a genuine hole in the required flow.
+            return ("deny", rect, None)
     return None
 
 
@@ -359,44 +377,32 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                 scope = f" on {proto}" + ("" if ports == [None] else f"/{ports}")
 
             if direction == "must_reach":
-                # A connectivity PROOF must hold for EVERY declared combination:
-                # each listed port and each zone-subnet pair. Short-circuiting on
-                # the first reachable combo attested "ok" while a sibling port
-                # (e.g. IPsec 4500 next to a permitted 500) was provably dropped
-                # — a false green for the exact rollout this feature guards.
-                combos = [(sa, db, port) for sa in zones[sname]
-                          for db in zones[dname] for port in ports]
-                first_hit = None
-                broken = None
-                indet = None
-                for sa, db, port in combos:
-                    hit, ind = _probe_space(aces, by_acl, [sa], [db],
-                                            proto, [port])
-                    if hit:
-                        if first_hit is None:
-                            first_hit = hit
-                        continue
-                    if ind:
-                        if indet is None:
-                            indet = ind
-                        continue
-                    broken = (sa, db, port)
-                    break
-                if broken:
-                    sa, db, port = broken
-                    psfx = f":{port}" if port is not None else ""
-                    findings.append(Finding(
-                        label, "connectivity-broken", "high",
-                        f"CONNECTIVITY BROKEN ({sname} must reach {dname}"
-                        f"{scope}): no parsed ruleset permits ANY packet of "
-                        f"{sa} -> {db}{psfx} — this part of the deployment "
-                        f"flow will be dropped at the filter layer.",
-                        "",
-                        fix=f"permit {sa} -> {db}{psfx} in the ruleset "
-                            f"governing this path"))
+                if sname in bad_zones or dname in bad_zones:
+                    findings.append(_policy_error(
+                        label,
+                        f"SEGMENTATION POLICY ERROR: assertion {sname}->"
+                        f"{dname}: zone definition has invalid CIDR(s), the "
+                        f"assertion cannot be certified.",
+                        "fix the segmentation policy file"))
                     continue
-                if indet:
-                    sub, rule, acl_name = indet
+                res = _prove_reach(aces, by_acl, zones[sname], zones[dname],
+                                   proto, ports)
+                kind, info = res
+                if kind == "ok":
+                    rule, probe, swit, dwit, wport = info
+                    portsfx = f":{wport}" if wport is not None else ""
+                    _line_part = f" (line {rule.line})" if rule.line else ""
+                    findings.append(Finding(
+                        f"{rule.acl}:{rule.seq}", "connectivity-ok", "info",
+                        f"CONNECTIVITY OK ({sname} must reach {dname}{scope}): "
+                        f"the ENTIRE flow space is provably permitted — e.g. "
+                        f"rule {rule.seq}{_line_part} permits "
+                        f"{swit} -> {dwit}{portsfx} ({probe}).",
+                        rule.raw,
+                        witness=f"{swit} -> {dwit}{portsfx} ({probe})",
+                        line=rule.line))
+                elif kind == "indeterminate":
+                    rule, acl_name = info
                     if rule is not None:
                         findings.append(Finding(
                             f"{rule.acl}:{rule.seq}",
@@ -414,31 +420,18 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                             f"the {acl_name} ruleset is too complex to search "
                             f"exhaustively; review manually.",
                             "", fix="simplify the ruleset or split the assertion"))
-                    continue
-                if sname in bad_zones or dname in bad_zones:
-                    findings.append(_policy_error(
-                        label,
-                        f"SEGMENTATION POLICY ERROR: assertion {sname}->"
-                        f"{dname}: zone definition has invalid CIDR(s), the "
-                        f"assertion cannot be certified.",
-                        "fix the segmentation policy file"))
-                    continue
-                sub, rule, probe, port = first_hit
-                swit, dwit = _witness_host(sub[0]), _witness_host(sub[1])
-                wport = port
-                if wport is None and probe in _PORTED:
-                    wport = _witness_port(sub[3])
-                portsfx = f":{wport}" if wport is not None else ""
-                _line_part = f" (line {rule.line})" if rule.line else ""
-                findings.append(Finding(
-                    f"{rule.acl}:{rule.seq}", "connectivity-ok", "info",
-                    f"CONNECTIVITY OK ({sname} must reach {dname}{scope}): "
-                    f"all {len(combos)} flow combination(s) provably "
-                    f"permitted — e.g. rule {rule.seq}{_line_part} permits "
-                    f"{swit} -> {dwit}{portsfx} ({probe}).",
-                    rule.raw,
-                    witness=f"{swit} -> {dwit}{portsfx} ({probe})",
-                    line=rule.line))
+                else:   # broken
+                    hsrc, hdst, hport, hprobe = info
+                    psfx = f":{hport}" if hport is not None else ""
+                    findings.append(Finding(
+                        label, "connectivity-broken", "high",
+                        f"CONNECTIVITY BROKEN ({sname} must reach {dname}"
+                        f"{scope}): no ruleset permits {hsrc} -> {hdst}"
+                        f"{psfx} ({hprobe}) — this part of the deployment "
+                        f"flow is dropped at the filter layer.",
+                        "",
+                        fix=f"permit {hsrc} -> {hdst}{psfx} in the ruleset "
+                            f"governing this path"))
                 continue
 
             permit_hit, indet = _probe_space(aces, by_acl, zones[sname],
@@ -553,3 +546,83 @@ def _probe_space(aces: List[ACE], by_acl: Dict[str, List[ACE]],
                         if indet is None:
                             indet = (sub, rule, acl_name)
     return None, indet
+
+
+def _reach_probes(aces: List[ACE], proto: str, ports: List[Optional[int]]):
+    """Concrete probe protocols for a must_reach assertion. Unlike the isolation
+    direction, a wildcard (`ip`) connectivity requirement is a claim about the
+    any-protocol space, so the single "ip" probe is exactly right — enumerating
+    concrete protocols would demand each be independently reachable, which is
+    stricter than the assertion. A specific proto probes itself."""
+    if proto in _WILDCARD_PROTO:
+        return ["ip"]
+    return [proto]
+
+
+def _prove_reach(aces: List[ACE], by_acl: Dict[str, List[ACE]],
+                 sa_nets: List[_IPNet], db_nets: List[_IPNet],
+                 proto: str, ports: List[Optional[int]]):
+    """EXHAUSTIVELY prove a must_reach flow. Connectivity-ok requires that some
+    transit context permits the ENTIRE flow space (every src-subnet x
+    dst-subnet x port) with NO denied hole — a permit covering only part of a
+    zone leaves the rest as a reported hole (the false-ok this guards). Returns:
+      ("ok",            (rule, probe, swit, dwit, wport))
+      ("indeterminate", (rule_or_None, acl_name))
+      ("broken",        (hole_src, hole_dst, hole_port, probe))
+    Preference order: ok > indeterminate > broken. A single scoped context (the
+    documented usage — one policy per config that owns the path) has no
+    ambiguity; with several transit contexts, ANY fully-permitting one proves an
+    open path (mirrors how must_not_reach treats any permitting context as a
+    leak)."""
+    probes = _reach_probes(aces, proto, ports)
+    combos = [(sa, db, port, probe) for sa in sa_nets for db in db_nets
+              for port in ports for probe in probes]
+    best_indet = None       # (rule_or_None, acl_name)
+    first_hole = None       # (src, dst, port, probe)
+    witness = None          # from any clean combo, for the ok message
+    for acl_name, acl_aces in by_acl.items():
+        ctx_hole = None
+        ctx_indet = None
+        for sa, db, port, probe in combos:
+            dpr = (PortRange(port, port)
+                   if port is not None and probe in _PORTED else ANY_PORTS)
+            rect = (sa, db, ANY_PORTS, dpr, _IT_ANY)
+            res = _search(acl_aces, 0, probe, rect, _Budget(_MAX_VISITS),
+                          want="deny")
+            if res is None:            # this combo fully permitted in this ctx
+                if witness is None:
+                    # find the permitting rule for the witness message
+                    p = _search(acl_aces, 0, probe, rect, _Budget(_MAX_VISITS))
+                    if p and p[0] == "permit":
+                        _, sub, rule = p
+                        wport = port if port is not None else (
+                            _witness_port(sub[3]) if probe in _PORTED else None)
+                        witness = (rule, probe, _witness_host(sub[0]),
+                                   _witness_host(sub[1]), wport)
+                continue
+            kind, sub, rule = res
+            if kind == "indeterminate":
+                if ctx_indet is None:
+                    ctx_indet = (rule, acl_name)
+                continue
+            # a denied hole in this context
+            ctx_hole = (_witness_host(sub[0]), _witness_host(sub[1]),
+                        port, probe)
+            break
+        if ctx_hole is None and ctx_indet is None:
+            # this context permits the WHOLE flow -> proven reachable
+            if witness is not None:
+                return ("ok", witness)
+        if ctx_indet is not None and best_indet is None:
+            best_indet = ctx_indet
+        if ctx_hole is not None and first_hole is None:
+            first_hole = ctx_hole
+    if best_indet is not None:
+        return ("indeterminate", best_indet)
+    if first_hole is not None:
+        return ("broken", first_hole)
+    # No context had a hole or indeterminate, yet none was recorded clean with a
+    # witness (e.g. an empty ruleset) — the flow is not permitted anywhere.
+    sa, db = sa_nets[0], db_nets[0]
+    return ("broken", (_witness_host(sa), _witness_host(db),
+                       ports[0], probes[0]))

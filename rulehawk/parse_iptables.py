@@ -52,7 +52,7 @@ import shlex
 from typing import Dict, List, Optional, Tuple
 
 from .model import ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet
-from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
+from .parse import _canon_icmp_type, _port_num  # reuse IANA maps + icmp canon
 
 _ANY4: _IPNet = ipaddress.ip_network("0.0.0.0/0")
 _ANY6: _IPNet = ipaddress.ip_network("::/0")
@@ -350,14 +350,17 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                          f"conservatively)")
             i += 2
         elif t == "--icmp-type" or t == "--icmpv6-type":
-            # Negated type: the complement isn't one type — keep None (all types).
+            # Negated type OR the literal `any` (matches EVERY type): the space
+            # is all types, so leave icmp_type None. A concrete type is
+            # canonicalized (echo-request == echo == 8) so it compares equal
+            # across spellings and against the Cisco frontend.
             if negate:
                 r.imprecise = True
                 notes.append(f"negated ICMP type (`! {t} {nxt}`) in {label} — "
                              f"over-approximated to all types (marked imprecise "
                              f"— verify)")
-            else:
-                r.icmp_type = nxt
+            elif (nxt or "").lower() != "any":
+                r.icmp_type = _canon_icmp_type(nxt)
             i += 2
         elif t in ("-m", "--match"):
             mod = nxt or ""

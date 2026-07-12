@@ -34,6 +34,53 @@ from typing import List, Optional, Tuple
 
 from .model import ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet
 
+# IANA protocol numbers Cisco IOS/ASA/NX-OS/EOS accept verbatim in the proto
+# slot (`permit 47 ...` == `permit gre ...`). Cisco keeps the raw number in the
+# config; RuleHawk normalizes so a numeric proto matches a named-proto policy
+# assertion — the Junos/iptables frontends already do this via their own maps.
+_PROTO_NUM = {"1": "icmp", "6": "tcp", "17": "udp", "47": "gre", "50": "esp",
+              "51": "ah", "58": "icmpv6", "88": "eigrp", "89": "ospf",
+              "103": "pim", "112": "vrrp", "132": "sctp"}
+
+
+def _norm_proto(tok: str) -> str:
+    """Lower-case a Cisco proto token and fold a numeric protocol to its name."""
+    t = tok.lower()
+    return _PROTO_NUM.get(t, t)
+
+
+# Canonical ICMP type: fold the IOS keyword forms and their numeric equivalents
+# to ONE token so `echo`, `echo-request` and `8` compare equal (covers() and the
+# segmentation search treat the type as an opaque string). A type we don't map is
+# passed through unchanged (still exact against an identical spelling; a differing
+# spelling merely under-reports coverage — sound). ICMP *code* keeps the
+# TYPE/CODE form the caller builds.
+_ICMP_TYPE_CANON = {
+    "8": "echo", "echo-request": "echo", "echo": "echo",
+    "0": "echo-reply", "echo-reply": "echo-reply",
+    "3": "unreachable", "unreachable": "unreachable",
+    "5": "redirect", "redirect": "redirect",
+    "11": "time-exceeded", "time-exceeded": "time-exceeded",
+    "time-exceeded-in-transit": "time-exceeded",
+    "12": "parameter-problem", "parameter-problem": "parameter-problem",
+    "13": "timestamp-request", "timestamp-request": "timestamp-request",
+    "14": "timestamp-reply", "timestamp-reply": "timestamp-reply",
+    "4": "source-quench", "source-quench": "source-quench",
+    "9": "router-advertisement", "router-advertisement": "router-advertisement",
+    "10": "router-solicitation", "router-solicitation": "router-solicitation",
+}
+
+
+def _canon_icmp_type(tok: Optional[str]) -> Optional[str]:
+    if tok is None:
+        return None
+    t = tok.lower()
+    if "/" in t:                       # TYPE/CODE — canonicalize the type half
+        ty, _, code = t.partition("/")
+        return f"{_ICMP_TYPE_CANON.get(ty, ty)}/{code}"
+    return _ICMP_TYPE_CANON.get(t, t)
+
+
 _NAMED_PORTS = {
     "ftp-data": 20, "ftp": 21, "ssh": 22, "telnet": 23, "smtp": 25,
     "domain": 53, "dns": 53, "tftp": 69, "http": 80, "www": 80, "pop3": 110,
@@ -713,7 +760,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
             return None
         i += 2
     elif i < n:
-        proto = toks[i].lower()
+        proto = _norm_proto(toks[i])
         i += 1
     else:
         return None
@@ -787,7 +834,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     # it stays exact and threads into the emitted ACEs. When a service group
     # occupies the proto slot (`proto` is None) there is no icmp context, so the
     # token stays unknown (fail closed below).
-    icmp_type = type_tok if proto == "icmp" else None
+    icmp_type = _canon_icmp_type(type_tok) if proto in ("icmp", "icmpv6") else None
     rnotes: List[str] = []
     if narrowing:
         # Same soundness rule as _parse_entry: a narrowed ACE modeled full-width
@@ -955,7 +1002,7 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0,
     exact union of per-port rules). ACEs are numbered seq+1, seq+2, ...; the
     caller advances its counter by len(result)."""
     action = toks[0].lower()
-    proto = toks[1].lower()
+    proto = _norm_proto(toks[1])
     ported = proto in ("tcp", "udp")
     i = 2
     extra_sp = extra_dp = 0
@@ -975,7 +1022,7 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0,
         # ASA `inactive`: the rule is DISABLED on the device — its true match
         # space is empty, so emitting no ACE is exact (not a narrowing).
         return [], [f"inactive (disabled on device, not enforced) -> skipped: {raw}"]
-    icmp_type = type_tok if proto == "icmp" else None
+    icmp_type = _canon_icmp_type(type_tok) if proto in ("icmp", "icmpv6") else None
     # Unknown trailing tokens: for icmp the first free token is the (modeled)
     # ICMP type; every other free token — and for non-icmp protos the first one
     # too — is an unrecognized qualifier (a TCP flag like `syn`, an `eq`-list
