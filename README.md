@@ -62,6 +62,14 @@ rule we can't model exactly (neq/complex mask) is flagged "indeterminate, review
 rather than a false pass. See `samples/policy.json` for an example and
 [`docs/policy.md`](docs/policy.md) for the full policy schema.
 
+The policy also takes **`must_reach`** — positive connectivity assertions for
+deployment prechecks ("users must reach the Zscaler/proxy egress ranges on
+80/443", "the appliance must reach its update CDN"). A provably permitted flow
+is attested with a concrete witness packet (`connectivity-ok`); a flow no
+ruleset permits **fails the gate** (`connectivity-broken`, high) before the
+rollout ships instead of during it. Filter-layer proof only — routing/NAT and
+the proxy itself are out of scope (see *Scope & limits*).
+
 ### Path-grounded segmentation (Hammerhead)
 If you have a [Hammerhead](https://github.com/optimesh-ai/hammerhead) snapshot of
 the network, RuleHawk can verify each segmentation-violation witness against

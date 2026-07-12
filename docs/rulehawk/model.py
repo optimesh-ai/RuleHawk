@@ -135,6 +135,17 @@ def covers(a: ACE, b: ACE) -> bool:
     if a.imprecise or a.stateful:
         # a's space is not exact — refuse to prove anything dead from it.
         return False
+    if b.imprecise and b.proto in _PORTED and not (
+            b.src_port.is_any() and b.dst_port.is_any()):
+        # An imprecise b whose ports are CONSTRAINED may be under-approximated
+        # in exactly the port dimension: the partial-precision parsers keep the
+        # known port(s) exact and flag imprecise for an unresolved extra (e.g.
+        # `eq www <unknown-service>`), so the true space can include ports the
+        # model doesn't show. Proving such a rule dead from its modeled ports
+        # could delete a rule that still carries the unknown service. When the
+        # imprecision lies elsewhere (ports ANY), being covered stays sound
+        # (real ⊆ modeled ⊆ coverer) — only this shape is refused.
+        return False
     if not _proto_covers(a.proto, b.proto):
         return False
     # ICMP type: an exact-typed rule only covers the same type; a typeless icmp

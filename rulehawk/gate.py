@@ -111,6 +111,16 @@ _KIND_HELP: Dict[str, str] = {
     "segmentation-error":
         "The segmentation policy itself is invalid (unknown zone, bad CIDR or "
         "port) — fail-closed: the affected assertion gets no PASS until fixed.",
+    "connectivity-ok":
+        "A declared must_reach deployment flow is provably permitted at the "
+        "filter layer — reported with a concrete witness packet.",
+    "connectivity-broken":
+        "A declared must_reach deployment flow (e.g. hosts -> proxy/vendor "
+        "egress ranges) is permitted by NO parsed ruleset — the traffic will "
+        "be dropped at the filter layer.",
+    "connectivity-indeterminate":
+        "The must_reach flow could not be proven open OR closed — a rule on "
+        "the path uses an unmodeled form. Review manually.",
 }
 
 
@@ -592,6 +602,7 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
     for fr in gate.files:
         real = [f for f in fr.findings if f.severity != "info"]
         ok = [f for f in fr.findings if f.kind == "segmentation-ok"]
+        conn_ok = [f for f in fr.findings if f.kind == "connectivity-ok"]
         if fr.status == "error":
             lines.append(f"<details><summary>❌ <code>{_sarif_uri(fr.path)}</code> "
                          f"— ERROR, could not read: {fr.error}</summary></details>")
@@ -631,6 +642,10 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
             lines.append("")
             lines.append("Segmentation proven: "
                          + ", ".join(f"`{f.rule_id.replace('!->', ' → ')}`" for f in ok))
+        if conn_ok:
+            lines.append("")
+            lines.append("Connectivity proven (must_reach): "
+                         + ", ".join(f"`{f.witness}`" for f in conn_ok))
         if fr.notes:
             lines += _notes_block(fr.notes)
         lines.append("</details>")

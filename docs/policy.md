@@ -24,6 +24,10 @@ Pass it with `--policy path/to/policy.json` (CLI) or the `policy:` input (Action
       "ports": [<int>, ...]     // optional — default: all ports
     },
     ...
+  ],
+  "must_reach": [               // optional — POSITIVE connectivity assertions
+    { "src": "...", "dst": "...", "proto": "...", "ports": [...] },
+    ...
   ]
 }
 ```
@@ -56,6 +60,47 @@ assertion); use `tcp`/`udp` + `ports` when only specific services are forbidden.
 is not valid in the policy; that belongs in the *config*, not the policy). List the
 exact ports: `"ports": [445, 3389, 22, 1433]`. Omit `ports` to forbid all ports of
 that protocol.
+
+### `must_reach` — deployment / vendor connectivity prechecks
+The mirror of `must_not_reach`: each entry declares a flow that **must be
+possible** — the shape of a third-party rollout precheck ("workstations must
+reach the proxy egress ranges", "the appliance must reach its update CDN").
+Same fields, same exact search engine, flipped labeling:
+
+- **`connectivity-ok`** (info) — the flow is provably permitted; reported with
+  a **concrete witness packet** and the permitting rule + line, the evidence
+  you attach to the change ticket before a rollout.
+- **`connectivity-broken`** (high — **blocks the gate** at the default
+  threshold) — *no* parsed ruleset permits any packet of the flow; the
+  deployment traffic will be dropped at the filter layer.
+- **`connectivity-indeterminate`** (medium, fail-closed) — a rule on the path
+  uses an unmodeled form; the flow is never claimed open on a guess.
+
+**Proxy example (Zscaler-style egress):** before cutting user traffic over to
+a cloud proxy, assert the egress firewall actually permits the tunnel/proxy
+flows. Substitute your vendor's published ranges (for Zscaler, take the ZEN
+ranges for your cloud from config.zscaler.com — they change, so keep the zone
+definition in version control next to the configs):
+
+```json
+{
+  "zones": {
+    "USERS":       ["10.20.0.0/16"],
+    "ZSCALER_ZEN": ["185.46.212.0/23", "104.129.192.0/20"]
+  },
+  "must_reach": [
+    { "src": "USERS", "dst": "ZSCALER_ZEN", "proto": "tcp", "ports": [80, 443, 9400, 9480] },
+    { "src": "USERS", "dst": "ZSCALER_ZEN", "proto": "udp", "ports": [443] }
+  ]
+}
+```
+
+**Scope caveat (read this):** `connectivity-ok` proves the **filter layer does
+not block the flow** in the audited configs. RuleHawk does not model routing,
+NAT, or the proxy itself (see the README's *Scope & limits*) — it is the
+firewall-side precheck, not an end-to-end path proof. For path grounding
+against a forwarding model, combine with `--hh-snapshot`/`--hh-from`
+(Hammerhead path-grounding).
 
 ## Examples
 
@@ -101,6 +146,10 @@ that protocol.
 ```
 
 ## What RuleHawk reports per assertion
+
+For `must_reach` entries: `connectivity-ok` (info, witness packet),
+`connectivity-broken` (high), `connectivity-indeterminate` (medium) — see the
+section above. For `must_not_reach` entries:
 
 - **`segmentation-violation`** (critical) — the config permits a concrete witness
   packet across the boundary; reported with the exact packet and the rule that

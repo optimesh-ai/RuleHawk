@@ -289,157 +289,201 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                 bad_zones.add(name)
         zones[name] = nets
 
-    for assertion in (policy.get("must_not_reach") or []):
-        if not isinstance(assertion, dict):
-            findings.append(_policy_error(
-                "policy", f"SEGMENTATION POLICY ERROR: must_not_reach entry is "
-                f"not an object: {assertion!r} — this assertion was NOT checked.",
-                "fix the segmentation policy file"))
-            continue
-        sname, dname = assertion.get("src"), assertion.get("dst")
-        proto = str(assertion.get("proto") or "ip").lower()
-        if proto == "any":
-            proto = "ip"
-        label = f"{sname}!->{dname}" + (f"/{proto}" if proto != "ip" else "")
-        # Fail closed on an assertion that names a zone we can't resolve. A null
-        # (omitted key) or misspelled/undefined src/dst would make the witness
-        # search iterate over an EMPTY zone and silently emit a
-        # "segmentation-ok" PASS — a fabricated bill of health for a check that
-        # never ran.
-        _defined = sorted(zones.keys())
-        _unknown = [role for role, nm in (("src", sname), ("dst", dname))
-                    if nm is None or nm not in zones]
-        if _unknown:
-            _detail = "; ".join(
-                (f"missing {role} zone" if (sname if role == "src" else dname) is None
-                 else f"unknown {role} zone "
-                      f"'{sname if role == 'src' else dname}'")
-                for role in _unknown)
-            findings.append(_policy_error(
-                label,
-                f"CANNOT EVALUATE ({sname} must not reach {dname}): {_detail}. "
-                f"Defined zones: {', '.join(_defined) or '(none)'}. "
-                f"This assertion was NOT checked — no isolation is proven.",
-                ("define the named zone(s) in policy 'zones', or fix the "
-                 "typo so src/dst reference existing zones")))
-            continue
-        ports = _coerce_ports(assertion.get("ports"))
-        if ports is None:
-            findings.append(_policy_error(
-                label,
-                f"SEGMENTATION POLICY ERROR: assertion {sname}->{dname}: "
-                f"'ports' must be integers in 0-65535 "
-                f"(got {assertion.get('ports')!r}) — this assertion was NOT "
-                f"checked.", "fix the segmentation policy file"))
-            continue
+    # Both assertion directions share the SAME exact search; only the labeling
+    # flips. must_not_reach: a permitted packet is a VIOLATION and "all denied"
+    # is the PASS. must_reach (deployment/vendor connectivity prechecks, e.g.
+    # "hosts must reach the proxy egress ranges"): a permitted packet is the
+    # connectivity PROOF and "all denied" means the flow is BROKEN at the
+    # filter layer. Indeterminate fails closed in both: it never upgrades to a
+    # PASS and never to a connectivity OK.
+    for direction, rel in (("must_not_reach", "must not reach"),
+                           ("must_reach", "must reach")):
+        for assertion in (policy.get(direction) or []):
+            if not isinstance(assertion, dict):
+                findings.append(_policy_error(
+                    "policy", f"SEGMENTATION POLICY ERROR: {direction} entry is "
+                    f"not an object: {assertion!r} — this assertion was NOT "
+                    f"checked.", "fix the segmentation policy file"))
+                continue
+            sname, dname = assertion.get("src"), assertion.get("dst")
+            proto = str(assertion.get("proto") or "ip").lower()
+            if proto == "any":
+                proto = "ip"
+            arrow = "!->" if direction == "must_not_reach" else "->"
+            label = f"{sname}{arrow}{dname}" + (f"/{proto}" if proto != "ip" else "")
+            # Fail closed on an assertion that names a zone we can't resolve. A
+            # null (omitted key) or misspelled/undefined src/dst would make the
+            # witness search iterate over an EMPTY zone and silently emit a
+            # confident verdict for a check that never ran.
+            _defined = sorted(zones.keys())
+            _unknown = [role for role, nm in (("src", sname), ("dst", dname))
+                        if nm is None or nm not in zones]
+            if _unknown:
+                _detail = "; ".join(
+                    (f"missing {role} zone" if (sname if role == "src" else dname) is None
+                     else f"unknown {role} zone "
+                          f"'{sname if role == 'src' else dname}'")
+                    for role in _unknown)
+                findings.append(_policy_error(
+                    label,
+                    f"CANNOT EVALUATE ({sname} {rel} {dname}): {_detail}. "
+                    f"Defined zones: {', '.join(_defined) or '(none)'}. "
+                    f"This assertion was NOT checked — nothing is proven.",
+                    ("define the named zone(s) in policy 'zones', or fix the "
+                     "typo so src/dst reference existing zones")))
+                continue
+            ports = _coerce_ports(assertion.get("ports"))
+            if ports is None:
+                findings.append(_policy_error(
+                    label,
+                    f"SEGMENTATION POLICY ERROR: assertion {sname}->{dname}: "
+                    f"'ports' must be integers in 0-65535 "
+                    f"(got {assertion.get('ports')!r}) — this assertion was NOT "
+                    f"checked.", "fix the segmentation policy file"))
+                continue
 
-        # Probe protocols. A wildcard assertion must be checked per concrete
-        # protocol — a tcp-only deny does not block the udp/icmp space — plus
-        # the "ip" probe for protocols only wildcard rules match. The "ip"
-        # probe goes FIRST: when a `permit ip` rule leaks the boundary, the
-        # strongest witness is the any-protocol one, not whichever concrete
-        # protocol happens to sort first. A port-constrained wildcard
-        # assertion is about ported protocols.
-        if proto not in _WILDCARD_PROTO:
-            probes = [proto]
-        else:
-            probes = ["ip"] + sorted({a.proto for a in aces
-                                      if a.proto not in _WILDCARD_PROTO})
-            if ports != [None]:
-                probes = [p for p in probes if p in _PORTED] or ["tcp", "udp"]
+            permit_hit, indet = _probe_space(aces, by_acl, zones[sname],
+                                             zones[dname], proto, ports)
 
-        violation = None      # (sub_rect, rule, probe, port)
-        indet = None          # (sub_rect, rule_or_None, acl_name)
-        for sa in zones[sname]:
-            for db in zones[dname]:
-                for port in ports:
-                    for probe in probes:
-                        dpr = (PortRange(port, port)
-                               if port is not None and probe in _PORTED
-                               else ANY_PORTS)
-                        rect = (sa, db, ANY_PORTS, dpr, _IT_ANY)
-                        for acl_name, acl_aces in by_acl.items():
-                            res = _search(acl_aces, 0, probe, rect,
-                                          _Budget(_MAX_VISITS))
-                            if res is None:
-                                continue
-                            kind, sub, rule = res
-                            if kind == "permit":
-                                violation = (sub, rule, probe, port)
-                                break
-                            if indet is None:
-                                indet = (sub, rule, acl_name)
-                        if violation:
-                            break
-                    if violation:
-                        break
-                if violation:
-                    break
-            if violation:
-                break
+            # Portless assertions cover EVERY port, so say "on tcp" (any port),
+            # not the abstract "on tcp/[None]".
+            scope = ""
+            if proto != "ip":
+                scope = f" on {proto}" + ("" if ports == [None] else f"/{ports}")
 
-        if violation:
-            sub, rule, probe, port = violation
-            swit, dwit = _witness_host(sub[0]), _witness_host(sub[1])
-            # The witness must be a REAL packet, concrete in the port dimension
-            # too: for a portless ported assertion, pick a representative from
-            # the sub-rectangle the search PROVED permitted.
-            wport = port
-            if wport is None and probe in _PORTED:
-                wport = _witness_port(sub[3])
-            portsfx = f":{wport}" if wport is not None else ""
-            # Paste-ready fix: the actual intersecting CIDRs (engine-proven,
-            # sub ⊆ zone ∩ rule), scoped to the ASSERTED ports — a portless
-            # assertion forbids EVERY port, so the deny must be portless too.
-            _port_part = f" port {port}" if port is not None else ""
-            _line_part = f" (line {rule.line})" if rule.line else ""
-            findings.append(Finding(
-                f"{rule.acl}:{rule.seq}", "segmentation-violation", "critical",
-                f"SEGMENTATION VIOLATION ({sname} must not reach {dname}): "
-                f"the ACL PERMITS {swit} -> {dwit}{portsfx} ({probe}) via "
-                f"rule {rule.seq}.",
-                rule.raw,
-                fix=(f"deny {sub[0]} -> {sub[1]}{_port_part} "
-                     f"before rule {rule.seq}{_line_part}"),
-                witness=f"{swit} -> {dwit}{portsfx} ({probe})",
-                line=rule.line))
-            continue
-        if indet:
-            sub, rule, acl_name = indet
-            if rule is not None:
+            if permit_hit:
+                sub, rule, probe, port = permit_hit
+                swit, dwit = _witness_host(sub[0]), _witness_host(sub[1])
+                # The witness must be a REAL packet, concrete in the port
+                # dimension too: for a portless ported assertion, pick a
+                # representative from the sub-rectangle PROVED permitted.
+                wport = port
+                if wport is None and probe in _PORTED:
+                    wport = _witness_port(sub[3])
+                portsfx = f":{wport}" if wport is not None else ""
+                _line_part = f" (line {rule.line})" if rule.line else ""
+                if direction == "must_not_reach":
+                    # Paste-ready fix: the actual intersecting CIDRs
+                    # (engine-proven, sub ⊆ zone ∩ rule), scoped to the ASSERTED
+                    # ports — a portless assertion forbids EVERY port, so the
+                    # deny must be portless too.
+                    _port_part = f" port {port}" if port is not None else ""
+                    findings.append(Finding(
+                        f"{rule.acl}:{rule.seq}", "segmentation-violation",
+                        "critical",
+                        f"SEGMENTATION VIOLATION ({sname} must not reach "
+                        f"{dname}): the ACL PERMITS {swit} -> {dwit}{portsfx} "
+                        f"({probe}) via rule {rule.seq}.",
+                        rule.raw,
+                        fix=(f"deny {sub[0]} -> {sub[1]}{_port_part} "
+                             f"before rule {rule.seq}{_line_part}"),
+                        witness=f"{swit} -> {dwit}{portsfx} ({probe})",
+                        line=rule.line))
+                else:
+                    findings.append(Finding(
+                        f"{rule.acl}:{rule.seq}", "connectivity-ok", "info",
+                        f"CONNECTIVITY OK ({sname} must reach {dname}{scope}): "
+                        f"rule {rule.seq}{_line_part} permits the witness "
+                        f"packet {swit} -> {dwit}{portsfx} ({probe}) — the "
+                        f"filter layer does not block this deployment flow.",
+                        rule.raw,
+                        witness=f"{swit} -> {dwit}{portsfx} ({probe})",
+                        line=rule.line))
+                continue
+            if indet:
+                sub, rule, acl_name = indet
+                goal = ("isolated from" if direction == "must_not_reach"
+                        else "able to reach")
+                if rule is not None:
+                    findings.append(Finding(
+                        f"{rule.acl}:{rule.seq}",
+                        f"{_IND_KIND[direction]}", "medium",
+                        f"Cannot prove {sname} is {goal} {dname} — "
+                        f"rule {rule.seq} uses an unmodeled form "
+                        f"(neq/complex mask); review manually.",
+                        rule.raw,
+                        fix="rewrite the rule with explicit ports/masks",
+                        line=rule.line))
+                else:
+                    findings.append(Finding(
+                        acl_name, f"{_IND_KIND[direction]}", "medium",
+                        f"Cannot prove {sname} is {goal} {dname} — the "
+                        f"{acl_name} ruleset is too complex to search "
+                        f"exhaustively; review manually.",
+                        "", fix="simplify the ruleset or split the assertion"))
+                continue
+            if sname in bad_zones or dname in bad_zones:
+                # Part of the zone definition was dropped as invalid — a
+                # verdict over the remaining subnets would be a false one.
+                findings.append(_policy_error(
+                    label,
+                    f"SEGMENTATION POLICY ERROR: assertion {sname}->{dname}: "
+                    f"zone definition has invalid CIDR(s), the assertion "
+                    f"cannot be certified.",
+                    "fix the segmentation policy file"))
+                continue
+            if direction == "must_not_reach":
                 findings.append(Finding(
-                    f"{rule.acl}:{rule.seq}", "segmentation-indeterminate",
-                    "medium",
-                    f"Cannot prove {sname} is isolated from {dname} — "
-                    f"rule {rule.seq} uses an unmodeled form "
-                    f"(neq/complex mask); review manually.",
-                    rule.raw, fix="rewrite the rule with explicit ports/masks",
-                    line=rule.line))
+                    label, "segmentation-ok", "info",
+                    f"PASS: {sname} cannot reach {dname}{scope}"
+                    + " (no permitted witness flow found).", "",
+                    fix=""))
             else:
                 findings.append(Finding(
-                    acl_name, "segmentation-indeterminate", "medium",
-                    f"Cannot prove {sname} is isolated from {dname} — the "
-                    f"{acl_name} ruleset is too complex to search exhaustively; "
-                    f"review manually.",
-                    "", fix="simplify the ruleset or split the assertion"))
-            continue
-        if sname in bad_zones or dname in bad_zones:
-            # Part of the zone definition was dropped as invalid — a PASS over
-            # the remaining subnets would be a false bill of health.
-            findings.append(_policy_error(
-                label,
-                f"SEGMENTATION POLICY ERROR: assertion {sname}->{dname}: zone "
-                f"definition has invalid CIDR(s), isolation cannot be certified.",
-                "fix the segmentation policy file"))
-            continue
-        # Portless assertions cover EVERY port, so say "on tcp" (any port),
-        # not the abstract "on tcp/[None]".
-        scope = ""
-        if proto != "ip":
-            scope = f" on {proto}" + ("" if ports == [None] else f"/{ports}")
-        findings.append(Finding(
-            label, "segmentation-ok", "info",
-            f"PASS: {sname} cannot reach {dname}{scope}"
-            + " (no permitted witness flow found).", "",
-            fix=""))
+                    label, "connectivity-broken", "high",
+                    f"CONNECTIVITY BROKEN ({sname} must reach {dname}{scope}): "
+                    f"no parsed ruleset permits ANY packet of this flow — the "
+                    f"deployment traffic will be dropped at the filter layer.",
+                    "",
+                    fix=f"permit {sname} -> {dname}{scope} in the ruleset "
+                        f"governing this path"))
     return findings
+
+
+_IND_KIND = {"must_not_reach": "segmentation-indeterminate",
+             "must_reach": "connectivity-indeterminate"}
+
+
+def _probe_space(aces: List[ACE], by_acl: Dict[str, List[ACE]],
+                 sa_nets: List[_IPNet], db_nets: List[_IPNet],
+                 proto: str, ports: List[Optional[int]]):
+    """Search every (zone-net pair x port x probe proto x ACL context) for a
+    permitted packet in the asserted flow space. Returns (permit_hit, indet):
+    permit_hit = (sub_rect, rule, probe, port) for the first provably
+    permitted packet, indet = (sub_rect, rule_or_None, acl_name) for the first
+    undecidable slice. Shared by both assertion directions — a permit is the
+    must_not_reach VIOLATION and the must_reach PROOF.
+
+    A wildcard assertion is checked per concrete protocol — a tcp-only deny
+    does not block the udp/icmp space — plus the "ip" probe for protocols only
+    wildcard rules match. The "ip" probe goes FIRST: when a `permit ip` rule
+    decides the boundary, the strongest witness is the any-protocol one. A
+    port-constrained wildcard assertion is about ported protocols."""
+    if proto not in _WILDCARD_PROTO:
+        probes = [proto]
+    else:
+        probes = ["ip"] + sorted({a.proto for a in aces
+                                  if a.proto not in _WILDCARD_PROTO})
+        if ports != [None]:
+            probes = [p for p in probes if p in _PORTED] or ["tcp", "udp"]
+
+    indet = None
+    for sa in sa_nets:
+        for db in db_nets:
+            for port in ports:
+                for probe in probes:
+                    dpr = (PortRange(port, port)
+                           if port is not None and probe in _PORTED
+                           else ANY_PORTS)
+                    rect = (sa, db, ANY_PORTS, dpr, _IT_ANY)
+                    for acl_name, acl_aces in by_acl.items():
+                        res = _search(acl_aces, 0, probe, rect,
+                                      _Budget(_MAX_VISITS))
+                        if res is None:
+                            continue
+                        kind, sub, rule = res
+                        if kind == "permit":
+                            return (sub, rule, probe, port), indet
+                        if indet is None:
+                            indet = (sub, rule, acl_name)
+    return None, indet

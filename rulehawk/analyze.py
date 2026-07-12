@@ -23,7 +23,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Dict, List, Optional, Tuple
 
-from .model import (ACE, _WILDCARD_PROTO, _compatible_coverer, covered_dimensions,
+from .model import (ACE, _PORTED, _WILDCARD_PROTO, _compatible_coverer, covered_dimensions,
                     covers, _union_covers)
 
 # Max compatible earlier rules considered when testing cumulative coverage. Beyond
@@ -91,6 +91,13 @@ def _union_shadow(b: ACE, earlier: List[ACE]) -> Optional[Tuple[str, str, List[A
     coverers that each span all of b.dst whose srcs union to b.src (Case A), or
     the symmetric Case B. Reached only when no SINGLE rule already covers b, so a
     genuine union needs >=2 rules."""
+    if b.imprecise and b.proto in _PORTED and not (
+            b.src_port.is_any() and b.dst_port.is_any()):
+        # Mirrors covers(): an imprecise b with CONSTRAINED ports may be
+        # under-approximated in the port dimension (partial-precision `eq
+        # known <unknown-service>`), so its modeled ports must not anchor a
+        # dead-rule proof.
+        return None
     coverers = [a for a in earlier if _compatible_coverer(a, b)]
     if len(coverers) < 2:
         return None
@@ -219,7 +226,10 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
                     f"permit {b.proto} any any — allows ALL traffic; defeats the ACL.",
                     b.raw, fix="replace with least-privilege permits + a default deny",
                     line=b.line))
-            else:
+            elif b.src_port.is_any() and b.dst_port.is_any():
+                # Port-scoped any/any rules (e.g. `permit tcp any any eq 443`)
+                # are NOT "all <proto> between any hosts" — the risky ones are
+                # already covered by the dangerous-exposure/ssh-exposure checks.
                 findings.append(Finding(
                     _id(b), "broad-any-any", "high",
                     f"permit {b.proto} any any — very broad; allows all {b.proto} "
