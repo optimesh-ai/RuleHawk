@@ -67,9 +67,12 @@ possible** — the shape of a third-party rollout precheck ("workstations must
 reach the proxy egress ranges", "the appliance must reach its update CDN").
 Same fields, same exact search engine, flipped labeling:
 
-- **`connectivity-ok`** (info) — the flow is provably permitted; reported with
-  a **concrete witness packet** and the permitting rule + line, the evidence
-  you attach to the change ticket before a rollout.
+- **`connectivity-ok`** (info) — **every** declared combination (each listed
+  port × each src-subnet × each dst-subnet) is provably permitted; reported
+  with a concrete witness packet and the permitting rule + line, the evidence
+  you attach to the change ticket before a rollout. One reachable port is
+  never taken as proof for its siblings — `ports: [500, 4500]` with 4500
+  blocked is `connectivity-broken`, naming the failing combination.
 - **`connectivity-broken`** (high — **blocks the gate** at the default
   threshold) — *no* parsed ruleset permits any packet of the flow; the
   deployment traffic will be dropped at the filter layer.

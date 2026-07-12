@@ -57,16 +57,63 @@ def test_denied_flow_is_connectivity_broken_high():
     assert "dropped at the filter layer" in f[0].message
 
 
-def test_scoped_deny_above_does_not_fake_broken():
-    # A deny on ONE port must not hide that the other asserted port works —
-    # the same exactness guarantee the isolation direction has.
+def test_one_blocked_port_fails_the_whole_assertion():
+    # The proof must hold for EVERY listed port: 443 working is not evidence
+    # for 80. A deny on one asserted port -> connectivity-broken naming it.
     acl = ("ip access-list extended EGRESS\n"
            " deny tcp any 185.46.212.0 0.0.1.255 eq 80\n"
            " permit tcp 10.20.0.0 0.0.255.255 185.46.212.0 0.0.1.255 eq 443\n"
            " deny ip any any\n")
     f = _run(acl)
-    assert [x.kind for x in f] == ["connectivity-ok"]
-    assert ":443" in f[0].witness           # the port that actually works
+    assert [x.kind for x in f] == ["connectivity-broken"]
+    assert ":80" in f[0].message            # names the failing combination
+
+
+def test_multi_port_partial_permit_is_not_a_false_ok():
+    # Regression for the short-circuit bug: udp 500 permitted, 4500 dropped —
+    # attesting "ok" off port 500 would green-light a rollout whose IPsec
+    # NAT-T is dead. Every (subnet pair x port) combination must be proven.
+    pol = {"zones": {"RTR": ["192.0.2.0/29"], "ZEN": ["185.46.212.0/23"]},
+           "must_reach": [{"src": "RTR", "dst": "ZEN", "proto": "udp",
+                           "ports": [500, 4500]}]}
+    acl = ("ip access-list extended EGRESS\n"
+           " permit udp 192.0.2.0 0.0.0.7 185.46.212.0 0.0.1.255 eq 500\n"
+           " deny ip any any\n")
+    f = _run(acl, pol)
+    assert [x.kind for x in f] == ["connectivity-broken"]
+    assert ":4500" in f[0].message
+    # ...and with both ports permitted, the proof covers all combinations.
+    acl_ok = acl.replace(
+        " deny ip any any\n",
+        " permit udp 192.0.2.0 0.0.0.7 185.46.212.0 0.0.1.255 eq 4500\n"
+        " deny ip any any\n")
+    f_ok = _run(acl_ok, pol)
+    assert [x.kind for x in f_ok] == ["connectivity-ok"]
+    assert "all 2 flow combination(s)" in f_ok[0].message
+
+
+def test_every_zone_subnet_pair_is_required():
+    # Two dst subnets declared, only one reachable -> broken (a proof over
+    # half the declared egress ranges is not a proof).
+    pol = {"zones": {"USERS": ["10.20.0.0/16"],
+                     "PROXY": ["185.46.212.0/23", "104.129.192.0/20"]},
+           "must_reach": [{"src": "USERS", "dst": "PROXY", "proto": "tcp",
+                           "ports": [443]}]}
+    acl = ("ip access-list extended EGRESS\n"
+           " permit tcp 10.20.0.0 0.0.255.255 185.46.212.0 0.0.1.255 eq 443\n"
+           " deny ip any any\n")
+    f = _run(acl, pol)
+    assert [x.kind for x in f] == ["connectivity-broken"]
+    assert "104.129.192.0/20" in f[0].message
+
+
+def test_empty_zone_list_fails_closed_both_directions():
+    # A defined-but-empty zone must never produce a vacuous verdict.
+    for key in ("must_reach", "must_not_reach"):
+        pol = {"zones": {"USERS": ["10.20.0.0/16"], "PROXY": []},
+               key: [{"src": "USERS", "dst": "PROXY"}]}
+        f = _run("ip access-list extended E\n permit ip any any\n", pol)
+        assert [x.kind for x in f] == ["segmentation-error"], key
 
 
 def test_imprecise_rule_fails_closed_to_indeterminate_not_ok():

@@ -341,15 +341,108 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                     f"(got {assertion.get('ports')!r}) — this assertion was NOT "
                     f"checked.", "fix the segmentation policy file"))
                 continue
-
-            permit_hit, indet = _probe_space(aces, by_acl, zones[sname],
-                                             zones[dname], proto, ports)
+            if not zones[sname] or not zones[dname]:
+                # A defined-but-EMPTY zone would make the search space empty and
+                # both directions vacuously confident — fail closed instead.
+                findings.append(_policy_error(
+                    label,
+                    f"CANNOT EVALUATE ({sname} {rel} {dname}): zone "
+                    f"{'and '.join(z for z in (sname, dname) if not zones[z])!s} "
+                    f"has no (valid) CIDRs. This assertion was NOT checked.",
+                    "give the zone at least one CIDR"))
+                continue
 
             # Portless assertions cover EVERY port, so say "on tcp" (any port),
             # not the abstract "on tcp/[None]".
             scope = ""
             if proto != "ip":
                 scope = f" on {proto}" + ("" if ports == [None] else f"/{ports}")
+
+            if direction == "must_reach":
+                # A connectivity PROOF must hold for EVERY declared combination:
+                # each listed port and each zone-subnet pair. Short-circuiting on
+                # the first reachable combo attested "ok" while a sibling port
+                # (e.g. IPsec 4500 next to a permitted 500) was provably dropped
+                # — a false green for the exact rollout this feature guards.
+                combos = [(sa, db, port) for sa in zones[sname]
+                          for db in zones[dname] for port in ports]
+                first_hit = None
+                broken = None
+                indet = None
+                for sa, db, port in combos:
+                    hit, ind = _probe_space(aces, by_acl, [sa], [db],
+                                            proto, [port])
+                    if hit:
+                        if first_hit is None:
+                            first_hit = hit
+                        continue
+                    if ind:
+                        if indet is None:
+                            indet = ind
+                        continue
+                    broken = (sa, db, port)
+                    break
+                if broken:
+                    sa, db, port = broken
+                    psfx = f":{port}" if port is not None else ""
+                    findings.append(Finding(
+                        label, "connectivity-broken", "high",
+                        f"CONNECTIVITY BROKEN ({sname} must reach {dname}"
+                        f"{scope}): no parsed ruleset permits ANY packet of "
+                        f"{sa} -> {db}{psfx} — this part of the deployment "
+                        f"flow will be dropped at the filter layer.",
+                        "",
+                        fix=f"permit {sa} -> {db}{psfx} in the ruleset "
+                            f"governing this path"))
+                    continue
+                if indet:
+                    sub, rule, acl_name = indet
+                    if rule is not None:
+                        findings.append(Finding(
+                            f"{rule.acl}:{rule.seq}",
+                            "connectivity-indeterminate", "medium",
+                            f"Cannot prove {sname} is able to reach {dname} — "
+                            f"rule {rule.seq} uses an unmodeled form "
+                            f"(neq/complex mask); review manually.",
+                            rule.raw,
+                            fix="rewrite the rule with explicit ports/masks",
+                            line=rule.line))
+                    else:
+                        findings.append(Finding(
+                            acl_name, "connectivity-indeterminate", "medium",
+                            f"Cannot prove {sname} is able to reach {dname} — "
+                            f"the {acl_name} ruleset is too complex to search "
+                            f"exhaustively; review manually.",
+                            "", fix="simplify the ruleset or split the assertion"))
+                    continue
+                if sname in bad_zones or dname in bad_zones:
+                    findings.append(_policy_error(
+                        label,
+                        f"SEGMENTATION POLICY ERROR: assertion {sname}->"
+                        f"{dname}: zone definition has invalid CIDR(s), the "
+                        f"assertion cannot be certified.",
+                        "fix the segmentation policy file"))
+                    continue
+                sub, rule, probe, port = first_hit
+                swit, dwit = _witness_host(sub[0]), _witness_host(sub[1])
+                wport = port
+                if wport is None and probe in _PORTED:
+                    wport = _witness_port(sub[3])
+                portsfx = f":{wport}" if wport is not None else ""
+                _line_part = f" (line {rule.line})" if rule.line else ""
+                findings.append(Finding(
+                    f"{rule.acl}:{rule.seq}", "connectivity-ok", "info",
+                    f"CONNECTIVITY OK ({sname} must reach {dname}{scope}): "
+                    f"all {len(combos)} flow combination(s) provably "
+                    f"permitted — e.g. rule {rule.seq}{_line_part} permits "
+                    f"{swit} -> {dwit}{portsfx} ({probe}).",
+                    rule.raw,
+                    witness=f"{swit} -> {dwit}{portsfx} ({probe})",
+                    line=rule.line))
+                continue
+
+            permit_hit, indet = _probe_space(aces, by_acl, zones[sname],
+                                             zones[dname], proto, ports)
 
             if permit_hit:
                 sub, rule, probe, port = permit_hit
@@ -362,43 +455,30 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                     wport = _witness_port(sub[3])
                 portsfx = f":{wport}" if wport is not None else ""
                 _line_part = f" (line {rule.line})" if rule.line else ""
-                if direction == "must_not_reach":
-                    # Paste-ready fix: the actual intersecting CIDRs
-                    # (engine-proven, sub ⊆ zone ∩ rule), scoped to the ASSERTED
-                    # ports — a portless assertion forbids EVERY port, so the
-                    # deny must be portless too.
-                    _port_part = f" port {port}" if port is not None else ""
-                    findings.append(Finding(
-                        f"{rule.acl}:{rule.seq}", "segmentation-violation",
-                        "critical",
-                        f"SEGMENTATION VIOLATION ({sname} must not reach "
-                        f"{dname}): the ACL PERMITS {swit} -> {dwit}{portsfx} "
-                        f"({probe}) via rule {rule.seq}.",
-                        rule.raw,
-                        fix=(f"deny {sub[0]} -> {sub[1]}{_port_part} "
-                             f"before rule {rule.seq}{_line_part}"),
-                        witness=f"{swit} -> {dwit}{portsfx} ({probe})",
-                        line=rule.line))
-                else:
-                    findings.append(Finding(
-                        f"{rule.acl}:{rule.seq}", "connectivity-ok", "info",
-                        f"CONNECTIVITY OK ({sname} must reach {dname}{scope}): "
-                        f"rule {rule.seq}{_line_part} permits the witness "
-                        f"packet {swit} -> {dwit}{portsfx} ({probe}) — the "
-                        f"filter layer does not block this deployment flow.",
-                        rule.raw,
-                        witness=f"{swit} -> {dwit}{portsfx} ({probe})",
-                        line=rule.line))
+                # Paste-ready fix: the actual intersecting CIDRs
+                # (engine-proven, sub ⊆ zone ∩ rule), scoped to the ASSERTED
+                # ports — a portless assertion forbids EVERY port, so the
+                # deny must be portless too.
+                _port_part = f" port {port}" if port is not None else ""
+                findings.append(Finding(
+                    f"{rule.acl}:{rule.seq}", "segmentation-violation",
+                    "critical",
+                    f"SEGMENTATION VIOLATION ({sname} must not reach "
+                    f"{dname}): the ACL PERMITS {swit} -> {dwit}{portsfx} "
+                    f"({probe}) via rule {rule.seq}.",
+                    rule.raw,
+                    fix=(f"deny {sub[0]} -> {sub[1]}{_port_part} "
+                         f"before rule {rule.seq}{_line_part}"),
+                    witness=f"{swit} -> {dwit}{portsfx} ({probe})",
+                    line=rule.line))
                 continue
             if indet:
                 sub, rule, acl_name = indet
-                goal = ("isolated from" if direction == "must_not_reach"
-                        else "able to reach")
                 if rule is not None:
                     findings.append(Finding(
                         f"{rule.acl}:{rule.seq}",
-                        f"{_IND_KIND[direction]}", "medium",
-                        f"Cannot prove {sname} is {goal} {dname} — "
+                        "segmentation-indeterminate", "medium",
+                        f"Cannot prove {sname} is isolated from {dname} — "
                         f"rule {rule.seq} uses an unmodeled form "
                         f"(neq/complex mask); review manually.",
                         rule.raw,
@@ -406,8 +486,8 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                         line=rule.line))
                 else:
                     findings.append(Finding(
-                        acl_name, f"{_IND_KIND[direction]}", "medium",
-                        f"Cannot prove {sname} is {goal} {dname} — the "
+                        acl_name, "segmentation-indeterminate", "medium",
+                        f"Cannot prove {sname} is isolated from {dname} — the "
                         f"{acl_name} ruleset is too complex to search "
                         f"exhaustively; review manually.",
                         "", fix="simplify the ruleset or split the assertion"))
@@ -422,26 +502,12 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                     f"cannot be certified.",
                     "fix the segmentation policy file"))
                 continue
-            if direction == "must_not_reach":
-                findings.append(Finding(
-                    label, "segmentation-ok", "info",
-                    f"PASS: {sname} cannot reach {dname}{scope}"
-                    + " (no permitted witness flow found).", "",
-                    fix=""))
-            else:
-                findings.append(Finding(
-                    label, "connectivity-broken", "high",
-                    f"CONNECTIVITY BROKEN ({sname} must reach {dname}{scope}): "
-                    f"no parsed ruleset permits ANY packet of this flow — the "
-                    f"deployment traffic will be dropped at the filter layer.",
-                    "",
-                    fix=f"permit {sname} -> {dname}{scope} in the ruleset "
-                        f"governing this path"))
+            findings.append(Finding(
+                label, "segmentation-ok", "info",
+                f"PASS: {sname} cannot reach {dname}{scope}"
+                + " (no permitted witness flow found).", "",
+                fix=""))
     return findings
-
-
-_IND_KIND = {"must_not_reach": "segmentation-indeterminate",
-             "must_reach": "connectivity-indeterminate"}
 
 
 def _probe_space(aces: List[ACE], by_acl: Dict[str, List[ACE]],
