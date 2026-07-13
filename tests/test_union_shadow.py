@@ -49,6 +49,45 @@ def test_union_same_action_is_redundant_low():
     assert f is not None and f.severity == "low" and f.rule_id == "U3:3"
 
 
+def test_mixed_action_union_does_not_overclaim_allowed():
+    # A permit + a deny together kill a later deny. The rule IS dead (critical:
+    # the permit half leaks), but the message must not claim ALL the traffic is
+    # allowed — half of it is already denied by rule 2.
+    cfg = (
+        "ip access-list extended MIX\n"
+        " permit tcp 10.0.0.0 0.0.0.255 any eq 443\n"
+        " deny tcp 10.0.1.0 0.0.0.255 any eq 443\n"
+        " deny tcp 10.0.0.0 0.0.1.255 any eq 443\n")
+    f = _by_kind(cfg).get("union-shadowed-deny-dead")
+    assert f is not None and f.severity == "critical" and f.rule_id == "MIX:3"
+    assert "The traffic you meant to block is ALLOWED" not in f.message
+    assert "part matched by the earlier permit(s) is ALLOWED" in f.message
+
+
+def test_mixed_action_union_does_not_overclaim_dropped():
+    cfg = (
+        "ip access-list extended MIX2\n"
+        " deny tcp 10.0.0.0 0.0.0.255 any eq 22\n"
+        " permit tcp 10.0.1.0 0.0.0.255 any eq 22\n"
+        " permit tcp 10.0.0.0 0.0.1.255 any eq 22\n")
+    f = _by_kind(cfg).get("union-shadowed-permit-dead")
+    assert f is not None and f.severity == "high" and f.rule_id == "MIX2:3"
+    assert "already drop the same traffic" not in f.message
+    assert "part matched by the earlier deny(s) is silently DROPPED" in f.message
+
+
+def test_uniform_union_message_still_claims_full_inversion():
+    # Guard the original wording for the all-opposite-action case.
+    cfg = (
+        "ip access-list extended UNI\n"
+        " permit tcp 10.0.0.0 0.0.0.255 any eq 443\n"
+        " permit tcp 10.0.1.0 0.0.0.255 any eq 443\n"
+        " deny tcp 10.0.0.0 0.0.1.255 any eq 443\n")
+    f = _by_kind(cfg).get("union-shadowed-deny-dead")
+    assert f is not None
+    assert "The traffic you meant to block is ALLOWED" in f.message
+
+
 def test_union_redundant_appears_in_cleanup_plan_with_line():
     # The Cleanup plan is the copy-into-ticket section: a union-redundant rule
     # is proven safe to remove, so it MUST be listed there, with its config

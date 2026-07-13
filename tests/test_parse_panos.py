@@ -217,6 +217,152 @@ def test_ip_range_address_expands_exactly():
     assert all(a.imprecise is False for a in aces)
 
 
+# ── Confirmed-bug regressions (parser contract: SUPERSET, never subset) ────────
+# model.py: an ACE's modeled space must be a superset of the rule's true match
+# space; imprecise=True never excuses a subset (segcheck checks containment
+# before imprecise). Each test below pins one confirmed subset-emission /
+# widening bug (P3, P4, P5, P6, P7, P8).
+
+
+def test_builtin_service_http_includes_8080():
+    # P3: the predefined PAN-OS service-http is tcp 80 AND 8080 — modeling only
+    # 80 FALSE-PASSED an 8080 leak.
+    cfg = ("set rulebase security rules web from any to any source 10.20.0.0/16 "
+           "destination 10.10.0.0/16 application any service service-http "
+           "action allow\n")
+    aces, _ = parse_panos(cfg)
+    assert {(a.dst_port.lo, a.dst_port.hi) for a in aces} == {(80, 80), (8080, 8080)}
+    assert all(a.proto == "tcp" and a.imprecise is False for a in aces)
+    pol = {"zones": _SEG_POLICY["zones"],
+           "must_not_reach": [{"src": "CORP", "dst": "PCI",
+                               "proto": "tcp", "ports": [8080]}]}
+    kinds = {f.kind for f in check_segmentation(aces, pol)}
+    assert "segmentation-violation" in kinds
+
+
+def test_builtin_service_https_stays_443():
+    # P3: service-https is unchanged — exactly tcp/443.
+    cfg = ("set rulebase security rules web from any to any source any "
+           "destination any application any service service-https action allow\n")
+    aces, _ = parse_panos(cfg)
+    assert [(a.dst_port.lo, a.dst_port.hi) for a in aces] == [(443, 443)]
+
+
+def test_multiline_address_group_members_accumulate():
+    # P4: `set address-group G static [ m ]` on multiple lines APPENDS (set
+    # semantics; exports emit one member per line) — overwriting kept only the
+    # last member, so a leak through the first FALSE-PASSED.
+    cfg = """
+    set address corp-a ip-netmask 10.20.0.0/16
+    set address corp-b ip-netmask 192.168.5.0/24
+    set address-group grp static [ corp-a ]
+    set address-group grp static [ corp-b ]
+    set service svc-smb protocol tcp port 445
+    set rulebase security rules leak from any to any source grp destination 10.10.0.0/16 application any service svc-smb action allow
+    """
+    aces, _ = parse_panos(cfg)
+    assert {str(a.src) for a in aces} == {"10.20.0.0/16", "192.168.5.0/24"}
+    assert all(a.imprecise is False for a in aces)
+    kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
+    assert "segmentation-violation" in kinds    # the first-line member leaks
+
+
+def test_mixed_static_group_unresolved_member_never_false_passes():
+    # P5: one unresolvable member (fqdn) means the resolved subset alone is NOT
+    # the rule's match space — keeping only the resolvable subset FALSE-PASSED
+    # flows through the unresolvable member. Partial precision now emits the
+    # resolved member as an EXACT ACE plus one opaque any/any imprecise ACE
+    # covering the unresolved remainder. The sound outcome is unchanged: the
+    # assertion can never PASS (the fqdn may cover CORP) and no false CRITICAL
+    # is invented (the resolved 192.168.5.0/24 is outside CORP).
+    cfg = """
+    set address good ip-netmask 192.168.5.0/24
+    set address evil fqdn evil.example.com
+    set address-group grp static [ good evil ]
+    set service svc-smb protocol tcp port 445
+    set rulebase security rules r from any to any source grp destination 10.10.0.0/16 application any service svc-smb action allow
+    """
+    aces, notes = parse_panos(cfg)
+    precise = [a for a in aces if not a.imprecise]
+    opaque = [a for a in aces if a.imprecise]
+    assert len(precise) == 1 and str(precise[0].src) == "192.168.5.0/24"
+    assert len(opaque) == 1
+    assert opaque[0].src_any and opaque[0].dst_any   # marker covers the remainder
+    assert any("partially resolved" in n for n in notes)
+    kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
+    assert "segmentation-ok" not in kinds            # never a false PASS
+    assert "segmentation-violation" not in kinds     # never a false CRITICAL
+    assert "segmentation-indeterminate" in kinds
+
+
+def test_max_expand_widens_to_any_never_truncates():
+    # P6: >_MAX_EXPAND expansions used to keep only the FIRST value per
+    # dimension — the forbidden source (a later member) vanished -> FALSE PASS.
+    # Now the rule becomes one all-ANY imprecise ACE: indeterminate, never PASS.
+    members = " ".join(f"198.18.{i // 250}.{i % 250 + 1}" for i in range(299))
+    cfg = (
+        "set service svc-smb protocol tcp port 445\n"
+        f"set rulebase security rules big from any to any source "
+        f"[ {members} 10.20.0.0/16 ] destination 10.10.0.0/16 "
+        f"application any service svc-smb action allow\n"
+    )
+    aces, notes = parse_panos(cfg)
+    assert len(aces) == 1
+    assert aces[0].src_any and aces[0].imprecise is True
+    assert any("widened" in n for n in notes)
+    kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
+    assert "segmentation-ok" not in kinds
+
+
+def test_bare_ipv6_address_is_host_route_not_slash32():
+    # P7: a bare v6 address was widened to f"{v}/32" (2001:db8::/32), colliding
+    # distinct hosts -> false-critical deny-dead. ip_network() yields the /128
+    # host route — via both the object path and the literal path.
+    cfg = """
+    set address h5 ip-netmask 2001:db8::5
+    set rulebase security rules a from any to any source any destination h5 application any service service-https action allow
+    set rulebase security rules b from any to any source any destination 2001:db8::6 application any service service-https action deny
+    """
+    aces, _ = parse_panos(cfg)
+    assert str(aces[0].dst) == "2001:db8::5/128"    # object path
+    assert str(aces[1].dst) == "2001:db8::6/128"    # literal path
+    assert all(a.imprecise is False for a in aces)
+    kinds = {f.kind for f in _analyze_aces(aces)}
+    assert "intent-inversion-deny-dead" not in kinds
+
+
+def test_sctp_service_ports_kept_exact():
+    # P8: sctp is port-carrying in the model (covers() compares its ports), so
+    # a custom sctp service keeps EXACT ports — a permit on 5000 can't kill a
+    # later deny on 132 (disjoint ports, no deny-dead).
+    cfg = """
+    set service svc-sctp-hi protocol sctp port 5000
+    set service svc-sctp-sig protocol sctp port 132
+    set rulebase security rules a from any to any source any destination any application any service svc-sctp-hi action allow
+    set rulebase security rules b from any to any source any destination any application any service svc-sctp-sig action deny
+    """
+    aces, _ = parse_panos(cfg)
+    assert [(a.proto, str(a.dst_port)) for a in aces] == [("sctp", "5000"),
+                                                          ("sctp", "132")]
+    assert all(a.imprecise is False for a in aces)
+    kinds = {f.kind for f in _analyze_aces(aces)}
+    assert "intent-inversion-deny-dead" not in kinds
+
+
+def test_ports_on_unported_protocol_widen_and_flag():
+    # P8: a port spec on a protocol covers() doesn't compare was dropped with no
+    # note and imprecise=False — the ACE then claimed an exact ALL-ports space.
+    cfg = """
+    set service svc-weird protocol gre port 47
+    set rulebase security rules r from any to any source any destination any application any service svc-weird action allow
+    """
+    aces, notes = parse_panos(cfg)
+    assert len(aces) == 1
+    assert aces[0].proto == "gre" and aces[0].dst_port.is_any()
+    assert aces[0].imprecise is True
+    assert any("non-port-carrying" in n for n in notes)
+
+
 # ── negate-source/destination soundness (false-PASS regression) ───────────────
 # `negate-source yes` means the rule matches the COMPLEMENT of the listed set.
 # Modeling the LISTED nets (even marked imprecise) UNDER-approximates: segcheck

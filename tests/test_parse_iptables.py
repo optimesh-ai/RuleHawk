@@ -73,7 +73,8 @@ def test_happy_path_save_form_maps_to_aces():
     assert web.imprecise is False
 
     icmp = next(a for a in inp if a.proto == "icmp")
-    assert icmp.icmp_type == "echo-request"
+    # canonicalized: iptables `echo-request` == Cisco `echo` == type 8.
+    assert icmp.icmp_type == "echo"
 
     # The default policy is the LAST rule of the chain and is a deny any/any.
     last = sorted(inp, key=lambda a: a.seq)[-1]
@@ -452,6 +453,251 @@ def test_ipv6_rules_use_v6_any():
     rule = next(a for a in aces if a.dst_port.lo == 22)
     assert rule.src.version == 6
     assert rule.dst.version == 6 and rule.dst_any   # unspecified dst -> ::/0
+
+
+# ── superset-contract regressions ──────────────────────────────────────────────
+# The parser contract: an ACE's modeled space must be a SUPERSET of the rule's
+# true match space. A negated match modeled as the un-negated value is a SUBSET
+# (narrower than reality) — a deny so narrowed can hide a real leak. Each fix
+# below over-approximates the dimension to ANY + imprecise instead.
+
+def test_negated_dport_not_narrowed_to_the_port():
+    # `! --dport 22` matches every port EXCEPT 22; modeling it as ==22 is a
+    # subset. The dimension must stay ANY (superset), flagged imprecise.
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -p tcp ! --dport 22 -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.dst_port.is_any() and rule.imprecise is True
+    assert any("negated --dport" in n and "imprecise" in n for n in notes)
+
+
+def test_negated_sport_and_multiport_dports_not_narrowed():
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -p tcp ! --sport 1024 -j ACCEPT\n"
+           "-A INPUT -p tcp -m multiport ! --dports 80,443 -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    permits = [a for a in aces if a.action == "permit"]
+    assert len(permits) == 2                       # NOT expanded per negated port
+    assert all(a.src_port.is_any() and a.dst_port.is_any() for a in permits)
+    assert all(a.imprecise for a in permits)
+    assert any("negated --sport" in n for n in notes)
+    assert any("negated --dports" in n for n in notes)
+
+
+def test_negated_proto_keeps_ip():
+    # `! -p tcp` matches every proto EXCEPT tcp; proto must stay "ip" (superset).
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT ! -p tcp -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.proto == "ip" and rule.imprecise is True
+    assert any("negated protocol" in n and "imprecise" in n for n in notes)
+
+
+def test_negated_icmp_type_keeps_all_types():
+    # `! --icmp-type echo-request` matches every type EXCEPT echo-request;
+    # icmp_type must stay None (all types), flagged imprecise.
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -p icmp ! --icmp-type echo-request -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.icmp_type is None and rule.imprecise is True
+    assert any("negated ICMP type" in n and "imprecise" in n for n in notes)
+
+
+def test_bare_restricting_module_marks_imprecise():
+    # `-m limit` restricts by default (3/hour) even with no options — a silently
+    # neutral model would over-count the permit's real space's complement... the
+    # rule matches FEWER packets than modeled, so imprecise is the honest flag.
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -p tcp --dport 22 -m limit -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.imprecise is True
+    assert any("match module `-m limit`" in n and "not modeled" in n for n in notes)
+
+
+def test_neutral_modules_stay_precise():
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -p tcp -m tcp --dport 22 -m comment -j ACCEPT\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.imprecise is False
+    assert not any("match module" in n for n in notes)
+
+
+def test_dccp_and_udplite_ports_kept():
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -p dccp --dport 33 -j ACCEPT\n"
+           "-A INPUT -p udplite --dport 5004 -j ACCEPT\nCOMMIT\n")
+    aces, _ = parse_iptables(cfg)
+    dccp = next(a for a in aces if a.proto == "dccp")
+    udpl = next(a for a in aces if a.proto == "udplite")
+    assert dccp.dst_port.lo == dccp.dst_port.hi == 33      # not dropped to ANY
+    assert udpl.dst_port.lo == udpl.dst_port.hi == 5004
+
+
+def test_return_in_base_chain_fails_closed_not_false_pass():
+    # `-j RETURN` in FORWARD applies the chain policy (ACCEPT) immediately: the
+    # flow leaks. Skipping the RETURN let the later DROP match and segcheck
+    # FALSE-PASS the leak. The fix emits the fail-closed imprecise marker.
+    cfg = ("*filter\n:FORWARD ACCEPT [0:0]\n"
+           "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 445 -j RETURN\n"
+           "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 445 -j DROP\n"
+           "COMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    findings = check_segmentation(aces, _SEG_POLICY)
+    kinds = {f.kind for f in findings}
+    assert "segmentation-ok" not in kinds, \
+        "FALSE PASS: RETURN->policy-ACCEPT leak reported as isolated"
+    assert kinds & {"segmentation-indeterminate", "segmentation-violation"}
+    assert any("RETURN" in n and "fail-closed" in n for n in notes)
+
+
+def test_return_in_input_stays_surface_only():
+    # INPUT is non-transit: a RETURN there never decides inter-zone reachability,
+    # so no synthetic ACE — surface-only, like the custom-chain jump on INPUT.
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -s 10.0.0.0/8 -j RETURN\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    assert not [a for a in aces if a.acl == "INPUT" and "policy" not in a.raw]
+    assert any("RETURN" in n for n in notes)
+
+
+def test_nat_table_save_form_rules_emit_no_ace():
+    # Save-form `-A` lines inside a *nat block must not be parsed as filter
+    # rules — a nat ACCEPT modeled as a filter permit is a false critical.
+    cfg = ("*nat\n:PREROUTING ACCEPT [0:0]\n"
+           "-A PREROUTING -d 203.0.113.5/32 -p tcp --dport 80 -j ACCEPT\nCOMMIT\n"
+           "*filter\n:FORWARD DROP [0:0]\nCOMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    assert not [a for a in aces if a.acl == "PREROUTING"]
+    assert not [a for a in aces if a.action == "permit"]   # only FORWARD's deny policy
+    assert any("nat" in n.lower() and "not modeled" in n for n in notes)
+
+
+def test_replace_noted_and_appended():
+    cfg = ("iptables -P INPUT DROP\n"
+           "iptables -A INPUT -p tcp --dport 22 -j ACCEPT\n"
+           "iptables -R INPUT 1 -p tcp --dport 2222 -j ACCEPT\n")
+    aces, notes = parse_iptables(cfg)
+    assert any(a.action == "permit" and a.dst_port.lo == 2222 for a in aces)
+    assert any("replace position not modeled" in n for n in notes)
+
+
+def test_flush_clears_accumulated_rules():
+    # An ignored mid-script flush would let the flushed DROP falsely prove the
+    # flow blocked; after `-F FORWARD` only the ACCEPT policy remains -> violation.
+    cfg = ("iptables -P FORWARD ACCEPT\n"
+           "iptables -A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 445 -j DROP\n"
+           "iptables -F FORWARD\n")
+    aces, notes = parse_iptables(cfg)
+    assert not [a for a in aces if a.acl == "FORWARD" and "policy" not in a.raw]
+    findings = check_segmentation(aces, _SEG_POLICY)
+    assert any(f.kind == "segmentation-violation" for f in findings), \
+        "flushed DROP must not keep proving the flow blocked"
+    assert any("flush" in n for n in notes)
+
+
+def test_flush_without_chain_clears_all_chains():
+    cfg = ("iptables -P INPUT DROP\n"
+           "iptables -A INPUT -p tcp --dport 22 -j ACCEPT\n"
+           "iptables -A FORWARD -p tcp --dport 80 -j ACCEPT\n"
+           "iptables -F\n")
+    aces, notes = parse_iptables(cfg)
+    assert not [a for a in aces if "policy" not in a.raw]
+    assert any("flush" in n for n in notes)
+
+
+def test_delete_noted_not_removed():
+    cfg = ("iptables -P INPUT DROP\n"
+           "iptables -A INPUT -p tcp --dport 23 -j ACCEPT\n"
+           "iptables -D INPUT 1\n")
+    aces, notes = parse_iptables(cfg)
+    # Removal is not attempted (surfaced instead): the rule stays visible.
+    assert any(a.dst_port.lo == 23 for a in aces)
+    assert any("delete not modeled" in n for n in notes)
+
+
+def test_ip6tables_save_policy_emitted_as_v6_any():
+    # Genuine ip6tables-save output has no command token; a 0.0.0.0/0 policy
+    # would never match a v6 flow (false PASS). Both v6 cues must work.
+    icmp6 = ("*filter\n:FORWARD DROP [0:0]\n"
+             "-A FORWARD -p ipv6-icmp -j ACCEPT\nCOMMIT\n")
+    literal = ("*filter\n:FORWARD DROP [0:0]\n"
+               "-A FORWARD -s fd00::/8 -p tcp --dport 22 -j ACCEPT\nCOMMIT\n")
+    for cfg in (icmp6, literal):
+        aces, _ = parse_iptables(cfg)
+        pol = next(a for a in aces if "policy" in a.raw)
+        assert str(pol.src) == "::/0" and str(pol.dst) == "::/0"
+
+
+def test_v4_save_without_command_token_stays_v4():
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -s 10.0.0.0/8 -p tcp --dport 22 -j ACCEPT\nCOMMIT\n")
+    aces, _ = parse_iptables(cfg)
+    pol = next(a for a in aces if "policy" in a.raw)
+    assert str(pol.src) == "0.0.0.0/0"
+
+
+def test_truncated_options_do_not_raise():
+    # A value-consuming option at end-of-line must surface + mark imprecise,
+    # never crash the whole parse.
+    for cfg in ("*filter\n:INPUT DROP [0:0]\n-A INPUT -s\nCOMMIT\n",
+                "iptables -A INPUT -p\n",
+                "*filter\n:INPUT DROP [0:0]\n-A INPUT -p tcp --dport\nCOMMIT\n"):
+        aces, notes = parse_iptables(cfg)     # must not raise
+        assert any("truncated" in n for n in notes)
+
+
+def test_reject_with_stays_precise():
+    # `--reject-with` selects the refusal packet only (iptables-save always
+    # writes it) — the deny must NOT go imprecise (needless INDETERMINATE).
+    cfg = ("*filter\n:INPUT ACCEPT [0:0]\n"
+           "-A INPUT -p tcp --dport 23 -j REJECT --reject-with icmp-port-unreachable\n"
+           "COMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    deny = next(a for a in aces if a.action == "deny")
+    assert deny.imprecise is False and deny.dst_port.lo == 23
+    assert not any("reject-with" in n for n in notes)
+
+
+def test_lowercase_jump_accept_is_a_custom_chain_not_builtin():
+    # Targets are case-sensitive: `-j accept` names a user chain, never the
+    # ACCEPT verdict. The chain is deliberately NOT declared here, so the
+    # precision-resolution pass fails closed (absent chain) and the transit
+    # jump keeps the fail-closed imprecise marker. Mutation guard: an
+    # `.upper()` regression would turn this into a precise ACCEPT permit
+    # (violation, non-imprecise ACE) and fail every assertion below.
+    cfg = ("*filter\n:FORWARD DROP [0:0]\n"
+           "-A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 445 -j accept\n"
+           "COMMIT\n")
+    aces, notes = parse_iptables(cfg)
+    fwd = [a for a in aces if a.acl == "FORWARD" and "policy" not in a.raw]
+    assert fwd and all(a.imprecise for a in fwd)   # marker, not a precise permit
+    assert any("custom chain" in n and "accept" in n for n in notes)
+    findings = check_segmentation(aces, _SEG_POLICY)
+    kinds = {f.kind for f in findings}
+    assert "segmentation-ok" not in kinds
+    assert kinds & {"segmentation-indeterminate", "segmentation-violation"}
+
+
+def test_dport_colon_range_exact():
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -p tcp --dport 1024:65535 -j ACCEPT\nCOMMIT\n")
+    aces, _ = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert (rule.dst_port.lo, rule.dst_port.hi) == (1024, 65535)
+    assert rule.imprecise is False
+
+
+def test_numeric_protocol_normalized():
+    cfg = ("*filter\n:INPUT DROP [0:0]\n"
+           "-A INPUT -p 6 --dport 22 -j ACCEPT\nCOMMIT\n")
+    aces, _ = parse_iptables(cfg)
+    rule = next(a for a in aces if a.action == "permit")
+    assert rule.proto == "tcp" and rule.dst_port.lo == 22
 
 
 # ── RH-iptables-precision: custom-chain jump precision resolution ─────────────

@@ -15,6 +15,17 @@ covering rule:
   * `stateful`   — `established` matches only return traffic (ACK/RST), so it
                    does not "cover" a new-flow rule.
 `covers()` returns False whenever `a` is imprecise or stateful.
+
+PARSER CONTRACT (load-bearing for every frontend): an ACE's modeled space must
+be a SUPERSET of the rule's true match space — parsers must WIDEN, never narrow.
+An `imprecise` ACE may safely BE covered (real ⊆ modeled ⊆ coverer) and segcheck
+treats any imprecise match as indeterminate, but both of those are sound ONLY
+under the superset guarantee. A frontend that narrows a dimension (dropping a
+negation's complement, truncating a member list, skipping an unresolvable
+member) breaks it: `covers()` would then prove a live rule dead and segcheck
+would false-PASS a witness that lives in the dropped part. When a construct
+can't be modeled exactly, over-approximate that dimension to ANY and set
+`imprecise` — never emit a subset.
 """
 
 from __future__ import annotations
@@ -26,7 +37,11 @@ from typing import Optional, Union
 _IPNet = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
 PORT_MIN, PORT_MAX = 0, 65535
-_PORTED = frozenset({"tcp", "udp"})
+# Protocols whose ACEs carry meaningful port ranges. sctp/dccp/udplite are here
+# because iptables matches ports on them; a proto in this set gets its ports
+# COMPARED by covers() — omitting one would let "permit sctp :5000" falsely
+# cover "deny sctp :9".
+_PORTED = frozenset({"tcp", "udp", "sctp", "dccp", "udplite"})
 _WILDCARD_PROTO = frozenset({"ip", "any", "ipv4", "ipv6"})
 # Protocols that carry an ICMP type dimension. covers() must respect icmp_type
 # for BOTH families: ip6tables `--icmpv6-type` rules (proto "icmpv6") are typed
@@ -119,6 +134,17 @@ def covers(a: ACE, b: ACE) -> bool:
     """True iff a's match-space is a (sound) superset of b's (a ⊇ b)."""
     if a.imprecise or a.stateful:
         # a's space is not exact — refuse to prove anything dead from it.
+        return False
+    if b.imprecise and b.proto in _PORTED and not (
+            b.src_port.is_any() and b.dst_port.is_any()):
+        # An imprecise b whose ports are CONSTRAINED may be under-approximated
+        # in exactly the port dimension: the partial-precision parsers keep the
+        # known port(s) exact and flag imprecise for an unresolved extra (e.g.
+        # `eq www <unknown-service>`), so the true space can include ports the
+        # model doesn't show. Proving such a rule dead from its modeled ports
+        # could delete a rule that still carries the unknown service. When the
+        # imprecision lies elsewhere (ports ANY), being covered stays sound
+        # (real ⊆ modeled ⊆ coverer) — only this shape is refused.
         return False
     if not _proto_covers(a.proto, b.proto):
         return False

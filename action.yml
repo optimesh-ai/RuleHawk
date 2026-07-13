@@ -102,8 +102,11 @@ runs:
         # verdict (captured below), and reporting is best-effort — nothing here may
         # abort the step, or a failed gate could be masked as green.
         set +e -f
+        # ${arr[@]+...} guards the empty-array expansion: bash 3.2 (macOS
+        # runners) treats "${POLICY_ARGS[@]}" as unbound under `set -u` and
+        # would abort the step before the verdict file is even written.
         python3 -m rulehawk gate ${RH_CONFIGS} \
-          "${POLICY_ARGS[@]}" \
+          ${POLICY_ARGS[@]+"${POLICY_ARGS[@]}"} \
           --fail-on "${RH_FAIL_ON}" \
           --vendor "${RH_VENDOR}" \
           --sarif "${SARIF}" \
@@ -148,15 +151,20 @@ runs:
     # the conversation. continue-on-error keeps fork PRs (read-only token) green
     # on the comment step — the check + SARIF still gate the merge.
     - name: Sticky PR comment
-      if: always() && inputs.comment == 'true' && github.event_name == 'pull_request' && steps.gate.outputs.comment != ''
+      if: always() && inputs.comment == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && steps.gate.outputs.comment != ''
       continue-on-error: true
       uses: actions/github-script@v9
+      env:
+        # Passed via env, not ${{ }}-interpolated into JS source — the value is
+        # runner-generated today, but inlining is the canonical script-injection
+        # shape and one refactor away from being exploitable.
+        RH_COMMENT_PATH: ${{ steps.gate.outputs.comment }}
       with:
         script: |
           const fs = require('fs');
           const marker = '<!-- rulehawk-gate -->';
           let body = '';
-          try { body = fs.readFileSync('${{ steps.gate.outputs.comment }}', 'utf8'); }
+          try { body = fs.readFileSync(process.env.RH_COMMENT_PATH, 'utf8'); }
           catch (e) { core.warning('no comment body: ' + e); return; }
           const {owner, repo} = context.repo;
           const issue_number = context.payload.pull_request.number;

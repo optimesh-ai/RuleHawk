@@ -231,9 +231,10 @@ def test_worker_and_index_fallback_agree():
     worker, index = _read(_WORKER), _read(_INDEX)
     assert _engine_modules(worker) == _engine_modules(index), \
         "worker.js and index.html load different engine modules"
-    assert _parsers_referenced(_analyze_py(worker)) == \
-        _parsers_referenced(_analyze_py(index)), \
-        "worker.js and the main-thread fallback dispatch different vendors"
+    assert _analyze_py(worker) == _analyze_py(index), (
+        "worker.js and the index.html main-thread fallback carry different "
+        "ANALYZE_PY entrypoints — they must stay byte-identical so the fallback "
+        "can never audit differently")
 
 
 def test_ui_supported_copy_names_no_unloaded_vendor():
@@ -289,6 +290,26 @@ def test_hosted_is_fail_closed_indeterminate_never_false_pass():
     kinds = {f["kind"] for f in env["report_json"]["findings"]}
     assert "segmentation-indeterminate" in kinds   # unmodeled ref -> fail closed
     assert "segmentation-ok" not in kinds          # never a false PASS
+
+
+def test_hosted_rule_lines_cover_expanded_object_group_aces():
+    """The UI's finding->source-line jump uses the envelope's rule_lines map.
+    One object-group line expands to SEVERAL ACEs that share a raw line; every
+    one of them must map to that exact line (a raw-text search would only find
+    the first)."""
+    cfg = (
+        "object-group network SRV\n"
+        " network-object host 10.0.0.1\n"
+        " network-object host 10.0.0.2\n"
+        "ip access-list extended T\n"
+        " permit tcp object-group SRV any eq 443\n"
+    )
+    env = _run_hosted(_analyze_py(_read(_WORKER)), cfg)
+    aces, _ = parse_acls(cfg)
+    assert len(aces) == 2, "object-group should expand to two ACEs"
+    for a in aces:
+        assert env["rule_lines"].get(f"{a.acl}:{a.seq}") == 5, (
+            f"ACE {a.acl}:{a.seq} must map to its source line 5")
 
 
 def test_hosted_fallback_entrypoint_also_matches():

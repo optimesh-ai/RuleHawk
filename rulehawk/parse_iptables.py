@@ -52,7 +52,7 @@ import shlex
 from typing import Dict, List, Optional, Tuple
 
 from .model import ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet
-from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
+from .parse import _canon_icmp_type, _port_num  # reuse IANA maps + icmp canon
 
 _ANY4: _IPNet = ipaddress.ip_network("0.0.0.0/0")
 _ANY6: _IPNet = ipaddress.ip_network("::/0")
@@ -100,9 +100,21 @@ def detect(text: str) -> bool:
 
 
 def _is_v6(text: str) -> bool:
-    """File-level default family: ip6tables (and no iptables) => IPv6."""
-    return bool(re.search(r"(?m)^\s*ip6tables\b", text)) and not re.search(
-        r"(?m)^\s*iptables\b", text)
+    """File-level default family. Command tokens decide when present; genuine
+    ip6tables-save output has NO command token, so fall back to v6 payload
+    evidence (icmpv6 proto or an IPv6 literal in an address argument) — else the
+    chain default policies would be emitted as 0.0.0.0/0 and no v6 flow could
+    ever match them (false PASS)."""
+    if re.search(r"(?m)^\s*ip6tables\b", text):
+        return not re.search(r"(?m)^\s*iptables\b", text)
+    if re.search(r"(?m)^\s*iptables\b", text):
+        return False
+    if re.search(r"-p\s+(?:ipv6-icmp|icmpv6|58)\b", text):
+        return True
+    if re.search(r"(?:^|\s)(?:-s|-d|--source|--destination|--src|--dst)\s+\S*:\S*",
+                 text):
+        return True
+    return False
 
 
 def _net(tok: str) -> _IPNet:
@@ -148,7 +160,7 @@ class _Rule:
 
     __slots__ = ("src", "dst", "proto", "sports", "dports", "stateful",
                  "imprecise", "icmp_type", "action", "skip_note", "modules",
-                 "jump_custom")
+                 "jump_custom", "base_return")
 
     def __init__(self) -> None:
         self.src: Optional[_IPNet] = None
@@ -163,10 +175,31 @@ class _Rule:
         self.skip_note: Optional[str] = None   # set => rule emits no ACE (surfaced)
         self.modules: List[str] = []
         self.jump_custom: Optional[str] = None  # target name of an unmodeled custom-chain jump
+        self.base_return = False               # `-j RETURN` (fail-closed in a base transit chain)
 
 
 _PROTO_NUM = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6",
               "47": "gre", "50": "esp", "51": "ah", "89": "ospf", "132": "sctp"}
+
+# `-m` modules known NOT to restrict the match space by themselves (their
+# narrowing options, if any, are parsed or surfaced separately). Anything else
+# (`limit`, `recent`, `time`, `owner`, ...) restricts by default -> imprecise.
+_NEUTRAL_MODULES = frozenset({"tcp", "udp", "icmp", "icmp6", "icmpv6", "sctp",
+                              "dccp", "udplite", "comment", "multiport",
+                              "state", "conntrack", "set", "ah", "esp"})
+
+# Options that consume a value token. A truncated line (option with no value)
+# must surface + mark imprecise, never crash mid-parse.
+_VALUE_OPTS = frozenset({
+    "-s", "--source", "--src", "-d", "--destination", "--dst",
+    "-p", "--protocol",
+    "--dport", "--destination-port", "--sport", "--source-port",
+    "--dports", "--destination-ports", "--sports", "--source-ports",
+    "--state", "--ctstate", "--match-set",
+    "-i", "--in-interface", "-o", "--out-interface",
+    "--icmp-type", "--icmpv6-type", "-m", "--match",
+    "-j", "--jump", "-g", "--goto", "--reject-with",
+})
 
 
 def _norm_proto(v: str) -> str:
@@ -191,6 +224,12 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
             i += 1
             continue
         nxt = toks[i + 1] if i + 1 < n else None
+        if nxt is None and t in _VALUE_OPTS:
+            # Truncated option (value missing): surface + imprecise, never crash.
+            r.imprecise = True
+            notes.append(f"truncated iptables option `{t}` in {label} — value "
+                         f"missing (marked imprecise — verify manually)")
+            break
         if t in ("-s", "--source", "--src"):
             if negate:
                 r.imprecise = True
@@ -199,7 +238,7 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
             else:
                 try:
                     r.src = _net(nxt)
-                except ValueError:
+                except (TypeError, ValueError):
                     r.imprecise = True
                     notes.append(f"unparsed iptables source '{nxt}' in {label} "
                                  f"(marked imprecise — verify manually)")
@@ -212,45 +251,65 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
             else:
                 try:
                     r.dst = _net(nxt)
-                except ValueError:
+                except (TypeError, ValueError):
                     r.imprecise = True
                     notes.append(f"unparsed iptables destination '{nxt}' in {label} "
                                  f"(marked imprecise — verify manually)")
             i += 2
         elif t in ("-p", "--protocol"):
-            r.proto = _norm_proto(nxt)
+            # Negated proto: the complement isn't one proto — keep "ip" (superset).
             if negate:
                 r.imprecise = True
-                notes.append(f"negated protocol (`! -p {nxt}`) in {label} "
-                             f"(marked imprecise — verify manually)")
+                notes.append(f"negated protocol (`! -p {nxt}`) in {label} — "
+                             f"over-approximated to all protocols (marked "
+                             f"imprecise — verify manually)")
+            else:
+                r.proto = _norm_proto(nxt)
             i += 2
         elif t in ("--dport", "--destination-port"):
-            pr, imp = _ports(nxt, label, "--dport", notes)
-            r.dports += pr
-            r.imprecise |= imp or negate
+            # Negated port: the complement isn't these ranges — keep ANY (superset).
             if negate:
-                notes.append(f"negated --dport in {label} (marked imprecise — verify)")
+                r.imprecise = True
+                notes.append(f"negated --dport {nxt} in {label} — over-approximated "
+                             f"to ANY ports (marked imprecise — verify)")
+            else:
+                pr, imp = _ports(nxt, label, "--dport", notes)
+                r.dports += pr
+                r.imprecise |= imp
             i += 2
         elif t in ("--sport", "--source-port"):
-            pr, imp = _ports(nxt, label, "--sport", notes)
-            r.sports += pr
-            r.imprecise |= imp or negate
             if negate:
-                notes.append(f"negated --sport in {label} (marked imprecise — verify)")
+                r.imprecise = True
+                notes.append(f"negated --sport {nxt} in {label} — over-approximated "
+                             f"to ANY ports (marked imprecise — verify)")
+            else:
+                pr, imp = _ports(nxt, label, "--sport", notes)
+                r.sports += pr
+                r.imprecise |= imp
             i += 2
         elif t in ("--dports", "--destination-ports"):   # multiport (exact union)
-            pr, imp = _ports(nxt, label, "--dports", notes)
-            r.dports += pr
-            r.imprecise |= imp or negate
-            notes.append(f"iptables multiport --dports '{nxt}' in {label} expanded to "
-                         f"{len(pr)} exact per-port rule(s)")
+            if negate:
+                r.imprecise = True
+                notes.append(f"negated --dports {nxt} in {label} — over-approximated "
+                             f"to ANY ports (marked imprecise — verify)")
+            else:
+                pr, imp = _ports(nxt, label, "--dports", notes)
+                r.dports += pr
+                r.imprecise |= imp
+                notes.append(f"iptables multiport --dports '{nxt}' in {label} expanded "
+                             f"to {len(pr)} exact per-port rule(s)")
             i += 2
         elif t in ("--sports", "--source-ports"):
-            pr, imp = _ports(nxt, label, "--sports", notes)
-            r.sports += pr
-            r.imprecise |= imp or negate
-            notes.append(f"iptables multiport --sports '{nxt}' in {label} expanded to "
-                         f"{len(pr)} exact per-port rule(s)")
+            if negate:
+                r.imprecise = True
+                notes.append(f"negated --sports {nxt} in {label} — over-approximated "
+                             f"to ANY ports (marked imprecise — verify)")
+            else:
+                pr, imp = _ports(nxt, label, "--sports", notes)
+                r.sports += pr
+                r.imprecise |= imp
+                notes.append(f"iptables multiport --sports '{nxt}' in {label} expanded "
+                             f"to {len(pr)} exact per-port rule(s)")
             i += 2
         elif t in ("--state", "--ctstate"):
             states = {s.strip().upper() for s in (nxt or "").split(",") if s.strip()}
@@ -291,13 +350,32 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                          f"conservatively)")
             i += 2
         elif t == "--icmp-type" or t == "--icmpv6-type":
-            r.icmp_type = nxt
+            # Negated type OR the literal `any` (matches EVERY type): the space
+            # is all types, so leave icmp_type None. A concrete type is
+            # canonicalized (echo-request == echo == 8) so it compares equal
+            # across spellings and against the Cisco frontend.
+            if negate:
+                r.imprecise = True
+                notes.append(f"negated ICMP type (`! {t} {nxt}`) in {label} — "
+                             f"over-approximated to all types (marked imprecise "
+                             f"— verify)")
+            elif (nxt or "").lower() != "any":
+                r.icmp_type = _canon_icmp_type(nxt)
             i += 2
         elif t in ("-m", "--match"):
-            r.modules.append(nxt or "")
+            mod = nxt or ""
+            r.modules.append(mod)
+            # A non-neutral module (limit, recent, time, owner, ...) restricts
+            # the space by its mere presence/defaults — over-approximate.
+            if mod not in _NEUTRAL_MODULES:
+                r.imprecise = True
+                notes.append(f"match module `-m {mod}` in {label} not modeled — "
+                             f"marked imprecise (verify manually)")
             i += 2
         elif t in ("-j", "--jump", "-g", "--goto"):
-            target = (nxt or "").upper()
+            # Targets are case-sensitive: builtins are uppercase; `-j accept`
+            # names a user chain, never the ACCEPT verdict.
+            target = nxt or ""
             if target in _TERMINATING:
                 r.action = _TERMINATING[target]
             elif target in _NONTERMINATING:
@@ -305,8 +383,15 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                                f"— matching packets continue to the next rule (no "
                                f"decision modeled)")
             elif target == "RETURN":
-                r.skip_note = (f"iptables `-j RETURN` in {label} returns to the calling "
-                               f"chain/policy (no terminating decision modeled)")
+                # In a BASE chain the default policy applies immediately; in a
+                # custom chain the caller resumes. add_rule fails the transit
+                # base-chain case closed (imprecise marker) — a policy-ACCEPT
+                # RETURN must never FALSE-PASS as isolated.
+                r.base_return = True
+                r.skip_note = (f"iptables `-j RETURN` in {label} applies the calling "
+                               f"chain / default policy at this point — modeled "
+                               f"fail-closed on the transit path (verify the "
+                               f"fall-through manually)")
             elif target in ("MASQUERADE", "SNAT", "DNAT", "REDIRECT", "NETMAP"):
                 r.skip_note = (f"iptables NAT target `-j {nxt}` in {label} — address "
                                f"rewriting is not modeled (filter-space only; verify "
@@ -324,6 +409,10 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                                f"below if the chain is fully modeled, otherwise "
                                f"kept indeterminate (fail-closed); host "
                                f"INPUT/OUTPUT jumps are surfaced only")
+            i += 2
+        elif t == "--reject-with":
+            # REJECT flavor only (iptables-save always writes it) — selects the
+            # refusal packet, never narrows the match space. Stays precise.
             i += 2
         elif t == "-f" or t == "--fragment":
             r.imprecise = True
@@ -366,7 +455,7 @@ def _expand(chain: str, r: _Rule, seq: int, entries: List[ACE],
     any_net = _ANY6 if v6 else _ANY4
     src = r.src if r.src is not None else any_net
     dst = r.dst if r.dst is not None else any_net
-    ported = r.proto in ("tcp", "udp", "sctp")
+    ported = r.proto in ("tcp", "udp", "sctp", "dccp", "udplite")
     sports = (r.sports or [ANY_PORTS]) if ported else [ANY_PORTS]
     dports = (r.dports or [ANY_PORTS]) if ported else [ANY_PORTS]
     transit = _is_transit(chain)
@@ -469,8 +558,8 @@ def _resolve_transit_jump(
         if r_dst is None:
             continue  # disjoint dst address spaces
 
-        # ── Port intersection (ported protocols only) ────────────────────────
-        ported = r_proto in ("tcp", "udp", "sctp")
+        # ── Port intersection (ported protocols only; same set as _expand) ──
+        ported = r_proto in ("tcp", "udp", "sctp", "dccp", "udplite")
         if ported:
             r_sports: List[PortRange] = []
             for ps in p_sports:
@@ -548,7 +637,8 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     chains_with_return: set = set()
     # Pending transit jumps to resolve after all chains are parsed.
     # Each entry: (parent_chain, ph_start, ph_end, target_chain,
-    #              jump_src, jump_dst, jump_proto, jump_sports, jump_dports, lineno)
+    #              jump_src, jump_dst, jump_proto, jump_sports, jump_dports,
+    #              lineno, jump_unresolvable)
     pending_jumps: list = []
 
     def ensure_chain(ch: str) -> None:
@@ -575,6 +665,15 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                 j_proto = r.proto
                 j_sports = list(r.sports)
                 j_dports = list(r.dports)
+                # Constraints the resolution pass cannot reproduce on resolved
+                # ACEs (its intersection covers src/dst/proto/ports only). A
+                # jump rule that is itself imprecise (negation, unmodeled
+                # module, ...), stateful, or ICMP-typed must KEEP the
+                # fail-closed placeholder — resolving it would silently widen
+                # the jump's true match space into "precise" ACEs (a resolved
+                # DENY wider than reality can FALSE-PASS a leak).
+                j_unresolvable = (r.imprecise or r.stateful
+                                  or r.icmp_type is not None)
                 r.action = "permit"
                 r.imprecise = True
                 ph_start = len(by_chain[ch])
@@ -582,15 +681,27 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                 ph_end = len(by_chain[ch])
                 pending_jumps.append((ch, ph_start, ph_end,
                                       r.jump_custom, j_src, j_dst, j_proto,
-                                      j_sports, j_dports, line))
+                                      j_sports, j_dports, line,
+                                      j_unresolvable))
             elif r.jump_custom is None:
                 # RETURN or NAT target: records that this chain uses control-
                 # flow constructs that prevent full precision modeling of any
                 # parent chain that jumps here. Non-terminating decorators
                 # (LOG/AUDIT) don't alter routing and are safe to skip.
-                sn = r.skip_note
-                if "RETURN" in sn or "NAT target" in sn:
+                if r.base_return or "NAT target" in r.skip_note:
                     chains_with_return.add(ch)
+                # `-j RETURN` in a BASE chain applies the chain default policy
+                # immediately; a policy-ACCEPT RETURN skipped here would let a
+                # later DROP falsely prove the flow blocked (FALSE PASS). Same
+                # fail-closed marker as the custom-chain jump, on the transit
+                # path only (a RETURN inside a CUSTOM chain resumes the caller
+                # instead — handled by the chains_with_return gate above, which
+                # keeps any jump to that chain indeterminate).
+                if r.base_return and ch in _BASE_CHAINS and _is_transit(ch):
+                    r.action = "permit"
+                    r.imprecise = True
+                    seqs[ch] = _expand(ch, r, seqs[ch], by_chain[ch],
+                                       default6, line)
             return
         if r.action is None:
             notes.append(f"iptables rule in {ch} has no terminating target "
@@ -653,8 +764,10 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                     notes.append(f"iptables '{tbl}' table rule present — not modeled "
                                  f"(filter-space only; review manually)")
                 continue
-        elif cmd is not None and not table_is_filter:
-            # A bare command line inside a non-filter save block (rare) — skip.
+        elif not table_is_filter:
+            # ANY rule line (save-form `-A ...` or command form) inside a
+            # *nat/*mangle/*raw block: the `*table` header already surfaced the
+            # block — skip; a nat ACCEPT must never become a filter permit.
             continue
 
         # Dispatch the action verb.
@@ -680,11 +793,51 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             k = toks.index("-P") if "-P" in toks else toks.index("--policy")
             if k + 2 < len(toks):
                 set_policy(toks[k + 1], toks[k + 2], lineno)
+        elif "-R" in toks or "--replace" in toks:
+            # Replace: modeled as append (like -I) — position math not modeled.
+            k = toks.index("-R") if "-R" in toks else toks.index("--replace")
+            if k + 1 < len(toks):
+                ch = toks[k + 1]
+                args = toks[k + 2:]
+                if args and args[0].isdigit():
+                    args = args[1:]
+                notes.append(f"iptables `-R {ch}` replace position not modeled "
+                             f"(verify) — rule appended at end for analysis")
+                add_rule(ch, args, lineno)
+        elif "-D" in toks or "--delete" in toks:
+            # Delete: removal not modeled — the deleted rule (if parsed earlier)
+            # stays in the analysis. Surfaced, never silent.
+            k = toks.index("-D") if "-D" in toks else toks.index("--delete")
+            ch = toks[k + 1] if k + 1 < len(toks) else "?"
+            notes.append(f"iptables `-D {ch}` delete not modeled — the deleted "
+                         f"rule may still appear in the analysis (verify manually)")
+        elif "-F" in toks or "--flush" in toks:
+            # Flush: an ignored mid-script flush could let a flushed earlier rule
+            # falsely prove a later rule dead — clear the accumulated rules.
+            k = toks.index("-F") if "-F" in toks else toks.index("--flush")
+            ch = toks[k + 1] if k + 1 < len(toks) else None
+            if ch is not None:
+                if ch in by_chain:
+                    by_chain[ch] = []
+                    seqs[ch] = 0
+                # Jump placeholders recorded for this chain were flushed with
+                # it — drop their pending entries (the stored indices are stale;
+                # resolving them would resurrect flushed rules).
+                pending_jumps[:] = [pj for pj in pending_jumps if pj[0] != ch]
+                notes.append(f"iptables `-F {ch}` flush — rules accumulated for "
+                             f"{ch} before this point cleared from the analysis")
+            else:
+                for c in by_chain:
+                    by_chain[c] = []
+                    seqs[c] = 0
+                pending_jumps[:] = []
+                notes.append("iptables `-F` flush — all rules accumulated before "
+                             "this point cleared from the analysis")
         elif "-N" in toks or "--new-chain" in toks:
             k = toks.index("-N") if "-N" in toks else toks.index("--new-chain")
             if k + 1 < len(toks):
                 ensure_chain(toks[k + 1])
-        # -F/-X/-Z and others: no rule contribution; ignored.
+        # -X/-Z and others: no rule contribution; ignored.
 
     # ── Precision resolution: replace imprecise transit-jump placeholders ────
     # For each pending transit jump, if the target chain is FULLY modeled
@@ -693,8 +846,12 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     # resolved ACEs computed by intersecting the jump's match space with each
     # rule in the target chain.
     #
-    # SOUNDNESS guarantee: the check is STRICTLY CONJUNCTIVE — all three gates
+    # SOUNDNESS guarantee: the check is STRICTLY CONJUNCTIVE — all four gates
     # must pass, or the placeholder stays imprecise (INDETERMINATE):
+    #   0. The jump rule ITSELF carries constraints the intersection cannot
+    #      reproduce (imprecise/negated match, stateful, ICMP type) → fail
+    #      closed (resolving would widen the jump space without the imprecise
+    #      marker — a widened resolved DENY could FALSE-PASS a real leak).
     #   1. Target chain absent → fail closed (unknown effect).
     #   2. Target chain in chains_with_return → fail closed (RETURN would
     #      cause some packets to bypass subsequent rules in the subchain; we
@@ -705,7 +862,11 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     #      a subchain that itself jumps to another custom chain gets an imprecise
     #      placeholder ACE during parsing, which triggers this gate.
     for (pch, ph_start, ph_end, tgt,
-         j_src, j_dst, j_proto, j_sports, j_dports, jline) in pending_jumps:
+         j_src, j_dst, j_proto, j_sports, j_dports, jline,
+         j_unresolvable) in pending_jumps:
+        if j_unresolvable:
+            continue                        # jump rule imprecise/stateful/ICMP-
+                                            # typed — keep imprecise (gate 0)
         if tgt not in by_chain:
             continue                        # absent chain — keep imprecise
         if tgt in chains_with_return:

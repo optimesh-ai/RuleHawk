@@ -32,6 +32,7 @@ DESIGN PRINCIPLES (inherited from the engine):
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -107,6 +108,19 @@ _KIND_HELP: Dict[str, str] = {
         "(neq / complex mask / unresolved group). Review manually.",
     "segmentation-ok":
         "A declared zone isolation holds: no permitted witness flow exists.",
+    "segmentation-error":
+        "The segmentation policy itself is invalid (unknown zone, bad CIDR or "
+        "port) — fail-closed: the affected assertion gets no PASS until fixed.",
+    "connectivity-ok":
+        "A declared must_reach deployment flow is provably permitted at the "
+        "filter layer — reported with a concrete witness packet.",
+    "connectivity-broken":
+        "A declared must_reach deployment flow (e.g. hosts -> proxy/vendor "
+        "egress ranges) is permitted by NO parsed ruleset — the traffic will "
+        "be dropped at the filter layer.",
+    "connectivity-indeterminate":
+        "The must_reach flow could not be proven open OR closed — a rule on "
+        "the path uses an unmodeled form. Review manually.",
 }
 
 
@@ -306,36 +320,70 @@ def run_gate(paths: List[str], policy: Optional[dict], fail_on: str = "high",
 # --------------------------------------------------------------------------- #
 # file discovery
 # --------------------------------------------------------------------------- #
-def discover(patterns: List[str]) -> List[str]:
+def discover(patterns: List[str]) -> Tuple[List[str], List[str]]:
     """Expand each pattern to a sorted, de-duplicated list of existing files.
 
     A pattern may be a literal file (kept as-is), a glob (recursive `**`
     supported), or a DIRECTORY (walked recursively for all files — so a natural
-    `configs: firewall` works, not only `firewall/**/*`)."""
+    `configs: firewall` works, not only `firewall/**/*`).
+
+    Returns (files, unmatched_patterns). A pattern that matches NOTHING is a
+    gate-level error, never silently dropped: a typo'd `configs:` entry would
+    otherwise mean that firewall is simply never audited — green check, zero
+    coverage."""
     seen: Dict[str, None] = {}
+    unmatched: List[str] = []
     for pat in patterns:
         if os.path.isfile(pat):
             seen.setdefault(pat, None)
             continue
         if os.path.isdir(pat):
-            for m in sorted(glob.glob(os.path.join(pat, "**", "*"),
-                                      recursive=True)):
-                if os.path.isfile(m):
-                    seen.setdefault(m, None)
-            continue
-        for m in sorted(glob.glob(pat, recursive=True)):
-            if os.path.isfile(m):
-                seen.setdefault(m, None)
-    return list(seen)
+            hits = [m for m in sorted(glob.glob(os.path.join(pat, "**", "*"),
+                                                recursive=True))
+                    if os.path.isfile(m)]
+        else:
+            hits = [m for m in sorted(glob.glob(pat, recursive=True))
+                    if os.path.isfile(m)]
+        if not hits:
+            unmatched.append(pat)
+        for m in hits:
+            seen.setdefault(m, None)
+    return list(seen), unmatched
 
 
 # --------------------------------------------------------------------------- #
 # SARIF 2.1.0
 # --------------------------------------------------------------------------- #
 def _sarif_uri(path: str) -> str:
-    """A repo-relative, forward-slash URI for SARIF artifactLocation."""
-    p = os.path.relpath(path).replace(os.sep, "/")
-    return p[2:] if p.startswith("./") else p
+    """A repo-relative, forward-slash URI for SARIF artifactLocation.
+
+    Relative to $GITHUB_WORKSPACE (the checkout root) when set — the Action may
+    run with a `working-directory:` below the root, and a CWD-relative URI would
+    then point at a nonexistent repo path, silently detaching every annotation.
+    A file OUTSIDE the workspace keeps its absolute path (an escaping `../` URI
+    is unmappable either way; absolute is at least unambiguous)."""
+    ap = os.path.abspath(path)
+    root = os.environ.get("GITHUB_WORKSPACE") or os.getcwd()
+    try:
+        rel = os.path.relpath(ap, root)
+    except ValueError:                      # different drive (Windows)
+        rel = None
+    if rel is None or rel == ".." or rel.startswith(".." + os.sep):
+        return ap.replace(os.sep, "/")
+    return rel.replace(os.sep, "/")
+
+
+def _fingerprint(uri: str, f: Finding) -> str:
+    """A CONTENT-based stable id for GitHub alert matching. Keyed on what the
+    finding IS (file, ACL, kind, normalized rule text, witness) — never on the
+    match-order `seq`, which shifts whenever an unrelated rule is inserted above
+    and would close-and-reopen every downstream alert on each PR. The witness
+    keeps two different boundary breaches on the SAME rule distinct."""
+    acl_seq = _split_rule_id(f.rule_id)
+    acl = acl_seq[0] if acl_seq else f.rule_id
+    rule_text = " ".join(f.rule.split())
+    body = "|".join((uri, acl, f.kind, rule_text, f.witness))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:32]
 
 
 def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
@@ -349,7 +397,8 @@ def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
     rules: List[dict] = []
     rule_index: Dict[str, int] = {}
     results: List[dict] = []
-    for fr, f in gate.real_findings:
+    fp_seen: Dict[str, int] = {}    # occurrence salt: two IDENTICAL rules that are
+    for fr, f in gate.real_findings:    # both e.g. `redundant` stay distinct alerts
         if f.kind not in rule_index:
             rule_index[f.kind] = len(rules)
             rules.append({
@@ -372,6 +421,11 @@ def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
         if f.fix:
             msg += f"\nFix: {f.fix}"
         line = fr.line_of(f)
+        fp = _fingerprint(_sarif_uri(fr.path), f)
+        n = fp_seen.get(fp, 0)
+        fp_seen[fp] = n + 1
+        if n:
+            fp = f"{fp}:{n}"
         results.append({
             "ruleId": f.kind,
             "ruleIndex": rule_index[f.kind],
@@ -384,17 +438,12 @@ def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
                 },
             }],
             "partialFingerprints": {
-                # The witness is the per-finding discriminator: for a
-                # segmentation violation `rule_id` is the offending ACL rule
-                # ({acl}:{seq}), which is IDENTICAL across every zone pair the
-                # one permissive rule breaches — so keying on rule_id+kind alone
-                # lets GitHub code scanning collapse distinct boundary breaches
-                # into a single alert, hiding real isolation failures. The
-                # witness encodes the concrete src/dst hosts and port, so it is
-                # unique per (zone-pair, proto, ports) finding and keeps each
-                # genuine violation as its own alert. Empty for non-segmentation
-                # findings (unchanged: those already differ by rule_id).
-                "ruleHawk/v1": f"{_sarif_uri(fr.path)}:{f.rule_id}:{f.kind}:{f.witness}",
+                # Content-based (see _fingerprint): keyed on file/ACL/kind/rule
+                # text/witness — never the match-order seq, which shifts on any
+                # insertion above and would churn every downstream alert. The
+                # witness keeps distinct boundary breaches via the SAME rule as
+                # separate alerts (rule_id+kind alone would collapse them).
+                "ruleHawk/v2": fp,
             },
         })
     # Fail-closed: a file that parsed to zero rules (or could not be read) must
@@ -430,7 +479,7 @@ def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
                 },
             }],
             "partialFingerprints": {
-                "ruleHawk/v1": f"{_sarif_uri(fr.path)}:parse-failure",
+                "ruleHawk/v2": f"{_sarif_uri(fr.path)}:parse-failure",
             },
         })
     sarif = {
@@ -494,8 +543,12 @@ _SEV_BADGE = {"critical": "**CRITICAL**", "high": "**HIGH**", "medium": "**MEDIU
 
 
 def _sorted(findings: List[Finding]) -> List[Finding]:
-    return sorted(findings, key=lambda f: (_SEV_RANK.get(f.severity, 0) * -1,
-                                           f.rule_id))
+    # Numeric-aware: `EDGE:10` must sort after `EDGE:2`, not before it.
+    def key(f: Finding):
+        acl_seq = _split_rule_id(f.rule_id)
+        acl, seq = acl_seq if acl_seq else (f.rule_id, 0)
+        return (-_SEV_RANK.get(f.severity, 0), acl, seq)
+    return sorted(findings, key=key)
 
 
 def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> str:
@@ -549,6 +602,7 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
     for fr in gate.files:
         real = [f for f in fr.findings if f.severity != "info"]
         ok = [f for f in fr.findings if f.kind == "segmentation-ok"]
+        conn_ok = [f for f in fr.findings if f.kind == "connectivity-ok"]
         if fr.status == "error":
             lines.append(f"<details><summary>❌ <code>{_sarif_uri(fr.path)}</code> "
                          f"— ERROR, could not read: {fr.error}</summary></details>")
@@ -588,6 +642,10 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
             lines.append("")
             lines.append("Segmentation proven: "
                          + ", ".join(f"`{f.rule_id.replace('!->', ' → ')}`" for f in ok))
+        if conn_ok:
+            lines.append("")
+            lines.append("Connectivity proven (must_reach): "
+                         + ", ".join(f"`{f.witness}`" for f in conn_ok))
         if fr.notes:
             lines += _notes_block(fr.notes)
         lines.append("</details>")
@@ -724,11 +782,27 @@ def main(argv: Optional[List[str]] = None) -> int:
               file=sys.stderr)
         return 2
 
+    # Anything still flag-shaped is an unknown option. Silently dropping it made
+    # `--fail-onn low` run at the default threshold with `low` as a (dead) file
+    # pattern — the user's intent ignored twice over.
+    unknown = [a for a in argv if a.startswith("-") and a != "-"]
+    if unknown:
+        print(f"rulehawk gate: unknown option(s): {' '.join(unknown)}",
+              file=sys.stderr)
+        print(_USAGE, file=sys.stderr)
+        return 2
+
     patterns = [a for a in argv if not a.startswith("-")]
     if not patterns:
         print("rulehawk gate: no config files/globs given", file=sys.stderr)
         return 2
-    paths = discover(patterns)
+    paths, unmatched = discover(patterns)
+    if unmatched:
+        # Fail closed: a pattern matching nothing means a config that is never
+        # audited. Do not run a partial gate and call it green.
+        print(f"rulehawk gate: no files matched pattern(s): "
+              f"{', '.join(unmatched)}", file=sys.stderr)
+        return 2
     if not paths:
         print(f"rulehawk gate: no files matched {patterns}", file=sys.stderr)
         return 2
@@ -747,16 +821,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not quiet:
         print(to_console(gate))
 
-    if sarif_path:
-        _write(sarif_path, to_sarif(gate))
-    if json_path:
-        _emit(json_path, to_json(gate))
-    # Step summary: explicit path, else GitHub's env file when present.
-    summary_target = summary_path or os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary_target:
-        _emit(summary_target, to_markdown(gate), append=(summary_path is None))
-    if comment_path:
-        _write(comment_path, comment_body(gate))
+    try:
+        if sarif_path:
+            _write(sarif_path, to_sarif(gate))
+        if json_path:
+            _emit(json_path, to_json(gate))
+        # Step summary: explicit path, else GitHub's env file when present.
+        summary_target = summary_path or os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary_target:
+            _emit(summary_target, to_markdown(gate), append=(summary_path is None))
+        if comment_path:
+            _write(comment_path, comment_body(gate))
+    except OSError as e:
+        # An unwritable output path must read as an infra/usage error (2), not
+        # as "findings blocked this change" (1) or a traceback.
+        print(f"rulehawk gate: cannot write output: {e}", file=sys.stderr)
+        return 2
 
     return gate.exit_code()
 

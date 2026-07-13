@@ -25,9 +25,25 @@ Modeled `from` matches: source-address, destination-address, protocol/next-heade
 source-port, destination-port (single value, [ list ], lo-hi range, named service).
 Multi-value matches are expanded to the exact union of ACEs (sound). Everything
 not modeled — `application`, `tcp-flags`, prefix-lists, `address`/`port`
-(direction-agnostic), `except` exclusions, icmp-type, the `set`-display form,
-unknown `then` actions — is SURFACED as a parse note, never silently dropped
-(the engine's discipline: an unmodeled line must never become an invisible hole).
+(direction-agnostic), icmp-type, the `set`-display form, unknown `then` actions —
+is SURFACED as a parse note, never silently dropped (the engine's discipline: an
+unmodeled line must never become an invisible hole). An `except` address
+exclusion is removed from the match space (the remaining prefixes — the
+exclusion left un-subtracted — are a sound superset, marked imprecise), and an
+`inactive:`-marked term or filter is NOT enforced on the device, so it is
+skipped entirely (with a note) rather than modeled as live.
+
+PARSER CONTRACT (model.py): every emitted exact (imprecise=False) ACE's space
+must be EXACT, and the union of (exact ACEs ∪ imprecise marker space) must be a
+SUPERSET of the term's true match space — a value we cannot model exactly must
+widen its dimension (superset) or be covered by an opaque imprecise ACE, never
+narrow it (subset = invisible hole = false PASS). Partial precision below: a
+term mixing resolved address values with unresolvable named references emits
+EXACT ACEs for the resolved members (they can prove a CRITICAL) plus ONE opaque
+any/any imprecise ACE covering the unresolved remainder (it keeps the remainder
+INDETERMINATE — never PASS, never a false CRITICAL). When another imprecision
+source blocks the partial path, the unresolved dimension is widened to ANY
+instead — the same soundness, less precision.
 
 `apply-groups` (configuration-group inheritance) injects terms we cannot see:
 inside a filter body it gets a note AND a leading opaque ACE (permit ip any->any,
@@ -56,7 +72,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from .model import ACE, ANY_PORTS, PortRange, _IPNet
+from .model import ACE, ANY_PORTS, _PORTED, PortRange, _IPNet
 from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
 
 _ANY_NET: _IPNet = ipaddress.ip_network("0.0.0.0/0")
@@ -94,8 +110,8 @@ _PROTO_NUM = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6",
               "47": "gre", "50": "esp", "51": "ah", "89": "ospf"}
 
 # Cap the cartesian expansion of one term so a pathological filter can't blow up;
-# beyond it we model the first value per dimension and mark the entry imprecise
-# (+ a note), never silently dropping the rest.
+# beyond it we widen every dimension to ANY (a superset) and mark the entry
+# imprecise (+ a note) — never truncate to a subset of the values.
 _MAX_EXPAND = 256
 
 
@@ -188,82 +204,92 @@ def _proto(v: str) -> str:
     return _PROTO_NUM.get(v, v.lower())
 
 
-def _addrs(vals: List[str], label: str, notes: List[str]) -> Tuple[List[_IPNet], bool, bool]:
-    """Parse a Junos address set. Returns (nets, imprecise, has_unresolved).
+def _addrs(vals: List[str], label: str,
+           notes: List[str]) -> Tuple[List[_IPNet], bool, bool, bool]:
+    """Parse a Junos address set.
+    Returns (nets, imprecise, has_unresolved, has_except).
 
     *imprecise* is True when any value introduces an approximation — either an
-    ``except`` exclusion or an unresolvable name.
+    ``except`` exclusion or an unresolvable named reference.
 
     *has_unresolved* is True ONLY when at least one value was an unresolvable
-    named reference (address-book entry, raised ``ValueError``).  It is NOT set
-    by ``except`` clauses.  The caller uses this flag to apply partial precision:
-    emit exact ACEs for the resolved CIDR subset plus one opaque ACE for the
-    unresolved remainder.
+    named reference (address-book entry, raised ``ValueError``).  The caller
+    uses this flag to apply partial precision: emit exact ACEs for the resolved
+    CIDR subset plus one opaque ACE for the unresolved remainder — or, when
+    another imprecision source blocks that path, widen the whole dimension to
+    ANY (superset), never keep the resolved subset alone (subset = false PASS).
 
-    ``except`` (set exclusion, e.g. ``10/8 except 10.1/16``) keeps the broader
-    prefix and marks the entry imprecise (it may over-approximate).  Because the
-    resolved net is already wider than the rule's true match, the caller must not
-    emit a "precise" (non-imprecise) ACE in that case — hence ``except`` sets
-    *imprecise* but NOT *has_unresolved*."""
+    *has_except* is True when an ``except`` exclusion was seen.  The exclusion
+    EXCLUDES the prefix it follows: that prefix must never appear as matched
+    space, so it is dropped and the remaining prefixes — the exclusion left
+    un-subtracted — are a sound SUPERSET, marked imprecise.  Because those nets
+    over-approximate the true match, the caller must not emit them as "precise"
+    ACEs: ``has_except`` blocks the partial-precision path."""
     nets: List[_IPNet] = []
     imprecise = False
     has_unresolved = False
+    has_except = False
+    prev_ok = False
     for v in vals:
         if v == "except":
+            if prev_ok and nets:
+                nets.pop()                    # the preceding prefix is excluded
             imprecise = True
-            notes.append(f"unmodeled Junos 'except' address exclusion in {label} "
-                         f"(kept the broader prefix, marked imprecise — verify manually)")
+            has_except = True
+            prev_ok = False
+            notes.append(f"Junos 'except' address exclusion in {label} — excluded "
+                         f"prefix removed from the match; remainder kept "
+                         f"un-subtracted (marked imprecise — verify manually)")
             continue
         try:
-            # A bare address is a host match: /128 for v6, /32 for v4. (A v4
-            # /32 suffix on a bare v6 address would silently widen it to a v6
-            # /32 — a huge over-approximation that could mint a false CRITICAL.)
-            if "/" not in v:
-                v = f"{v}/128" if ":" in v else f"{v}/32"
+            # ip_network() on a bare address yields the host route (/32 for v4,
+            # /128 for v6) — never widen a bare v6 address to a /32 (a huge
+            # over-approximation that could mint a false CRITICAL).
             nets.append(ipaddress.ip_network(v, strict=False))
+            prev_ok = True
         except ValueError:
             # Can't parse this address — it is a named address-book reference
             # that isn't defined in the config snippet we received.  Skipping it
-            # alone would let an all-bad set fall back to ANY and over-approximate,
-            # which could falsely prove a later deny dead.  Mark imprecise so this
-            # ACE is never used to prove another rule dead (trust > coverage), and
-            # set has_unresolved so the caller can apply the partial-precision
-            # pattern (emit exact ACEs for the other resolved members).
+            # alone would model a SUBSET of the term's true space (the parser-
+            # contract breaker).  Mark imprecise so this term can never prove
+            # another rule dead, and set has_unresolved so the caller applies
+            # the partial-precision pattern (or widens the dimension to ANY).
             imprecise = True
             has_unresolved = True
+            prev_ok = False
             notes.append(f"unparsed Junos address '{v}' in {label} "
                          f"(marked imprecise — verify manually)")
-    return nets, imprecise, has_unresolved
+    return nets, imprecise, has_unresolved, has_except
 
 
 def _ports(vals: List[str], label: str, key: str,
            notes: List[str]) -> Tuple[List[PortRange], bool]:
     """Parse a Junos port set. Returns (ranges, imprecise).
 
-    A value we cannot parse is skipped with a note AND flips imprecise: an
-    all-unparsed port set otherwise falls back to ANY (in _parse_term) and
-    could falsely prove a later deny rule dead — the trust-breaking case."""
+    The whole token is tried as a named/numeric port FIRST — `ftp-data` is
+    port 20, not a range — and only then split as lo-hi (each side may itself
+    be a service name). An unparseable value widens the whole dimension to ANY:
+    skipping just that member would model a SUBSET of the term's true space,
+    and a narrowed deny can be falsely proven dead."""
     ranges: List[PortRange] = []
-    imprecise = False
+    widen = False
     for v in vals:
+        p = _port_num(v)
+        if p >= 0:
+            ranges.append(PortRange(p, p))
+            continue
         if "-" in v and not v.startswith("-"):
             lo, hi = v.split("-", 1)
             ln, hn = _port_num(lo), _port_num(hi)
-            if ln < 0 or hn < 0:
-                imprecise = True
-                notes.append(f"unparsed Junos {key} '{v}' in {label} "
-                             f"(marked imprecise — verify manually)")
+            if ln >= 0 and hn >= 0:
+                ranges.append(PortRange(min(ln, hn), max(ln, hn)))
                 continue
-            ranges.append(PortRange(min(ln, hn), max(ln, hn)))
-        else:
-            p = _port_num(v)
-            if p < 0:
-                imprecise = True
-                notes.append(f"unparsed Junos {key} '{v}' in {label} "
-                             f"(marked imprecise — verify manually)")
-                continue
-            ranges.append(PortRange(p, p))
-    return ranges, imprecise
+        widen = True
+        notes.append(f"unparsed Junos {key} '{v}' in {label} "
+                     f"(dimension widened to ANY, marked imprecise — verify manually)")
+    if widen:
+        ranges = [ANY_PORTS]
+    return ranges, widen
 
 
 @dataclass
@@ -282,31 +308,30 @@ class _Match:
     has_unresolved_dst: bool = False   # ≥1 dst address was an unresolved named ref
     other_imprecise: bool = False      # imprecision from any source EXCEPT unresolved
                                        # named addresses (e.g. except-clauses, port
-                                       # parse failures, unmodeled match keys).  When
-                                       # True the resolved-address subset is NOT exactly
-                                       # bounded, so partial-precision emission is blocked.
+                                       # parse failures, tcp-flags, unmodeled match
+                                       # keys).  When True the resolved-address subset
+                                       # is NOT exactly bounded, so partial-precision
+                                       # emission is blocked.
 
 
 def _parse_from(from_toks: List[str], label: str, notes: List[str]) -> _Match:
     m = _Match()
     for key, vals in _read_conditions(from_toks):
         if key in ("source-address",):
-            nets, imp, has_unres = _addrs(vals, label, notes)
+            nets, imp, has_unres, has_exc = _addrs(vals, label, notes)
             m.srcs += nets
             m.imprecise |= imp
             m.has_unresolved_src |= has_unres
-            # An except-clause over-approximates the resolved net (the broader
-            # prefix is kept, not the subset after exclusion), so partial-precision
-            # emission is blocked — flag as other_imprecise.
-            if imp and not has_unres:
-                m.other_imprecise = True
+            # An except-clause over-approximates the remaining nets (exclusion
+            # left un-subtracted), so partial-precision emission is blocked —
+            # a "precise" ACE would over-claim.
+            m.other_imprecise |= has_exc
         elif key in ("destination-address",):
-            nets, imp, has_unres = _addrs(vals, label, notes)
+            nets, imp, has_unres, has_exc = _addrs(vals, label, notes)
             m.dsts += nets
             m.imprecise |= imp
             m.has_unresolved_dst |= has_unres
-            if imp and not has_unres:
-                m.other_imprecise = True
+            m.other_imprecise |= has_exc
         elif key in ("protocol", "next-header"):
             m.protos += [_proto(v) for v in vals]
         elif key == "source-port":
@@ -321,11 +346,19 @@ def _parse_from(from_toks: List[str], label: str, notes: List[str]) -> _Match:
             m.dports += pr
             m.imprecise |= imp
             m.other_imprecise |= imp
-        elif key in ("tcp-established", "tcp-flags", "tcp-initial"):
-            # return-traffic / flag match — like Cisco `established`: not a new flow.
+        elif key in ("tcp-established", "established"):
+            # return-traffic only — like Cisco `established`: not a new flow.
             m.stateful = True
             notes.append(f"Junos '{key}' in {label} modeled as stateful "
                          f"(return-traffic only; never used to prove a rule dead)")
+        elif key in ("tcp-flags", "tcp-initial"):
+            # A generic flag match CAN match new-flow SYNs — modeling it as
+            # stateful would hide the term from the segmentation witness search
+            # (false PASS). It narrows an unmodeled dimension: over-approximate.
+            m.imprecise = True
+            m.other_imprecise = True
+            notes.append(f"Junos '{key}' in {label} not modeled — flag restriction "
+                         f"ignored (over-approximated, marked imprecise)")
         elif key in ("address", "port", "icmp-type", "icmp-code"):
             # direction-agnostic / typed matches we can't place in the rectangle:
             # over-approximate (mark imprecise) so it's never used to prove deadness.
@@ -423,32 +456,30 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
     sports = m.sports or [ANY_PORTS]
     dports = m.dports or [ANY_PORTS]
     imprecise = m.imprecise
+    other_imprecise = m.other_imprecise
+
+    if (m.sports or m.dports) and any(p not in _PORTED for p in protos):
+        # covers()/segcheck ignore ports on a non-port-carrying protocol
+        # (including an omitted protocol -> "ip"), so those ACEs would claim an
+        # exact all-ports space: widen the ports (superset) and flag imprecise.
+        # This also blocks partial precision (the port space is approximate).
+        imprecise = True
+        other_imprecise = True
+        notes.append(f"Junos term {label}: port match on a non-port-carrying "
+                     f"protocol — ports widened to ANY for those protocols "
+                     f"(marked imprecise — verify manually)")
 
     cap_exceeded = False
     if len(srcs) * len(dsts) * len(protos) * len(sports) * len(dports) > _MAX_EXPAND:
-        notes.append(f"Junos term {label} expands to >{_MAX_EXPAND} rules; modeled "
-                     f"the first value per match and marked imprecise — verify manually")
-        srcs, dsts, protos = srcs[:1], dsts[:1], protos[:1]
-        sports, dports = sports[:1], dports[:1]
+        # Truncating to the first value per dimension would model a SUBSET
+        # (dropped members become invisible holes): widen everything instead.
+        notes.append(f"Junos term {label} expands to >{_MAX_EXPAND} rules; widened "
+                     f"to a single any/any rule (superset) and marked imprecise "
+                     f"— verify manually")
+        srcs, dsts, protos = [fam_any], [fam_any], ["ip"]
+        sports, dports = [ANY_PORTS], [ANY_PORTS]
         imprecise = True
         cap_exceeded = True
-
-    if (any(p not in ("tcp", "udp") for p in protos)
-            and (m.sports or m.dports)):
-        notes.append(f"Junos term {label}: port match on a non-tcp/udp protocol — "
-                     f"ports ignored for those protocols (verify manually)")
-
-    # (src, dst) pairs to emit. When exactly one side fell back to "any", the
-    # fallback takes the IP VERSION OF THE GIVEN SIDE, so the ACE is always
-    # internally version-consistent (a v4-src/v6-dst ACE matches nothing and
-    # would be an invisible hole). Covers family-less snippets: a lone v6
-    # source-address still gets a ::/0 destination, never 0.0.0.0/0.
-    if m.srcs and not m.dsts:
-        pairs = [(s, _ANY6_NET if s.version == 6 else _ANY_NET) for s in srcs]
-    elif m.dsts and not m.srcs:
-        pairs = [(_ANY6_NET if d.version == 6 else _ANY_NET, d) for d in dsts]
-    else:
-        pairs = [(s, d) for s in srcs for d in dsts]
 
     # --- Partial-precision path -----------------------------------------------
     # When at least one source-address or destination-address value was an
@@ -469,15 +500,40 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
     #       source/destination space and risk a false CRITICAL.
     _do_partial = (
         (m.has_unresolved_src or m.has_unresolved_dst)  # at least one unresolved name
-        and not m.other_imprecise                         # no other approximation source
+        and not other_imprecise                           # no other approximation source
         and not cap_exceeded                              # _MAX_EXPAND cap not hit
         and (not m.has_unresolved_src or bool(m.srcs))   # partial src: resolved srcs exist
         and (not m.has_unresolved_dst or bool(m.dsts))   # partial dst: resolved dsts exist
     )
+
+    if not _do_partial and not cap_exceeded:
+        # Blocked/normal path: a dimension holding unresolved names is widened
+        # to the family ANY. Keeping only the resolved subset would model a
+        # SUBSET of the term's true space (the unresolved members add unknown
+        # space) and segcheck could skip the permit entirely — a false PASS.
+        # ANY ⊇ true match restores the over-approximation invariant; the term
+        # is imprecise here, so ANY can never prove a violation or deadness.
+        if m.has_unresolved_src:
+            srcs = [fam_any]
+        if m.has_unresolved_dst:
+            dsts = [fam_any]
+
+    # (src, dst) pairs to emit. When exactly one side fell back to "any", the
+    # fallback takes the IP VERSION OF THE GIVEN SIDE, so the ACE is always
+    # internally version-consistent (a v4-src/v6-dst ACE matches nothing and
+    # would be an invisible hole). Covers family-less snippets: a lone v6
+    # source-address still gets a ::/0 destination, never 0.0.0.0/0.
+    if m.srcs and not m.dsts:
+        pairs = [(s, _ANY6_NET if s.version == 6 else _ANY_NET) for s in srcs]
+    elif m.dsts and not m.srcs:
+        pairs = [(_ANY6_NET if d.version == 6 else _ANY_NET, d) for d in dsts]
+    else:
+        pairs = [(s, d) for s in srcs for d in dsts]
+
     if _do_partial:
         n_precise = 0
         for proto in protos:
-            ported = proto in ("tcp", "udp")
+            ported = proto in _PORTED
             for s, d in pairs:
                 for sp in (sports if ported else [ANY_PORTS]):
                     for dp in (dports if ported else [ANY_PORTS]):
@@ -506,7 +562,7 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
 
     # Normal (non-partial) path — existing behaviour.
     for proto in protos:
-        ported = proto in ("tcp", "udp")
+        ported = proto in _PORTED
         for s, d in pairs:
             for sp in (sports if ported else [ANY_PORTS]):
                 for dp in (dports if ported else [ANY_PORTS]):
@@ -651,6 +707,15 @@ def _walk(toks: List[str], entries: List[ACE], notes: List[str],
             fam = toks[i + 1]
             fam_body, i = _read_block(toks, i + 2)
             _walk(fam_body, entries, notes, term_lines, fam)
+        elif (toks[i] == "inactive:" and i + 3 < n and toks[i + 1] == "filter"
+                and toks[i + 3] == "{"):
+            # An `inactive:`-marked filter is deactivated — NONE of its terms
+            # are enforced. Parsing it would let a deactivated deny block the
+            # witness (false PASS). Skipped entirely, surfaced as a note.
+            fname = toks[i + 2]
+            _, i = _read_block(toks, i + 3)
+            notes.append(f"Junos filter {fname} is inactive (deactivated) — "
+                         f"not enforced; skipped")
         # A filter DEFINITION is `filter NAME {`. An *applied* filter
         # (`filter input NAME;` or `filter { input NAME; }` on an interface)
         # is not followed by NAME + `{`, so the guard below skips it.

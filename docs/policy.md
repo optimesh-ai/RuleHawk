@@ -24,6 +24,10 @@ Pass it with `--policy path/to/policy.json` (CLI) or the `policy:` input (Action
       "ports": [<int>, ...]     // optional — default: all ports
     },
     ...
+  ],
+  "must_reach": [               // optional — POSITIVE connectivity assertions
+    { "src": "...", "dst": "...", "proto": "...", "ports": [...] },
+    ...
   ]
 }
 ```
@@ -56,6 +60,50 @@ assertion); use `tcp`/`udp` + `ports` when only specific services are forbidden.
 is not valid in the policy; that belongs in the *config*, not the policy). List the
 exact ports: `"ports": [445, 3389, 22, 1433]`. Omit `ports` to forbid all ports of
 that protocol.
+
+### `must_reach` — deployment / vendor connectivity prechecks
+The mirror of `must_not_reach`: each entry declares a flow that **must be
+possible** — the shape of a third-party rollout precheck ("workstations must
+reach the proxy egress ranges", "the appliance must reach its update CDN").
+Same fields, same exact search engine, flipped labeling:
+
+- **`connectivity-ok`** (info) — **every** declared combination (each listed
+  port × each src-subnet × each dst-subnet) is provably permitted; reported
+  with a concrete witness packet and the permitting rule + line, the evidence
+  you attach to the change ticket before a rollout. One reachable port is
+  never taken as proof for its siblings — `ports: [500, 4500]` with 4500
+  blocked is `connectivity-broken`, naming the failing combination.
+- **`connectivity-broken`** (high — **blocks the gate** at the default
+  threshold) — *no* parsed ruleset permits any packet of the flow; the
+  deployment traffic will be dropped at the filter layer.
+- **`connectivity-indeterminate`** (medium, fail-closed) — a rule on the path
+  uses an unmodeled form; the flow is never claimed open on a guess.
+
+**Proxy example (Zscaler-style egress):** before cutting user traffic over to
+a cloud proxy, assert the egress firewall actually permits the tunnel/proxy
+flows. Substitute your vendor's published ranges (for Zscaler, take the ZEN
+ranges for your cloud from config.zscaler.com — they change, so keep the zone
+definition in version control next to the configs):
+
+```json
+{
+  "zones": {
+    "USERS":       ["10.20.0.0/16"],
+    "ZSCALER_ZEN": ["185.46.212.0/23", "104.129.192.0/20"]
+  },
+  "must_reach": [
+    { "src": "USERS", "dst": "ZSCALER_ZEN", "proto": "tcp", "ports": [80, 443, 9400, 9480] },
+    { "src": "USERS", "dst": "ZSCALER_ZEN", "proto": "udp", "ports": [443] }
+  ]
+}
+```
+
+**Scope caveat (read this):** `connectivity-ok` proves the **filter layer does
+not block the flow** in the audited configs. RuleHawk does not model routing,
+NAT, or the proxy itself (see the README's *Scope & limits*) — it is the
+firewall-side precheck, not an end-to-end path proof. For path grounding
+against a forwarding model, combine with `--hh-snapshot`/`--hh-from`
+(Hammerhead path-grounding).
 
 ## Examples
 
@@ -102,6 +150,10 @@ that protocol.
 
 ## What RuleHawk reports per assertion
 
+For `must_reach` entries: `connectivity-ok` (info, witness packet),
+`connectivity-broken` (high), `connectivity-indeterminate` (medium) — see the
+section above. For `must_not_reach` entries:
+
 - **`segmentation-violation`** (critical) — the config permits a concrete witness
   packet across the boundary; reported with the exact packet and the rule that
   allowed it. An earlier `deny`/`DROP` that already blocks the flow yields **no**
@@ -112,16 +164,23 @@ that protocol.
   guess "isolated."
 - **`segmentation-ok`** (info) — proven isolated: no permitted witness flow exists.
   This is a positive attestation, not just the absence of a finding.
+- **`segmentation-error`** (high) — the policy itself is invalid: a
+  `src`/`dst` naming a zone that isn't defined, an unparseable CIDR in `zones`,
+  or an unusable `ports` value. RuleHawk **fails closed**: the affected
+  assertion is never given a PASS until the policy is fixed (a typo must not
+  certify isolation over an empty search space).
 
 ## Gotchas
 
 - **Zone names must match exactly.** A `src`/`dst` that isn't a key in `zones`
-  contributes no networks to test, so the assertion vacuously "passes." Keep the
-  policy and your zone inventory in sync (the worked example pairs the policy with
-  `docs/architecture.md` for this reason).
-- **`proto` and port values are not validated** — an unknown protocol simply won't
-  match any rule (effectively a vacuous pass). Stick to the protocols above.
-- **`ports` apply to `tcp`/`udp`.** With `proto: "ip"`, ports are ignored (all
-  traffic is forbidden, which is the point).
+  raises `segmentation-error` (high) — it can never vacuously "pass."
+- **Ports may be integers or numeric strings** (`[445]` and `["445"]` both
+  work); anything else is a `segmentation-error`. There is **no range
+  syntax** in the policy.
+- **`ports` with `proto: "ip"`** restricts the check to port-carrying protocols
+  (tcp/udp/sctp/...). Omit `ports` for total isolation.
+- An unknown `proto` value is probed as-written: only wildcard (`ip`-proto)
+  rules can match it, so a `permit ip any any` still trips it, but a typo like
+  `"tpc"` will not match your tcp rules — stick to the protocols listed above.
 - The policy declares **forbidden** flows. Everything not forbidden is allowed by
   the policy; the configs decide what is actually permitted.

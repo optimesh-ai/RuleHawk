@@ -9,7 +9,7 @@ from .pathground import (HammerheadReachOracle, Reach, Witness, parse_witness,
                          path_ground)
 from .report import to_json, to_text
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = ["ACE", "Finding", "analyze", "score", "covers", "parse_acls",
            "parse_iptables", "parse_junos", "parse_panos", "to_json", "to_text",
            "HammerheadReachOracle", "Reach", "Witness", "parse_witness",

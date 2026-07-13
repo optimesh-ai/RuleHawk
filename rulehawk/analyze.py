@@ -23,7 +23,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Dict, List, Optional, Tuple
 
-from .model import (ACE, _WILDCARD_PROTO, _compatible_coverer, covered_dimensions,
+from .model import (ACE, _PORTED, _WILDCARD_PROTO, _compatible_coverer, covered_dimensions,
                     covers, _union_covers)
 
 # Max compatible earlier rules considered when testing cumulative coverage. Beyond
@@ -91,6 +91,13 @@ def _union_shadow(b: ACE, earlier: List[ACE]) -> Optional[Tuple[str, str, List[A
     coverers that each span all of b.dst whose srcs union to b.src (Case A), or
     the symmetric Case B. Reached only when no SINGLE rule already covers b, so a
     genuine union needs >=2 rules."""
+    if b.imprecise and b.proto in _PORTED and not (
+            b.src_port.is_any() and b.dst_port.is_any()):
+        # Mirrors covers(): an imprecise b with CONSTRAINED ports may be
+        # under-approximated in the port dimension (partial-precision `eq
+        # known <unknown-service>`), so its modeled ports must not anchor a
+        # dead-rule proof.
+        return None
     coverers = [a for a in earlier if _compatible_coverer(a, b)]
     if len(coverers) < 2:
         return None
@@ -117,14 +124,27 @@ def _union_shadow(b: ACE, earlier: List[ACE]) -> Optional[Tuple[str, str, List[A
     return ("union-shadowed-permit-dead", "high", chosen)
 
 
+# Message key: kind, plus "+mixed" when the covering union mixes permits AND
+# denies. A mixed union still proves the rule dead, but only PART of its traffic
+# gets the opposite action — the message must not claim ALL of it does.
 _UNION_MSG = {
     "union-shadowed-deny-dead": (
         "This deny NEVER takes effect — earlier rules {seqs} cumulatively "
         "already allow the same traffic. The traffic you meant to block is ALLOWED.",
         "make the deny match only traffic not already permitted, or move it above rules {seqs}"),
+    "union-shadowed-deny-dead+mixed": (
+        "This deny NEVER takes effect — earlier rules {seqs} cumulatively "
+        "match all of its traffic first. The part matched by the earlier "
+        "permit(s) is ALLOWED despite this deny.",
+        "make the deny match only traffic not already permitted, or move it above rules {seqs}"),
     "union-shadowed-permit-dead": (
         "This permit NEVER takes effect — earlier rules {seqs} cumulatively "
         "already drop the same traffic. Likely a silent connectivity loss.",
+        "move rule {seq} above rules {seqs}, or narrow them"),
+    "union-shadowed-permit-dead+mixed": (
+        "This permit NEVER takes effect — earlier rules {seqs} cumulatively "
+        "match all of its traffic first. The part matched by the earlier "
+        "deny(s) is silently DROPPED.",
         "move rule {seq} above rules {seqs}, or narrow them"),
     "union-redundant": (
         "Rule is redundant — its traffic is already fully handled by earlier "
@@ -179,7 +199,10 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
             if u:
                 kind, sev, chosen = u
                 seqs = ", ".join(str(a.seq) for a in sorted(chosen, key=lambda x: x.seq))
-                msg, fix_tmpl = _UNION_MSG[kind]
+                # A mixed union (permits AND denies) must not over-claim what
+                # happens to the traffic — pick the "+mixed" message variant.
+                mixed = len({a.action for a in chosen}) > 1
+                msg, fix_tmpl = _UNION_MSG[kind + "+mixed" if mixed else kind]
                 # Annotate the covered rule's seq reference with its file line when
                 # known — the {seq} placeholder in the template refers to b.
                 seq_with_line = f"{b.seq}{_line_sfx(b.line)}"
@@ -203,7 +226,10 @@ def _analyze_one_acl(aces: List[ACE]) -> List[Finding]:
                     f"permit {b.proto} any any — allows ALL traffic; defeats the ACL.",
                     b.raw, fix="replace with least-privilege permits + a default deny",
                     line=b.line))
-            else:
+            elif b.src_port.is_any() and b.dst_port.is_any():
+                # Port-scoped any/any rules (e.g. `permit tcp any any eq 443`)
+                # are NOT "all <proto> between any hosts" — the risky ones are
+                # already covered by the dangerous-exposure/ssh-exposure checks.
                 findings.append(Finding(
                     _id(b), "broad-any-any", "high",
                     f"permit {b.proto} any any — very broad; allows all {b.proto} "

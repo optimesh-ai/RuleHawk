@@ -228,10 +228,12 @@ def test_unknown_eq_service_name_marks_imprecise():
 
 def test_unknown_eq_service_name_does_not_false_pass_segmentation():
     # The unresolvable name could be ANY port (including the forbidden one), so
-    # the assertion must come back indeterminate, never PASS.
+    # the assertion must come back indeterminate, never PASS. (`exec` used to be
+    # the unknown name here, but it is a real IOS service (512) and is now in
+    # _NAMED_PORTS — use a name no vendor defines.)
     aces, _ = parse_acls(
         "ip access-list extended OUT\n"
-        " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq www exec\n")
+        " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq www frobnicate\n")
     kinds = _seg_kinds(aces)
     assert "segmentation-ok" not in kinds
     assert "segmentation-indeterminate" in kinds
@@ -285,3 +287,25 @@ def test_show_access_list_hitcnt_residue_fails_closed():
         "(hitcnt=1234) 0xabcd1234\n")
     assert len(aces) == 1 and aces[0].imprecise is True
     assert any("unrecognized trailing qualifier" in n for n in notes)
+
+
+def test_unknown_eq_service_name_is_never_proven_dead():
+    # The partial-precision ACE for `eq www <unknown>` models port 80 exactly
+    # and flags imprecise for the unknown extra — its TRUE space may include a
+    # port the model doesn't show, so no earlier rule (nor union of rules) may
+    # prove it redundant/dead from the modeled ports alone. Deleting it on that
+    # advice would sever the unknown service.
+    from rulehawk.analyze import analyze
+    aces, _ = parse_acls(
+        "ip access-list extended T\n"
+        " permit tcp any any eq 80\n"
+        " permit tcp any any eq www frobnicate\n")
+    kinds = {f.kind for f in analyze(aces)}
+    assert "redundant" not in kinds and "union-redundant" not in kinds
+    assert not any(k.endswith("-dead") for k in kinds)
+    # ...while a genuinely exact duplicate is still called redundant.
+    aces2, _ = parse_acls(
+        "ip access-list extended T\n"
+        " permit tcp any any eq 80\n"
+        " permit tcp any any eq 80\n")
+    assert "redundant" in {f.kind for f in analyze(aces2)}
