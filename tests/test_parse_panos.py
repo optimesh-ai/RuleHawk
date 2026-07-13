@@ -421,3 +421,170 @@ def test_negate_source_repro_indeterminate_not_pass():
     # space, so it must be INDETERMINATE (review manually), never CRITICAL.
     assert "segmentation-indeterminate" in kinds
     assert "segmentation-violation" not in kinds
+
+
+# ── Rulebase phase ordering: pre-rulebase < local rulebase < post-rulebase ─────
+# PAN-OS evaluates security rules pre-rulebase -> device-local rulebase ->
+# post-rulebase (Panorama pushes pre/post around the firewall's own rules).
+# Emitting in TEXTUAL first-appearance order let a pre-rulebase deny that appears
+# after a local allow (or a post-rulebase deny before a local allow) land on the
+# wrong side of first-match -> a false verdict. ACEs must be ordered by phase.
+
+def test_pre_rulebase_deny_isolates_before_local_allow():
+    # A pre-rulebase deny appearing textually AFTER a local allow still runs
+    # FIRST on the device, so the flow is ISOLATED. Textual order kept the allow
+    # first -> a false segmentation-violation.
+    cfg = """
+    set rulebase security rules allow-web from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action allow
+    set pre-rulebase security rules block from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action deny
+    """
+    aces, _ = parse_panos(cfg)
+    # pre-rulebase deny emitted first (seq 1), local allow second.
+    assert [a.action for a in aces] == ["deny", "permit"]
+    assert aces[0].seq < aces[1].seq
+    kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
+    assert "segmentation-ok" in kinds, (
+        "pre-rulebase deny runs before the local allow -> flow is isolated")
+    assert "segmentation-violation" not in kinds
+
+
+def test_post_rulebase_deny_runs_after_local_allow_no_false_ok():
+    # post-rulebase runs LAST. A post-rulebase deny appearing textually BEFORE a
+    # local allow does NOT block it -> the allow wins and the flow leaks. Phase
+    # ordering must not let the post deny falsely certify isolation.
+    cfg = """
+    set post-rulebase security rules block from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action deny
+    set rulebase security rules allow-all from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action allow
+    """
+    aces, _ = parse_panos(cfg)
+    # local rulebase (main) emitted before post-rulebase.
+    assert [a.action for a in aces] == ["permit", "deny"]
+    kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
+    assert "segmentation-violation" in kinds, (
+        "the local allow wins; a post-rulebase deny runs too late to isolate")
+    assert "segmentation-ok" not in kinds
+
+
+def test_textual_order_preserved_within_a_phase():
+    # Phase ordering is a STABLE reorder: rules in the same phase keep textual
+    # order, so an early allow still shadows a later deny for the same flow.
+    cfg = """
+    set rulebase security rules allow-first from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action allow
+    set rulebase security rules deny-second from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action deny
+    """
+    aces, _ = parse_panos(cfg)
+    assert [a.action for a in aces] == ["permit", "deny"]
+    kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
+    assert "segmentation-violation" in kinds
+
+
+# ── Per-vsys / device-group scoping: independent first-match contexts ─────────
+# `set vsys NAME rulebase ...` (and `device-group NAME`) belongs to a SEPARATE
+# rulebase. Ignoring the scope segment merged same-named rules across vsys into
+# one garbled rule (8 permits from 2 rules, the deny action lost). Each scope
+# must become its own `acl` so segcheck searches it in isolation.
+
+def test_two_vsys_are_independent_contexts_deny_not_lost():
+    # vsys1 denies CORP->PCI, vsys2 permits it. They are DIFFERENT rules in
+    # DIFFERENT contexts -> exactly 2 ACEs (deny + permit), not 8 merged permits,
+    # and the deny action survives. vsys2's allow is a real independent leak.
+    cfg = """
+    set vsys vsys1 rulebase security rules r from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action deny
+    set vsys vsys2 rulebase security rules r from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action allow
+    """
+    aces, _ = parse_panos(cfg)
+    assert len(aces) == 2
+    by_acl = {a.acl: a for a in aces}
+    assert set(by_acl) == {"security/vsys1", "security/vsys2"}
+    assert by_acl["security/vsys1"].action == "deny"     # deny NOT lost to merge
+    assert by_acl["security/vsys2"].action == "permit"
+    kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
+    assert "segmentation-violation" in kinds, (
+        "vsys2 independently permits CORP->PCI:445 -> a real leak")
+
+
+def test_two_vsys_independent_must_reach_not_merged():
+    # must_reach direction: each vsys is its own first-match context. vsys2 fully
+    # permits CORP->PCI, so the path is OPEN (connectivity-ok) regardless of
+    # vsys1's deny. Merging the two into one ACL would put vsys1's deny in front
+    # of vsys2's permit and falsely report the flow BROKEN.
+    cfg = """
+    set vsys vsys1 rulebase security rules block from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action deny
+    set vsys vsys2 rulebase security rules allow from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action allow
+    """
+    aces, _ = parse_panos(cfg)
+    assert {a.acl for a in aces} == {"security/vsys1", "security/vsys2"}
+    pol = {"zones": _SEG_POLICY["zones"],
+           "must_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp",
+                           "ports": [443]}]}
+    kinds = {f.kind for f in check_segmentation(aces, pol)}
+    assert "connectivity-ok" in kinds, (
+        "vsys2 independently permits the whole flow -> path is open")
+    assert "connectivity-broken" not in kinds
+
+
+def test_device_group_scope_is_independent_context():
+    # `device-group NAME` scopes the same way as vsys (Panorama pushes).
+    cfg = """
+    set device-group DG-A rulebase security rules r from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action allow
+    """
+    aces, _ = parse_panos(cfg)
+    assert len(aces) == 1 and aces[0].acl == "security/DG-A"
+    kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
+    assert "segmentation-violation" in kinds
+
+
+def test_pre_post_ordering_is_per_vsys():
+    # Phase ordering is scoped per vsys: vsys1's pre-rulebase deny is emitted
+    # before its own local allow, while vsys2 is untouched.
+    cfg = """
+    set vsys vsys1 rulebase security rules r from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action allow
+    set vsys vsys1 pre-rulebase security rules guard from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action deny
+    set vsys vsys2 rulebase security rules r from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action allow
+    """
+    aces, _ = parse_panos(cfg)
+    v1 = [a for a in aces if a.acl == "security/vsys1"]
+    v2 = [a for a in aces if a.acl == "security/vsys2"]
+    assert [a.action for a in v1] == ["deny", "permit"]   # pre before main, per vsys
+    assert [a.action for a in v2] == ["permit"]
+
+
+# ── Multi-line service definition: ports UNION, never last-wins ───────────────
+# `set service s protocol tcp port 443` then `... port 445` — on the device `s`
+# now matches BOTH ports (a set on a list node appends). Last-wins kept only 445,
+# so a must_not_reach on 443 FALSE-PASSED. Ports must accumulate to the union.
+
+def test_multiline_service_ports_accumulate_no_false_pass():
+    cfg = """
+    set service s protocol tcp port 443
+    set service s protocol tcp port 445
+    set rulebase security rules leak from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service s action allow
+    """
+    aces, _ = parse_panos(cfg)
+    # Both declared ports are modeled, each an exact ACE.
+    assert {(a.dst_port.lo, a.dst_port.hi) for a in aces} == {(443, 443), (445, 445)}
+    assert all(a.proto == "tcp" and a.imprecise is False for a in aces)
+    # must_not_reach on the port the last-wins bug DROPPED (443): must NOT PASS.
+    pol443 = {"zones": _SEG_POLICY["zones"],
+              "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp",
+                                  "ports": [443]}]}
+    kinds443 = {f.kind for f in check_segmentation(aces, pol443)}
+    assert "segmentation-ok" not in kinds443, (
+        "dropped port 443 must not certify isolation")
+    assert "segmentation-violation" in kinds443
+    # The retained port (445) still leaks too.
+    kinds445 = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
+    assert "segmentation-violation" in kinds445
+
+
+def test_multiline_service_single_line_list_still_unions():
+    # Regression guard: the single-LINE `port 443,445` case is unchanged, and a
+    # following multi-LINE `port 8443` extends it (union of all three).
+    cfg = """
+    set service s protocol tcp port 443,445
+    set service s protocol tcp port 8443
+    set rulebase security rules r from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service s action allow
+    """
+    aces, _ = parse_panos(cfg)
+    assert {a.dst_port.lo for a in aces} == {443, 445, 8443}
+    assert all(a.proto == "tcp" and a.imprecise is False for a in aces)

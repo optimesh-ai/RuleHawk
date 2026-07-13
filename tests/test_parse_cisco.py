@@ -349,3 +349,22 @@ def test_mixed_numbered_and_unnumbered_acl_keeps_text_order():
         " 10 permit tcp any any eq 80\n"
         " deny ip any any\n")
     assert [a.action for a in aces] == ["permit", "deny"]
+
+
+def test_asa_any4_any6_parse_exact():
+    # ASA writes any4/any6 explicitly; they must be exact 0.0.0.0/0 / ::/0,
+    # not degrade to an opaque imprecise ACE.
+    a4, _ = parse_acls("access-list OUT extended permit tcp any4 any4 eq 445\n")
+    assert str(a4[0].src) == "0.0.0.0/0" and a4[0].imprecise is False
+    a6, _ = parse_acls("access-list OUT extended permit tcp any6 any6 eq 445\n")
+    assert str(a6[0].src) == "::/0" and a6[0].imprecise is False
+
+
+def test_mixed_case_keywords_parse_exact():
+    # Cisco keywords are case-insensitive; HOST/ANY/EQ/TCP/WWW must parse exact.
+    aces, _ = parse_acls(
+        "ip access-list extended T\n permit TCP HOST 10.20.0.1 ANY EQ WWW\n")
+    assert str(aces[0].src) == "10.20.0.1/32"
+    assert str(aces[0].dst) == "0.0.0.0/0"
+    assert str(aces[0].dst_port) == "80" and aces[0].proto == "tcp"
+    assert aces[0].imprecise is False

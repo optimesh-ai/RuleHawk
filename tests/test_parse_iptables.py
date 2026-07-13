@@ -1097,3 +1097,150 @@ class TestImpreciseMarkingBranches:
             "imprecise flag — RuleHawk certified isolation it cannot prove")
         assert "segmentation-indeterminate" in kinds
         assert any("negated destination" in n and "imprecise" in n for n in notes)
+
+
+# ── RH-iptables soundness regression: -I / -R first-match ORDER ────────────────
+# `iptables -I CHAIN [N]` inserts a rule at position N (default 1 = the very
+# front); `-R CHAIN N` replaces the rule at position N. The old frontend APPENDED
+# both at the end, INVERTING first-match order — a `-I CHAIN 1 ... -j ACCEPT`
+# ahead of a deny was modeled as deny-then-permit and segcheck FALSE-PASSed the
+# leak (the unsound direction). The parser contract (model.py) requires the
+# emitted per-chain ACEs to be in true device order with monotonic `seq`; these
+# tests pin the SOUND end-to-end verdict through check_segmentation.
+
+# CORP(10.20/16) must not reach ZONE99(10.99/16) — the task's repro address pair.
+_INSERT_POLICY = {
+    "zones": {"CORP": ["10.20.0.0/16"], "Z99": ["10.99.0.0/16"]},
+    "must_not_reach": [{"src": "CORP", "dst": "Z99", "proto": "ip"}],
+}
+
+
+def _fwd_ordered(aces):
+    return sorted((a for a in aces if a.acl == "FORWARD" and "policy" not in a.raw),
+                  key=lambda a: a.seq)
+
+
+def test_insert_index1_drop_before_accept_isolates():
+    """The task's repro: `-I FORWARD 1 ... -j DROP` lands the DROP at the FRONT,
+    before the earlier ACCEPT. On the device the flow is DROPPED (isolated), so
+    segcheck must yield segmentation-ok. The old append-at-end modeled ACCEPT
+    first and over-reported a leak."""
+    cfg = ("iptables -P FORWARD DROP\n"
+           "iptables -A FORWARD -s 10.20.0.0/16 -d 10.99.0.0/16 -j ACCEPT\n"
+           "iptables -I FORWARD 1 -s 10.20.0.0/16 -d 10.99.0.0/16 -j DROP\n")
+    aces, _ = parse_iptables(cfg)
+    fwd = _fwd_ordered(aces)
+    assert [a.action for a in fwd] == ["deny", "permit"], \
+        "the inserted DROP must occupy the FRONT (seq before the ACCEPT)"
+    assert fwd[0].seq < fwd[1].seq                     # seq monotonic in device order
+    kinds = {f.kind for f in check_segmentation(aces, _INSERT_POLICY)}
+    assert "segmentation-ok" in kinds
+    assert "segmentation-violation" not in kinds
+
+
+def test_insert_index1_permit_before_deny_is_violation_not_false_pass():
+    """The DANGEROUS direction: `-I FORWARD 1 ... -j ACCEPT` inserts a permit
+    ahead of a deny. On the device the flow is PERMITTED — a real leak. The old
+    frontend appended the ACCEPT last, behind the DROP, and FALSE-PASSed. It must
+    now surface as a segmentation-violation."""
+    cfg = ("iptables -P FORWARD DROP\n"
+           "iptables -A FORWARD -s 10.20.0.0/16 -d 10.99.0.0/16 -j DROP\n"
+           "iptables -I FORWARD 1 -s 10.20.0.0/16 -d 10.99.0.0/16 -j ACCEPT\n")
+    aces, _ = parse_iptables(cfg)
+    fwd = _fwd_ordered(aces)
+    assert [a.action for a in fwd] == ["permit", "deny"]
+    kinds = {f.kind for f in check_segmentation(aces, _INSERT_POLICY)}
+    assert "segmentation-violation" in kinds, \
+        "front-inserted ACCEPT permits the flow — the FALSE-PASS this fix kills"
+    assert "segmentation-ok" not in kinds
+
+
+def test_insert_no_index_goes_to_front():
+    """`-I CHAIN` with no numeric position inserts at the very front (position 1)."""
+    cfg = ("iptables -P FORWARD DROP\n"
+           "iptables -A FORWARD -s 10.20.0.0/16 -d 10.99.0.0/16 -j ACCEPT\n"
+           "iptables -I FORWARD -s 10.20.0.0/16 -d 10.99.0.0/16 -j DROP\n")  # no index
+    aces, _ = parse_iptables(cfg)
+    fwd = _fwd_ordered(aces)
+    assert [a.action for a in fwd] == ["deny", "permit"], \
+        "`-I` with no index must land at the FRONT, not the end"
+    kinds = {f.kind for f in check_segmentation(aces, _INSERT_POLICY)}
+    assert "segmentation-ok" in kinds
+    assert "segmentation-violation" not in kinds
+
+
+def test_insert_at_1based_middle_position_orders_correctly():
+    """`-I FORWARD 2` splices between rule 1 and rule 2 (1-based position N among
+    the chain's current non-policy rules)."""
+    cfg = ("iptables -P FORWARD DROP\n"
+           "iptables -A FORWARD -d 10.99.0.1/32 -j ACCEPT\n"    # pos 1
+           "iptables -A FORWARD -d 10.99.0.2/32 -j ACCEPT\n"    # pos 2
+           "iptables -A FORWARD -d 10.99.0.3/32 -j ACCEPT\n"    # pos 3
+           "iptables -I FORWARD 2 -d 10.99.0.9/32 -j DROP\n")   # -> new pos 2
+    aces, _ = parse_iptables(cfg)
+    fwd = _fwd_ordered(aces)
+    assert [str(a.dst) for a in fwd] == [
+        "10.99.0.1/32", "10.99.0.9/32", "10.99.0.2/32", "10.99.0.3/32"], \
+        "insert at 1-based position 2 must land between the 1st and 2nd rules"
+    assert fwd[1].action == "deny"
+    assert [a.seq for a in fwd] == [1, 2, 3, 4]        # seq stays 1..N, monotonic
+
+
+def test_insert_position_beyond_end_appends():
+    """N past the end of the chain appends (fail-safe, matches iptables)."""
+    cfg = ("iptables -P FORWARD DROP\n"
+           "iptables -A FORWARD -d 10.99.0.1/32 -j ACCEPT\n"
+           "iptables -I FORWARD 99 -d 10.99.0.2/32 -j DROP\n")   # 99 > len -> append
+    aces, _ = parse_iptables(cfg)
+    fwd = _fwd_ordered(aces)
+    assert [str(a.dst) for a in fwd] == ["10.99.0.1/32", "10.99.0.2/32"]
+    assert fwd[-1].action == "deny"
+
+
+def test_replace_at_position_changes_first_match_verdict():
+    """`-R FORWARD 1` replaces the rule currently at position 1 IN PLACE (not
+    append), inheriting its first-match slot. Replacing a leaking ACCEPT with a
+    DROP flips the verdict from violation to isolated."""
+    cfg = ("iptables -P FORWARD DROP\n"
+           "iptables -A FORWARD -s 10.20.0.0/16 -d 10.99.0.0/16 -j ACCEPT\n"
+           "iptables -R FORWARD 1 -s 10.20.0.0/16 -d 10.99.0.0/16 -j DROP\n")
+    aces, notes = parse_iptables(cfg)
+    fwd = _fwd_ordered(aces)
+    assert len(fwd) == 1 and fwd[0].action == "deny", \
+        "replace must swap the rule at position 1 in place, not add a second rule"
+    kinds = {f.kind for f in check_segmentation(aces, _INSERT_POLICY)}
+    assert "segmentation-ok" in kinds
+    assert "segmentation-violation" not in kinds
+    assert any("replace" in n for n in notes)         # still surfaced
+
+
+def test_plain_append_ordering_unchanged():
+    """No regression to ordinary `-A`: a plain ACCEPT-then-DROP append keeps its
+    order, so first-match ACCEPT wins and the flow leaks (violation)."""
+    cfg = ("iptables -P FORWARD DROP\n"
+           "iptables -A FORWARD -s 10.20.0.0/16 -d 10.99.0.0/16 -j ACCEPT\n"
+           "iptables -A FORWARD -s 10.20.0.0/16 -d 10.99.0.0/16 -j DROP\n")
+    aces, _ = parse_iptables(cfg)
+    fwd = _fwd_ordered(aces)
+    assert [a.action for a in fwd] == ["permit", "deny"]
+    assert [a.seq for a in fwd] == [1, 2]
+    kinds = {f.kind for f in check_segmentation(aces, _INSERT_POLICY)}
+    assert "segmentation-violation" in kinds, \
+        "plain -A order must be unchanged: ACCEPT-then-DROP first-match leaks"
+
+
+def test_multiport_insert_occupies_consecutive_positions():
+    """A rule that expands to multiple ACEs (multiport) inserted at position N
+    must occupy CONSECUTIVE positions there — the 3 DROP ACEs land at the front
+    (seq 1,2,3), the pre-existing permit follows at seq 4."""
+    cfg = ("iptables -P FORWARD DROP\n"
+           "iptables -A FORWARD -s 10.20.0.0/16 -d 10.99.0.0/16 -p tcp --dport 22 -j ACCEPT\n"
+           "iptables -I FORWARD 1 -s 10.20.0.0/16 -d 10.99.0.0/16 -p tcp"
+           " -m multiport --dports 80,443,445 -j DROP\n")
+    aces, _ = parse_iptables(cfg)
+    fwd = _fwd_ordered(aces)
+    assert [a.seq for a in fwd] == [1, 2, 3, 4]                # contiguous, monotonic
+    assert [a.action for a in fwd[:3]] == ["deny", "deny", "deny"]
+    assert sorted(a.dst_port.lo for a in fwd[:3]) == [80, 443, 445]
+    assert all(not a.imprecise for a in fwd[:3])               # multiport stays exact
+    assert fwd[3].action == "permit" and fwd[3].dst_port.lo == 22 and fwd[3].seq == 4

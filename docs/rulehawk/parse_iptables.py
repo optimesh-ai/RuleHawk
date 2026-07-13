@@ -178,6 +178,33 @@ class _Rule:
         self.base_return = False               # `-j RETURN` (fail-closed in a base transit chain)
 
 
+class _Item:
+    """One rule's slot in a chain's ordered list, BEFORE ACE expansion.
+
+    Every processed `-A`/`-I`/`-R` rule becomes a position-holding item so that
+    `-I CHAIN N` / `-R CHAIN N` indices line up with the device's rule numbering
+    (a rule that emits no ACE — LOG, a non-transit jump, a bare match — still
+    occupies a position). Expansion is deferred to a single per-chain pass so
+    inserts/replaces have already fixed the item order: ACE `seq` is then handed
+    out monotonically in list order (= true first-match order), and jump
+    placeholders receive their FINAL ACE indices for the resolution pass.
+
+      * `r`    — the `_Rule` to expand, or None for a position holder (no ACE).
+      * `line` — 1-based source line, propagated to every ACE it expands to.
+      * `jump` — for a TRANSIT custom-chain jump only, the snapshot needed to
+                 register a pending resolution once ACE indices are known:
+                 (target, src, dst, proto, sports, dports, unresolvable). None
+                 for every other item.
+    """
+
+    __slots__ = ("r", "line", "jump")
+
+    def __init__(self, r: Optional[_Rule], line: int, jump=None) -> None:
+        self.r = r
+        self.line = line
+        self.jump = jump
+
+
 _PROTO_NUM = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6",
               "47": "gre", "50": "esp", "51": "ah", "89": "ospf", "132": "sctp"}
 
@@ -625,8 +652,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     default6 = _is_v6(text)
     notes: List[str] = []
     chains: List[str] = []                       # chain order of first appearance
-    by_chain: Dict[str, List[ACE]] = {}
-    seqs: Dict[str, int] = {}
+    items_by_chain: Dict[str, List[_Item]] = {}  # ordered rule items per chain
     policies: Dict[str, str] = {}                # chain -> permit|deny (from policy)
     policy_lines: Dict[str, int] = {}            # chain -> source line of its `-P`/`:` policy
     table = "filter"                             # iptables-save default before *table
@@ -635,31 +661,33 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     # Chains that contain RETURN or NAT targets — their control flow cannot be
     # fully modeled, so any jump TO them must fail closed (stay INDETERMINATE).
     chains_with_return: set = set()
-    # Pending transit jumps to resolve after all chains are parsed.
-    # Each entry: (parent_chain, ph_start, ph_end, target_chain,
-    #              jump_src, jump_dst, jump_proto, jump_sports, jump_dports,
-    #              lineno, jump_unresolvable)
-    pending_jumps: list = []
 
     def ensure_chain(ch: str) -> None:
-        if ch not in by_chain:
-            by_chain[ch] = []
-            seqs[ch] = 0
+        if ch not in items_by_chain:
+            items_by_chain[ch] = []
             chains.append(ch)
 
-    def add_rule(ch: str, args: List[str], line: int = 0) -> None:
+    def parse_one(ch: str, args: List[str], line: int) -> _Item:
+        """Parse one -A/-I/-R rule body into a chain `_Item` (expansion deferred).
+
+        Mirrors the former immediate-expansion logic exactly, but returns an
+        item the caller then APPENDs (-A), INSERTs (-I), or REPLACEs (-R) into
+        the chain's ordered list. ACE expansion + pending-jump registration
+        happen later in one per-chain pass, so first-match order is whatever the
+        caller's splice produced — the fix that lets -I/-R model position."""
         ensure_chain(ch)
-        label = f"{ch}:{seqs[ch] + 1}"
+        label = f"{ch}:{len(items_by_chain[ch]) + 1}"
         r = _parse_rule(args, label, notes)
         if r.skip_note is not None:
             notes.append(r.skip_note)
             if r.jump_custom is not None and _is_transit(ch):
                 # SOUNDNESS / fail-closed: a jump to a custom chain on the
-                # TRANSIT path. Save the jump's match-space snapshot and emit
-                # an IMPRECISE placeholder (fail-closed fallback). A post-parse
-                # resolution pass below replaces this placeholder with precise
-                # ACEs when the target chain is fully modeled. Non-transit hooks
-                # (INPUT/OUTPUT) keep the surface-only behavior (no ACE at all).
+                # TRANSIT path. Snapshot the jump's match-space and emit an
+                # IMPRECISE placeholder (fail-closed fallback); deferred
+                # expansion registers the pending resolution with FINAL ACE
+                # indices, and the post-parse pass replaces the placeholder with
+                # precise ACEs when the target chain is fully modeled. Non-
+                # transit hooks (INPUT/OUTPUT) stay surface-only (no ACE).
                 j_src = r.src
                 j_dst = r.dst
                 j_proto = r.proto
@@ -676,14 +704,9 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                                   or r.icmp_type is not None)
                 r.action = "permit"
                 r.imprecise = True
-                ph_start = len(by_chain[ch])
-                seqs[ch] = _expand(ch, r, seqs[ch], by_chain[ch], default6, line)
-                ph_end = len(by_chain[ch])
-                pending_jumps.append((ch, ph_start, ph_end,
-                                      r.jump_custom, j_src, j_dst, j_proto,
-                                      j_sports, j_dports, line,
-                                      j_unresolvable))
-            elif r.jump_custom is None:
+                return _Item(r, line, (r.jump_custom, j_src, j_dst, j_proto,
+                                       j_sports, j_dports, j_unresolvable))
+            if r.jump_custom is None:
                 # RETURN or NAT target: records that this chain uses control-
                 # flow constructs that prevent full precision modeling of any
                 # parent chain that jumps here. Non-terminating decorators
@@ -700,14 +723,18 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                 if r.base_return and ch in _BASE_CHAINS and _is_transit(ch):
                     r.action = "permit"
                     r.imprecise = True
-                    seqs[ch] = _expand(ch, r, seqs[ch], by_chain[ch],
-                                       default6, line)
-            return
+                    return _Item(r, line)
+            # A skipped rule (RETURN/NAT/non-terminating decorator, or a non-
+            # transit custom-chain jump) emits no ACE — but is STILL a position
+            # holder so a later `-I`/`-R` index stays aligned with the device's
+            # rule numbering (a zero-ACE rule that shifted positions could
+            # otherwise invert a decision-carrying rule's first-match order).
+            return _Item(None, line)
         if r.action is None:
             notes.append(f"iptables rule in {ch} has no terminating target "
                          f"(-j ACCEPT/DROP/REJECT) — skipped")
-            return
-        seqs[ch] = _expand(ch, r, seqs[ch], by_chain[ch], default6, line)
+            return _Item(None, line)
+        return _Item(r, line)
 
     def set_policy(ch: str, pol: str, line: int = 0) -> None:
         act = _TERMINATING.get(pol.upper())
@@ -775,35 +802,56 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             k = toks.index("-A") if "-A" in toks else toks.index("--append")
             if k + 1 < len(toks):
                 ch = toks[k + 1]
-                add_rule(ch, toks[k + 2:], lineno)
+                ensure_chain(ch)
+                items_by_chain[ch].append(parse_one(ch, toks[k + 2:], lineno))
         elif "-I" in toks or "--insert" in toks:
-            # Insert: surfaced (we can't reorder soundly without the index math);
-            # treat as append-at-position-unknown -> note, then append for coverage.
+            # Insert at 1-based position N (no index => the very front). iptables
+            # evaluates the inserted rule BEFORE whatever rule currently sits at
+            # position N, so we SPLICE it into the chain's ordered item list at
+            # that slot — first-match order is thereby modeled (ACE `seq` is
+            # assigned in list order at expansion). N past the end appends; N < 1
+            # is treated as 1 (front). The compensating "position not modeled"
+            # note is retained (contract of the transit-jump-edge tests).
             k = toks.index("-I") if "-I" in toks else toks.index("--insert")
             if k + 1 < len(toks):
                 ch = toks[k + 1]
                 args = toks[k + 2:]
-                # Drop a leading numeric insert position if present.
+                pos = None
                 if args and args[0].isdigit():
+                    pos = int(args[0])          # capture the position, not drop it
                     args = args[1:]
                 notes.append(f"iptables `-I {ch}` insert in {ch} appended at end for "
                              f"analysis — original insert position not modeled (verify)")
-                add_rule(ch, args, lineno)
+                ensure_chain(ch)
+                item = parse_one(ch, args, lineno)
+                lst = items_by_chain[ch]
+                idx = 0 if pos is None else max(0, min(pos - 1, len(lst)))
+                lst.insert(idx, item)
         elif "-P" in toks or "--policy" in toks:
             k = toks.index("-P") if "-P" in toks else toks.index("--policy")
             if k + 2 < len(toks):
                 set_policy(toks[k + 1], toks[k + 2], lineno)
         elif "-R" in toks or "--replace" in toks:
-            # Replace: modeled as append (like -I) — position math not modeled.
+            # Replace the rule currently at 1-based position N in place, so the
+            # replacement inherits N's first-match slot. An out-of-range (or
+            # missing) index fails safe: append at the end + surface the note.
             k = toks.index("-R") if "-R" in toks else toks.index("--replace")
             if k + 1 < len(toks):
                 ch = toks[k + 1]
                 args = toks[k + 2:]
+                pos = None
                 if args and args[0].isdigit():
+                    pos = int(args[0])
                     args = args[1:]
                 notes.append(f"iptables `-R {ch}` replace position not modeled "
                              f"(verify) — rule appended at end for analysis")
-                add_rule(ch, args, lineno)
+                ensure_chain(ch)
+                item = parse_one(ch, args, lineno)
+                lst = items_by_chain[ch]
+                if pos is not None and 1 <= pos <= len(lst):
+                    lst[pos - 1] = item
+                else:
+                    lst.append(item)
         elif "-D" in toks or "--delete" in toks:
             # Delete: removal not modeled — the deleted rule (if parsed earlier)
             # stays in the analysis. Surfaced, never silent.
@@ -813,24 +861,19 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                          f"rule may still appear in the analysis (verify manually)")
         elif "-F" in toks or "--flush" in toks:
             # Flush: an ignored mid-script flush could let a flushed earlier rule
-            # falsely prove a later rule dead — clear the accumulated rules.
+            # falsely prove a later rule dead — clear the accumulated items. Any
+            # jump placeholders they carried go with them: deferred expansion
+            # never sees flushed rules, so no stale pending resolution survives.
             k = toks.index("-F") if "-F" in toks else toks.index("--flush")
             ch = toks[k + 1] if k + 1 < len(toks) else None
             if ch is not None:
-                if ch in by_chain:
-                    by_chain[ch] = []
-                    seqs[ch] = 0
-                # Jump placeholders recorded for this chain were flushed with
-                # it — drop their pending entries (the stored indices are stale;
-                # resolving them would resurrect flushed rules).
-                pending_jumps[:] = [pj for pj in pending_jumps if pj[0] != ch]
+                if ch in items_by_chain:
+                    items_by_chain[ch] = []
                 notes.append(f"iptables `-F {ch}` flush — rules accumulated for "
                              f"{ch} before this point cleared from the analysis")
             else:
-                for c in by_chain:
-                    by_chain[c] = []
-                    seqs[c] = 0
-                pending_jumps[:] = []
+                for c in items_by_chain:
+                    items_by_chain[c] = []
                 notes.append("iptables `-F` flush — all rules accumulated before "
                              "this point cleared from the analysis")
         elif "-N" in toks or "--new-chain" in toks:
@@ -838,6 +881,39 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             if k + 1 < len(toks):
                 ensure_chain(toks[k + 1])
         # -X/-Z and others: no rule contribution; ignored.
+
+    # ── Expansion: materialize each chain's ACEs in device (first-match) order.
+    # Deferred until now so the -A/-I/-R splices above have already fixed each
+    # chain's item order; ACE `seq` is handed out monotonically in list order
+    # (= true first-match order) and each transit-jump placeholder gets its
+    # FINAL ACE index range, which the resolution pass below splices precisely.
+    # A multiport rule inserted at position N therefore occupies its N ACEs
+    # CONSECUTIVELY at that slot. Position-holder items (item.r is None) emit no
+    # ACE. seqs[ch] == len(by_chain[ch]) is preserved (the resolution pass and
+    # policy-append below rely on it).
+    by_chain: Dict[str, List[ACE]] = {}
+    seqs: Dict[str, int] = {}
+    # Pending transit jumps to resolve after all chains are expanded. Each entry:
+    # (parent_chain, ph_start, ph_end, target_chain, jump_src, jump_dst,
+    #  jump_proto, jump_sports, jump_dports, lineno, jump_unresolvable)
+    pending_jumps: list = []
+    for ch in chains:
+        aces_ch: List[ACE] = []
+        seq = 0
+        for item in items_by_chain[ch]:
+            if item.r is None:
+                continue                       # position holder — no ACE emitted
+            ph_start = len(aces_ch)
+            seq = _expand(ch, item.r, seq, aces_ch, default6, item.line)
+            ph_end = len(aces_ch)
+            if item.jump is not None:
+                (tgt, j_src, j_dst, j_proto,
+                 j_sports, j_dports, j_unres) = item.jump
+                pending_jumps.append((ch, ph_start, ph_end, tgt, j_src, j_dst,
+                                      j_proto, j_sports, j_dports, item.line,
+                                      j_unres))
+        by_chain[ch] = aces_ch
+        seqs[ch] = seq
 
     # ── Precision resolution: replace imprecise transit-jump placeholders ────
     # For each pending transit jump, if the target chain is FULLY modeled

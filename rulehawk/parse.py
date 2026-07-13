@@ -242,9 +242,16 @@ def _parse_addr(tokens: List[str], i: int, v6: bool = False) -> Tuple[_IPNet, in
     """Parse an address operand; return (net, next_i, imprecise). `v6` is the
     enclosing ACL's family (`ipv6 access-list`) — it sizes `any`; `host` sizes
     itself from the address (/32 v4, /128 v6)."""
-    t = tokens[i]
-    if t == "any":
+    # Cisco keywords are case-insensitive on the device, and ASA writes `any4`
+    # (IPv4 any) / `any6` (IPv6 any) explicitly. Fold both here so `ANY`, `Host`
+    # and `any4` parse EXACT instead of degrading to an opaque imprecise ACE.
+    t = tokens[i].lower()
+    if t == "any":                     # family follows the enclosing ACL
         return (_ANY6_NET if v6 else _ANY_NET), i + 1, False
+    if t == "any4":                    # ASA: IPv4 any, explicitly
+        return _ANY_NET, i + 1, False
+    if t == "any6":                    # ASA: IPv6 any, explicitly
+        return _ANY6_NET, i + 1, False
     if t == "host":
         return _host_net(tokens[i + 1]), i + 2, False
     if "/" in t:
@@ -272,7 +279,7 @@ def _parse_port_op(tokens: List[str], i: int) -> Tuple[List[PortRange], int, boo
     the count of additional `eq` ports (surfaced as a note for the audit trail)."""
     if i >= len(tokens):
         return [ANY_PORTS], i, False, 0
-    op = tokens[i]
+    op = tokens[i].lower()             # eq/gt/lt/neq/range are case-insensitive
     if op == "eq":
         ports: List[int] = [_port_num(tokens[i + 1])]
         j = i + 2
