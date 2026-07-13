@@ -818,8 +818,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     gate = run_gate(paths, policy, fail_on, vendor)
 
+    # When a machine artifact is written to stdout ('-'), the human console
+    # report must NOT interleave with it (that corrupts the JSON/markdown a
+    # pipe consumes). Route the console to stderr in that case.
+    stdout_machine = "-" in (json_path, summary_path, sarif_path, comment_path)
     if not quiet:
-        print(to_console(gate))
+        print(to_console(gate), file=(sys.stderr if stdout_machine else sys.stdout))
 
     try:
         if sarif_path:

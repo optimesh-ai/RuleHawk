@@ -993,7 +993,54 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
         seq += len(aces)
         entries.extend(aces)
         notes.extend(enotes)
+    entries = _reorder_by_sequence(entries, notes)
     return entries, notes
+
+
+_SEQ_PREFIX = re.compile(r"^\s*(\d+)\s")
+
+
+def _reorder_by_sequence(entries: List[ACE], notes: List[str]) -> List[ACE]:
+    """Honor explicit ACL sequence numbers as the device's match order.
+
+    IOS/NX-OS/EOS number ACL entries (`10 permit ...`, `20 deny ...`) and the
+    device evaluates them in NUMERIC order regardless of the order they appear
+    in the text. `show running-config` normally emits them already sorted, but a
+    hand-edited or automation-pushed config can be out of order — and evaluating
+    the text order would silently mis-rank first-match (a `10 permit` written
+    below a `20 deny` would be wrongly shadowed -> false PASS).
+
+    Conservative: an ACL is reordered ONLY when EVERY one of its entries carries
+    an explicit leading number (mixing numbered and unnumbered is ambiguous, so
+    we leave text order). Entries expanded from one source line share that
+    line's number and keep their relative order (stable sort). The match-order
+    `seq` is reassigned to the sorted position so findings/witnesses rank
+    correctly; `raw`/`line` are preserved."""
+    import dataclasses
+
+    order: List[str] = []
+    by_acl: "dict[str, List[ACE]]" = {}
+    for a in entries:
+        if a.acl not in by_acl:
+            by_acl[a.acl] = []
+            order.append(a.acl)
+        by_acl[a.acl].append(a)
+
+    out: List[ACE] = []
+    for acl in order:
+        group = by_acl[acl]
+        nums = [_SEQ_PREFIX.match(a.raw) for a in group]
+        if all(nums) and len(group) > 1:
+            keyed = sorted(range(len(group)),
+                           key=lambda i: (int(nums[i].group(1)), i))
+            if keyed != list(range(len(group))):
+                group = [group[i] for i in keyed]
+                notes.append(f"ACL {acl}: entries reordered by explicit sequence "
+                             f"number to match device first-match evaluation")
+            group = [dataclasses.replace(a, seq=n)
+                     for n, a in enumerate(group, 1)]
+        out.extend(group)
+    return out
 
 
 def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0,

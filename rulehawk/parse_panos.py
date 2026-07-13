@@ -419,8 +419,9 @@ def _raw(name: str, action: str, proto: str, s: _IPNet, d: _IPNet,
 
 def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
                 addresses, addr_groups, services,
-                entries: List[ACE], notes: List[str], line: int = 0) -> int:
-    label = f"security/{name}"
+                entries: List[ACE], notes: List[str], line: int = 0,
+                acl: str = "security") -> int:
+    label = f"{acl}/{name}"
 
     # Scalar fields set on several lines follow `set` semantics: last wins.
     if fields.get("disabled", []) and fields["disabled"][-1].lower() == "yes":
@@ -548,14 +549,14 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
                         raw=_raw(name, action, proto, s, d,
                                  sp if ported else ANY_PORTS,
                                  dp if ported else ANY_PORTS),
-                        acl="security", line=line))
+                        acl=acl, line=line))
         # Trailing opaque ACE covers the unresolved-name remainder.
         seq += 1
         entries.append(ACE(
             seq=seq, action=action, proto="ip",
             src=_ANY_NET, dst=_ANY_NET, imprecise=True,
             raw=f"rule {name}: {action} ip any -> any (unresolved address remainder)",
-            acl="security", line=line))
+            acl=acl, line=line))
         notes.append(
             f"PAN-OS rule {label}: partially resolved address references — "
             f"{n_precise} exact ACE(s) + 1 opaque for unresolved names"
@@ -585,7 +586,7 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
                     stateful=False, imprecise=imprecise,
                     raw=_raw(name, action, proto, s, d,
                              sp if ported else ANY_PORTS, dp if ported else ANY_PORTS),
-                    acl="security", line=line))
+                    acl=acl, line=line))
     return seq
 
 

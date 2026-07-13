@@ -147,7 +147,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"rulehawk: cannot read {argv[0]!r}: {e}", file=sys.stderr)
             return 2
     else:
-        text = sys.stdin.read()  # no file, or explicit "-"
+        # Read stdin as bytes and decode leniently: a non-UTF-8 config (a
+        # latin-1 export, a stray BOM/binary) must degrade like the file path
+        # does (errors="replace"), never crash with an uncaught
+        # UnicodeDecodeError and exit 1 (the "finding found" code).
+        try:
+            raw = sys.stdin.buffer.read()
+        except (AttributeError, OSError):
+            raw = sys.stdin.read().encode("utf-8", "replace")
+        text = raw.decode("utf-8", "replace")  # no file, or explicit "-"
 
     # Auto-detect vendor (same precedence order as gate.py _pick_parser).
     # "ios-asa" is the fallback: no positive signal was found.

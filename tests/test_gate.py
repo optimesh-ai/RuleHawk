@@ -554,3 +554,12 @@ def test_sarif_uri_is_workspace_relative(tmp_path, monkeypatch):
             for r in s["runs"][0]["results"]}
     assert uris == {"network/edge.acl"}
     assert p  # silence lint
+
+
+def test_json_stdout_not_corrupted_by_console_report(tmp_path, capsys):
+    # `--json -` must emit clean JSON on stdout; the human console report goes
+    # to stderr so a pipe consumer isn't fed the "====" banner.
+    p = _write(str(tmp_path), "edge.acl", _CISCO)
+    gate.main([p, "--json", "-"])
+    out = capsys.readouterr().out
+    json.loads(out)                             # stdout is pure JSON, no banner

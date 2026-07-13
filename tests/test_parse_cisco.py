@@ -323,3 +323,29 @@ def test_new_named_ports_are_exact():
     ports = [(a.dst_port.lo, a.dst_port.hi) for a in aces]
     assert ports == [(67, 67), (49, 49), (1812, 1812)]
     assert all(not a.imprecise for a in aces)       # no longer ANY+imprecise
+
+
+def test_out_of_order_sequence_numbers_are_evaluated_numerically():
+    # NX-OS/EOS/IOS evaluate ACL entries in NUMERIC sequence order, not text
+    # order. A `10 permit` written below a `20 deny` must rank first (the device
+    # permits -> a leak), never be shadowed by the higher-numbered deny.
+    from rulehawk.parse_nxos import parse_nxos
+    from rulehawk.segcheck import check_segmentation
+    aces, notes = parse_nxos(
+        "ip access-list E\n"
+        " 20 deny ip 10.20.0.0/16 10.99.0.0/16\n"
+        " 10 permit ip 10.20.0.0/16 10.99.0.0/16\n")
+    assert [a.action for a in aces] == ["permit", "deny"]   # 10 before 20
+    pol = {"zones": {"C": ["10.20.0.0/16"], "P": ["10.99.0.0/16"]},
+           "must_not_reach": [{"src": "C", "dst": "P", "proto": "ip"}]}
+    assert "segmentation-ok" not in {f.kind for f in check_segmentation(aces, pol)}
+    assert any("reordered by explicit sequence" in n for n in notes)
+
+
+def test_mixed_numbered_and_unnumbered_acl_keeps_text_order():
+    # Ambiguous (some entries numbered, some not) -> leave text order untouched.
+    aces, _ = parse_acls(
+        "ip access-list extended E\n"
+        " 10 permit tcp any any eq 80\n"
+        " deny ip any any\n")
+    assert [a.action for a in aces] == ["permit", "deny"]
