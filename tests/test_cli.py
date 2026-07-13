@@ -93,3 +93,20 @@ def test_semantically_bad_policy_fails_closed(tmp_path, capsys):
 def test_help_exits_0(capsys):
     assert cli.main(["--help"]) == 0
     assert "usage" in capsys.readouterr().out
+
+
+def test_non_utf8_stdin_does_not_crash(monkeypatch, capsys):
+    # A latin-1 / binary / BOM config on stdin must degrade like a file path
+    # (errors="replace"), never raise UnicodeDecodeError and exit 1.
+    import io
+    payload = ("ip access-list extended E\n"
+               " permit tcp 10.20.0.0 0.0.255.255 10.99.0.0 0.0.255.255 eq 445\n"
+               " deny ip any any\n").encode("utf-8")
+    payload = b"\xff\xfe" + payload            # invalid UTF-8 prefix
+
+    class _Stdin(io.StringIO):
+        buffer = io.BytesIO(payload)
+    monkeypatch.setattr(sys, "stdin", _Stdin())
+    rc = cli.main(["-"])
+    assert rc in (0, 1)                          # parsed, not a traceback/2
+    assert "Hygiene score" in capsys.readouterr().out

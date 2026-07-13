@@ -190,6 +190,12 @@ def _collect_objects(lines: List[List[str]], notes: List[str]) -> Tuple[
     addr_groups: Dict[str, Optional[List[str]]] = {}
     services: Dict[str, Optional[Tuple[str, List[PortRange], List[PortRange]]]] = dict(
         _BUILTIN_SERVICES)
+    # Repeated `set service NAME protocol P port ...` lines APPEND on the device
+    # (a `set` on a list node adds a member); last-wins would model a SUBSET of
+    # the ports the service matches (dropping one false-PASSes a must_not_reach on
+    # it). Accumulate each service's definition tokens across lines and parse the
+    # UNION once, mirroring the address-group member accumulation above.
+    service_defs: "Dict[str, List[str]]" = {}
 
     for toks in lines:
         if not toks or toks[0] != "set":
@@ -250,7 +256,10 @@ def _collect_objects(lines: List[List[str]], notes: List[str]) -> Tuple[
             k = toks.index("service")
             if k + 2 < len(toks) and toks[k + 2] == "protocol":
                 name = toks[k + 1]
-                services[name] = _parse_service_def(toks[k + 2:], name, notes)
+                # Concatenate this line's `protocol ... port ...` segment onto any
+                # prior lines for the same service; _parse_service_def then unions
+                # every `port` spec (and keeps a single protocol per service).
+                service_defs.setdefault(name, []).extend(toks[k + 2:])
             continue
         if "service-group" in toks:
             k = toks.index("service-group")
@@ -258,6 +267,11 @@ def _collect_objects(lines: List[List[str]], notes: List[str]) -> Tuple[
                 notes.append(f"unmodeled PAN-OS service-group '{toks[k + 1]}' — "
                              f"referencing rule marked imprecise")
             continue
+
+    # Parse each service's accumulated definition once (union of all its port
+    # members across lines). A user redefinition overrides a same-named builtin.
+    for name, deftoks in service_defs.items():
+        services[name] = _parse_service_def(deftoks, name, notes)
     return addresses, addr_groups, services
 
 
@@ -419,8 +433,9 @@ def _raw(name: str, action: str, proto: str, s: _IPNet, d: _IPNet,
 
 def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
                 addresses, addr_groups, services,
-                entries: List[ACE], notes: List[str], line: int = 0) -> int:
-    label = f"security/{name}"
+                entries: List[ACE], notes: List[str], line: int = 0,
+                acl: str = "security") -> int:
+    label = f"{acl}/{name}"
 
     # Scalar fields set on several lines follow `set` semantics: last wins.
     if fields.get("disabled", []) and fields["disabled"][-1].lower() == "yes":
@@ -548,14 +563,14 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
                         raw=_raw(name, action, proto, s, d,
                                  sp if ported else ANY_PORTS,
                                  dp if ported else ANY_PORTS),
-                        acl="security", line=line))
+                        acl=acl, line=line))
         # Trailing opaque ACE covers the unresolved-name remainder.
         seq += 1
         entries.append(ACE(
             seq=seq, action=action, proto="ip",
             src=_ANY_NET, dst=_ANY_NET, imprecise=True,
             raw=f"rule {name}: {action} ip any -> any (unresolved address remainder)",
-            acl="security", line=line))
+            acl=acl, line=line))
         notes.append(
             f"PAN-OS rule {label}: partially resolved address references — "
             f"{n_precise} exact ACE(s) + 1 opaque for unresolved names"
@@ -585,7 +600,7 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
                     stateful=False, imprecise=imprecise,
                     raw=_raw(name, action, proto, s, d,
                              sp if ported else ANY_PORTS, dp if ported else ANY_PORTS),
-                    acl="security", line=line))
+                    acl=acl, line=line))
     return seq
 
 
@@ -598,12 +613,46 @@ def _rule_anchor(toks: List[str]) -> int:
     return -1
 
 
+# PAN-OS evaluates security rules pre-rulebase -> device-local rulebase ->
+# post-rulebase (Panorama pushes pre/post around the firewall's own rules).
+# `_PHASE_RANK` orders emitted ACEs by this real evaluation order; textual order
+# is preserved WITHIN a phase.
+_PHASE_OF = {"pre-rulebase": "pre", "rulebase": "main", "post-rulebase": "post"}
+_PHASE_RANK = {"pre": 0, "main": 1, "post": 2}
+
+
+def _rule_path(toks: List[str]) -> "Tuple[int, str, str]":
+    """(anchor, phase, scope) for a security-rule line, else (-1, "", "").
+
+    anchor = index of `rules`; phase in {pre, main, post} from the rulebase
+    keyword; scope = the `vsys <name>` / `device-group <name>` the rulebase
+    belongs to ("" for a firewall-global rulebase). Each scope is an INDEPENDENT
+    first-match context (its own ACL), so same-named rules in different vsys /
+    device-groups must never merge; phase only orders rules WITHIN one scope."""
+    k = _rule_anchor(toks)
+    if k < 0:
+        return -1, "", ""
+    phase = _PHASE_OF.get(toks[k - 2], "main")
+    scope = ""
+    # The path between `set` and the rulebase keyword (toks[k-2]) may carry a
+    # `vsys <name>` or `device-group <name>` scope segment.
+    j = 1
+    while j + 1 < k - 2:
+        if toks[j] in ("vsys", "device-group"):
+            scope = toks[j + 1]
+            break
+        j += 1
+    return k, phase, scope
+
+
 def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
     """Parse a PAN-OS set-format security policy; return (entries, notes).
 
     Same contract as `parse.parse_acls`, so `analyze`/`check_segmentation`
-    consume the result unchanged. Rule order = first appearance of each rule
-    name (PAN-OS evaluates one ordered rulebase, first match wins).
+    consume the result unchanged. Rules are grouped by their `vsys`/`device-group`
+    scope (each an INDEPENDENT first-match context, emitted as its own `acl`) and,
+    within a scope, ordered pre-rulebase -> local rulebase -> post-rulebase (the
+    real PAN-OS evaluation order), preserving textual order within a phase.
     """
     numbered = [(i, _tok(ln)) for i, ln in enumerate(text.splitlines(), 1)
                 if ln.strip()]
@@ -613,33 +662,51 @@ def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
 
     addresses, addr_groups, services = _collect_objects(lines, notes)
 
-    # Second pass: accumulate each rule's fields (split across lines) in
-    # first-appearance order, then assemble the ordered rulebase. We remember the
-    # source line of each rule for the CI gate's diff annotations — preferring the
-    # line that carries `action` (the rule's decisive line), else first appearance.
-    order: List[str] = []
-    rules: "Dict[str, Dict[str, List[str]]]" = {}
-    rule_lines: Dict[str, int] = {}
+    # Second pass: accumulate each rule's fields (split across lines) keyed by
+    # (scope, phase, name) so same-named rules in different vsys / device-groups
+    # or different rulebase phases never merge. We remember the source line of
+    # each rule for the CI gate's diff annotations — preferring the line that
+    # carries `action` (the rule's decisive line), else first appearance.
+    Key = Tuple[str, str, str]                        # (scope, phase, name)
+    order: List[Key] = []
+    rules: "Dict[Key, Dict[str, List[str]]]" = {}
+    rule_lines: Dict[Key, int] = {}
     for lineno, toks in numbered:
         if not toks or toks[0] != "set":
             continue
-        k = _rule_anchor(toks)
+        k, phase, scope = _rule_path(toks)
         if k < 0 or k + 1 >= len(toks):
             continue
         name = toks[k + 1]
-        if name not in rules:
-            rules[name] = {}
-            order.append(name)
+        key: Key = (scope, phase, name)
+        if key not in rules:
+            rules[key] = {}
+            order.append(key)
         fields_here = _read_fields(toks[k + 2:])
-        for key, vals in fields_here.items():
-            rules[name].setdefault(key, []).extend(vals)
-        if "action" in fields_here or name not in rule_lines:
-            rule_lines[name] = lineno
+        for fk, vals in fields_here.items():
+            rules[key].setdefault(fk, []).extend(vals)
+        if "action" in fields_here or key not in rule_lines:
+            rule_lines[key] = lineno
 
-    seq = 0
-    for name in order:
-        seq = _build_rule(name, rules[name], seq, addresses, addr_groups,
-                          services, entries, notes, rule_lines.get(name, 0))
+    # Emit ordered per scope. Each scope is an independent first-match context
+    # (its own `acl`, so segcheck searches it in isolation); WITHIN a scope rules
+    # run pre-rulebase -> local rulebase -> post-rulebase, textual order kept
+    # within a phase (stable sort). seq is 1-based per scope.
+    scope_order: List[str] = []
+    by_scope: "Dict[str, List[Key]]" = {}
+    for key in order:
+        scope = key[0]
+        if scope not in by_scope:
+            by_scope[scope] = []
+            scope_order.append(scope)
+        by_scope[scope].append(key)
+
+    for scope in scope_order:
+        acl = "security" if not scope else f"security/{scope}"
+        seq = 0
+        for key in sorted(by_scope[scope], key=lambda kk: _PHASE_RANK[kk[1]]):
+            seq = _build_rule(key[2], rules[key], seq, addresses, addr_groups,
+                              services, entries, notes, rule_lines.get(key, 0), acl)
 
     if not entries and re.search(r"<\s*(?:rulebase|security|entry)\b", text):
         notes.append("PAN-OS XML config detected but not yet supported — export "

@@ -242,9 +242,13 @@ def _policy_error(rule_id: str, msg: str, fix: str) -> Finding:
 
 
 def _coerce_ports(raw) -> Optional[List[Optional[int]]]:
-    """[445, "3389"] -> [445, 3389]; None/[] -> [None] (= any port);
-    anything unusable -> None (caller emits a segmentation-error)."""
-    if not raw:
+    """[445, "3389"] -> [445, 3389]; absent (None) or empty list -> [None]
+    (= any port); anything unusable -> None (caller emits a segmentation-error).
+
+    A SCALAR `0` (or `"0"`) is the literal port 0, NOT "no ports" — `if not raw`
+    would misread it as absent and search the whole port space, reporting a
+    witness OUTSIDE the asserted port-0 flow."""
+    if raw is None or (isinstance(raw, (list, tuple)) and not raw):
         return [None]
     if not isinstance(raw, (list, tuple)):
         raw = [raw]

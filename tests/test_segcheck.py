@@ -458,3 +458,20 @@ def test_nxos_inherits_narrowing_guard():
     kinds = {f.kind for f in _cs(aces, _POLICY)}
     assert "segmentation-ok" not in kinds
     assert "segmentation-indeterminate" in kinds
+
+
+def test_scalar_port_zero_is_literal_not_any():
+    # `"ports": 0` (scalar, falsy) must mean the literal port 0, not "any port".
+    # Coercing it to any produced a witness OUTSIDE the asserted flow space.
+    from rulehawk.segcheck import _coerce_ports
+    assert _coerce_ports(0) == [0]
+    assert _coerce_ports("0") == [0]
+    assert _coerce_ports(None) == [None] and _coerce_ports([]) == [None]
+    acl = ("ip access-list extended T\n"
+           " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq 80\n")
+    aces, _ = parse_acls(acl)
+    pol = {"zones": _POLICY["zones"],
+           "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp",
+                               "ports": 0}]}
+    # port 0 is genuinely not permitted (only 80 is) -> honest PASS, no witness.
+    assert {f.kind for f in check_segmentation(aces, pol)} == {"segmentation-ok"}
