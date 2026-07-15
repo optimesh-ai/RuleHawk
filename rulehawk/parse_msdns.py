@@ -15,14 +15,23 @@ for a packet auditor. A policy that carries such a dimension is not exactly
 modelable as one src-rectangle, so it is widened + flagged ``imprecise`` (never
 narrowed) rather than silently dropped.
 
-TARGET FORMAT — the PowerShell cmdlets that DEFINE this access layer (this is
-how Windows DNS client-subnets and query-resolution policies are configured and
-exported):
+TARGET FORMAT — the PowerShell cmdlets that DEFINE this access layer:
 
     Add-DnsServerClientSubnet -Name "CorpSubnet"  -IPv4Subnet "10.20.0.0/16"
     Add-DnsServerClientSubnet -Name "GuestSubnet" -IPv4Subnet "10.70.0.0/16","10.71.0.0/16"
     Add-DnsServerQueryResolutionPolicy -Name "BlockGuest" -Action DENY  -ClientSubnet "EQ,GuestSubnet" -ProcessingOrder 1
     Add-DnsServerQueryResolutionPolicy -Name "AllowCorp"  -Action ALLOW -ClientSubnet "EQ,CorpSubnet"  -ProcessingOrder 2
+
+This is the PROVISIONING form (an IaC / DSC / setup-script artifact). Note the
+audit-time reality: reading an EXISTING server with
+`Get-DnsServerQueryResolutionPolicy` renders the match criteria as the opaque
+`{DnsServerPolicyCriteria}` token — the `-ClientSubnet` expression and CIDRs are
+NOT in that output (they live in the nested `$_.Criteria` object and the
+separate `Get-DnsServerClientSubnet` object). So the plain `Get-*` output is
+NOT a usable input and is out of scope; feed the `Add-*` cmdlets (from your
+provisioning repo) or a `Get-*` dump expanded to the `Add-*` form. Feeding an
+out-of-scope format is SAFE: it matches no detector, parses to zero rules, and
+the gate fails closed (exit 2) — never a false clean audit.
 
 THE ACE MAPPING (reach-the-resolver, modeled soundly as a SUPERSET).
 The "packet" is a DNS query FROM a client subnet TO this DNS server on port 53.

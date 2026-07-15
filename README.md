@@ -112,12 +112,17 @@ Host & cloud:
 - **AWS Security Groups** (`describe-security-groups` JSON, incl. Control Tower multi-account bundles)
 
 DNS access-control (the L3/L4 "who may reach the resolver" slice):
-- **Infoblox / BIND** DNS ACLs (`acl {…}` + `allow-query`/`allow-recursion`/`allow-transfer`)
-- **Microsoft DNS** client-subnet query-resolution policies
+- **Infoblox / BIND** DNS ACLs — ISC BIND `named.conf` (`acl {…}` + `allow-query`/`allow-recursion`/`allow-transfer`)
+- **Microsoft DNS** client-subnet query-resolution policies — the `Add-DnsServer…` provisioning cmdlets
 
 Vendor is auto-detected. The DNS frontends model client access to the resolver
 (udp/tcp 53) only — RPZ / domain-content filtering is DNS-application-layer and
-out of scope for a packet auditor. (Roadmap: AWS NACLs, nftables, GCP/Azure firewall.)
+out of scope. They target the config artifacts above (ISC-BIND `named.conf`; the
+`Add-DnsServer…` cmdlet form). A pure Infoblox-NIOS WAPI/CSV export or the
+`Get-DnsServer…` audit output (which hides its match criteria) are out of scope —
+and, like any unrecognized input, **fail closed** (parsed to zero rules → the gate
+exits 2) rather than ever producing a false clean audit.
+(Roadmap: Infoblox WAPI-JSON adapter, AWS NACLs, nftables, GCP/Azure firewall.)
 
 ## Scope & limits (what it does *not* model)
 RuleHawk is a fast, sound **config-change gate**, not a network-wide reachability

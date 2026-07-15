@@ -14,6 +14,17 @@ filtering are a DNS-LAYER concern (they filter by queried NAME, not by client
 packet) and are explicitly OUT OF SCOPE for a packet auditor — this module never
 models them.
 
+INPUT FORMAT (what to feed it). ISC BIND `named.conf` text — the native,
+version-controlled config artifact of any ISC BIND operator. A pure *Infoblox
+NIOS* deployment does NOT expose a live `named.conf`: NIOS keeps named ACLs as
+structured objects, exported via the Grid Manager UI, the `namedacl` WAPI JSON
+object, or CSV (and emits `named.conf` only as a one-way LEGACY IMPORT source).
+So this frontend fits a real ISC-BIND shop or a NIOS migration that still holds
+the legacy `named.conf`; a NIOS grid's own WAPI/CSV export is out of scope
+(a WAPI-JSON adapter is the roadmap item to close that). Feeding an
+out-of-scope format is SAFE: it matches no vendor detector, parses to zero
+rules, and the gate fails closed (exit 2) — never a false clean audit.
+
 THE ADDRESS-MATCH-LIST -> ORDERED FIRST-MATCH MAPPING. BIND evaluates an
 address-match-list top-to-bottom, first match wins, and a leading `!` on an
 entry means "explicitly do NOT match here" (an ordered deny). This is EXACTLY
@@ -455,8 +466,9 @@ def _resolve_port_prefix(name_parts: List[str], ctx: str,
                          notes: List[str]) -> Tuple[PortRange, bool]:
     """Read the optional `port N` / `transport X` prefix an access statement may
     carry between its keyword and its `{ ... }` list (e.g.
-    `allow-transfer port 853 transport tls { ... }`). Returns (dst_port_range,
-    imprecise).
+    `allow-transfer port 853 transport tls { ... }`; this prefix is BIND 9.18+
+    syntax — 9.16 and earlier accept no port/transport on allow-transfer).
+    Returns (dst_port_range, imprecise).
 
     The reach-the-resolver model defaults to DNS port 53. A statement that moves
     the port MUST NOT stay pinned at 53 (53 would be a SUBSET of the true space —
