@@ -45,7 +45,7 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 | `configs` | — (**required**) | Files/globs to audit, whitespace or newline separated. Recursive `**` supported (e.g. `firewall/**/*.conf`). |
 | `policy` | `''` | Path to a segmentation policy JSON (zones + `must_not_reach`; see [`policy.md`](policy.md)). Omit for hygiene checks only. |
 | `fail-on` | `high` | Fail the check at this severity or worse: `critical` \| `high` \| `medium` \| `low` \| `none`. `none` is advisory (never blocks). |
-| `vendor` | `auto` | Force a vendor for every file: `auto` \| `ios` \| `junos` \| `panos` \| `iptables`. |
+| `vendor` | `auto` | Force a vendor for every file: `auto` \| `ios` \| `junos` \| `panos` \| `iptables` \| `nxos` \| `eos` \| `fortinet` \| `aws-sg` \| `umbrella` \| `winfw` \| `msdns` \| `infoblox`. |
 | `comment` | `true` | Post/update a single sticky PR comment with the findings. |
 | `upload-sarif` | `true` | Upload SARIF to code scanning so findings annotate the exact diff line. |
 | `working-directory` | `.` | Directory to run the audit in. |
@@ -74,8 +74,8 @@ SARIF and posts the comment first, so the gate always reports its value.
 ## What you get
 
 - **Inline diff annotations** — SARIF results land on the exact source line of each
-  finding (exact for all five vendors, thanks to per-rule line tracking). They show
-  in the *Files changed* tab and the Security tab, bucketed by severity.
+  finding (exact for every supported vendor, thanks to per-rule line tracking).
+  They show in the *Files changed* tab and the Security tab, bucketed by severity.
 - **A single sticky comment** — one comment per PR, updated in place each push
   (keyed by a hidden `<!-- rulehawk-gate -->` marker), led by the segmentation
   witness packets.

@@ -26,6 +26,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import rulehawk.parse_infoblox as _ib  # noqa: E402
 from rulehawk.parse_infoblox import detect, parse_infoblox  # noqa: E402
 from rulehawk.segcheck import check_segmentation  # noqa: E402
 
@@ -228,3 +229,162 @@ def test_non_acl_bind_config_is_ignored_not_crashed():
     aces, _ = parse_infoblox(cfg)
     # Only the access statement is modeled; the zone/logging blocks are ignored.
     assert {a.acl for a in aces} == {"global:allow-query"}
+
+
+# ── 6. [FIX 1] deep chain / deep nesting fail closed — never crash-to-empty ───
+# A deep acl-reference chain or nested match-list used to overflow the recursive
+# resolver -> RecursionError -> the whole parse returned [] -> segcheck read "no
+# ACEs" as "nothing permits" = a FALSE isolation PASS. Now it degrades to
+# INDETERMINATE (never segmentation-ok, never a crash).
+
+def _deep_acl_chain(n):
+    """acl a0{a1}; acl a1{a2}; ...; acl a(n-1){0.0.0.0/0}; allow-query{a0}. A
+    non-cyclic, very deep reference chain ultimately permitting every client."""
+    lines = [f'acl "a{i}" {{ {f"a{i + 1}" if i + 1 < n else "0.0.0.0/0"}; }};'
+             for i in range(n)]
+    lines.append("options { allow-query { a0; }; };")
+    return "\n".join(lines)
+
+
+def test_deep_acl_chain_is_indeterminate_never_empty_never_crash():
+    cfg = _deep_acl_chain(500)
+    aces, notes = parse_infoblox(cfg)               # must NOT raise
+    assert aces                                     # NOT an empty parse
+    assert any(a.imprecise for a in aces)
+    assert any("nesting deeper" in n or "fail-closed" in n.lower() for n in notes)
+    # The chain ultimately permits 0.0.0.0/0, so a client must NOT be falsely
+    # reported isolated — the sound verdict is indeterminate, never PASS.
+    pol = {"zones": {"GUEST": ["192.168.0.0/16"], "DNS": _DNS},
+           "must_not_reach": [{"src": "GUEST", "dst": "DNS",
+                               "proto": "udp", "ports": [53]}]}
+    assert _run(cfg, pol) == [("segmentation-indeterminate", "medium")]
+
+
+def test_deep_nested_matchlist_is_indeterminate_never_crash():
+    inner = "{ " * 300 + "0.0.0.0/0; " + "} " * 300
+    cfg = f"options {{ allow-query {inner}; }};"
+    aces, _ = parse_infoblox(cfg)                   # must NOT raise
+    assert aces and any(a.imprecise for a in aces)
+    pol = {"zones": {"GUEST": ["192.168.0.0/16"], "DNS": _DNS},
+           "must_not_reach": [{"src": "GUEST", "dst": "DNS",
+                               "proto": "udp", "ports": [53]}]}
+    assert _run(cfg, pol) == [("segmentation-indeterminate", "medium")]
+
+
+def test_parse_exception_fails_closed_not_empty(monkeypatch):
+    """ANY parse exception must degrade to a single imprecise `permit ip any any`
+    context (=> segcheck indeterminate in BOTH directions), never an EMPTY parse
+    (which segcheck reads as a false isolation PASS)."""
+    def _boom(_text):
+        raise RuntimeError("synthetic parse failure")
+    monkeypatch.setattr(_ib, "_strip_comments", _boom)
+    cfg = 'options { allow-query { 10.0.0.0/8; }; };'
+    aces, notes = parse_infoblox(cfg)               # must NOT raise
+    assert aces                                     # never empty
+    assert any(a.action == "permit" and a.proto == "ip"
+               and a.src.prefixlen == 0 and a.dst.prefixlen == 0 and a.imprecise
+               for a in aces)
+    assert any("fail-closed" in n.lower() for n in notes)
+    pol_iso = {"zones": {"GUEST": ["192.168.0.0/16"], "DNS": _DNS},
+               "must_not_reach": [{"src": "GUEST", "dst": "DNS",
+                                   "proto": "udp", "ports": [53]}]}
+    pol_reach = {"zones": {"CORP": ["10.0.0.0/8"], "DNS": _DNS},
+                 "must_reach": [{"src": "CORP", "dst": "DNS",
+                                 "proto": "udp", "ports": [53]}]}
+    assert _run(cfg, pol_iso) == [("segmentation-indeterminate", "medium")]
+    assert _run(cfg, pol_reach) == [("connectivity-indeterminate", "medium")]
+
+
+# ── 7. [FIX 2] `port N` / `transport` prefix moves the port off 53 (superset) ──
+# `allow-transfer port 853 transport tls { ... }` used to be modeled at port 53
+# (imprecise=False), so a must_not_reach on tcp/853 false-PASSed (853 disjoint
+# from 53). The port is now modeled at 853 (never silently kept at 53).
+
+def test_allow_transfer_port_853_moves_port_off_53():
+    cfg = 'options { allow-transfer port 853 transport tls { 10.0.0.0/8; }; };'
+    aces, notes = parse_infoblox(cfg)
+    permits = [a for a in aces if a.action == "permit"]
+    assert permits
+    assert all(a.dst_port.lo == 853 and a.dst_port.hi == 853 for a in permits)
+    assert all(a.dst_port.lo != 53 for a in permits)     # never kept at 53
+    assert any("853" in n for n in notes)
+    # A must_not_reach on tcp/853 is NOT falsely segmentation-ok.
+    pol_853 = {"zones": {"X": ["10.0.0.0/8"], "DNS": _DNS},
+               "must_not_reach": [{"src": "X", "dst": "DNS",
+                                   "proto": "tcp", "ports": [853]}]}
+    assert _run(cfg, pol_853) == [("segmentation-violation", "critical")]
+    # ...and a tcp/53 assertion stays sane: the transfer statement grants 853,
+    # not 53, so port 53 is soundly not permitted by it.
+    pol_53 = {"zones": {"X": ["10.0.0.0/8"], "DNS": _DNS},
+              "must_not_reach": [{"src": "X", "dst": "DNS",
+                                  "proto": "tcp", "ports": [53]}]}
+    assert _run(cfg, pol_53) == [("segmentation-ok", "info")]
+
+
+def test_transport_prefix_without_explicit_port_widens_imprecise():
+    # A non-cleartext transport whose default port is not 53, with no explicit
+    # `port`, cannot be pinned -> widen to ANY + imprecise (fail-closed).
+    cfg = 'options { allow-query transport tls { 10.0.0.0/8; }; };'
+    aces, notes = parse_infoblox(cfg)
+    assert any(a.imprecise for a in aces)
+    assert any("imprecise" in n.lower() for n in notes)
+    pol = {"zones": {"X": ["10.0.0.0/8"], "DNS": _DNS},
+           "must_not_reach": [{"src": "X", "dst": "DNS",
+                               "proto": "tcp", "ports": [853]}]}
+    assert _run(cfg, pol) == [("segmentation-indeterminate", "medium")]
+
+
+def test_explicit_port_53_stays_precise_on_53():
+    cfg = 'options { allow-query port 53 { 10.0.0.0/8; }; };'
+    aces, _ = parse_infoblox(cfg)
+    permits = [a for a in aces if a.action == "permit"]
+    assert permits and all(a.dst_port.lo == 53 and a.dst_port.hi == 53
+                           and a.imprecise is False for a in permits)
+
+
+# ── 8. [FIX 3] allow-query is the master reach gate ───────────────────────────
+# allow-recursion / allow-query-cache / allow-transfer / match-clients permits
+# no longer stand alone as a must_reach connectivity proof (they were false
+# connectivity-ok when allow-query denied). Isolation over-report stays sound.
+
+def test_view_match_clients_with_allow_query_none_not_connectivity_ok():
+    cfg = ('view "internal" { match-clients { 10.0.0.0/8; }; '
+           'allow-query { none; }; };')
+    pol = {"zones": {"CORP": ["10.0.0.0/8"], "DNS": _DNS},
+           "must_reach": [{"src": "CORP", "dst": "DNS",
+                           "proto": "udp", "ports": [53]}]}
+    res = _run(cfg, pol)
+    # Real BIND: allow-query{none} DENIES — must NOT read as connectivity-ok.
+    assert ("connectivity-ok", "info") not in res
+    assert res == [("connectivity-indeterminate", "medium")]
+
+
+def test_allow_recursion_alone_does_not_prove_reach():
+    cfg = 'options { allow-query { none; }; allow-recursion { 10.0.0.0/8; }; };'
+    pol = {"zones": {"CORP": ["10.0.0.0/8"], "DNS": _DNS},
+           "must_reach": [{"src": "CORP", "dst": "DNS",
+                           "proto": "udp", "ports": [53]}]}
+    res = _run(cfg, pol)
+    assert ("connectivity-ok", "info") not in res
+    assert res == [("connectivity-indeterminate", "medium")]
+
+
+def test_allow_query_still_proves_reach_even_with_recursion_present():
+    # allow-query is authoritative: it alone proves reach; a reach_opaque
+    # allow-recursion permit in the same config does not block it.
+    cfg = ('options { allow-query { 10.0.0.0/8; }; '
+           'allow-recursion { 10.0.0.0/8; }; };')
+    pol = {"zones": {"CORP": ["10.0.0.0/8"], "DNS": _DNS},
+           "must_reach": [{"src": "CORP", "dst": "DNS",
+                           "proto": "udp", "ports": [53]}]}
+    assert _run(cfg, pol) == [("connectivity-ok", "info")]
+
+
+def test_reach_nonauthoritative_permit_still_over_reports_isolation():
+    # Isolation stays SOUND: a recursion permit still counts as a (safe-side)
+    # must_not_reach over-report — never a false segmentation-ok.
+    cfg = 'options { allow-query { none; }; allow-recursion { 10.0.0.0/8; }; };'
+    pol = {"zones": {"CORP": ["10.0.0.0/8"], "DNS": _DNS},
+           "must_not_reach": [{"src": "CORP", "dst": "DNS",
+                               "proto": "udp", "ports": [53]}]}
+    assert _run(cfg, pol) == [("segmentation-violation", "critical")]

@@ -220,6 +220,12 @@ def test_empty_and_degenerate_groups_degrade_with_notes():
     # Empty describe output: SG-shaped but no groups -> no rules, a note, no crash.
     aces, notes = parse_awssg(json.dumps({"SecurityGroups": []}))
     assert aces == [] and notes
-    # A group with only a GroupId: just the implicit default-deny, no crash.
-    aces2, _ = parse_awssg(json.dumps({"GroupId": "sg-empty"}))
-    assert all(a.action == "deny" for a in aces2) and len(aces2) == 2
+    # A group with only a GroupId (no IpPermissionsEgress key): AWS's real default
+    # egress is allow-all, so — to avoid a false egress isolation PASS — we assume
+    # it as an IMPRECISE permit (2 families) plus the implicit default-deny.
+    aces2, notes2 = parse_awssg(json.dumps({"GroupId": "sg-empty"}))
+    perms = [a for a in aces2 if a.action == "permit"]
+    denies = [a for a in aces2 if a.action == "deny"]
+    assert len(perms) == 2 and all(p.imprecise for p in perms)   # assumed egress, fail-closed
+    assert len(denies) == 2                                       # implicit default-deny
+    assert any("default allow-all egress" in n for n in notes2)

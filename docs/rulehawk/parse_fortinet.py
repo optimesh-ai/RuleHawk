@@ -26,22 +26,42 @@ rather than a possibly-wrong verdict. Concretely:
     PAN-OS is most decisive on any-zone rules.
   * `set schedule` other than `always`, and identity narrowing (`set users` /
     `set groups` / `set fsso-groups`) genuinely restrict the match -> imprecise.
-  * `set srcaddr-negate enable` / `set dstaddr-negate enable`: the rule matches
-    the COMPLEMENT of the listed set, which is NOT one rectangle. We widen that
-    dimension to ANY (ANY ⊇ complement restores the superset invariant) and set
-    imprecise — NEVER keep the negated value (that would under-approximate and
-    let segcheck FALSE-PASS a probe outside the listed set).
+  * `set srcaddr-negate enable` / `set dstaddr-negate enable` / `set
+    service-negate enable`: the rule matches the COMPLEMENT of the listed set,
+    which is NOT one rectangle. We widen that dimension to ANY (ANY ⊇ complement
+    restores the superset invariant) and set imprecise — NEVER keep the negated
+    value (that would under-approximate and let segcheck FALSE-PASS a probe
+    outside the listed set).
+  * `set action` maps to permit/deny by SEMANTICS, not a two-way accept/else
+    split: `accept` -> permit; `deny`/`drop` (and an omitted action, whose
+    FortiGate default is deny) -> deny; every FORWARDING action
+    (`ipsec`/`ssl-vpn`/`redirect`/`tunnel`, and any unrecognized action) ->
+    permit + imprecise, because those actions FORWARD matched traffic (into a
+    tunnel / to a portal) rather than drop it. Modeling a forward as a `deny`
+    would both FALSE-PASS a must_not_reach (the flow really is forwarded) and
+    kill a later live permit as "dead"; the safe over-approximation is a permit
+    whose exact post-tunnel path/NAT we cannot model -> imprecise.
   * `set nat enable` and UTM profiles (av/webfilter/ips/application-list) do NOT
     change the L3/L4 match space (they inspect/rewrite already-forwarded
     traffic) — surfaced as a note only, never imprecise.
+
+IPv4 AND IPv6 (the family-threading lesson): FortiOS filters both families. A
+`config firewall policy6` block is v6-only; a unified `config firewall policy`
+block can carry v4 (`srcaddr`/`dstaddr`) AND v6 (`srcaddr6`/`dstaddr6`) address
+refs at once. The built-in `all` object resolves to `0.0.0.0/0` in a v4 context
+and `::/0` in a v6 context, so the parser threads the policy FAMILY through
+resolution, reads the v6 address fields, and appends a v6 implicit deny-all
+alongside the v4 one. Modeling a v6 policy as v4-only would leave every v6 flow
+untouched by any ACE -> a segmentation FALSE-PASS (the flow runs off the end of
+a v4-only ruleset and reads as isolated).
 
 ADDRESS / SERVICE / GROUP resolution (the objgroup/Junos union pattern):
   * `config firewall address` objects reduce to exact CIDRs: `set subnet A.B.C.D
     MASK` (netmask form) or `.../len`; `set type iprange` + start/end-ip
     summarize to the EXACT covering CIDR set; IPv6 `set subnet <v6>/len` /
-    `set ip6 ...`. The built-in object `all` = 0.0.0.0/0. `set type fqdn` /
-    `geography` / `wildcard` / dynamic objects have no fixed L3 space and are
-    UNRESOLVABLE.
+    `set ip6 ...`. The built-in object `all` = 0.0.0.0/0 (v4) or ::/0 (v6).
+    `set type fqdn` / `geography` / `wildcard` / dynamic objects have no fixed L3
+    space and are UNRESOLVABLE.
   * `config firewall addrgrp` groups union their members (nested groups allowed).
   * `config firewall service custom`: tcp/udp/sctp-portrange (`dst[:src]`, a
     space list expands to the exact union), `protocol-number N`, `protocol
@@ -53,16 +73,24 @@ ADDRESS / SERVICE / GROUP resolution (the objgroup/Junos union pattern):
     a note — NEVER a subset. So resolution can only turn an INDETERMINATE into a
     precise verdict, never manufacture a false PASS.
 
-CONTEXT / DEFAULT-DENY: every FortiGate policy lives in ONE global ordered
-first-match list, so all ACEs share `acl="firewall-policy"`. A trailing
-`deny ip any any` (the FortiGate implicit deny-all) is appended so segcheck can
-never FALSE-PASS a leak by running off the end of the ruleset. `set status
+CONTEXT / VDOMs / DEFAULT-DENY: a plain (non-VDOM) FortiGate config is ONE global
+ordered first-match list, so its ACEs share `acl="firewall-policy"`. Under
+`config vdom` each VDOM is an INDEPENDENT routing domain with its OWN first-match
+policy list and its OWN (same-named!) address/service objects — merging them
+would let a deny in one VDOM subtract before a permit in another (false-PASS) and
+declare the other VDOM's live permit dead. So VDOM policies are scoped to
+`acl="firewall-policy:<vdom>"`, the object tables are keyed per VDOM, and a
+trailing implicit `deny ip any any` (v4 AND v6) is appended PER context so
+segcheck can never FALSE-PASS a leak by running off the end. `set status
 disable` disables a policy on the device (empty match space) — skipped entirely
 (exact, like Cisco `inactive`).
 
 Robustness: malformed / truncated blocks, unbalanced edit/next/end, undefined
 references, and empty policies all DEGRADE with a note and never crash — the
-scan and each policy expansion are wrapped fail-closed.
+scan and each policy expansion are wrapped fail-closed. An `edit` left open by a
+missing `next` is committed implicitly (on the next `edit`, on `end`, and at EOF)
+so a pending rule is never silently dropped — a dropped PERMIT masked by a
+following deny would be a segmentation FALSE-PASS.
 """
 
 from __future__ import annotations
@@ -77,7 +105,7 @@ from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
 _ANY4: _IPNet = ipaddress.ip_network("0.0.0.0/0")
 _ANY6: _IPNet = ipaddress.ip_network("::/0")
 
-_ACL = "firewall-policy"   # every FortiGate policy is one global first-match list
+_ACL = "firewall-policy"   # base name; VDOM policies use "firewall-policy:<vdom>"
 
 # IP protocol numbers FortiGate uses in `set protocol-number N` / a custom
 # service `set protocol IP`. Folded to the same names the other frontends emit so
@@ -164,8 +192,10 @@ def _tokenize(line: str) -> List[str]:
 
 def _kind_of(rest: List[str]) -> str:
     r = [t.lower() for t in rest]
-    if r[:2] in (["firewall", "policy"], ["firewall", "policy6"]):
+    if r[:2] == ["firewall", "policy"]:
         return "policy"
+    if r[:2] == ["firewall", "policy6"]:
+        return "policy6"          # v6-only policy table (family threaded through)
     if r[:2] in (["firewall", "address"], ["firewall", "address6"]):
         return "address"
     if r[:2] in (["firewall", "addrgrp"], ["firewall", "addrgrp6"]):
@@ -174,7 +204,27 @@ def _kind_of(rest: List[str]) -> str:
         return "svc_custom"
     if r[:3] == ["firewall", "service", "group"]:
         return "svc_group"
+    if r[:1] == ["vdom"]:
+        return "vdom"             # `config vdom` — an independent routing domain
     return "other"
+
+
+def _action_of(raw: Optional[str]) -> Tuple[str, bool]:
+    """Map a `set action` value to (rulehawk-action, is_forwarding).
+
+    accept -> ("permit", False); deny/drop or an OMITTED action (FortiGate's
+    default is deny) -> ("deny", False). Every FORWARDING action
+    (ipsec/ssl-vpn/redirect/tunnel) and any UNRECOGNIZED action -> ("permit",
+    True): those FORWARD matched traffic, so the safe over-approximation is a
+    permit whose exact forwarded path we can't model (caller sets imprecise).
+    Choosing permit (never deny) for the unknown case guarantees we never falsely
+    prove isolation and never kill a live rule as dead."""
+    a = (raw or "").lower()
+    if a == "accept":
+        return "permit", False
+    if a in ("deny", "drop", ""):
+        return "deny", False
+    return "permit", True
 
 
 def _first(vals: Optional[List[str]]) -> Optional[str]:
@@ -230,38 +280,63 @@ def _resolve_addr_obj(obj: Dict[str, List[str]]) -> Optional[List[_IPNet]]:
     return None
 
 
+# Object-table key: (vdom, name). vdom is None for a plain (non-VDOM) config, so
+# same-named objects in different VDOMs never collide in the flat dicts.
+_ObjKey = Tuple[Optional[str], str]
+
+
 def parse_fortinet(text: str) -> Tuple[List[ACE], List[str]]:
     """Parse FortiOS firewall config in `text`; return (entries, notes).
 
     Same contract as `parse.parse_acls`, so `analyze`/`check_segmentation` consume
-    the result unchanged. Every policy is one global ordered first-match context
-    (`acl="firewall-policy"`); a trailing implicit `deny ip any any` is appended.
+    the result unchanged. Each VDOM is one ordered first-match context
+    (`acl="firewall-policy:<vdom>"`, or `"firewall-policy"` with no VDOM); a
+    trailing implicit `deny ip any any` (v4 and v6) is appended per context.
     """
     notes: List[str] = []
-    addresses: Dict[str, Dict[str, List[str]]] = {}
-    addrgrps: Dict[str, Dict[str, List[str]]] = {}
-    svc_custom: Dict[str, Dict[str, List[str]]] = {}
-    svc_groups: Dict[str, Dict[str, List[str]]] = {}
-    policies: List[Tuple[str, Dict[str, List[str]], int]] = []
+    addresses: Dict[_ObjKey, Dict[str, List[str]]] = {}
+    addrgrps: Dict[_ObjKey, Dict[str, List[str]]] = {}
+    svc_custom: Dict[_ObjKey, Dict[str, List[str]]] = {}
+    svc_groups: Dict[_ObjKey, Dict[str, List[str]]] = {}
+    # policy tuple: (name, edit, line, vdom, block_kind) where block_kind is
+    # "policy" (v4/unified) or "policy6" (v6-only).
+    policies: List[Tuple[str, Dict[str, List[str]], int, Optional[str], str]] = []
 
     # ── Scan the config/edit/next/end structure into the collections above. A
     # stack of frames tolerates nested `config` blocks and unbalanced markers.
     frames: List[dict] = []
 
-    def commit(fr: dict) -> None:
+    def _current_vdom() -> Optional[str]:
+        """The innermost enclosing `config vdom` edit name (None if not in one)."""
+        v: Optional[str] = None
+        for f in frames:
+            if f["kind"] == "vdom" and f.get("name"):
+                v = f["name"]
+        return v
+
+    def commit(fr: dict) -> bool:
+        """Store a completed edit into its per-VDOM table. Returns True iff it
+        stored something (a `vdom`/`other`/empty frame stores nothing)."""
         name, edit, kind = fr.get("name"), fr.get("edit"), fr["kind"]
         if name is None or edit is None:
-            return
+            return False
+        vdom = _current_vdom()
         if kind == "address":
-            addresses[name] = edit
+            addresses[(vdom, name)] = edit
         elif kind == "addrgrp":
-            addrgrps[name] = edit
+            addrgrps[(vdom, name)] = edit
         elif kind == "svc_custom":
-            svc_custom[name] = edit
+            svc_custom[(vdom, name)] = edit
         elif kind == "svc_group":
-            svc_groups[name] = edit
-        elif kind == "policy":
-            policies.append((name, edit, fr.get("line", 0)))
+            svc_groups[(vdom, name)] = edit
+        elif kind in ("policy", "policy6"):
+            policies.append((name, edit, fr.get("line", 0), vdom, kind))
+        else:
+            return False
+        return True
+
+    def _pending(fr: dict) -> bool:
+        return fr.get("edit") is not None and fr.get("name") is not None
 
     try:
         for lineno, raw in enumerate(text.splitlines(), 1):
@@ -278,12 +353,27 @@ def parse_fortinet(text: str) -> Tuple[List[ACE], List[str]]:
                 continue
             if head == "end":
                 if frames:
+                    top = frames[-1]
+                    # `end` while an edit is still open (no closing `next`) must
+                    # not drop that edit — commit it first.
+                    if _pending(top) and commit(top):
+                        notes.append(f"fortinet: `config {top['kind']}` ended "
+                                     f"with `edit {top['name']}` still open (no "
+                                     f"`next`) — committed implicitly (edit/next "
+                                     f"imbalance repaired)")
                     frames.pop()
                 continue
             if not frames:
                 continue
             fr = frames[-1]
             if head == "edit":
+                # A new `edit` while the previous one is still open (missing
+                # `next`) implicitly closes it — commit so no rule is dropped.
+                if _pending(fr) and commit(fr):
+                    notes.append(f"fortinet: `edit {fr['name']}` in `config "
+                                 f"{fr['kind']}` was not closed by `next` before "
+                                 f"the next edit — committed implicitly "
+                                 f"(edit/next imbalance repaired)")
                 fr["name"] = toks[1] if len(toks) > 1 else ""
                 fr["edit"] = {}
                 fr["line"] = lineno
@@ -296,45 +386,60 @@ def parse_fortinet(text: str) -> Tuple[List[ACE], List[str]]:
                 if len(toks) >= 2:
                     fr["edit"][toks[1].lower()] = toks[2:] if head == "set" else []
                 continue
+        # EOF with edits still open (truncated dump / missing `next`+`end`):
+        # commit whatever is pending so a trailing rule is never lost.
+        for fr in frames:
+            if _pending(fr) and commit(fr):
+                notes.append(f"fortinet: `config {fr['kind']}` reached EOF with "
+                             f"`edit {fr['name']}` still open — committed "
+                             f"implicitly (edit/next imbalance repaired)")
     except Exception as exc:                 # never crash on a malformed dump
         notes.append(f"fortinet: error scanning config ({exc!r}) — parsed what "
                      f"was readable, fail-closed on the rest")
 
+    def _any_of(family: int) -> _IPNet:
+        return _ANY6 if family == 6 else _ANY4
+
     # ── Resolvers (closures over the collected definitions). ------------------
-    def resolve_name(name: str, seen: frozenset) -> Optional[List[_IPNet]]:
-        """A src/dst address name -> exact nets, or None (unresolvable -> widen)."""
+    def resolve_name(name: str, seen: frozenset, vdom: Optional[str],
+                     family: int) -> Optional[List[_IPNet]]:
+        """A src/dst address name -> exact nets, or None (unresolvable -> widen).
+        `family` (4/6) resolves the built-in `all` to the right wildcard; object
+        lookups are scoped to `vdom`."""
         if name == "all":
-            return [_ANY4]
-        if name in addresses:
-            return _resolve_addr_obj(addresses[name])
-        if name in addrgrps:
-            key = ("grp", name)
+            return [_any_of(family)]
+        if (vdom, name) in addresses:
+            return _resolve_addr_obj(addresses[(vdom, name)])
+        if (vdom, name) in addrgrps:
+            key = ("grp", vdom, name)
             if key in seen:
                 return None                  # cycle -> fail closed
-            members = addrgrps[name].get("member") or []
+            members = addrgrps[(vdom, name)].get("member") or []
             if not members:
                 return None                  # empty group -> fail closed
             out: List[_IPNet] = []
             for m in members:
-                sub = resolve_name(m, seen | {key})
+                sub = resolve_name(m, seen | {key}, vdom, family)
                 if sub is None:
                     return None              # any bad member widens the whole dim
                 out.extend(sub)
             return out or None
         return None                          # undefined -> fail closed
 
-    def resolve_addr_list(names: List[str]) -> Tuple[List[_IPNet], bool]:
+    def resolve_addr_list(names: List[str], vdom: Optional[str],
+                          family: int) -> Tuple[List[_IPNet], bool]:
         """Resolve a policy srcaddr/dstaddr list. Returns (nets, exact). On any
         unresolvable member the WHOLE dimension widens to ANY (superset)."""
+        any_net = _any_of(family)
         if not names:
-            return [_ANY4], False
+            return [any_net], False
         out: List[_IPNet] = []
         for name in names:
-            nets = resolve_name(name, frozenset())
+            nets = resolve_name(name, frozenset(), vdom, family)
             if nets is None:
-                return [_ANY4], False
+                return [any_net], False
             out.extend(nets)
-        return (out, True) if out else ([_ANY4], False)
+        return (out, True) if out else ([any_net], False)
 
     def parse_range(spec: str) -> Optional[PortRange]:
         spec = spec.strip()
@@ -367,25 +472,27 @@ def parse_fortinet(text: str) -> Tuple[List[ACE], List[str]]:
             combos.append((proto, spr, dpr, None))
         return combos or None
 
-    def resolve_service(name: str, seen: frozenset) -> Optional[List[_Combo]]:
-        """A service name -> combos, or None if unresolvable (widen + imprecise)."""
+    def resolve_service(name: str, seen: frozenset,
+                        vdom: Optional[str]) -> Optional[List[_Combo]]:
+        """A service name -> combos, or None if unresolvable (widen + imprecise).
+        Custom services and service groups are scoped to `vdom`."""
         up = name.upper()
         if up == "ALL":
             return [_ANY_SVC]
         if up in ("ALL_TCP", "ALL_UDP", "ALL_SCTP"):
             return [(up.split("_")[1].lower(), ANY_PORTS, ANY_PORTS, None)]
-        if name in svc_custom:
-            return _resolve_custom_svc(svc_custom[name])
-        if name in svc_groups:
-            key = ("svcgrp", name)
+        if (vdom, name) in svc_custom:
+            return _resolve_custom_svc(svc_custom[(vdom, name)])
+        if (vdom, name) in svc_groups:
+            key = ("svcgrp", vdom, name)
             if key in seen:
                 return None
-            members = svc_groups[name].get("member") or []
+            members = svc_groups[(vdom, name)].get("member") or []
             if not members:
                 return None
             out: List[_Combo] = []
             for m in members:
-                sub = resolve_service(m, seen | {key})
+                sub = resolve_service(m, seen | {key}, vdom)
                 if sub is None:
                     return None
                 out.extend(sub)
@@ -420,12 +527,13 @@ def parse_fortinet(text: str) -> Tuple[List[ACE], List[str]]:
             combos.append((proto, ANY_PORTS, ANY_PORTS, None))
         return combos or None
 
-    def resolve_service_list(names: List[str]) -> Tuple[List[_Combo], bool]:
+    def resolve_service_list(names: List[str],
+                             vdom: Optional[str]) -> Tuple[List[_Combo], bool]:
         if not names:
             return [_ANY_SVC], True          # no service set == FortiGate "ALL"
         combos: List[_Combo] = []
         for name in names:
-            got = resolve_service(name, frozenset())
+            got = resolve_service(name, frozenset(), vdom)
             if got is None:
                 return [_ANY_SVC], False     # widen service dim + imprecise
             combos.extend(got)
@@ -434,6 +542,7 @@ def parse_fortinet(text: str) -> Tuple[List[ACE], List[str]]:
     # ── Expand each enabled policy (in edit order) into ACEs. -----------------
     entries: List[ACE] = []
     seq = 0
+    contexts: set = set()   # distinct acl (first-match) contexts seen
 
     def enable(vals: Optional[List[str]]) -> bool:
         return (_first(vals) or "").lower() != "disable"
@@ -441,23 +550,46 @@ def parse_fortinet(text: str) -> Tuple[List[ACE], List[str]]:
     def flag_on(vals: Optional[List[str]]) -> bool:
         return (_first(vals) or "").lower() == "enable"
 
-    for pname, pol, pline in policies:
+    for pname, pol, pline, pvdom, block in policies:
+        acl = _ACL if pvdom is None else f"{_ACL}:{pvdom}"
+        contexts.add(acl)
+        # Which address families this policy emits. `policy6` is v6-only; a
+        # unified `policy` carries v4 (srcaddr/dstaddr) and, when present, v6
+        # (srcaddr6/dstaddr6) — emit an ACE set for each.
+        if block == "policy6":
+            fams: List[Tuple[int, str, str]] = [(6, "srcaddr", "dstaddr")]
+        else:
+            fams = []
+            has6 = bool(pol.get("srcaddr6") or pol.get("dstaddr6"))
+            has4 = bool(pol.get("srcaddr") or pol.get("dstaddr"))
+            if has4 or not has6:            # default to v4 when no addr field set
+                fams.append((4, "srcaddr", "dstaddr"))
+            if has6:
+                fams.append((6, "srcaddr6", "dstaddr6"))
         try:
             if not enable(pol.get("status")):
                 notes.append(f"fortinet policy {pname} is disabled "
                              f"(set status disable) — skipped (not enforced)")
                 continue
 
-            action = "permit" if (_first(pol.get("action")) or "").lower() == \
-                "accept" else "deny"
-            imprecise = False
+            action, forwarding = _action_of(_first(pol.get("action")))
+            base_imprecise = False
+
+            if forwarding:
+                base_imprecise = True
+                notes.append(f"fortinet policy {pname}: action "
+                             f"'{(_first(pol.get('action')) or '').lower()}' "
+                             f"FORWARDS matched traffic (tunnel/portal/redirect) "
+                             f"— modeled as an over-approximating PERMIT + "
+                             f"imprecise (never a deny); the exact forwarded "
+                             f"path/NAT is unmodeled")
 
             # Interfaces: a SPECIFIC srcintf/dstintf narrows the match (like a
             # PAN-OS from/to zone) — over-approximate + imprecise. "any" is exact.
             for ik in ("srcintf", "dstintf"):
                 iv = pol.get(ik) or []
                 if any(v.lower() != "any" for v in iv):
-                    imprecise = True
+                    base_imprecise = True
                     notes.append(f"fortinet policy {pname}: specific {ik} "
                                  f"{[v for v in iv if v.lower() != 'any']} not "
                                  f"modeled (L3/L4 over-approximation — marked "
@@ -465,14 +597,14 @@ def parse_fortinet(text: str) -> Tuple[List[ACE], List[str]]:
 
             sched = (_first(pol.get("schedule")) or "always").lower()
             if sched != "always":
-                imprecise = True
+                base_imprecise = True
                 notes.append(f"fortinet policy {pname}: schedule '{sched}' "
                              f"restricts WHEN the rule matches — not modeled "
                              f"(marked imprecise, verify manually)")
 
             for idk in ("users", "groups", "fsso-groups"):
                 if pol.get(idk):
-                    imprecise = True
+                    base_imprecise = True
                     notes.append(f"fortinet policy {pname}: identity match "
                                  f"`set {idk}` narrows the match — not modeled "
                                  f"(marked imprecise, verify manually)")
@@ -483,81 +615,117 @@ def parse_fortinet(text: str) -> Tuple[List[ACE], List[str]]:
                              f"NAT is not modeled (filter-space only; the L3/L4 "
                              f"match space is unchanged)")
 
-            srcs, src_ok = resolve_addr_list(pol.get("srcaddr") or [])
-            dsts, dst_ok = resolve_addr_list(pol.get("dstaddr") or [])
-            combos, svc_ok = resolve_service_list(pol.get("service") or [])
-            if not src_ok:
-                imprecise = True
-                notes.append(f"fortinet policy {pname}: srcaddr "
-                             f"{pol.get('srcaddr')} has an unresolvable/undefined "
-                             f"member — src widened to ANY (marked imprecise)")
-            if not dst_ok:
-                imprecise = True
-                notes.append(f"fortinet policy {pname}: dstaddr "
-                             f"{pol.get('dstaddr')} has an unresolvable/undefined "
-                             f"member — dst widened to ANY (marked imprecise)")
+            combos, svc_ok = resolve_service_list(pol.get("service") or [], pvdom)
             if not svc_ok:
-                imprecise = True
+                base_imprecise = True
                 notes.append(f"fortinet policy {pname}: service "
                              f"{pol.get('service')} unresolvable — widened to ANY "
                              f"proto/port (marked imprecise)")
 
-            # Negated addresses match the COMPLEMENT — not one rectangle. Widen
-            # that dimension to ANY (superset) + imprecise; never keep the value.
-            if flag_on(pol.get("srcaddr-negate")):
-                srcs, imprecise = [_ANY4], True
-                notes.append(f"fortinet policy {pname}: srcaddr-negate enable — "
-                             f"matches the complement of the listed set; widened "
-                             f"to ANY (marked imprecise)")
-            if flag_on(pol.get("dstaddr-negate")):
-                dsts, imprecise = [_ANY4], True
-                notes.append(f"fortinet policy {pname}: dstaddr-negate enable — "
-                             f"matches the complement of the listed set; widened "
-                             f"to ANY (marked imprecise)")
+            # Negated service matches the COMPLEMENT of the service set — not one
+            # rectangle. Widen the whole service dimension to ANY proto/port
+            # (superset) + imprecise; never keep the listed set (that would
+            # under-approximate and let segcheck FALSE-PASS a probe outside it).
+            if flag_on(pol.get("service-negate")):
+                combos, base_imprecise = [_ANY_SVC], True
+                notes.append(f"fortinet policy {pname}: service-negate enable — "
+                             f"matches the complement of the listed services; "
+                             f"widened to ANY proto/port (marked imprecise)")
 
-            if len(srcs) * len(dsts) * len(combos) > _MAX_EXPAND:
-                notes.append(f"fortinet policy {pname} expands to >"
-                             f"{_MAX_EXPAND} ACEs; widened to a single any/any "
-                             f"ACE (superset) and marked imprecise — verify")
-                srcs, dsts, combos, imprecise = [_ANY4], [_ANY4], [_ANY_SVC], True
+            for family, sf, df in fams:
+                any_net = _any_of(family)
+                imprecise = base_imprecise
+                cbs = combos
 
-            for s in srcs:
-                for d in dsts:
-                    for proto, spr, dpr, itype in combos:
-                        seq += 1
-                        entries.append(ACE(
-                            seq=seq, action=action, proto=proto, src=s, dst=d,
-                            src_port=spr, dst_port=dpr, icmp_type=itype,
-                            stateful=False, imprecise=imprecise,
-                            raw=(f"policy {pname}: {action} {proto} {s} -> {d}"
-                                 + (f" dport {dpr}" if not dpr.is_any() else "")
-                                 + (f" type {itype}" if itype else "")),
-                            acl=_ACL, line=pline, transit=True))
+                srcs, src_ok = resolve_addr_list(pol.get(sf) or [], pvdom, family)
+                dsts, dst_ok = resolve_addr_list(pol.get(df) or [], pvdom, family)
+                if not src_ok:
+                    imprecise = True
+                    notes.append(f"fortinet policy {pname}: {sf} "
+                                 f"{pol.get(sf)} has an unresolvable/undefined "
+                                 f"member — src widened to ANY (marked imprecise)")
+                if not dst_ok:
+                    imprecise = True
+                    notes.append(f"fortinet policy {pname}: {df} "
+                                 f"{pol.get(df)} has an unresolvable/undefined "
+                                 f"member — dst widened to ANY (marked imprecise)")
+
+                # Negated addresses match the COMPLEMENT — not one rectangle.
+                # Widen that dimension to ANY (superset) + imprecise.
+                if flag_on(pol.get("srcaddr-negate")):
+                    srcs, imprecise = [any_net], True
+                    notes.append(f"fortinet policy {pname}: srcaddr-negate enable "
+                                 f"— matches the complement of the listed set; "
+                                 f"widened to ANY (marked imprecise)")
+                if flag_on(pol.get("dstaddr-negate")):
+                    dsts, imprecise = [any_net], True
+                    notes.append(f"fortinet policy {pname}: dstaddr-negate enable "
+                                 f"— matches the complement of the listed set; "
+                                 f"widened to ANY (marked imprecise)")
+
+                if len(srcs) * len(dsts) * len(cbs) > _MAX_EXPAND:
+                    notes.append(f"fortinet policy {pname} expands to >"
+                                 f"{_MAX_EXPAND} ACEs; widened to a single "
+                                 f"any/any ACE (superset) and marked imprecise "
+                                 f"— verify")
+                    srcs, dsts, cbs, imprecise = [any_net], [any_net], \
+                        [_ANY_SVC], True
+
+                for s in srcs:
+                    for d in dsts:
+                        for proto, spr, dpr, itype in cbs:
+                            seq += 1
+                            entries.append(ACE(
+                                seq=seq, action=action, proto=proto, src=s, dst=d,
+                                src_port=spr, dst_port=dpr, icmp_type=itype,
+                                stateful=False, imprecise=imprecise,
+                                raw=(f"policy {pname}: {action} {proto} {s} -> {d}"
+                                     + (f" dport {dpr}" if not dpr.is_any() else "")
+                                     + (f" type {itype}" if itype else "")),
+                                acl=acl, line=pline, transit=True))
         except Exception as exc:
             # A policy we cannot expand fails CLOSED: one opaque any/any imprecise
-            # ACE preserving its action, so it becomes segmentation-INDETERMINATE
-            # for any flow it touches (never a silent hole / false PASS).
-            seq += 1
-            act = "permit" if (_first(pol.get("action")) or "").lower() == \
-                "accept" else "deny"
-            entries.append(ACE(seq=seq, action=act, proto="ip", src=_ANY4,
-                               dst=_ANY4, imprecise=True,
-                               raw=f"policy {pname}: unparsed ({exc!r}) — "
-                                   f"fail-closed", acl=_ACL, line=pline,
-                               transit=True))
+            # ACE per family (preserving its action), so it becomes
+            # segmentation-INDETERMINATE for any flow it touches (never a silent
+            # hole / false PASS).
+            act, _fwd = _action_of(_first(pol.get("action")))
+            for family, _sf, _df in (fams or [(4, "srcaddr", "dstaddr")]):
+                any_net = _any_of(family)
+                seq += 1
+                entries.append(ACE(seq=seq, action=act, proto="ip", src=any_net,
+                                   dst=any_net, imprecise=True,
+                                   raw=f"policy {pname}: unparsed ({exc!r}) — "
+                                       f"fail-closed", acl=acl, line=pline,
+                                   transit=True))
             notes.append(f"fortinet policy {pname}: expansion error ({exc!r}) — "
                          f"kept as an opaque imprecise ACE (fail-closed)")
 
-    # ── Trailing implicit deny-all (the FortiGate default). Without it segcheck
-    # could FALSE-PASS a leak that simply runs off the end of the policy list.
-    seq += 1
-    entries.append(ACE(seq=seq, action="deny", proto="ip", src=_ANY4, dst=_ANY4,
-                       raw="firewall-policy: implicit default deny-all",
-                       acl=_ACL, line=0, transit=True))
+    # ── Trailing implicit deny-all (the FortiGate default) PER context, for BOTH
+    # families. Without it segcheck could FALSE-PASS a leak that simply runs off
+    # the end of a policy list. A v6-only deny would leave v4 flows uncovered and
+    # vice-versa, so each context gets both. The plain "firewall-policy" context
+    # (if any) is appended LAST so its v4 deny is the final ACE (stable for
+    # callers that inspect the tail).
+    ctx_list = sorted(c for c in contexts if c != _ACL)
+    if _ACL in contexts or not contexts:
+        ctx_list.append(_ACL)
+    for acl in ctx_list:
+        seq += 1
+        entries.append(ACE(seq=seq, action="deny", proto="ip", src=_ANY6,
+                           dst=_ANY6,
+                           raw=f"{acl}: implicit default deny-all (IPv6)",
+                           acl=acl, line=0, transit=True))
+        seq += 1
+        entries.append(ACE(seq=seq, action="deny", proto="ip", src=_ANY4,
+                           dst=_ANY4,
+                           raw=f"{acl}: implicit default deny-all",
+                           acl=acl, line=0, transit=True))
 
     if not policies:
         notes.append("fortinet: no `config firewall policy` entries found — only "
                      "the implicit default deny-all is modeled")
-    notes.append(f"fortinet: {len(policies)} policy edit(s) modeled as one global "
-                 f"first-match context; trailing implicit deny-all appended")
+    notes.append(f"fortinet: {len(policies)} policy edit(s) across "
+                 f"{len(ctx_list)} first-match context(s) "
+                 f"{sorted(ctx_list)}; trailing implicit deny-all (v4+v6) "
+                 f"appended per context")
     return entries, notes

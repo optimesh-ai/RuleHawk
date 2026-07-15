@@ -241,11 +241,22 @@ def audit_file(path: str, policy: Optional[dict], vendor: str = "auto") -> FileR
         text = open(path, encoding="utf-8", errors="replace").read()
     except OSError as e:
         return FileResult(path, "?", "error", 0, error=str(e))
-    vlabel, parse_fn = _pick_parser(text, vendor)
-    aces, notes = parse_fn(text)
-    findings = analyze(aces)
-    if policy:
-        findings += check_segmentation(aces, policy)
+    # Defense-in-depth: a detector or parser must never take the whole gate down
+    # with an uncaught exception (e.g. RecursionError on adversarially-deep JSON)
+    # — that would exit 1 (a traceback) instead of the intended fail-closed
+    # exit 2. Any crash here degrades to a parse ERROR, which parse_failures
+    # treats as fail-closed. RecursionError is not an OSError/ValueError, so we
+    # catch broadly on purpose.
+    try:
+        vlabel, parse_fn = _pick_parser(text, vendor)
+        aces, notes = parse_fn(text)
+        findings = analyze(aces)
+        if policy:
+            findings += check_segmentation(aces, policy)
+    except Exception as e:                       # noqa: BLE001 (fail-closed guard)
+        return FileResult(path, "?", "error", 0,
+                          error=f"parse/analyze crashed (fail-closed): "
+                                f"{type(e).__name__}: {e}")
     line_by_id = {(a.acl, a.seq): a.line for a in aces}
     status = "ok" if aces else "no_rules_parsed"
     return FileResult(path, vlabel, status, len(aces), findings, notes, line_by_id)
@@ -748,7 +759,8 @@ options:
   --fail-on LEVEL      fail the gate at this severity or worse:
                        critical | high | medium | low | none   (default: high)
   --vendor V           force a vendor for every file:
-                       auto | ios | junos | panos | iptables | nxos | eos
+                       auto | ios | junos | panos | iptables | nxos | eos |
+                       fortinet | aws-sg | umbrella | winfw | msdns | infoblox
                        (default: auto)
   --sarif PATH         write a SARIF 2.1.0 report (for code scanning)
   --summary PATH       write the markdown report ('-' for stdout); defaults to

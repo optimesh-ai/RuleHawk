@@ -36,6 +36,20 @@ LESS restrictive). It therefore never falsely PERMITS: an inter-zone
 ``must_not_reach`` can never FALSE-PASS because we dropped a block, and a
 ``must_reach`` connectivity check fails closed rather than over-claiming.
 
+PROFILE SCOPING (``Profiles: Domain|Private|Public``). WFAS rules are scoped to a
+subset of the three network-location profiles, and only ONE profile is active on
+an interface at a time — a Domain interface never applies a Public-scoped rule.
+So block-precedence holds only WITHIN a profile: a Block scoped to ``Public``
+must not be allowed to prove an Allow scoped to ``Domain`` dead (they never
+coexist on one interface). We model this by making the first-match context
+per (direction, profile): an all-profiles rule (no ``Profiles``, ``Any``/``All``,
+or all three) keeps the shared ``Inbound``/``Outbound`` context; a profile-scoped
+rule goes into one ``Inbound:Domain`` / ``Inbound:Public`` / ... context per named
+profile. analyze()/segcheck group by ``acl``, so a Block only ever shadows an
+Allow in the SAME profile context — cross-profile dead-claims are structurally
+impossible. Placing a rule in fewer shared contexts can only DROP a dead-rule
+claim (sound under-reporting), never invent one.
+
 DIRECTION -> HOST-HOOK ORIENTATION (transit=False).
   * ``Direction: In`` (inbound): the host is the packet DESTINATION.
     ``LocalIP`` -> dst (``Any`` = the host itself = ANY, a superset), ``RemoteIP``
@@ -67,11 +81,18 @@ ANY + ``imprecise``.
 
 OTHER FIELDS. ``Enabled: No`` -> the rule is disabled on the device; it is
 skipped (no ACE) + note (exact, like ASA ``inactive``). ``Protocol: ICMPv4`` ->
-``icmp``; ``ICMPv6`` -> ``icmpv6`` (an ICMP ``Type:Code`` is modeled as
-``icmp_type`` when present, else all types). L3/L4-orthogonal NARROWING scopes we
-do not model (``Program``, ``Service``, ``InterfaceType``, IPsec ``Security``)
-mark the ACE ``imprecise`` so a narrowed deny can never prove isolation the
-device does not enforce.
+``icmp``; ``ICMPv6`` -> ``icmpv6``. An ICMP ``Type:Code`` given as a proper
+``Type:`` field is modeled as ``icmp_type``; the INDENTED ``Type  Code`` sub-table
+netsh prints beneath ``Protocol:`` is NOT a continuation of the proto value (it
+would corrupt proto into a no-match string) — it is ignored, leaving
+``icmp_type=None`` (all types = sound superset). Only the genuinely multi-value
+fields (LocalIP/RemoteIP, LocalPort/RemotePort) join continuation lines; scalar
+fields never do. L3/L4-orthogonal NARROWING scopes we do not model (``Program``,
+``Service``, ``InterfaceType``, IPsec ``Security``) mark the ACE ``imprecise`` so
+a narrowed deny can never prove isolation the device does not enforce.
+``Action: Bypass`` (authenticated / IPsec-secured override) is a valid WFAS
+action RuleHawk does not model as permit/deny — intentionally skipped with a note
+(skipping only makes the model more restrictive, so it stays sound).
 
 Malformed / partial blocks degrade with a note, never crash: a block missing
 ``Action`` or ``Direction`` is skipped with a note.
@@ -104,6 +125,11 @@ _PROTO_NUM = {"1": "icmp", "2": "igmp", "6": "tcp", "17": "udp", "47": "gre",
 _FIELD_RE = re.compile(r"^(?P<name>[A-Za-z][A-Za-z0-9 /_.-]*?)\s*:\s*(?P<val>.*?)\s*$")
 # Fields whose values legitimately repeat / continue across lines.
 _MULTI = frozenset({"localip", "remoteip", "localport", "remoteport"})
+# The three WFAS profiles. A rule's `Profiles:` scopes it to a subset of these;
+# a Domain interface only ever applies rules scoped to Domain (or to all), so a
+# Block in one profile must NEVER shadow an Allow in a DISJOINT profile.
+_PROFILES = ("Domain", "Private", "Public")
+_PROFILES_LOWER = frozenset(p.lower() for p in _PROFILES)
 # `LOW-HIGH` numeric port range.
 _PORT_RANGE_RE = re.compile(r"^(\d+)\s*-\s*(\d+)$")
 
@@ -150,6 +176,42 @@ def _norm_proto(v: str) -> str:
     return _PROTO_NUM.get(v, v)             # numeric/other -> name or opaque-exact
 
 
+def _profile_contexts(fields: Dict[str, object], base_acl: str) -> List[str]:
+    """The first-match ``acl`` context(s) a rule participates in, one PER active
+    profile so cross-profile coverage cannot happen.
+
+    A rule that applies to ALL profiles (no ``Profiles:`` field, ``Any``/``All``,
+    or all three named) keeps the SHARED base context (``Inbound``/``Outbound``):
+    every interface applies it, so two all-profiles rules always coexist and may
+    soundly shadow each other. A rule scoped to a STRICT subset goes into one
+    ``base:Profile`` context per named profile (e.g. ``Inbound:Domain``), so a
+    Block scoped only to ``Public`` (context ``Inbound:Public``) and an Allow
+    scoped only to ``Domain`` (context ``Inbound:Domain``) live in different
+    first-match contexts and analyze()/segcheck — which group by ``acl`` — can
+    never use one to prove the other dead. An unrecognized profile token is kept
+    as its own isolated context (never merged into the shared bucket), so it can
+    neither be falsely covered by nor falsely cover an all-profiles rule.
+
+    This is over-approximation-safe: putting a rule in FEWER shared contexts can
+    only DROP dead-rule claims (a genuine cross-profile shadow may go unreported —
+    sound under-reporting), never manufacture a false one.
+    """
+    raw = str(fields.get("profiles") or "").strip().lower()
+    if raw in ("", "any", "all"):
+        return [base_acl]
+    named: List[str] = []
+    for tok in raw.split(","):
+        t = tok.strip()
+        if not t:
+            continue
+        cap = t.capitalize() if t in _PROFILES_LOWER else t.title()
+        if cap not in named:
+            named.append(cap)
+    if not named or {n.lower() for n in named} == _PROFILES_LOWER:
+        return [base_acl]                       # all profiles -> shared context
+    return [f"{base_acl}:{n}" for n in named]
+
+
 def _iter_blocks(text: str) -> List[Dict[str, object]]:
     """Split netsh show-rule output into per-rule field dictionaries.
 
@@ -166,12 +228,24 @@ def _iter_blocks(text: str) -> List[Dict[str, object]]:
         if raw.strip() == "":
             cur_field = None
             continue
-        if raw[:1].isspace():                       # continuation of cur_field
-            if cur is not None and cur_field is not None:
+        if raw[:1].isspace():                       # indented line
+            # Continuation joining applies ONLY to the multi-value fields that
+            # legitimately span lines (LocalIP/RemoteIP, and LocalPort/RemotePort
+            # netsh may wrap). An indented line under a SCALAR field — most
+            # importantly the ICMP ``Type  Code`` sub-table printed beneath
+            # ``Protocol: ICMPv4`` — is NOT part of that field's value; joining it
+            # would corrupt the proto string ('icmpv4,type code,8 any') into a
+            # deny that matches no real packet (a narrow-without-imprecise
+            # superset breach). So we join only _MULTI fields and otherwise drop
+            # the stray line (and stop attributing further indented lines to the
+            # scalar), leaving proto=icmp / icmp_type=None (all types = superset).
+            if cur is not None and cur_field in _MULTI:
                 v = raw.strip()
                 if v:
                     prev = cur.get(cur_field)
                     cur[cur_field] = (str(prev) + "," + v) if prev else v
+            else:
+                cur_field = None
             continue
         m = _FIELD_RE.match(raw)
         if not m:                                    # `-----` separator / prose
@@ -325,12 +399,27 @@ def _block_to_aces(fields: Dict[str, object], notes: List[str]) -> List[ACE]:
                      f"context to place it in).")
         return []
     action_raw = str(fields.get("action") or "").strip().lower()
+    if action_raw == "bypass":
+        # `Action: Bypass` is a VALID WFAS action (an authenticated / IPsec-secured
+        # override that lets matching authenticated traffic bypass Block rules).
+        # RuleHawk does not model it as a plain permit/deny, so it is intentionally
+        # skipped — NOT a parse error. Skipping only ever makes the model MORE
+        # restrictive (we never add the implied permit), so it stays sound.
+        notes.append(f"WinFW rule '{name}': Action 'Bypass' (authenticated / "
+                     f"IPsec-secured override) is a valid WFAS action RuleHawk "
+                     f"does not model as permit/deny — intentionally skipped (not "
+                     f"an error; verify manually if it bears on isolation).")
+        return []
     if action_raw not in ("allow", "block"):
         notes.append(f"WinFW rule '{name}': missing/unknown Action "
                      f"({fields.get('action')!r}) — skipped.")
         return []
 
     acl = "Inbound" if direction == "in" else "Outbound"
+    # Per-profile first-match contexts: an all-profiles rule stays in the shared
+    # base context; a profile-scoped rule is placed in `base:Profile` context(s)
+    # so a Block in one profile cannot cover an Allow in a disjoint profile.
+    contexts = _profile_contexts(fields, acl)
     action = "permit" if action_raw == "allow" else "deny"
 
     proto = _norm_proto(str(fields.get("protocol") or ""))
@@ -432,7 +521,7 @@ def _block_to_aces(fields: Dict[str, object], notes: List[str]) -> List[ACE]:
                            icmp_type=icmp_type, imprecise=True,
                            raw=f"{acl}: {action} '{name}' (over-cap; widened)",
                            acl=acl, line=line, transit=False))
-        return out
+        return _fan_profiles(out, acl, contexts)
 
     out = []
     for (s, d) in combos:
@@ -444,7 +533,24 @@ def _block_to_aces(fields: Dict[str, object], notes: List[str]) -> List[ACE]:
                     stateful=False, imprecise=base_imprecise,
                     raw=_raw(acl, action, name, proto, s, d, sp, dp, ported),
                     acl=acl, line=line, transit=False))
-    return out
+    return _fan_profiles(out, acl, contexts)
+
+
+def _fan_profiles(out: List[ACE], base_acl: str, contexts: List[str]) -> List[ACE]:
+    """Replicate a block's ACEs into every profile context it applies to. For the
+    shared base context (the all-profiles / common case) the list is returned
+    unchanged; a profile-scoped rule is copied once per `base:Profile` context
+    with its ``acl`` (and the acl label in ``raw``) rewritten so each copy lands
+    in the right first-match bucket."""
+    if len(contexts) == 1 and contexts[0] == base_acl:
+        return out
+    prefix = base_acl + ":"
+    expanded: List[ACE] = []
+    for ctx in contexts:
+        for a in out:
+            expanded.append(dataclasses.replace(
+                a, acl=ctx, raw=a.raw.replace(prefix, ctx + ":", 1)))
+    return expanded
 
 
 def _opt(fields: Dict[str, object], key: str) -> Optional[str]:
@@ -453,15 +559,29 @@ def _opt(fields: Dict[str, object], key: str) -> Optional[str]:
 
 
 def _default_aces(acl: str) -> List[ACE]:
-    """The per-profile direction default as the trailing rule(s): inbound ->
+    """The per-context direction default as the trailing rule(s): inbound ->
     ``deny ip any any`` (blocked by default), outbound -> ``permit ip any any``
-    (allowed by default). Emitted for both families (v4 + v6)."""
-    act = "deny" if acl == "Inbound" else "permit"
-    desc = ("per-profile default: inbound is blocked"
-            if acl == "Inbound" else "per-profile default: outbound is allowed")
+    (allowed by default). Emitted for both families (v4 + v6).
+
+    The OUTBOUND default-permit is flagged ``imprecise=True``: Windows' allow-all
+    outbound is an OS default, not an authored ``permit ip any any``, so flagging
+    it CRITICAL ``permit-any-any`` on every host with any outbound rule is pure
+    noise. analyze()'s permit-any-any / broad-any-any checks skip imprecise ACEs,
+    so this suppresses the synthetic finding while leaving any REAL authored
+    all-any permit (which is exact) still flagged. It is segcheck-safe: every
+    WinFW ACE is transit=False and so excluded from the inter-zone witness search
+    entirely — an imprecise host default at worst yields a conservative
+    connectivity-indeterminate, never a false PASS or a false reach. The inbound
+    default-deny stays EXACT (it is the trailing rule and never covers anything
+    earlier, and an exact host default-deny is the truthful model)."""
+    inbound = acl.split(":", 1)[0] == "Inbound"
+    act = "deny" if inbound else "permit"
+    desc = ("per-profile default: inbound is blocked" if inbound
+            else "per-profile default: outbound is allowed (OS default)")
     out: List[ACE] = []
     for net in (_ANY4, _ANY6):
         out.append(ACE(seq=0, action=act, proto="ip", src=net, dst=net,
+                       imprecise=not inbound,
                        raw=f"{acl}: default policy — {desc}", acl=acl,
                        line=0, transit=False))
     return out
@@ -472,15 +592,14 @@ def parse_winfw(text: str) -> Tuple[List[ACE], List[str]]:
 
     Returns the same ``(List[ACE], notes)`` IR as the other frontends, so
     ``analyze`` / ``check_segmentation`` consume it unchanged. Rules are grouped
-    into two first-match contexts (``acl`` = ``Inbound`` / ``Outbound``); within
-    each, Block rules are ordered before Allow rules (block-precedence) and the
-    direction default is appended as the trailing rule. See the module docstring.
+    into per-direction, per-PROFILE first-match contexts (``acl`` = ``Inbound`` /
+    ``Outbound`` for all-profiles rules, or ``Inbound:Domain`` etc. for
+    profile-scoped rules); within each, Block rules are ordered before Allow rules
+    (block-precedence) and the direction default is appended as the trailing rule.
+    See the module docstring.
     """
     notes: List[str] = []
-    buckets: Dict[str, Dict[str, List[ACE]]] = {
-        "Inbound": {"deny": [], "permit": []},
-        "Outbound": {"deny": [], "permit": []},
-    }
+    buckets: Dict[str, Dict[str, List[ACE]]] = {}
     for blk in _iter_blocks(text):
         try:
             aces = _block_to_aces(blk, notes)
@@ -489,10 +608,13 @@ def parse_winfw(text: str) -> Tuple[List[ACE], List[str]]:
                          f"({exc!r}) — skipped (verify manually).")
             continue
         for a in aces:
-            buckets[a.acl][a.action].append(a)
+            buckets.setdefault(a.acl, {"deny": [], "permit": []})[a.action].append(a)
 
     entries: List[ACE] = []
-    for acl in ("Inbound", "Outbound"):
+    # Sorted for deterministic output; contexts are INDEPENDENT first-match
+    # scopes (analyze/segcheck group by acl), so the order between them is
+    # immaterial to correctness.
+    for acl in sorted(buckets):
         denies = buckets[acl]["deny"]
         permits = buckets[acl]["permit"]
         if not denies and not permits:

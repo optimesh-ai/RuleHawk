@@ -281,3 +281,149 @@ def test_malformed_lines_do_not_crash_and_surface_notes():
     # Never crashes; always emits at least the fail-closed default markers.
     assert any(a.proto == "ip" and a.imprecise for a in aces)
     assert notes  # degraded with surfaced notes rather than silently
+
+
+# --------------------------------------------------------------------------- #
+# Soundness regressions — Windows would REJECT or ORDER these differently than
+# the config text implies, so a CONFIDENT deny would over-cover and false-PASS.
+# Each must instead be imprecise -> segmentation-INDETERMINATE.
+# --------------------------------------------------------------------------- #
+
+def test_processingorder_collision_is_imprecise_not_order_dependent():
+    # Two policies share -ProcessingOrder 1 with overlapping src and OPPOSITE
+    # actions. Windows keeps ProcessingOrder unique at runtime (an insert shifts
+    # existing ones), so the config text does NOT fix their relative first-match
+    # order. The verdict must be INDETERMINATE regardless of authoring order —
+    # it must never flip (deny-first PASS / allow-first violation).
+    deny_first = (
+        'Add-DnsServerClientSubnet -Name "CorpSubnet" -IPv4Subnet "10.20.0.0/16"\n'
+        'Add-DnsServerQueryResolutionPolicy -Name "Deny" -Action DENY '
+        '-ClientSubnet "EQ,CorpSubnet" -ProcessingOrder 1\n'
+        'Add-DnsServerQueryResolutionPolicy -Name "Allow" -Action ALLOW '
+        '-ClientSubnet "EQ,CorpSubnet" -ProcessingOrder 1\n'
+    )
+    allow_first = (
+        'Add-DnsServerClientSubnet -Name "CorpSubnet" -IPv4Subnet "10.20.0.0/16"\n'
+        'Add-DnsServerQueryResolutionPolicy -Name "Allow" -Action ALLOW '
+        '-ClientSubnet "EQ,CorpSubnet" -ProcessingOrder 1\n'
+        'Add-DnsServerQueryResolutionPolicy -Name "Deny" -Action DENY '
+        '-ClientSubnet "EQ,CorpSubnet" -ProcessingOrder 1\n'
+    )
+    policy = {"zones": _ZONES,
+              "must_not_reach": [{"src": "CORP", "dst": "DNS",
+                                  "proto": "tcp", "ports": [53]}]}
+    for cfg in (deny_first, allow_first):
+        aces, notes = parse_msdns(cfg)
+        assert any("share -ProcessingOrder" in n for n in notes)
+        # Every colliding policy's ACEs are imprecise.
+        policy_aces = [a for a in aces if a.proto in ("udp", "tcp")]
+        assert policy_aces and all(a.imprecise for a in policy_aces)
+        kinds = _kinds(aces, policy)
+        assert kinds == ["segmentation-indeterminate"]
+        assert "segmentation-ok" not in kinds
+        assert "segmentation-violation" not in kinds
+
+
+def test_set_policy_with_no_prior_add_is_imprecise_reaches_default_allow():
+    # Set-DnsServerQueryResolutionPolicy on a policy that was never Add-ed:
+    # Windows errors (no rule is created) and the client falls through to the
+    # default-ALLOW. Synthesizing a confident DENY would falsely certify Guest
+    # isolation; it must be imprecise -> INDETERMINATE.
+    cfg = (
+        'Add-DnsServerClientSubnet -Name "GuestSubnet" -IPv4Subnet "10.70.0.0/16"\n'
+        'Set-DnsServerQueryResolutionPolicy -Name "Block" -Action DENY '
+        '-ClientSubnet "EQ,GuestSubnet" -ProcessingOrder 1\n'
+    )
+    aces, notes = parse_msdns(cfg)
+    assert any("no prior Add" in n for n in notes)
+    policy_aces = [a for a in aces if a.proto in ("udp", "tcp")]
+    assert policy_aces and all(a.imprecise for a in policy_aces)
+    policy = {"zones": _ZONES,
+              "must_not_reach": [{"src": "GUEST", "dst": "DNS",
+                                  "proto": "tcp", "ports": [53]}]}
+    kinds = _kinds(aces, policy)
+    assert kinds == ["segmentation-indeterminate"]
+    assert "segmentation-ok" not in kinds
+
+
+def test_duplicate_add_client_subnet_is_imprecise_not_a_false_pass():
+    # First Add is the smaller (real) subnet; a second Add with a BIGGER CIDR is
+    # REJECTED by Windows (the first definition stays). A confident deny of the
+    # over-broad last definition would certify isolation of the whole /16 that
+    # the server does not enforce — it must be imprecise -> INDETERMINATE.
+    cfg = (
+        'Add-DnsServerClientSubnet -Name "GuestSubnet" -IPv4Subnet "10.70.0.0/24"\n'
+        'Add-DnsServerClientSubnet -Name "GuestSubnet" -IPv4Subnet "10.70.0.0/16"\n'
+        'Add-DnsServerQueryResolutionPolicy -Name "Block" -Action DENY '
+        '-ClientSubnet "EQ,GuestSubnet" -ProcessingOrder 1\n'
+    )
+    aces, notes = parse_msdns(cfg)
+    assert any("Add-ed more than once" in n for n in notes)
+    policy = {"zones": _ZONES,
+              "must_not_reach": [{"src": "GUEST", "dst": "DNS",
+                                  "proto": "tcp", "ports": [53]}]}
+    kinds = _kinds(aces, policy)
+    assert kinds == ["segmentation-indeterminate"]
+    assert "segmentation-ok" not in kinds
+
+
+def test_set_client_subnet_action_remove_is_imprecise_not_a_false_pass():
+    # Set -Action REMOVE shrinks the subnet: removed members leave the group and
+    # are NOT denied. Treating it as REPLACE (the old behavior) denied exactly
+    # the removed CIDR and false-passed its isolation. It must be imprecise so a
+    # deny cannot over-cover -> INDETERMINATE.
+    zones = dict(_ZONES)
+    zones["REMOVED"] = ["10.70.5.0/24"]
+    cfg = (
+        'Add-DnsServerClientSubnet -Name "GuestSubnet" -IPv4Subnet "10.70.0.0/16"\n'
+        'Set-DnsServerClientSubnet -Name "GuestSubnet" -Action REMOVE '
+        '-IPv4Subnet "10.70.5.0/24"\n'
+        'Add-DnsServerQueryResolutionPolicy -Name "Block" -Action DENY '
+        '-ClientSubnet "EQ,GuestSubnet" -ProcessingOrder 1\n'
+    )
+    aces, notes = parse_msdns(cfg)
+    assert any("-Action REMOVE" in n for n in notes)
+    policy = {"zones": zones,
+              "must_not_reach": [{"src": "REMOVED", "dst": "DNS",
+                                  "proto": "tcp", "ports": [53]}]}
+    kinds = _kinds(aces, policy)
+    assert kinds == ["segmentation-indeterminate"]
+    assert "segmentation-ok" not in kinds
+
+
+def test_set_client_subnet_action_replace_stays_precise():
+    # The DEFAULT Set action is REPLACE, which IS exactly modelable — a plain
+    # Set (or -Action REPLACE) must NOT be flagged imprecise, so a legitimate
+    # DENY still certifies isolation (guards against over-flagging).
+    cfg = (
+        'Add-DnsServerClientSubnet -Name "GuestSubnet" -IPv4Subnet "10.99.0.0/16"\n'
+        'Set-DnsServerClientSubnet -Name "GuestSubnet" -Action REPLACE '
+        '-IPv4Subnet "10.70.0.0/16"\n'
+        'Add-DnsServerQueryResolutionPolicy -Name "Block" -Action DENY '
+        '-ClientSubnet "EQ,GuestSubnet" -ProcessingOrder 1\n'
+    )
+    aces, _ = parse_msdns(cfg)
+    policy = {"zones": _ZONES,
+              "must_not_reach": [{"src": "GUEST", "dst": "DNS",
+                                  "proto": "tcp", "ports": [53]}]}
+    assert _kinds(aces, policy) == ["segmentation-ok"]
+
+
+def test_compound_boolean_client_subnet_note_names_operator_not_undefined():
+    # "EQ,Corp,NE,Guest" is a compound boolean criterion; the "NE" is an
+    # OPERATOR, not a subnet name. The RESULT was already sound (widened to ANY +
+    # imprecise); assert the NOTE is now accurate and no longer claims an
+    # undefined subnet named 'NE'.
+    cfg = (
+        'Add-DnsServerClientSubnet -Name "Corp" -IPv4Subnet "10.20.0.0/16"\n'
+        'Add-DnsServerClientSubnet -Name "Guest" -IPv4Subnet "10.70.0.0/16"\n'
+        'Add-DnsServerQueryResolutionPolicy -Name "P" -Action DENY '
+        '-ClientSubnet "EQ,Corp,NE,Guest" -ProcessingOrder 1\n'
+    )
+    aces, notes = parse_msdns(cfg)
+    assert any("compound/boolean" in n and "operator 'NE'" in n for n in notes)
+    assert not any("undefined client-subnet 'NE'" in n for n in notes)
+    # Still sound: src widened to ANY + imprecise.
+    policy_aces = [a for a in aces if a.proto in ("udp", "tcp")]
+    assert policy_aces and all(a.imprecise and a.src.prefixlen == 0
+                               for a in policy_aces)

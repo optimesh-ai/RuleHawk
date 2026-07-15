@@ -165,45 +165,53 @@ def main(argv: list[str] | None = None) -> int:
         text = raw.decode("utf-8", "replace")  # no file, or explicit "-"
 
     # Auto-detect vendor (same precedence order as gate.py _pick_parser).
-    # "ios-asa" is the fallback: no positive signal was found.
+    # "ios-asa" is the fallback: no positive signal was found. The whole
+    # detect+parse+analyze is guarded: a detector or parser crash (e.g.
+    # RecursionError on adversarially-deep JSON) must degrade to a fail-closed
+    # exit 2, never an uncaught traceback + exit 1.
     forced = force_junos or force_panos or force_iptables
-    if force_junos or (not forced and detect_junos(text)):
-        aces, notes = parse_junos(text)
-        vendor = "junos"
-    elif force_panos or (not forced and detect_panos(text)):
-        aces, notes = parse_panos(text)
-        vendor = "panos"
-    elif force_iptables or (not forced and detect_iptables(text)):
-        aces, notes = parse_iptables(text)
-        vendor = "iptables"
-    elif not forced and detect_nxos(text):
-        aces, notes = parse_nxos(text)
-        vendor = "nxos"
-    elif not forced and detect_eos(text):
-        aces, notes = parse_eos(text)
-        vendor = "eos"
-    elif not forced and detect_fortinet(text):
-        aces, notes = parse_fortinet(text)
-        vendor = "fortinet"
-    elif not forced and detect_awssg(text):
-        aces, notes = parse_awssg(text)
-        vendor = "aws-sg"
-    elif not forced and detect_umbrella(text):
-        aces, notes = parse_umbrella(text)
-        vendor = "umbrella"
-    elif not forced and detect_winfw(text):
-        aces, notes = parse_winfw(text)
-        vendor = "winfw"
-    elif not forced and detect_msdns(text):
-        aces, notes = parse_msdns(text)
-        vendor = "msdns"
-    elif not forced and detect_infoblox(text):
-        aces, notes = parse_infoblox(text)
-        vendor = "infoblox"
-    else:
-        aces, notes = parse_acls(text)
-        vendor = "ios-asa"
-    findings = analyze(aces)
+    try:
+        if force_junos or (not forced and detect_junos(text)):
+            aces, notes = parse_junos(text)
+            vendor = "junos"
+        elif force_panos or (not forced and detect_panos(text)):
+            aces, notes = parse_panos(text)
+            vendor = "panos"
+        elif force_iptables or (not forced and detect_iptables(text)):
+            aces, notes = parse_iptables(text)
+            vendor = "iptables"
+        elif not forced and detect_nxos(text):
+            aces, notes = parse_nxos(text)
+            vendor = "nxos"
+        elif not forced and detect_eos(text):
+            aces, notes = parse_eos(text)
+            vendor = "eos"
+        elif not forced and detect_fortinet(text):
+            aces, notes = parse_fortinet(text)
+            vendor = "fortinet"
+        elif not forced and detect_awssg(text):
+            aces, notes = parse_awssg(text)
+            vendor = "aws-sg"
+        elif not forced and detect_umbrella(text):
+            aces, notes = parse_umbrella(text)
+            vendor = "umbrella"
+        elif not forced and detect_winfw(text):
+            aces, notes = parse_winfw(text)
+            vendor = "winfw"
+        elif not forced and detect_msdns(text):
+            aces, notes = parse_msdns(text)
+            vendor = "msdns"
+        elif not forced and detect_infoblox(text):
+            aces, notes = parse_infoblox(text)
+            vendor = "infoblox"
+        else:
+            aces, notes = parse_acls(text)
+            vendor = "ios-asa"
+        findings = analyze(aces)
+    except Exception as e:                       # noqa: BLE001 (fail-closed guard)
+        print(f"rulehawk: parse/analyze crashed (fail-closed): "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return 2
     if policy_path:
         try:
             policy = json.load(open(policy_path, encoding="utf-8"))

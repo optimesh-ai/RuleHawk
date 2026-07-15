@@ -336,3 +336,147 @@ def test_malformed_and_truncated_blocks_do_not_crash():
         assert isinstance(aces, list) and isinstance(notes, list)
         # always at least the trailing default deny
         assert aces and aces[-1].action == "deny"
+
+
+# --------------------------------------------------------------------------- #
+# regression: 5 confirmed soundness defects (each asserts the SOUND end-to-end
+# verdict — a fix must turn a FALSE-PASS / false dead-claim into indeterminate,
+# a violation, or a preserved live rule; never back into segmentation-ok).
+# --------------------------------------------------------------------------- #
+
+# IPv6 zones for the family-threading defect.
+_SEG6 = {"zones": {"CORP6": ["2001:db8:20::/48"], "PCI6": ["2001:db8:10::/48"]},
+         "must_not_reach": [{"src": "CORP6", "dst": "PCI6",
+                             "proto": "tcp", "ports": [445]}]}
+
+
+def test_ipv6_policy6_all_to_all_is_not_false_pass():
+    # DEFECT 1: a `config firewall policy6` permitting all -> all was modeled
+    # as v4 (all -> 0.0.0.0/0), so a v6 flow touched NO ACE and read as
+    # isolated. `all` must resolve to ::/0 in a v6 policy, and a v6 implicit
+    # deny-all must exist — so the v6 leak is caught, never segmentation-ok.
+    cfg = ("config firewall policy6\n    edit 1\n        set srcaddr \"all\"\n"
+           "        set dstaddr \"all\"\n        set action accept\n"
+           "        set service \"ALL\"\n    next\nend\n")
+    aces, _ = parse_fortinet(cfg)
+    # An exact v6 permit (all -> all) exists over ::/0.
+    permits = [a for a in aces if a.action == "permit"]
+    assert permits and all(a.src == ipaddress.ip_network("::/0")
+                           and a.dst == ipaddress.ip_network("::/0")
+                           for a in permits)
+    # A v6 implicit deny-all is appended alongside the v4 one.
+    assert any(a.action == "deny" and a.src == ipaddress.ip_network("::/0")
+               for a in aces)
+    k = _kinds(check_segmentation(aces, _SEG6))
+    assert "segmentation-ok" not in k          # must NOT false-PASS the v6 flow
+    assert "segmentation-violation" in k
+
+    # Same soundness for a UNIFIED policy that filters v6 via srcaddr6/dstaddr6.
+    uni = ('config firewall policy\n    edit 1\n        set srcaddr6 "all"\n'
+           '        set dstaddr6 "all"\n        set action accept\n'
+           '        set service "ALL"\n    next\nend\n')
+    assert "segmentation-ok" not in _kinds(check_segmentation(
+        parse_fortinet(uni)[0], _SEG6))
+    # v4 assurance preserved: a v4 all->all is still exact (not widened away).
+    assert any(a.action == "deny" and a.src == ipaddress.ip_network("0.0.0.0/0")
+               for a in aces)
+
+
+def test_service_negate_widens_service_dim_not_false_pass():
+    # DEFECT 2: `set service-negate enable` matches the COMPLEMENT of {tcp/445},
+    # so a must_not_reach on tcp/3389 lives in the matched (permitted) space.
+    # The service dim must widen to ANY proto/port + imprecise, so tcp/3389 is
+    # indeterminate — never a segmentation-ok that ignores the negation.
+    cfg = _policy('    edit 1\n        set srcaddr "corp-net"\n'
+                  '        set dstaddr "pci-net"\n        set action accept\n'
+                  '        set service "SMB"\n        set service-negate enable\n'
+                  '    next\n')
+    aces, _ = parse_fortinet(cfg)
+    permits = [a for a in aces if a.action == "permit"]
+    assert permits and all(a.imprecise for a in permits)
+    seg3389 = {"zones": {"CORP": ["10.20.0.0/16"], "PCI": ["10.10.0.0/16"]},
+               "must_not_reach": [{"src": "CORP", "dst": "PCI",
+                                   "proto": "tcp", "ports": [3389]}]}
+    assert "segmentation-ok" not in _kinds(check_segmentation(aces, seg3389))
+
+
+def test_vdoms_are_independent_first_match_contexts():
+    # DEFECT 3: two independent VDOMs — vdom_A denies CORP->PCI, vdom_B permits
+    # it. Merged into one list the deny would (wrongly) mask the permit
+    # (false-PASS) and analyze() would call the live permit dead. Scoped per
+    # VDOM: vdom_B's permit is a real leak, and it is never dead.
+    cfg = (
+        "config vdom\n"
+        "edit vdom_A\n"
+        "    config firewall address\n"
+        '        edit "corp-net"\n            set subnet 10.20.0.0 255.255.0.0\n        next\n'
+        '        edit "pci-net"\n            set subnet 10.10.0.0 255.255.0.0\n        next\n'
+        "    end\n"
+        "    config firewall service custom\n"
+        '        edit "SMB"\n            set tcp-portrange 445\n        next\n'
+        "    end\n"
+        "    config firewall policy\n"
+        '        edit 1\n            set srcaddr "corp-net"\n            set dstaddr "pci-net"\n'
+        '            set action deny\n            set service "SMB"\n        next\n'
+        "    end\n"
+        "next\n"
+        "edit vdom_B\n"
+        "    config firewall address\n"
+        '        edit "corp-net"\n            set subnet 10.20.0.0 255.255.0.0\n        next\n'
+        '        edit "pci-net"\n            set subnet 10.10.0.0 255.255.0.0\n        next\n'
+        "    end\n"
+        "    config firewall service custom\n"
+        '        edit "SMB"\n            set tcp-portrange 445\n        next\n'
+        "    end\n"
+        "    config firewall policy\n"
+        '        edit 1\n            set srcaddr "corp-net"\n            set dstaddr "pci-net"\n'
+        '            set action accept\n            set service "SMB"\n        next\n'
+        "    end\n"
+        "next\n"
+        "end\n")
+    aces, _ = parse_fortinet(cfg)
+    # Each VDOM is its own first-match context (not one merged "firewall-policy").
+    assert {"firewall-policy:vdom_A", "firewall-policy:vdom_B"} <= {a.acl for a in aces}
+    k = _kinds(check_segmentation(aces, _SEG))
+    assert "segmentation-violation" in k       # vdom_B's permit leaks
+    assert "segmentation-ok" not in k          # vdom_A's deny must not mask it
+    # analyze() must NOT declare vdom_B's live permit dead from vdom_A's deny.
+    assert "intent-inversion-permit-dead" not in _kinds(analyze(aces))
+
+
+def test_forwarding_action_ipsec_is_permit_not_deny():
+    # DEFECT 4: `set action ipsec` FORWARDS matched traffic — modeling it as a
+    # hard deny both false-PASSes a must_not_reach AND kills the later live
+    # permit as dead. It must be permit + imprecise: the flow is not provably
+    # isolated, and covers() refuses the imprecise coverer so nothing is dead.
+    cfg = _policy('    edit 1\n        set srcaddr "corp-net"\n'
+                  '        set dstaddr "pci-net"\n        set action ipsec\n'
+                  '        set service "SMB"\n    next\n'
+                  '    edit 2\n        set srcaddr "corp-net"\n'
+                  '        set dstaddr "pci-net"\n        set action accept\n'
+                  '        set service "SMB"\n    next\n')
+    aces, _ = parse_fortinet(cfg)
+    fwd = [a for a in aces if a.action == "permit"
+           and a.src == ipaddress.ip_network("10.20.0.0/16")]
+    # The ipsec rule is a permit (never a deny) and marked imprecise.
+    assert fwd and any(a.imprecise for a in fwd)
+    assert "segmentation-ok" not in _kinds(_seg(cfg))          # not false-PASS
+    assert "intent-inversion-permit-dead" not in _kinds(analyze(aces))  # not dead
+
+
+def test_edit_without_next_does_not_drop_a_permit():
+    # DEFECT 5: `edit 1` (a PERMIT) with no closing `next` before `edit 2`
+    # (a deny) used to be silently overwritten — the leak vanished and the
+    # config false-PASSed. The pending edit must be committed implicitly so the
+    # permit survives and its leak surfaces.
+    cfg = _policy('    edit 1\n        set srcaddr "corp-net"\n'
+                  '        set dstaddr "pci-net"\n        set action accept\n'
+                  '        set service "SMB"\n'
+                  '    edit 2\n        set srcaddr "corp-net"\n'
+                  '        set dstaddr "pci-net"\n        set action deny\n'
+                  '        set service "SMB"\n    next\n')
+    aces, _ = parse_fortinet(cfg)
+    assert [a for a in aces if a.action == "permit"]   # the permit was not dropped
+    k = _kinds(_seg(cfg))
+    assert "segmentation-violation" in k               # its leak surfaces
+    assert "segmentation-ok" not in k

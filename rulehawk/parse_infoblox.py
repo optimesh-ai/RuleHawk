@@ -84,6 +84,49 @@ _ACCESS_STMTS = frozenset({
     "allow-query-cache", "match-clients",
 })
 
+# Only `allow-query` (global or per-view) is the MASTER gate that decides whether
+# a client can actually get a DNS answer. allow-recursion / allow-query-cache are
+# sub-behaviours BEHIND allow-query, allow-transfer is a separate (AXFR) grant,
+# and a view's match-clients only BINDS a client to a view whose allow-query
+# STILL applies — none of them, on their own, prove reach-the-resolver. So their
+# permits must never stand alone as a must_reach connectivity PROOF (that is how
+# `match-clients{X}; allow-query{none}` or `allow-query{none}; allow-recursion{X}`
+# used to read as a false connectivity-ok). We keep those permits for the
+# ISOLATION direction (a must_not_reach over-report is the safe side) but mark
+# them `reach_opaque`, so segcheck returns indeterminate — never a false
+# connectivity-ok — on the must_reach side. Isolation soundness is preserved:
+# segcheck ignores reach_opaque in the must_not_reach (want="permit") search.
+_REACH_AUTHORITATIVE = frozenset({"allow-query"})
+
+# Depth cap for the recursive acl-reference / nested-match-list resolver. A
+# valid-but-very-deep config (or a long non-cyclic acl-reference chain) must
+# degrade to ANY + imprecise (=> segcheck INDETERMINATE) rather than raise
+# RecursionError and collapse the whole parse to EMPTY — which segcheck would
+# read as "nothing permits" = a false isolation PASS. Kept well under CPython's
+# default 1000-frame limit, with headroom for the caller's own stack.
+_MAX_RESOLVE_DEPTH = 100
+
+
+def _fail_closed_entries() -> List[ACE]:
+    """A single fail-closed reach context: `permit ip any any`, imprecise, for
+    BOTH address families. Used when parsing raises (deep/malformed config) so
+    the audit degrades to INDETERMINATE — never an EMPTY parse, which segcheck
+    reads as "nothing permits" = a false isolation PASS. An imprecise permit
+    makes BOTH directions fail closed: must_not_reach -> indeterminate (never a
+    false segmentation-ok), must_reach -> indeterminate (never a false
+    connectivity-ok)."""
+    aces: List[ACE] = []
+    seq = 0
+    for fam in (_ANY4, _ANY6):
+        seq += 1
+        aces.append(ACE(
+            seq=seq, action="permit", proto="ip", src=fam, dst=fam,
+            src_port=ANY_PORTS, dst_port=ANY_PORTS, imprecise=True,
+            raw="parse-error fail-closed: permit ip any any (imprecise) — "
+                "modeled to force INDETERMINATE, never a false isolation PASS",
+            acl="global:parse-error", line=0, transit=True))
+    return aces
+
 
 class _Tok:
     """One lexical token with its 1-based source line."""
@@ -263,7 +306,8 @@ _Atom = Tuple[str, List[_IPNet], bool, int]
 
 
 def _resolve_value(tok: _Tok, negate: bool, acls: Dict[str, List[_Tok]],
-                   notes: List[str], ctx: str, stack: List[str]) -> List[_Atom]:
+                   notes: List[str], ctx: str, stack: List[str],
+                   depth: int) -> List[_Atom]:
     """Resolve one member value (with its leading-`!` state) into ordered atoms.
 
     A plain CIDR/IP -> one exact permit/deny. `any` -> all addresses (exact).
@@ -304,7 +348,8 @@ def _resolve_value(tok: _Tok, negate: bool, acls: Dict[str, List[_Tok]],
                          f"match-list is not one rectangle; widened to ANY "
                          f"(imprecise; verify manually)")
             return [("deny", [_ANY4, _ANY6], True, tok.line)]
-        return _resolve_matchlist(acls[v], acls, notes, ctx, stack + [v])
+        return _resolve_matchlist(acls[v], acls, notes, ctx, stack + [v],
+                                  depth + 1)
 
     notes.append(f"undefined acl/reference `{v}` in {ctx} — widened to ANY "
                  f"(imprecise; fail-closed, verify manually)")
@@ -313,8 +358,19 @@ def _resolve_value(tok: _Tok, negate: bool, acls: Dict[str, List[_Tok]],
 
 def _resolve_matchlist(inner: List[_Tok], acls: Dict[str, List[_Tok]],
                        notes: List[str], ctx: str,
-                       stack: List[str]) -> List[_Atom]:
+                       stack: List[str], depth: int = 0) -> List[_Atom]:
     """Resolve an address-match-list's inner tokens into ordered atoms."""
+    if depth > _MAX_RESOLVE_DEPTH:
+        # A deep-but-valid acl-reference chain / nested-list nesting. Rather than
+        # recurse into a RecursionError (which would abort the whole parse to an
+        # empty, false-isolation result), widen this position to ANY + imprecise
+        # so segcheck is INDETERMINATE here (fail-closed). Only reached via a
+        # POSITIVE expansion (negated acl/nested lists never recurse), so permit.
+        line = inner[0].line if inner else 0
+        notes.append(f"acl/match-list nesting deeper than {_MAX_RESOLVE_DEPTH} in "
+                     f"{ctx} — widened to ANY (imprecise; fail-closed, verify "
+                     f"manually)")
+        return [("permit", [_ANY4, _ANY6], True, line)]
     atoms: List[_Atom] = []
     negate = False
     i, n = 0, len(inner)
@@ -339,24 +395,35 @@ def _resolve_matchlist(inner: List[_Tok], acls: Dict[str, List[_Tok]],
                              f"rectangle; widened to ANY (imprecise; verify)")
                 atoms.append(("deny", [_ANY4, _ANY6], True, tok.line))
             else:
-                atoms.extend(_resolve_matchlist(block_inner, acls, notes, ctx, stack))
+                atoms.extend(_resolve_matchlist(block_inner, acls, notes, ctx,
+                                                stack, depth + 1))
             negate = False
             i = after
             continue
         if txt == "}":
             i += 1
             continue
-        atoms.extend(_resolve_value(tok, negate, acls, notes, ctx, stack))
+        atoms.extend(_resolve_value(tok, negate, acls, notes, ctx, stack, depth))
         negate = False
         i += 1
     return atoms
 
 
-def _atoms_to_aces(atoms: List[_Atom], label: str, stmt_line: int) -> List[ACE]:
-    """Expand ordered atoms into a context's ACEs: two per source net (udp/53
-    and tcp/53), plus a trailing explicit BIND default-deny for both families."""
+def _atoms_to_aces(atoms: List[_Atom], label: str, stmt_line: int,
+                   dst_pr: PortRange = _DNS_PR, port_imprecise: bool = False,
+                   reach_opaque: bool = False) -> List[ACE]:
+    """Expand ordered atoms into a context's ACEs: two per source net (udp and
+    tcp), plus a trailing explicit BIND default-deny for both families.
+
+    `dst_pr` is the destination port range (default DNS 53; a `port N` prefix on
+    the access statement moves it — never silently kept at 53). `port_imprecise`
+    marks the whole context imprecise when the port could not be pinned (a
+    non-default `transport`, or an unparseable `port`) — a SUPERSET fix (53 is a
+    subset of the true space). `reach_opaque` marks permits that must not stand
+    alone as a must_reach connectivity proof (non-authoritative statements)."""
     aces: List[ACE] = []
     seq = 0
+    dport_txt = "53" if dst_pr == _DNS_PR else str(dst_pr)
     for action, nets, imprecise, line in atoms:
         for net in nets:
             fam_any = _ANY6 if net.version == 6 else _ANY4
@@ -364,8 +431,10 @@ def _atoms_to_aces(atoms: List[_Atom], label: str, stmt_line: int) -> List[ACE]:
                 seq += 1
                 aces.append(ACE(
                     seq=seq, action=action, proto=proto, src=net, dst=fam_any,
-                    src_port=ANY_PORTS, dst_port=_DNS_PR, imprecise=imprecise,
-                    raw=f"{label}: {action} {proto}/{_DNS_PORT} from {net} "
+                    src_port=ANY_PORTS, dst_port=dst_pr,
+                    imprecise=imprecise or port_imprecise,
+                    reach_opaque=(reach_opaque and action == "permit"),
+                    raw=f"{label}: {action} {proto}/{dport_txt} from {net} "
                         f"(reach DNS resolver)",
                     acl=label, line=line, transit=True))
     # BIND's default is deny-if-unmatched. Emit it explicitly for both families
@@ -382,16 +451,77 @@ def _atoms_to_aces(atoms: List[_Atom], label: str, stmt_line: int) -> List[ACE]:
     return aces
 
 
+def _resolve_port_prefix(name_parts: List[str], ctx: str,
+                         notes: List[str]) -> Tuple[PortRange, bool]:
+    """Read the optional `port N` / `transport X` prefix an access statement may
+    carry between its keyword and its `{ ... }` list (e.g.
+    `allow-transfer port 853 transport tls { ... }`). Returns (dst_port_range,
+    imprecise).
+
+    The reach-the-resolver model defaults to DNS port 53. A statement that moves
+    the port MUST NOT stay pinned at 53 (53 would be a SUBSET of the true space —
+    a disjoint-port must_not_reach would then false-PASS). So:
+      * a clean `port N` (N != 53)  -> model exactly N (precise superset);
+      * an explicit `port 53`       -> unchanged default;
+      * an unparseable `port` value, a non-cleartext `transport` (tls/quic/https/
+        dot/doq/doh, whose default port is NOT 53) without an explicit port, or
+        any other unrecognized prefix token -> widen the port dimension to ANY +
+        imprecise (fail-closed => segcheck indeterminate)."""
+    if not name_parts:
+        return _DNS_PR, False
+    explicit_port: Optional[object] = None   # int, or "bad", or None
+    transport: Optional[str] = None
+    unknown = False
+    i, n = 0, len(name_parts)
+    while i < n:
+        w = name_parts[i].lower()
+        if w == "port" and i + 1 < n:
+            try:
+                pv = int(name_parts[i + 1])
+                explicit_port = pv if 0 <= pv <= 65535 else "bad"
+            except ValueError:
+                explicit_port = "bad"
+            i += 2
+            continue
+        if w == "transport" and i + 1 < n:
+            transport = name_parts[i + 1].lower()
+            i += 2
+            continue
+        unknown = True
+        i += 1
+    if isinstance(explicit_port, int):
+        if explicit_port == _DNS_PORT:
+            return _DNS_PR, False
+        notes.append(f"{ctx} carries `port {explicit_port}` — destination port "
+                     f"modeled as {explicit_port}, not the DNS default 53")
+        return PortRange(explicit_port, explicit_port), False
+    if explicit_port == "bad":
+        notes.append(f"{ctx} has an unparseable `port` value — destination port "
+                     f"unknown; widened to ANY (imprecise; fail-closed, verify)")
+        return ANY_PORTS, True
+    # No explicit port. A non-cleartext transport defaults to a port that is NOT
+    # 53 (DoT/DoQ -> 853, DoH -> 443); with the exact port unstated, fail closed.
+    if (transport is not None and transport not in ("tcp", "udp")) or unknown:
+        notes.append(f"{ctx} carries a port/transport prefix whose destination "
+                     f"port differs from (or is unknown vs) the DNS default 53 — "
+                     f"widened to ANY (imprecise; fail-closed, verify manually)")
+        return ANY_PORTS, True
+    return _DNS_PR, False
+
+
 def _scan_statements(inner: List[_Tok], label: str, acls: Dict[str, List[_Tok]],
                      notes: List[str]) -> List[ACE]:
     """Find the access statements inside an options/view body and emit one
     ordered ACL context per statement. Non-access statements are ignored."""
     out: List[ACE] = []
-    for kw, _name, blk, line in _iter_constructs(inner, notes):
+    for kw, name_parts, blk, line in _iter_constructs(inner, notes):
         if kw in _ACCESS_STMTS:
             ctx = f"{label}:{kw}"
-            atoms = _resolve_matchlist(blk, acls, notes, ctx, [])
-            out.extend(_atoms_to_aces(atoms, ctx, line))
+            dst_pr, port_imp = _resolve_port_prefix(name_parts, ctx, notes)
+            atoms = _resolve_matchlist(blk, acls, notes, ctx, [], 0)
+            out.extend(_atoms_to_aces(
+                atoms, ctx, line, dst_pr, port_imp,
+                reach_opaque=kw not in _REACH_AUTHORITATIVE))
     return out
 
 
@@ -430,14 +560,23 @@ def parse_infoblox(text: str) -> Tuple[List[ACE], List[str]]:
                 entries.extend(_scan_statements(inner, vname, acls, notes))
             elif kw in _ACCESS_STMTS:
                 ctx = f"global:{kw}"
-                atoms = _resolve_matchlist(inner, acls, notes, ctx, [])
-                entries.extend(_atoms_to_aces(atoms, ctx, line))
+                dst_pr, port_imp = _resolve_port_prefix(name_parts, ctx, notes)
+                atoms = _resolve_matchlist(inner, acls, notes, ctx, [], 0)
+                entries.extend(_atoms_to_aces(
+                    atoms, ctx, line, dst_pr, port_imp,
+                    reach_opaque=kw not in _REACH_AUTHORITATIVE))
             else:
                 ignored.add(kw)
     except Exception as exc:  # never crash the audit on a malformed config
-        notes.append(f"parse aborted on malformed BIND config ({type(exc).__name__}: "
-                     f"{exc}) — output may be incomplete (verify manually)")
-        return [], notes
+        # Fail CLOSED, not empty: an empty parse reads as "nothing permits" = a
+        # false isolation PASS. Emit one imprecise `permit ip any any` context so
+        # segcheck is INDETERMINATE in BOTH directions (never a false PASS / OK),
+        # even when called directly rather than via the CI gate.
+        notes.append(f"parse aborted on malformed/too-deep BIND config "
+                     f"({type(exc).__name__}: {exc}) — modeled fail-closed as "
+                     f"permit-any (imprecise) so segmentation is INDETERMINATE, "
+                     f"never a false isolation PASS (output incomplete; verify)")
+        return _fail_closed_entries(), notes
 
     if ignored:
         notes.append("ignored non-ACL BIND config block(s): "

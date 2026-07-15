@@ -16,13 +16,14 @@ These pin the properties the frontend must guarantee:
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rulehawk.analyze import analyze  # noqa: E402
-from rulehawk.model import covers  # noqa: E402
+from rulehawk.model import ACE, covers  # noqa: E402
 from rulehawk.parse_winfw import detect, parse_winfw  # noqa: E402
 
 
@@ -401,3 +402,208 @@ Action:                               Allow
     v4 = _by([a for a in aces if a.proto == "icmp"], action="permit")
     v6 = _by([a for a in aces if a.proto == "icmpv6"], action="permit")
     assert v4.src.version == 4 and v6.src.version == 6
+
+
+# --------------------------------------------------------------------------- #
+# 7. profile scoping — a Block in one profile must NOT prove an Allow in a
+#    DISJOINT profile dead (they never coexist on one interface), but a Block
+#    in the SAME profile still does (real shadow detection preserved).
+# --------------------------------------------------------------------------- #
+
+# Public-scoped Block + Domain-scoped Allow, same 5-tuple. On a Domain interface
+# the Public block is never applied, so the Domain allow is LIVE.
+_PUBLIC_BLOCK_DOMAIN_ALLOW = """\
+Rule Name:                            Block SMB Public
+Enabled:                              Yes
+Direction:                            In
+Profiles:                             Public
+LocalIP:                              10.0.0.10
+RemoteIP:                             Any
+Protocol:                             TCP
+LocalPort:                            445
+RemotePort:                           Any
+Action:                               Block
+
+Rule Name:                            Allow SMB Domain
+Enabled:                              Yes
+Direction:                            In
+Profiles:                             Domain
+LocalIP:                              10.0.0.10
+RemoteIP:                             Any
+Protocol:                             TCP
+LocalPort:                            445
+RemotePort:                           Any
+Action:                               Allow
+"""
+
+# Same but BOTH scoped to Domain — they DO coexist, so the block shadows the allow.
+_DOMAIN_BLOCK_DOMAIN_ALLOW = """\
+Rule Name:                            Block SMB Domain
+Enabled:                              Yes
+Direction:                            In
+Profiles:                             Domain
+LocalIP:                              10.0.0.10
+RemoteIP:                             Any
+Protocol:                             TCP
+LocalPort:                            445
+RemotePort:                           Any
+Action:                               Block
+
+Rule Name:                            Allow SMB Domain
+Enabled:                              Yes
+Direction:                            In
+Profiles:                             Domain
+LocalIP:                              10.0.0.10
+RemoteIP:                             Any
+Protocol:                             TCP
+LocalPort:                            445
+RemotePort:                           Any
+Action:                               Allow
+"""
+
+
+def test_disjoint_profile_block_does_not_prove_allow_dead():
+    aces, _ = parse_winfw(_PUBLIC_BLOCK_DOMAIN_ALLOW)
+    # The Public block and the Domain allow land in SEPARATE first-match contexts.
+    block = _by([a for a in aces if a.action == "deny" and a.proto == "tcp"],
+                proto="tcp")
+    allow = _by([a for a in aces if a.action == "permit" and a.proto == "tcp"],
+                proto="tcp")
+    assert block.acl == "Inbound:Public"
+    assert allow.acl == "Inbound:Domain"
+    assert block.acl != allow.acl
+    # Because analyze() groups by acl, the cross-profile block can NEVER prove the
+    # Domain allow dead — the false intent-inversion-permit-dead is gone.
+    kinds = {f.kind for f in analyze(aces)}
+    assert "intent-inversion-permit-dead" not in kinds
+
+
+def test_same_profile_block_still_proves_allow_dead():
+    aces, _ = parse_winfw(_DOMAIN_BLOCK_DOMAIN_ALLOW)
+    inbound = [a for a in aces if a.acl == "Inbound:Domain"]
+    block = _by(inbound, action="deny", proto="tcp")
+    allow = _by(inbound, action="permit", proto="tcp")
+    # Block-first within the same profile context, and the block covers the allow.
+    assert block.seq < allow.seq
+    assert covers(block, allow)
+    kinds = {f.kind for f in analyze(aces)}
+    assert "intent-inversion-permit-dead" in kinds
+
+
+def test_all_profiles_rule_stays_in_shared_context():
+    # No Profiles field (and explicit all-three) -> the shared Inbound/Outbound
+    # context, so all-profiles rules still shadow each other as before.
+    no_profiles = _BLOCK_AND_ALLOW  # no Profiles: field on any rule
+    aces, _ = parse_winfw(no_profiles)
+    assert all(a.acl == "Inbound" for a in aces)
+
+    all_three = """\
+Rule Name:                            Allow SMB every profile
+Enabled:                              Yes
+Direction:                            In
+Profiles:                             Domain,Private,Public
+LocalIP:                              10.0.0.10
+RemoteIP:                             Any
+Protocol:                             TCP
+LocalPort:                            445
+RemotePort:                           Any
+Action:                               Allow
+"""
+    aces2, _ = parse_winfw(all_three)
+    # Domain,Private,Public == all -> shared context, not three separate ones.
+    assert {a.acl for a in aces2} == {"Inbound"}
+
+
+# --------------------------------------------------------------------------- #
+# 8. indented ICMP Type/Code sub-table must not corrupt the Protocol value.
+# --------------------------------------------------------------------------- #
+
+def test_indented_icmp_type_table_keeps_proto_icmp():
+    # netsh prints an ICMP rule's Type/Code as an INDENTED sub-table beneath
+    # Protocol: continuation-joining it would corrupt proto into a no-match string.
+    cfg = """\
+Rule Name:                            Block ICMP Echo
+Enabled:                              Yes
+Direction:                            In
+LocalIP:                              Any
+RemoteIP:                             Any
+Protocol:                             ICMPv4
+                                      Type    Code
+                                      8       Any
+Action:                               Block
+"""
+    aces, _ = parse_winfw(cfg)
+    denies = [a for a in aces if a.action == "deny" and a.proto != "ip"]
+    # Exactly one ICMP deny (proto pinned to v4, not the {4,6} of a garbage proto).
+    assert len(denies) == 1
+    deny = denies[0]
+    assert deny.proto == "icmp"            # NOT 'icmpv4,type code,8 any'
+    assert deny.imprecise is False
+    assert deny.icmp_type is None          # sub-table ignored -> all types (superset)
+    # It is a REAL deny: it covers an actual ICMP packet (not a no-match).
+    probe = ACE(seq=99, action="permit", proto="icmp",
+                src=ipaddress.ip_network("0.0.0.0/0"),
+                dst=ipaddress.ip_network("0.0.0.0/0"))
+    assert covers(deny, probe) is True
+
+
+# --------------------------------------------------------------------------- #
+# 9. the synthetic OUTBOUND default-permit must not be flagged permit-any-any.
+# --------------------------------------------------------------------------- #
+
+def test_outbound_default_permit_is_not_permit_any_any_noise():
+    aces, _ = parse_winfw(_OUTBOUND_HTTPS)
+    outbound = sorted((a for a in aces if a.acl == "Outbound"), key=lambda a: a.seq)
+    default = outbound[-1]
+    # The synthetic outbound default is a permit ip any any but flagged imprecise
+    # so analyze() skips it (OS default, not an authored any/any).
+    assert default.action == "permit" and default.proto == "ip"
+    assert default.src_any and default.dst_any and default.imprecise is True
+    kinds = [f.kind for f in analyze(aces)]
+    assert "permit-any-any" not in kinds
+    assert "broad-any-any" not in kinds
+
+
+def test_real_authored_outbound_any_any_is_still_flagged():
+    # A genuinely authored all-any outbound Allow is EXACT -> still flagged.
+    cfg = """\
+Rule Name:                            Allow everything out
+Enabled:                              Yes
+Direction:                            Out
+LocalIP:                              Any
+RemoteIP:                             Any
+Protocol:                             Any
+LocalPort:                            Any
+RemotePort:                           Any
+Action:                               Allow
+"""
+    aces, _ = parse_winfw(cfg)
+    authored = [a for a in aces if a.action == "permit" and a.line != 0]
+    assert authored and all(not a.imprecise for a in authored)
+    kinds = [f.kind for f in analyze(aces)]
+    # The authored rule fires permit-any-any; the synthetic default does not.
+    assert "permit-any-any" in kinds
+
+
+# --------------------------------------------------------------------------- #
+# 10. Action: Bypass — valid WFAS action, skipped with an accurate note.
+# --------------------------------------------------------------------------- #
+
+def test_bypass_action_skipped_with_accurate_note():
+    cfg = """\
+Rule Name:                            IPsec authenticated bypass
+Enabled:                              Yes
+Direction:                            In
+LocalIP:                              10.0.0.10
+RemoteIP:                             Any
+Protocol:                             TCP
+LocalPort:                            445
+RemotePort:                           Any
+Action:                               Bypass
+"""
+    aces, notes = parse_winfw(cfg)
+    assert aces == []
+    note = next(n for n in notes if "Bypass" in n)
+    # No longer the misleading "missing/unknown Action" wording.
+    assert "missing/unknown" not in note
+    assert "intentionally skipped" in note

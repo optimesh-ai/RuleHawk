@@ -118,14 +118,14 @@ def _num(v) -> Optional[int]:
         return v
     try:
         return int(str(v).strip())
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return None
 
 
 def _try_net(val) -> Optional[_IPNet]:
     try:
         return ipaddress.ip_network(str(val).strip(), strict=False)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return None
 
 
@@ -313,16 +313,20 @@ def _acl_of(rule: dict) -> str:
 
 
 def _is_default_rule(rule: Optional[dict]) -> bool:
-    """True iff `rule` is an explicit trailing catch-all / default: an explicit
-    default flag, OR a total match-all (any/absent src+dst, any/absent proto, no
-    ports). Such a rule already decides the tail, so no fail-closed marker is
-    appended after it."""
+    """True iff `rule` is an ACTUAL trailing catch-all / default: a total
+    match-all (any/absent src+dst, any/absent proto, no ports). Such a rule
+    already decides the tail, so no fail-closed marker is appended after it.
+
+    A self-declared `default`/`isDefault`/`type:"default"` flag is NOT trusted on
+    its own (the earlier soundness hole): the flag on a NARROW rule — e.g. a
+    specific-proto/host BLOCK carrying `"default": true` — does not decide the
+    tail, yet suppressing the marker for it would let an unmatched forbidden flow
+    fall to segcheck's implicit default-deny and false-PASS as `segmentation-ok`.
+    Only the match-all shape below (which genuinely covers every unmatched
+    packet) suppresses the marker; a flagged narrow rule keeps the marker and its
+    unmatched flows stay INDETERMINATE."""
     if not isinstance(rule, dict):
         return False
-    if rule.get("default") is True or rule.get("isDefault") is True:
-        return True
-    if str(rule.get("type") or "").strip().lower() == "default":
-        return True
 
     def _any_ep(raw) -> bool:
         items = _as_list(raw)
@@ -388,7 +392,7 @@ def detect(text: str) -> bool:
     """
     try:
         data = json.loads(text)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return False
     if _has_aws_sg_markers(data):
         return False
@@ -425,7 +429,7 @@ def parse_umbrella(text: str) -> Tuple[List[ACE], List[str]]:
     notes: List[str] = []
     try:
         data = json.loads(text)
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, RecursionError) as exc:
         return [], [f"input is not valid JSON ({exc}) — no Umbrella CDFW rules "
                     f"parsed."]
 
@@ -441,9 +445,45 @@ def parse_umbrella(text: str) -> Tuple[List[ACE], List[str]]:
         return [], ["Umbrella CDFW export has an empty 'rules' array — nothing "
                     "to model."]
 
+    # Per-rule AWS Security-Group guard (mirrors detect()): a bare array — or a
+    # 'rules' array — of SG rule objects (GroupId / IpPermissions / IpRanges /
+    # UserIdGroupPairs) is NOT a CDFW export. detect() already routes it away, so
+    # this is defense-in-depth for a direct call: reject cleanly (as the dict
+    # form is rejected above) instead of emitting fail-closed markers over an
+    # AWS-shaped input.
+    if any(isinstance(r, dict) and any(m in r for m in _AWS_RULE_MARKERS)
+           for r in rules):
+        return [], ["input carries AWS Security-Group markers "
+                    "(GroupId/IpPermissions/IpRanges) — this is not an Umbrella "
+                    "CDFW export; nothing parsed."]
+
     # Order first-match by `order`/`rank` ascending, stable. Rules missing an
     # explicit order keep document order and sort after ordered ones.
     indexed = list(enumerate(rules))
+
+    def _has_order(r) -> bool:
+        return (isinstance(r, dict)
+                and (_num(r.get("order")) is not None
+                     or _num(r.get("rank")) is not None))
+
+    # If the array MIXES rules that carry an explicit order/rank with rules that
+    # DON'T, the intended first-match evaluation order is AMBIGUOUS: sorting the
+    # unordered rules after the ordered ones (below) can reposition a rule the
+    # real device evaluates in document position — flipping a leak to a false
+    # PASS. We can't recover the device's true order, so we over-approximate:
+    # every emitted ACE is flagged imprecise (segcheck → INDETERMINATE, never a
+    # false PASS). When ALL rules have an order — or NONE do (pure document
+    # order) — the order is unambiguous and behavior stays exact.
+    dict_rules = [r for _, r in indexed if isinstance(r, dict)]
+    order_ambiguous = (any(_has_order(r) for r in dict_rules)
+                       and any(not _has_order(r) for r in dict_rules))
+    if order_ambiguous:
+        notes.append(
+            "rules array MIXES entries carrying an explicit order/rank with "
+            "entries that don't — the first-match evaluation order is ambiguous; "
+            "every rule is marked IMPRECISE so segmentation is INDETERMINATE "
+            "(never a false PASS). Give every rule an explicit order/rank, or "
+            "none (pure document order), to make this precise.")
 
     def _sortkey(t):
         idx, r = t
@@ -499,7 +539,7 @@ def parse_umbrella(text: str) -> Tuple[List[ACE], List[str]]:
         emitted_here = False
         for proto in protos:
             port_ranges, port_imp = _ports(r, proto, notes, label)
-            imprecise = base_imp or port_imp
+            imprecise = base_imp or port_imp or order_ambiguous
             for s in src_nets:
                 for d in dst_nets:
                     if s.version != d.version:

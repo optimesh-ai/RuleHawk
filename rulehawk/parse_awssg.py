@@ -130,7 +130,7 @@ def detect(text: str) -> bool:
         return False                        # not JSON object/array — skip fast
     try:
         doc = json.loads(text)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return False
     return _looks_like_sg(doc)
 
@@ -173,7 +173,7 @@ def _parse_net(cidr: object) -> Optional[_IPNet]:
         return None
     try:
         return ipaddress.ip_network(cidr.strip(), strict=False)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return None
 
 
@@ -302,10 +302,16 @@ def _emit_perm(perm: object, direction: str, acl: str, line: int,
         for fam in fams:
             any_net = _ANY6 if fam == 6 else _ANY4
             concrete = net if (net is not None and net.version == fam) else any_net
+            reach_opaque = False
             if direction == "ingress":
                 # Source is exact (the CidrIp); destination (the instances) is
                 # the ANY superset. Imprecise only when the peer is unresolved.
+                # reach_opaque flags the widened destination: this permit may
+                # over-report a must_not_reach violation and drives hygiene
+                # (src/ports exact), but must NEVER prove a must_reach flow
+                # reaches a specific zone (dst is unknown ANY).
                 src, dst, imprecise = concrete, any_net, ep_imprecise
+                reach_opaque = not ep_imprecise   # imprecise already blocks reach
             else:
                 # Egress: destination exact, SOURCE (the instances) widened to
                 # ANY -> imprecise (fail-closed; see module docstring).
@@ -314,7 +320,7 @@ def _emit_perm(perm: object, direction: str, acl: str, line: int,
             aces.append(ACE(
                 seq=seq, action="permit", proto=proto, src=src, dst=dst,
                 src_port=ANY_PORTS, dst_port=dport, icmp_type=itype,
-                imprecise=imprecise,
+                imprecise=imprecise, reach_opaque=reach_opaque,
                 raw=_raw(acl, direction, proto, src, dst, dport, itype, imprecise),
                 acl=acl, line=line, transit=True))
     return seq
@@ -337,10 +343,23 @@ def _parse_group(g: dict, text: str, notes: List[str],
 
     egress = g.get("IpPermissionsEgress")
     if egress is None:
+        # A filtered/partial export can omit egress. AWS's real default egress is
+        # allow-all-outbound, so NOT modeling it would let a must_not_reach over
+        # the egress path FALSE-PASS (segmentation-ok) instead of failing closed.
+        # Emit the AWS default (allow-all-outbound) as an IMPRECISE permit — the
+        # source (instances) is unknown/widened — so segcheck yields
+        # indeterminate, never a false isolation PASS.
         notes.append(f"security group {acl}: no 'IpPermissionsEgress' field — "
-                     f"egress not modeled. AWS's default egress is allow-all; if "
-                     f"this export omitted egress, those flows are UNMODELED "
-                     f"(paste full describe-security-groups output to audit egress).")
+                     f"assuming AWS default allow-all egress (imprecise). Paste "
+                     f"full describe-security-groups output to model egress "
+                     f"precisely.")
+        for any_net in (_ANY4, _ANY6):
+            seq += 1
+            aces.append(ACE(
+                seq=seq, action="permit", proto="ip", src=any_net, dst=any_net,
+                imprecise=True,
+                raw=f"{acl}: assumed AWS default allow-all egress (imprecise)",
+                acl=acl, line=line, transit=True))
     elif not isinstance(egress, list):
         notes.append(f"security group {acl}: 'IpPermissionsEgress' is not a list "
                      f"— egress ignored.")
@@ -391,7 +410,7 @@ def parse_awssg(text: str) -> Tuple[List[ACE], List[str]]:
         return [], ["AWS security-group input is not text — nothing parsed."]
     try:
         doc = json.loads(text)
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, RecursionError) as exc:
         return [], [f"AWS security-group input is not valid JSON ({exc}) — "
                     f"nothing parsed."]
 

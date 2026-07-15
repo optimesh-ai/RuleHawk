@@ -291,10 +291,12 @@ def test_ui_supported_copy_names_no_unloaded_vendor():
     names there must have a loaded parser.  All six families now have parsers."""
     index = _read(_INDEX)
     label = re.search(r'for="config">.*?</label>', index, re.S).group(0).lower()
-    loaded = {"cisco", "junos", "pan-os", "iptables", "nx-os", "arista"}
-    for token in ("cisco", "junos", "pan-os", "iptables", "nx-os", "arista"):
+    # Every vendor named in the input label must have a wired parser. Includes
+    # the enterprise/cloud frontends so the copy can't drift behind the engine.
+    for token in ("cisco", "junos", "pan-os", "iptables", "nx-os", "arista",
+                  "fortinet", "windows firewall", "aws security groups",
+                  "infoblox", "microsoft dns", "umbrella"):
         assert token in label, f"supported-vendor copy omits a wired vendor: {token}"
-    assert loaded  # loaded set documents the audited families
 
 
 # --------------------------------------------------------------------------- #

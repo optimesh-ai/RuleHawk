@@ -69,6 +69,15 @@ _SEG_POLICY = {
                         "ports": [445]}],
 }
 
+# GUEST (10.40) is a source NO narrow CORP-scoped rule touches — used to prove a
+# flow that falls THROUGH the explicit rules must hit the fail-closed marker
+# (indeterminate), never the implicit default-deny (a false segmentation-ok).
+_GUEST_POLICY = {
+    "zones": {"PCI": ["10.10.0.0/16"], "GUEST": ["10.40.0.0/16"]},
+    "must_not_reach": [{"src": "GUEST", "dst": "PCI", "proto": "tcp",
+                        "ports": [445]}],
+}
+
 
 def _one(action, proto="TCP", src="10.20.0.0/16", dst="10.10.0.0/16",
          port=445, **extra):
@@ -337,3 +346,125 @@ def test_missing_and_odd_fields_degrade_with_notes():
     assert any("unparsable address" in n for n in notes)
     bad = [a for a in aces if a.action == "permit" and "fail-closed" not in a.raw]
     assert bad and all(a.imprecise and a.src_any for a in bad)
+
+
+# ── 5. regression: self-declared default flag must not suppress the marker ───────
+
+def test_narrow_rule_with_default_flag_does_not_suppress_marker():
+    # A NARROW rule (specific src/dst/proto/port) that carries a self-declared
+    # default / isDefault / type:"default" flag is NOT the tail-decider. The flag
+    # alone must NOT suppress the trailing fail-closed marker: a flow the narrow
+    # rule never touches (GUEST->PCI) would otherwise fall to segcheck's implicit
+    # default-deny and false-PASS as segmentation-ok. All three spellings.
+    for flag in ({"default": True}, {"isDefault": True}, {"type": "default"}):
+        aces, notes = parse_umbrella(_one("BLOCK", **flag))
+        assert any("fail-closed" in a.raw for a in aces), flag
+        assert not any("catch-all/default" in n for n in notes), flag
+        kinds = {f.kind for f in check_segmentation(aces, _GUEST_POLICY)}
+        assert "segmentation-ok" not in kinds, \
+            f"narrow rule with {flag} must not FALSE-PASS via a suppressed marker"
+        assert "segmentation-indeterminate" in kinds, flag
+
+
+def test_genuine_matchall_catchall_decides_tail_no_redundant_marker():
+    # ASSURANCE preserved: a GENUINE match-all catch-all (any src, any dst, any
+    # proto, no ports) still decides the tail on its own — no redundant marker —
+    # whether or not it ALSO carries a self-declared default flag. GUEST->PCI
+    # falls through the narrow allow to the catch-all BLOCK: a clean PASS.
+    for extra in ({}, {"default": True}, {"isDefault": True}, {"type": "default"}):
+        catchall = {"name": "catchall", "order": 99, "action": "BLOCK",
+                    "protocol": "ANY", "sources": [{"type": "ANY"}],
+                    "destinations": [{"type": "ANY"}]}
+        catchall.update(extra)
+        cfg = json.dumps({"rules": [
+            {"name": "allow-web", "order": 1, "action": "ALLOW", "protocol": "TCP",
+             "sources": [{"type": "CIDR", "value": "10.20.0.0/16"}],
+             "destinations": [{"type": "CIDR", "value": "10.30.0.0/16"}],
+             "ports": [{"from": 443, "to": 443}]},
+            catchall]})
+        aces, notes = parse_umbrella(cfg)
+        assert not any("fail-closed" in a.raw for a in aces), extra
+        assert any("catch-all/default" in n for n in notes), extra
+        kinds = {f.kind for f in check_segmentation(aces, _GUEST_POLICY)}
+        assert "segmentation-ok" in kinds, extra
+        assert "segmentation-indeterminate" not in kinds, extra
+
+
+# ── 6. regression: mixed present/absent order is order-ambiguous -> indeterminate ─
+
+def test_mixed_present_absent_order_is_indeterminate_not_false_pass():
+    # An UNORDERED ALLOW leak listed FIRST, then an order:1 BLOCK of the same
+    # flow. Sorting the unordered rule LAST would reposition BLOCK ahead of the
+    # ALLOW and mask the leak as segmentation-ok. Because the array MIXES ordered
+    # and unordered rules the first-match order is ambiguous, so every ACE is
+    # flagged imprecise -> the flow is INDETERMINATE, never a false PASS.
+    cfg = json.dumps({"rules": [
+        {"name": "allow-leak", "action": "ALLOW", "protocol": "TCP",
+         "sources": [{"type": "CIDR", "value": "10.20.0.0/16"}],
+         "destinations": [{"type": "CIDR", "value": "10.10.0.0/16"}],
+         "ports": [{"from": 445, "to": 445}]},
+        {"name": "block", "order": 1, "action": "BLOCK", "protocol": "TCP",
+         "sources": [{"type": "CIDR", "value": "10.20.0.0/16"}],
+         "destinations": [{"type": "CIDR", "value": "10.10.0.0/16"}],
+         "ports": [{"from": 445, "to": 445}]}]})
+    aces, notes = parse_umbrella(cfg)
+    assert all(a.imprecise for a in aces if "fail-closed" not in a.raw)
+    assert any("evaluation order is ambiguous" in n for n in notes)
+    kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
+    assert "segmentation-ok" not in kinds, \
+        "mixed present/absent order must not FALSE-PASS via silent reordering"
+    assert "segmentation-indeterminate" in kinds
+
+
+def test_pure_document_order_and_all_ordered_stay_exact():
+    # NONE of the rules carry an order -> pure document order, unambiguous: the
+    # BLOCK precedes the ALLOW, so the flow is isolated EXACTLY (no imprecise
+    # widening, a clean PASS) — the fix must not touch this path.
+    doc = json.dumps({"rules": [
+        {"name": "block", "action": "BLOCK", "protocol": "TCP",
+         "sources": [{"type": "CIDR", "value": "10.20.0.0/16"}],
+         "destinations": [{"type": "CIDR", "value": "10.10.0.0/16"}],
+         "ports": [{"from": 445, "to": 445}]},
+        {"name": "allow", "action": "ALLOW", "protocol": "TCP",
+         "sources": [{"type": "CIDR", "value": "10.20.0.0/16"}],
+         "destinations": [{"type": "CIDR", "value": "10.10.0.0/16"}],
+         "ports": [{"from": 445, "to": 445}]}]})
+    aces, notes = parse_umbrella(doc)
+    assert not any(a.imprecise for a in aces if "fail-closed" not in a.raw)
+    assert not any("evaluation order is ambiguous" in n for n in notes)
+    kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
+    assert "segmentation-ok" in kinds
+    assert "segmentation-indeterminate" not in kinds
+
+    # ALL rules carry an order -> also unambiguous; no imprecise widening.
+    ordered = json.dumps({"rules": [
+        {"name": "block", "order": 1, "action": "BLOCK", "protocol": "TCP",
+         "sources": [{"type": "CIDR", "value": "10.20.0.0/16"}],
+         "destinations": [{"type": "CIDR", "value": "10.10.0.0/16"}],
+         "ports": [{"from": 445, "to": 445}]},
+        {"name": "allow", "order": 2, "action": "ALLOW", "protocol": "TCP",
+         "sources": [{"type": "CIDR", "value": "10.20.0.0/16"}],
+         "destinations": [{"type": "CIDR", "value": "10.10.0.0/16"}],
+         "ports": [{"from": 445, "to": 445}]}]})
+    aces2, notes2 = parse_umbrella(ordered)
+    assert not any(a.imprecise for a in aces2 if "fail-closed" not in a.raw)
+    assert not any("evaluation order is ambiguous" in n for n in notes2)
+    kinds2 = {f.kind for f in check_segmentation(aces2, _SEG_POLICY)}
+    assert "segmentation-ok" in kinds2
+    assert "segmentation-indeterminate" not in kinds2
+
+
+# ── 7. regression: bare AWS-SG array is rejected cleanly (parser parity) ─────────
+
+def test_bare_aws_sg_array_returns_note_not_markers():
+    # A bare array of AWS Security-Group rule objects slips past the top-level
+    # marker guard (it is a list, not a dict), but the per-rule guard must reject
+    # it cleanly — ([], [note]) — exactly as the dict form is rejected, NOT emit
+    # fail-closed markers over an AWS-shaped input.
+    aws = [{"GroupId": "sg-0abc", "IpPermissions": [], "IpRanges": []}]
+    aces, notes = parse_umbrella(json.dumps(aws))
+    assert aces == []
+    assert notes and "AWS Security-Group markers" in notes[0]
+    assert not any("fail-closed" in n for n in notes)
+    # detect() still (correctly) routes it away — routing is unaffected.
+    assert detect(json.dumps(aws)) is False

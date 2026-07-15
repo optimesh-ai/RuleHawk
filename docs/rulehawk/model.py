@@ -101,6 +101,16 @@ class ACE:
     # FORWARD permit in the segmentation witness search. Non-transit ACEs stay
     # available for hygiene analysis (shadow/least-privilege), just not the
     # inter-zone witness. Default True keeps single-context vendors unchanged.
+    reach_opaque: bool = False        # the DESTINATION coverage is over-approximated.
+    # Set by frontends that widen the destination to ANY because the true target
+    # set is unknown from the config alone (AWS Security Group INGRESS rules: the
+    # rule permits traffic TO whatever instances carry the group — an unknown set
+    # modeled as dst=ANY). Such a permit is a sound SUPERSET, so it may still
+    # over-report a must_not_reach violation (the safe direction) and drive
+    # hygiene (its src/ports are exact) — but it must NEVER serve as a must_reach
+    # connectivity PROOF: "permits to ANY" does not prove the flow reaches a
+    # SPECIFIC destination zone. segcheck's must_reach search treats a
+    # reach_opaque permit as indeterminate, never a clean connectivity-ok.
 
     @property
     def src_any(self) -> bool:

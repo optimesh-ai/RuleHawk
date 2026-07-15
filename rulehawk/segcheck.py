@@ -217,6 +217,13 @@ def _search(aces: List[ACE], i0: int, probe: str, rect0, budget: _Budget,
             if iti is None:
                 continue
             sub = (si, di, spi, dpi, iti)
+            if want == "deny" and r.action == "permit" and r.reach_opaque:
+                # must_reach: a permit whose DESTINATION was widened to ANY
+                # (dst unknown from the config — e.g. an AWS SG ingress rule)
+                # cannot PROVE the flow reaches a specific destination zone.
+                # It intersects the rectangle, so we can't call the flow open
+                # OR closed for this slice -> fail closed (indeterminate).
+                return ("indeterminate", sub, r)
             if r.action == want:
                 return (want, sub, r)
             # r is the passing action: it decides its slice the safe way, so
@@ -553,14 +560,24 @@ def _probe_space(aces: List[ACE], by_acl: Dict[str, List[ACE]],
 
 
 def _reach_probes(aces: List[ACE], proto: str, ports: List[Optional[int]]):
-    """Concrete probe protocols for a must_reach assertion. Unlike the isolation
-    direction, a wildcard (`ip`) connectivity requirement is a claim about the
-    any-protocol space, so the single "ip" probe is exactly right — enumerating
-    concrete protocols would demand each be independently reachable, which is
-    stricter than the assertion. A specific proto probes itself."""
-    if proto in _WILDCARD_PROTO:
-        return ["ip"]
-    return [proto]
+    """Probe protocols for a must_reach assertion — the SAME decomposition the
+    isolation direction uses (_probe_space). A wildcard (`ip`) connectivity
+    requirement is a claim about the WHOLE protocol space, so proving it OPEN
+    means proving it open for every protocol: the `ip` probe alone only matches
+    wildcard rules, so a proto-specific carve-out (`deny icmp`) is invisible to
+    it and a `permit ip` with an icmp deny would falsely read as fully reachable.
+    Enumerating `["ip"] + {concrete protos present}` and requiring EVERY probe
+    reachable (in _prove_reach) closes that false-ok; the cost is that a wildcard
+    reach over a ruleset that only permits tcp/udp reports `broken`/indeterminate
+    for the uncovered protocols — the conservative, never-false-green direction.
+    Specify a concrete `proto` for a precise per-protocol check."""
+    if proto not in _WILDCARD_PROTO:
+        return [proto]
+    probes = ["ip"] + sorted({a.proto for a in aces
+                              if a.proto not in _WILDCARD_PROTO})
+    if ports != [None]:
+        probes = [p for p in probes if p in _PORTED] or ["tcp", "udp"]
+    return probes
 
 
 def _prove_reach(aces: List[ACE], by_acl: Dict[str, List[ACE]],
