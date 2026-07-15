@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>RuleHawk — firewall &amp; segmentation auditor</title>
-<meta name="description" content="Paste or upload a Cisco IOS / ASA, Cisco NX-OS, Juniper Junos, Palo Alto PAN-OS, Linux iptables, or Arista EOS config and get a ranked list of dead, shadowed, redundant, and dangerously-permissive rules in seconds. Vendor is auto-detected. Runs entirely in your browser — your config never leaves your machine." />
+<meta name="description" content="Paste or upload a Cisco IOS/ASA/NX-OS/Umbrella, Arista EOS, Juniper Junos, Palo Alto PAN-OS, Fortinet FortiGate, Linux iptables, Windows Firewall, AWS Security Groups, Infoblox/BIND, or Microsoft DNS config and get a ranked list of dead, shadowed, redundant, and dangerously-permissive rules in seconds. Vendor is auto-detected. Runs entirely in your browser — your config never leaves your machine." />
 <!--
   RuleHawk web tool — 100% client-side.
   The engine under docs/rulehawk/ is a VENDORED copy of the top-level rulehawk/
@@ -204,7 +204,7 @@
   </div>
 
   <div class="card" id="config-card">
-    <label class="fld" for="config">Firewall / ACL config <span class="hint">— Cisco IOS/ASA, Cisco NX-OS, Juniper Junos, Palo Alto PAN-OS, Linux iptables, or Arista EOS · vendor auto-detected · paste, drag &amp; drop a file, or upload</span></label>
+    <label class="fld" for="config">Firewall / ACL config <span class="hint">— Cisco IOS/ASA/NX-OS/Umbrella, Arista EOS, Juniper Junos, Palo Alto PAN-OS, Fortinet, iptables, Windows Firewall, AWS Security Groups, Infoblox/BIND, Microsoft DNS · vendor auto-detected · paste, drag &amp; drop a file, or upload</span></label>
     <textarea id="config" spellcheck="false" placeholder="ip access-list extended EDGE_IN&#10; permit tcp any host 203.0.113.10 eq 443&#10; ...&#10;&#10;…or drag a config file onto this box."></textarea>
     <input type="file" id="file" accept=".txt,.cfg,.conf,.acl,.lst,.log,text/plain" style="display:none" />
     <div class="row">
@@ -339,7 +339,7 @@ const SAMPLES = {
   nxos:     { cfg: SAMPLE_NXOS,     pol: SAMPLE_POLICY,
     msg: "Cisco NX-OS ACL + PCI policy loaded — Audit to prove CORP reaches PCI on 445 (witness packet) and see a permit killed by an earlier deny-any." },
 };
-const ENGINE_MODULES = ["__init__","model","parse","parse_junos","parse_panos","parse_iptables","parse_nxos","parse_eos","analyze","report","segcheck","pathground"];
+const ENGINE_MODULES = ["__init__","model","parse","parse_junos","parse_panos","parse_iptables","parse_nxos","parse_eos","parse_fortinet","parse_awssg","parse_umbrella","parse_winfw","parse_msdns","parse_infoblox","analyze","report","segcheck","pathground"];
 const PYODIDE_VER = "v0.26.4";
 // Fallback (main-thread) analysis stays synchronous, so cap it; the worker path has no cap.
 const FALLBACK_MAX_LINES = 4000;
@@ -396,6 +396,12 @@ from rulehawk.parse_panos import detect as detect_panos, parse_panos
 from rulehawk.parse_iptables import detect as detect_iptables, parse_iptables
 from rulehawk.parse_nxos import detect as detect_nxos, parse_nxos
 from rulehawk.parse_eos import detect as detect_eos, parse_eos
+from rulehawk.parse_fortinet import detect as detect_fortinet, parse_fortinet
+from rulehawk.parse_awssg import detect as detect_awssg, parse_awssg
+from rulehawk.parse_umbrella import detect as detect_umbrella, parse_umbrella
+from rulehawk.parse_winfw import detect as detect_winfw, parse_winfw
+from rulehawk.parse_msdns import detect as detect_msdns, parse_msdns
+from rulehawk.parse_infoblox import detect as detect_infoblox, parse_infoblox
 from rulehawk.analyze import analyze
 from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
@@ -409,6 +415,18 @@ elif detect_nxos(cfg):
     vendor, (aces, notes) = "Cisco NX-OS", parse_nxos(cfg)
 elif detect_eos(cfg):
     vendor, (aces, notes) = "Arista EOS", parse_eos(cfg)
+elif detect_fortinet(cfg):
+    vendor, (aces, notes) = "Fortinet FortiGate", parse_fortinet(cfg)
+elif detect_awssg(cfg):
+    vendor, (aces, notes) = "AWS Security Groups", parse_awssg(cfg)
+elif detect_umbrella(cfg):
+    vendor, (aces, notes) = "Cisco Umbrella CDFW", parse_umbrella(cfg)
+elif detect_winfw(cfg):
+    vendor, (aces, notes) = "Windows Firewall", parse_winfw(cfg)
+elif detect_msdns(cfg):
+    vendor, (aces, notes) = "Microsoft DNS", parse_msdns(cfg)
+elif detect_infoblox(cfg):
+    vendor, (aces, notes) = "Infoblox / BIND DNS", parse_infoblox(cfg)
 else:
     vendor, (aces, notes) = "Cisco IOS / ASA", parse_acls(cfg)
 findings = analyze(aces)
@@ -479,7 +497,7 @@ async function bootMain(){
       pyodide.FS.writeFile(`rulehawk/${m}.py`, await r.text());
     }
     setStatus(bootProgressHtml({stage:"start"}));
-    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
+    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, rulehawk.parse_fortinet, rulehawk.parse_awssg, rulehawk.parse_umbrella, rulehawk.parse_winfw, rulehawk.parse_msdns, rulehawk.parse_infoblox, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
     mode = "main"; ready();
   }catch(e){
     setStatus("Failed to load the engine: " + esc(e.message||e), true);
@@ -658,7 +676,7 @@ function render(d, vendor){
       + `<div class="norules">
         <svg class="norules-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
         <div class="norules-body"><b>No ACL rules parsed.</b> This is <i>not</i> a clean bill of health —
-        check the input is a supported config (Cisco IOS/ASA, Cisco NX-OS, Juniper Junos,
+        check the input is a supported config (Cisco IOS/ASA/NX-OS/Umbrella, Arista EOS, Juniper Junos, Fortinet, AWS Security Groups, Windows Firewall, Infoblox/BIND, Microsoft DNS,
         Palo Alto PAN-OS, Linux iptables, or Arista EOS).</div>
       </div>` + notesHTML(d.parse_notes, true);
     box.scrollIntoView({behavior:"smooth",block:"nearest"}); return;

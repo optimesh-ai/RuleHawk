@@ -46,6 +46,12 @@ from .parse_junos import detect as detect_junos, parse_junos
 from .parse_panos import detect as detect_panos, parse_panos
 from .parse_nxos import detect as detect_nxos, parse_nxos
 from .parse_eos import detect as detect_eos, parse_eos
+from .parse_fortinet import detect as detect_fortinet, parse_fortinet
+from .parse_awssg import detect as detect_awssg, parse_awssg
+from .parse_umbrella import detect as detect_umbrella, parse_umbrella
+from .parse_winfw import detect as detect_winfw, parse_winfw
+from .parse_msdns import detect as detect_msdns, parse_msdns
+from .parse_infoblox import detect as detect_infoblox, parse_infoblox
 from .segcheck import check_segmentation
 
 # Severity ordering shared by the threshold logic, SARIF level mapping, and the
@@ -185,35 +191,47 @@ _VENDORS = {
     "iptables": "iptables", "netfilter": "iptables",
     "nxos": "nxos", "nx-os": "nxos", "nexus": "nxos",
     "eos": "eos", "arista": "eos",
+    "fortinet": "fortinet", "fortigate": "fortinet", "forti": "fortinet",
+    "aws-sg": "aws-sg", "awssg": "aws-sg", "aws": "aws-sg", "securitygroups": "aws-sg",
+    "umbrella": "umbrella", "cdfw": "umbrella",
+    "winfw": "winfw", "windows": "winfw", "windows-firewall": "winfw", "wfas": "winfw",
+    "msdns": "msdns", "ms-dns": "msdns", "windows-dns": "msdns",
+    "infoblox": "infoblox", "bind": "infoblox", "ddi": "infoblox",
 }
 
 
 def _pick_parser(text: str, vendor: str):
     """Return (vendor_label, parse_fn) for `text`, honoring a forced vendor or
     auto-detecting (same precedence as the CLI)."""
+    _FORCED = {
+        "junos": ("junos", parse_junos), "panos": ("panos", parse_panos),
+        "iptables": ("iptables", parse_iptables), "nxos": ("nxos", parse_nxos),
+        "eos": ("eos", parse_eos), "fortinet": ("fortinet", parse_fortinet),
+        "aws-sg": ("aws-sg", parse_awssg), "umbrella": ("umbrella", parse_umbrella),
+        "winfw": ("winfw", parse_winfw), "msdns": ("msdns", parse_msdns),
+        "infoblox": ("infoblox", parse_infoblox),
+    }
     if vendor and vendor != "auto":
         v = _VENDORS.get(vendor.lower())
-        if v == "junos":
-            return "junos", parse_junos
-        if v == "panos":
-            return "panos", parse_panos
-        if v == "iptables":
-            return "iptables", parse_iptables
-        if v == "nxos":
-            return "nxos", parse_nxos
-        if v == "eos":
-            return "eos", parse_eos
-        return "ios-asa", parse_acls
-    if detect_junos(text):
-        return "junos", parse_junos
-    if detect_panos(text):
-        return "panos", parse_panos
-    if detect_iptables(text):
-        return "iptables", parse_iptables
-    if detect_nxos(text):
-        return "nxos", parse_nxos
-    if detect_eos(text):
-        return "eos", parse_eos
+        return _FORCED.get(v, ("ios-asa", parse_acls))
+    # Auto-detect precedence (same order as the CLI). Each detect() is specific
+    # enough that exactly one fires per config (enforced by a cross-detection
+    # test); ios-asa is the fallback for Cisco IOS/ASA which have no unique marker.
+    for detect, label, fn in (
+        (detect_junos, "junos", parse_junos),
+        (detect_panos, "panos", parse_panos),
+        (detect_iptables, "iptables", parse_iptables),
+        (detect_nxos, "nxos", parse_nxos),
+        (detect_eos, "eos", parse_eos),
+        (detect_fortinet, "fortinet", parse_fortinet),
+        (detect_awssg, "aws-sg", parse_awssg),
+        (detect_umbrella, "umbrella", parse_umbrella),
+        (detect_winfw, "winfw", parse_winfw),
+        (detect_msdns, "msdns", parse_msdns),
+        (detect_infoblox, "infoblox", parse_infoblox),
+    ):
+        if detect(text):
+            return label, fn
     return "ios-asa", parse_acls
 
 
@@ -777,8 +795,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"rulehawk gate: bad --fail-on {fail_on!r}", file=sys.stderr)
         return 2
     if vendor != "auto" and vendor not in _VENDORS:
-        print(f"rulehawk gate: unknown --vendor {vendor!r} "
-              "(choose: auto | ios | junos | panos | iptables | nxos | eos)",
+        print(f"rulehawk gate: unknown --vendor {vendor!r} (choose: auto | ios | "
+              "junos | panos | iptables | nxos | eos | fortinet | aws-sg | "
+              "umbrella | winfw | msdns | infoblox)",
               file=sys.stderr)
         return 2
 

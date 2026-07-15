@@ -98,11 +98,26 @@ oracle error, or an unknown device all **fail closed** and the violation is kept
 - A hygiene **score** and an exportable **JSON** report.
 
 ## Vendors today
-Cisco IOS extended ACLs, Cisco NX-OS access-lists, Cisco ASA access-lists (with
-object-group resolution), Arista EOS access-lists, Juniper Junos firewall filters
-(brace form), Palo Alto PAN-OS security policy (set format), and Linux
-iptables/ip6tables filter rules — vendor auto-detected.
-(Roadmap: FortiGate, AWS Security Groups/NACLs, nftables.)
+Network firewalls / ACLs:
+- **Cisco** IOS extended ACLs, ASA access-lists (with object-group resolution),
+  NX-OS access-lists, and **Umbrella Cloud-Delivered Firewall** (CDFW L3/L4 rules)
+- **Arista EOS** access-lists
+- **Juniper Junos** firewall filters (brace form)
+- **Palo Alto PAN-OS** security policy (set format)
+- **Fortinet FortiGate** firewall policy (`config firewall policy` + address/service objects)
+- **Linux iptables/ip6tables** filter rules
+
+Host & cloud:
+- **Windows Defender Firewall** (`netsh advfirewall` rule export — inbound/outbound host hooks)
+- **AWS Security Groups** (`describe-security-groups` JSON, incl. Control Tower multi-account bundles)
+
+DNS access-control (the L3/L4 "who may reach the resolver" slice):
+- **Infoblox / BIND** DNS ACLs (`acl {…}` + `allow-query`/`allow-recursion`/`allow-transfer`)
+- **Microsoft DNS** client-subnet query-resolution policies
+
+Vendor is auto-detected. The DNS frontends model client access to the resolver
+(udp/tcp 53) only — RPZ / domain-content filtering is DNS-application-layer and
+out of scope for a packet auditor. (Roadmap: AWS NACLs, nftables, GCP/Azure firewall.)
 
 ## Scope & limits (what it does *not* model)
 RuleHawk is a fast, sound **config-change gate**, not a network-wide reachability

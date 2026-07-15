@@ -8,7 +8,8 @@
 // can never be audited, and the UI must never claim it. tests/test_hosted_
 // parity.py fails the build if this list, the dispatch, or the engine drift apart.
 const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
-                        "parse_iptables", "parse_nxos", "parse_eos", "analyze", "report",
+                        "parse_iptables", "parse_nxos", "parse_eos",
+                        "parse_fortinet", "parse_awssg", "parse_umbrella", "parse_winfw", "parse_msdns", "parse_infoblox", "analyze", "report",
                         "segcheck", "pathground"];
 
 // Build the report envelope: structured JSON + human-readable text + a
@@ -27,6 +28,12 @@ from rulehawk.parse_panos import detect as detect_panos, parse_panos
 from rulehawk.parse_iptables import detect as detect_iptables, parse_iptables
 from rulehawk.parse_nxos import detect as detect_nxos, parse_nxos
 from rulehawk.parse_eos import detect as detect_eos, parse_eos
+from rulehawk.parse_fortinet import detect as detect_fortinet, parse_fortinet
+from rulehawk.parse_awssg import detect as detect_awssg, parse_awssg
+from rulehawk.parse_umbrella import detect as detect_umbrella, parse_umbrella
+from rulehawk.parse_winfw import detect as detect_winfw, parse_winfw
+from rulehawk.parse_msdns import detect as detect_msdns, parse_msdns
+from rulehawk.parse_infoblox import detect as detect_infoblox, parse_infoblox
 from rulehawk.analyze import analyze
 from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
@@ -40,6 +47,18 @@ elif detect_nxos(cfg):
     vendor, (aces, notes) = "Cisco NX-OS", parse_nxos(cfg)
 elif detect_eos(cfg):
     vendor, (aces, notes) = "Arista EOS", parse_eos(cfg)
+elif detect_fortinet(cfg):
+    vendor, (aces, notes) = "Fortinet FortiGate", parse_fortinet(cfg)
+elif detect_awssg(cfg):
+    vendor, (aces, notes) = "AWS Security Groups", parse_awssg(cfg)
+elif detect_umbrella(cfg):
+    vendor, (aces, notes) = "Cisco Umbrella CDFW", parse_umbrella(cfg)
+elif detect_winfw(cfg):
+    vendor, (aces, notes) = "Windows Firewall", parse_winfw(cfg)
+elif detect_msdns(cfg):
+    vendor, (aces, notes) = "Microsoft DNS", parse_msdns(cfg)
+elif detect_infoblox(cfg):
+    vendor, (aces, notes) = "Infoblox / BIND DNS", parse_infoblox(cfg)
 else:
     vendor, (aces, notes) = "Cisco IOS / ASA", parse_acls(cfg)
 findings = analyze(aces)
@@ -83,6 +102,8 @@ async function boot() {
   pyodide.runPython("import sys; sys.path.insert(0, '.'); "
     + "import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, "
     + "rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, "
+    + "rulehawk.parse_fortinet, rulehawk.parse_awssg, rulehawk.parse_umbrella, "
+    + "rulehawk.parse_winfw, rulehawk.parse_msdns, rulehawk.parse_infoblox, "
     + "rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
   return pyodide;
 }

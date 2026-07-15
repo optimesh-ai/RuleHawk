@@ -25,11 +25,17 @@ import sys
 
 from .analyze import analyze, score
 from .parse import parse_acls
+from .parse_awssg import detect as detect_awssg, parse_awssg
 from .parse_eos import detect as detect_eos, parse_eos
+from .parse_fortinet import detect as detect_fortinet, parse_fortinet
+from .parse_infoblox import detect as detect_infoblox, parse_infoblox
 from .parse_iptables import detect as detect_iptables, parse_iptables
 from .parse_junos import detect as detect_junos, parse_junos
+from .parse_msdns import detect as detect_msdns, parse_msdns
 from .parse_nxos import detect as detect_nxos, parse_nxos
 from .parse_panos import detect as detect_panos, parse_panos
+from .parse_umbrella import detect as detect_umbrella, parse_umbrella
+from .parse_winfw import detect as detect_winfw, parse_winfw
 from .pathground import HammerheadReachOracle, path_ground
 from .report import to_json, to_text
 from .segcheck import check_segmentation
@@ -53,8 +59,9 @@ options:
   --hh-from DEVICE     source device for path-grounding (needs --hh-snapshot)
   -h, --help           show this help
 
-Vendor is auto-detected: Cisco IOS/ASA, Cisco NX-OS, Arista EOS, Juniper Junos,
-Palo Alto PAN-OS, Linux iptables/ip6tables.
+Vendor is auto-detected: Cisco IOS/ASA/NX-OS/Umbrella, Arista EOS, Juniper Junos,
+Palo Alto PAN-OS, Fortinet FortiGate, Linux iptables, Windows Firewall, AWS
+Security Groups, Infoblox/BIND DNS ACLs, Microsoft DNS.
 
 Single-file mode takes exactly one config file. To audit several at once (e.g.
 a shell glob like `rulehawk configs/*.txt`), use `rulehawk gate <files...>` —
@@ -175,6 +182,24 @@ def main(argv: list[str] | None = None) -> int:
     elif not forced and detect_eos(text):
         aces, notes = parse_eos(text)
         vendor = "eos"
+    elif not forced and detect_fortinet(text):
+        aces, notes = parse_fortinet(text)
+        vendor = "fortinet"
+    elif not forced and detect_awssg(text):
+        aces, notes = parse_awssg(text)
+        vendor = "aws-sg"
+    elif not forced and detect_umbrella(text):
+        aces, notes = parse_umbrella(text)
+        vendor = "umbrella"
+    elif not forced and detect_winfw(text):
+        aces, notes = parse_winfw(text)
+        vendor = "winfw"
+    elif not forced and detect_msdns(text):
+        aces, notes = parse_msdns(text)
+        vendor = "msdns"
+    elif not forced and detect_infoblox(text):
+        aces, notes = parse_infoblox(text)
+        vendor = "infoblox"
     else:
         aces, notes = parse_acls(text)
         vendor = "ios-asa"

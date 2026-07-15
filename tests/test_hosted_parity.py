@@ -41,6 +41,12 @@ from rulehawk.parse_junos import detect as detect_junos, parse_junos  # noqa: E4
 from rulehawk.parse_panos import detect as detect_panos, parse_panos  # noqa: E402
 from rulehawk.parse_nxos import detect as detect_nxos, parse_nxos  # noqa: E402
 from rulehawk.parse_eos import detect as detect_eos, parse_eos  # noqa: E402
+from rulehawk.parse_fortinet import detect as detect_fortinet, parse_fortinet  # noqa: E402
+from rulehawk.parse_awssg import detect as detect_awssg, parse_awssg  # noqa: E402
+from rulehawk.parse_umbrella import detect as detect_umbrella, parse_umbrella  # noqa: E402
+from rulehawk.parse_winfw import detect as detect_winfw, parse_winfw  # noqa: E402
+from rulehawk.parse_msdns import detect as detect_msdns, parse_msdns  # noqa: E402
+from rulehawk.parse_infoblox import detect as detect_infoblox, parse_infoblox  # noqa: E402
 from rulehawk.segcheck import check_segmentation  # noqa: E402
 
 _DOCS = os.path.join(_ROOT, "docs")
@@ -57,6 +63,12 @@ _DISPATCH_PARSERS = {
     "parse_iptables": "parse_iptables",
     "parse_nxos": "parse_nxos",
     "parse_eos": "parse_eos",
+    "parse_fortinet": "parse_fortinet",
+    "parse_awssg": "parse_awssg",
+    "parse_umbrella": "parse_umbrella",
+    "parse_winfw": "parse_winfw",
+    "parse_msdns": "parse_msdns",
+    "parse_infoblox": "parse_infoblox",
     "parse_acls": "parse",          # Cisco IOS/ASA fallback lives in parse.py
 }
 
@@ -118,6 +130,18 @@ def _cli_route(cfg: str):
         return "Cisco NX-OS", parse_nxos(cfg)
     if detect_eos(cfg):
         return "Arista EOS", parse_eos(cfg)
+    if detect_fortinet(cfg):
+        return "Fortinet FortiGate", parse_fortinet(cfg)
+    if detect_awssg(cfg):
+        return "AWS Security Groups", parse_awssg(cfg)
+    if detect_umbrella(cfg):
+        return "Cisco Umbrella CDFW", parse_umbrella(cfg)
+    if detect_winfw(cfg):
+        return "Windows Firewall", parse_winfw(cfg)
+    if detect_msdns(cfg):
+        return "Microsoft DNS", parse_msdns(cfg)
+    if detect_infoblox(cfg):
+        return "Infoblox / BIND DNS", parse_infoblox(cfg)
     return "Cisco IOS / ASA", parse_acls(cfg)
 
 
@@ -184,6 +208,31 @@ ip access-list CORP_OUT
  10 permit tcp 10.20.0.0 0.0.255.255 any eq 443
  20 deny ip any any
 """
+
+# The enterprise/cloud frontends — one leaking fixture each, so the hosted
+# entrypoint's routing + verdicts are proven for every new vendor too.
+_FORTINET_CFG = (
+    'config firewall address\n edit "corp"\n  set subnet 10.20.0.0 255.255.0.0\n'
+    ' next\n edit "pci"\n  set subnet 10.10.0.0 255.255.0.0\n next\nend\n'
+    'config firewall policy\n edit 1\n  set srcaddr "corp"\n  set dstaddr "pci"\n'
+    '  set action accept\n  set service "ALL"\n next\nend\n'
+)
+_AWSSG_CFG = json.dumps({"SecurityGroups": [{"GroupId": "sg-1", "GroupName": "pci",
+    "IpPermissions": [{"IpProtocol": "tcp", "FromPort": 445, "ToPort": 445,
+                       "IpRanges": [{"CidrIp": "10.20.0.0/16"}]}],
+    "IpPermissionsEgress": []}]})
+_UMBRELLA_CFG = json.dumps({"rules": [{"name": "leak", "order": 1, "action": "ALLOW",
+    "protocol": "TCP", "sources": [{"type": "CIDR", "value": "10.20.0.0/16"}],
+    "destinations": [{"type": "CIDR", "value": "10.10.0.0/16"}],
+    "ports": [{"from": 445, "to": 445}]}]})
+_WINFW_CFG = ("Rule Name:  Allow RDP from anywhere\nEnabled:  Yes\n"
+              "Direction:  In\nProtocol:  TCP\nLocalPort:  3389\n"
+              "RemoteIP:  Any\nAction:  Allow\n")
+_MSDNS_CFG = ('Add-DnsServerClientSubnet -Name "Corp" -IPv4Subnet "10.20.0.0/16"\n'
+              'Add-DnsServerQueryResolutionPolicy -Name "AllowCorp" -Action ALLOW '
+              '-ClientSubnet "EQ,Corp" -ProcessingOrder 1\n')
+_INFOBLOX_CFG = ('acl "trusted" { 10.20.0.0/16; };\n'
+                 'options { allow-query { trusted; }; };\n')
 
 
 # --------------------------------------------------------------------------- #
@@ -258,6 +307,12 @@ def test_ui_supported_copy_names_no_unloaded_vendor():
     (_CISCO_INDET, "Cisco IOS / ASA"),
     (_NXOS_CFG, "Cisco NX-OS"),
     (_EOS_CFG, "Arista EOS"),
+    (_FORTINET_CFG, "Fortinet FortiGate"),
+    (_AWSSG_CFG, "AWS Security Groups"),
+    (_UMBRELLA_CFG, "Cisco Umbrella CDFW"),
+    (_WINFW_CFG, "Windows Firewall"),
+    (_MSDNS_CFG, "Microsoft DNS"),
+    (_INFOBLOX_CFG, "Infoblox / BIND DNS"),
 ])
 def test_hosted_autodetects_same_vendor_as_cli(cfg, vendor):
     env = _run_hosted(_analyze_py(_read(_WORKER)), cfg)
@@ -266,7 +321,9 @@ def test_hosted_autodetects_same_vendor_as_cli(cfg, vendor):
 
 
 @pytest.mark.parametrize("cfg", [_JUNOS_LEAK, _PANOS_CFG, _IPTABLES, _CISCO_INDET,
-                                  _NXOS_CFG, _EOS_CFG])
+                                  _NXOS_CFG, _EOS_CFG, _FORTINET_CFG, _AWSSG_CFG,
+                                  _UMBRELLA_CFG, _WINFW_CFG, _MSDNS_CFG,
+                                  _INFOBLOX_CFG])
 def test_hosted_findings_match_cli_exactly(cfg):
     """Strongest assertion: the hosted entrypoint's findings == running the CLI's
     detect+parse+analyze+segcheck directly. Same engine, same verdicts."""
