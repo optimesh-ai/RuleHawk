@@ -459,7 +459,10 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                         f"flow is dropped at the filter layer.",
                         "",
                         fix=f"permit {hsrc} -> {hdst}{psfx} in the ruleset "
-                            f"governing this path"))
+                            f"governing this path",
+                        claim={"direction": direction, "src": sname,
+                               "dst": dname, "proto": proto,
+                               "ports": assertion.get("ports")}))
                 continue
 
             permit_hit, indet = _probe_space(aces, by_acl, zones[sname],
@@ -491,7 +494,9 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                     fix=(f"deny {sub[0]} -> {sub[1]}{_port_part} "
                          f"before rule {rule.seq}{_line_part}"),
                     witness=f"{swit} -> {dwit}{portsfx} ({probe})",
-                    line=rule.line))
+                    line=rule.line,
+                    claim={"direction": direction, "src": sname, "dst": dname,
+                           "proto": proto, "ports": assertion.get("ports")}))
                 continue
             if indet:
                 sub, rule, acl_name = indet

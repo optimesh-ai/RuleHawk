@@ -341,7 +341,7 @@ const SAMPLES = {
 };
 const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
                         "parse_iptables", "parse_nxos", "parse_eos", "parse_awssg", "analyze", "report",
-                        "segcheck", "evidence", "pathground"];
+                        "segcheck", "riskaccept", "evidence", "pathground"];
 const PYODIDE_VER = "v0.26.4";
 // Fallback (main-thread) analysis stays synchronous, so cap it; the worker path has no cap.
 const FALLBACK_MAX_LINES = 4000;
@@ -495,7 +495,7 @@ async function bootMain(){
       pyodide.FS.writeFile(`rulehawk/${m}.py`, await r.text());
     }
     setStatus(bootProgressHtml({stage:"start"}));
-    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, rulehawk.parse_awssg, rulehawk.analyze, rulehawk.report, rulehawk.segcheck, "
+    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, rulehawk.parse_awssg, rulehawk.analyze, rulehawk.report, rulehawk.segcheck, rulehawk.riskaccept, "
     + "rulehawk.evidence");
     mode = "main"; ready();
   }catch(e){

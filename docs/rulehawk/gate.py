@@ -48,6 +48,7 @@ from .parse_panos import detect as detect_panos, parse_panos
 from .parse_nxos import detect as detect_nxos, parse_nxos
 from .parse_awssg import detect as detect_awssg, parse_awssg
 from .parse_eos import detect as detect_eos, parse_eos
+from .riskaccept import apply_to_findings, evaluate, finalize
 from .segcheck import check_segmentation
 
 # Severity ordering shared by the threshold logic, SARIF level mapping, and the
@@ -235,7 +236,8 @@ def _pick_parser(text: str, vendor: str):
     return "ios-asa", parse_acls
 
 
-def audit_file(path: str, policy: Optional[dict], vendor: str = "auto") -> FileResult:
+def audit_file(path: str, policy: Optional[dict], vendor: str = "auto",
+               ledger=None) -> FileResult:
     """Parse + analyze (+ segment-check) one config file."""
     # Read BYTES so the evidence digest is of the file an auditor can re-hash.
     try:
@@ -248,7 +250,12 @@ def audit_file(path: str, policy: Optional[dict], vendor: str = "auto") -> FileR
     aces, notes = parse_fn(text)
     findings = analyze(aces)
     if policy:
-        findings += check_segmentation(aces, policy)
+        seg = check_segmentation(aces, policy)
+        if ledger is not None:
+            # Risk acceptance is scoped per config, so an exception written for
+            # one device cannot silently cover the whole estate.
+            seg = apply_to_findings(seg, ledger, path)
+        findings += seg
     line_by_id = {(a.acl, a.seq): a.line for a in aces}
     status = "ok" if aces else "no_rules_parsed"
     return FileResult(path, vlabel, status, len(aces), findings, notes,
@@ -262,6 +269,7 @@ def audit_file(path: str, policy: Optional[dict], vendor: str = "auto") -> FileR
 class GateResult:
     files: List[FileResult]
     fail_on: str
+    ledger: object = None      # riskaccept.Ledger for this run (set by run_gate)
 
     @property
     def real_findings(self) -> List[Tuple[FileResult, Finding]]:
@@ -301,7 +309,7 @@ class GateResult:
         if self.fail_on == "none":
             return []
         return [(fr, f) for fr, f in self.real_findings
-                if _SEV_RANK.get(f.severity, 0) >= thr]
+                if _SEV_RANK.get(f.severity, 0) >= thr and f.accepted is None]
 
     @property
     def parse_failures(self) -> List[FileResult]:
@@ -335,8 +343,20 @@ class GateResult:
 
 
 def run_gate(paths: List[str], policy: Optional[dict], fail_on: str = "high",
-             vendor: str = "auto") -> GateResult:
-    return GateResult([audit_file(p, policy, vendor) for p in paths], fail_on)
+             vendor: str = "auto", as_of=None) -> GateResult:
+    """Audit every path. One exception ledger is shared across the whole run, so
+    `unused` is judged against the ENTIRE fleet — an exception that matches on
+    device 400 is in use, even though it matched nothing on device 1."""
+    ledger = evaluate(policy, as_of)
+    files = [audit_file(p, policy, vendor, ledger) for p in paths]
+    finalize(ledger)
+    gate = GateResult(files, fail_on)
+    gate.ledger = ledger
+    # Exceptions that did NOT apply are reported against the policy itself.
+    # An INVALID one is high severity: it looks like protection and gives none.
+    if files and ledger.entries:
+        files[0].findings = list(files[0].findings) + ledger.problems
+    return gate
 
 
 # --------------------------------------------------------------------------- #

@@ -189,6 +189,59 @@ group permits the forbidden flow. Two caveats specific to AWS:
   rule, so the affected assertion is `segmentation-indeterminate` — never a PASS.
   Export the referenced group's members as CIDRs if you need a decisive verdict.
 
+## Risk acceptance (`exceptions`)
+
+Point this at a real estate of firewalls and the first run is red: our own scale
+test on 300 devices produced **62 pre-existing CRITICAL violations**, none of them
+introduced by the pull request being gated. A gate that is red on day one and
+stays red gets switched off — so the policy can carry *time-boxed, attributed*
+risk acceptances:
+
+```jsonc
+"exceptions": [
+  {
+    "id":          "RISK-4471",              // your ticket
+    "claim":       {"src": "CORP", "dst": "PCI", "proto": "tcp", "ports": [1433]},
+    "subjects":    ["firewall/dc-core-asa.txt"],   // optional; omit = fleet-wide
+    "reason":      "Reporting server requires SQL to the CDE. Compensating control: jump-host allowlist + query audit (SEC-88).",
+    "approved_by": "jane.doe@acme.com",
+    "expires":     "2027-03-31"              // required, and enforced
+  }
+]
+```
+
+This is **not** a suppression list, and the difference is the whole point:
+
+| | ignore-list | RuleHawk exception |
+|---|---|---|
+| the finding | disappears | still reported, with its witness packet |
+| the claim | reads as passing | reads `ACCEPTED_RISK` — never `VERIFIED` |
+| who owns it | nobody | `approved_by`, in the evidence artifact |
+| when it ends | never | `expires` — the gate re-arms itself |
+| if it's stale | invisible forever | reported `unused` |
+
+Five rules are enforced, each pinned by tests:
+
+1. **Nothing disappears.** An accepted finding keeps its kind, severity and
+   witness packet; the artifact gains an `accepted_risks` section naming the
+   ticket, the approver and the expiry. A claim covered only by acceptances is
+   `ACCEPTED_RISK`, never `VERIFIED` — isolation was *not* proven.
+2. **Expiry is mandatory and enforced.** A missing or past `expires` means the
+   exception does not apply: the finding is enforced again and the gate goes red
+   on its own, with no config change.
+3. **Accountability is mandatory.** Missing `id`, `reason` or `approved_by`
+   makes the exception **invalid** — it suppresses nothing and is reported at
+   *high* severity, because an exception that looks like protection and gives
+   none is worse than no exception.
+4. **Anything unparseable fails closed** — a malformed date, a claim that does
+   not name zones, a non-object entry.
+5. **Dead exceptions are surfaced** as `unused`, so the list gets pruned instead
+   of accreting forever.
+
+An exception matches its claim exactly on zones and protocol; a portless
+exception covers every port of that protocol, but a narrow one never waives a
+broader assertion. The accepted risk is the one the approver actually read.
+
 ## Gotchas
 
 - **Zone names must match exactly.** A `src`/`dst` that isn't a key in `zones`

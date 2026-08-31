@@ -141,9 +141,8 @@ def test_must_reach_is_attested_too():
     assert a["direction"] == "must_reach"
     assert a["claim"] == "CORP must reach PCI on tcp/443"
     assert a["status"] == FAILED           # the ACL denies it
-    ids = {(c["framework"], c["control"]) for c in a["controls"]}
-    assert ("SOC2-TSC-2017", "A1.2") in ids        # availability
-    assert ("PCI-DSS-4.0", "11.4.5") not in ids    # NOT segmentation testing
+    assert "SOC2-TSC-2017:A1.2" in a["controls"]        # availability
+    assert "PCI-DSS-4.0:11.4.5" not in a["controls"]    # NOT segmentation testing
 
 
 def test_no_policy_makes_no_isolation_claim():

@@ -48,7 +48,7 @@ def to_json(findings: List[Finding], notes: List[str], n_rules: int,
         "findings": [
             {"rule_id": f.rule_id, "kind": f.kind, "severity": f.severity,
              "message": f.message, "rule": f.rule, "cited": f.cited, "fix": f.fix,
-             "witness": f.witness, "line": f.line}
+             "witness": f.witness, "accepted": f.accepted, "line": f.line}
             for f in _sorted(findings)
         ],
         "parse_notes": notes,
@@ -104,7 +104,8 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int,
         )
     for f in _sorted(findings):
         lines.append("")
-        lines.append(f"[{f.severity.upper():8}] {f.kind}  ({f.rule_id})")
+        tag = " ACCEPTED" if f.accepted else ""
+        lines.append(f"[{f.severity.upper():8}]{tag} {f.kind}  ({f.rule_id})")
         lines.append(f"   rule : {f.rule}")
         if f.line:
             lines.append(f"   line : {f.line}")
@@ -118,6 +119,15 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int,
             # already shows it; the CLI text report must too.
             lines.append(f"   pkt  : {f.witness}")
         lines.append(f"   why  : {f.message}")
+        if f.accepted:
+            a = f.accepted
+            # Say plainly that the risk is OWNED, not gone: the finding stands,
+            # the gate simply is not red for it until the acceptance lapses.
+            lines.append(f"   risk : ACCEPTED under {a['id']} by "
+                         f"{a['approved_by']} until {a['expires']} — this is "
+                         f"NOT proof of isolation; the finding stands.")
+            if a.get("reason"):
+                lines.append(f"   why? : {a['reason']}")
         if f.fix:
             lines.append(f"   fix  : {f.fix}")
     # Cleanup plan: the safe-to-delete (redundant) rules, collected. Both

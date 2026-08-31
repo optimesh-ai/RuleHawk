@@ -56,6 +56,7 @@ import json
 from typing import Dict, List, Optional, Sequence
 
 from .analyze import Finding, score
+from .riskaccept import Ledger, accepted_for, evaluate, finalize
 from .segcheck import check_segmentation
 
 SCHEMA = "rulehawk.evidence/v1"
@@ -225,6 +226,7 @@ DISCLAIMER = (
 # Attestation / control status vocabulary.
 VERIFIED = "VERIFIED"            # proved across every audited ruleset
 FAILED = "FAILED"                # disproved: a concrete witness packet
+ACCEPTED_RISK = "ACCEPTED_RISK"  # disproved, but formally accepted and owned
 INDETERMINATE = "INDETERMINATE"  # could not decide — never read as a pass
 ATTENTION = "ATTENTION"          # mapped findings, but below critical/high
 NO_EVIDENCE = "NO_EVIDENCE"      # nothing audited bears on this control
@@ -319,6 +321,30 @@ def controls_for(kind: str) -> List[dict]:
     return out
 
 
+def control_refs(kind: str) -> List[str]:
+    """The same controls as compact `framework:control` references.
+
+    Findings carry refs rather than inlined {framework, control, title} objects:
+    every finding of a given kind maps to the identical control set, so inlining
+    the titles duplicated them once per finding. On a 1,200-device fleet that
+    was 3.8 MB of an artifact whose actual content is 0.3 MB — 82% of every
+    finding was a copy of the same requirement text. `control_catalog` resolves
+    each ref once.
+    """
+    return [f"{c['framework']}:{c['control']}" for c in controls_for(kind)]
+
+
+def _control_catalog(refs) -> Dict[str, dict]:
+    """Resolve every ref used anywhere in this artifact, once."""
+    out: Dict[str, dict] = {}
+    for ref in sorted(set(refs)):
+        fw, _, cid = ref.partition(":")
+        out[ref] = {"framework": fw, "framework_name": FRAMEWORKS.get(fw, fw),
+                    "control": cid,
+                    "title": CONTROL_TITLES.get(fw, {}).get(cid, "")}
+    return out
+
+
 def _assertion_claim(a: dict, direction: str) -> str:
     spec = _DIRECTIONS[direction]
     proto = str(a.get("proto") or "ip").lower()
@@ -371,12 +397,24 @@ def _fleet_status(per_subject: Sequence[dict], all_audited: bool) -> str:
         return FAILED
     if not all_audited or INDETERMINATE in statuses or not statuses:
         return INDETERMINATE
+    # Everything that broke the claim is formally accepted. That is NOT proof of
+    # isolation and must never roll up as one — it is an owned, expiring breach.
+    if ACCEPTED_RISK in statuses:
+        return ACCEPTED_RISK
     return VERIFIED
 
 
 def build_attestations(subjects: Sequence[Subject],
-                       policy: Optional[dict]) -> List[dict]:
-    """One attestation per assertion, across all subjects, both directions."""
+                       policy: Optional[dict],
+                       ledger: Optional[Ledger] = None) -> List[dict]:
+    """One attestation per assertion, across all subjects, both directions.
+
+    A per-subject FAILED covered by an in-force exception becomes ACCEPTED_RISK.
+    That is NOT a pass: the claim is still disproved, we have merely recorded
+    who owns the breach and when the acceptance lapses. `_fleet_status` keeps
+    them distinct so a control rollup can never read an accepted risk as
+    verified isolation.
+    """
     if not policy:
         return []
     zones = policy.get("zones") or {}
@@ -391,10 +429,24 @@ def build_attestations(subjects: Sequence[Subject],
             for s in audited:
                 status, witness, detail = _subject_verdict(
                     s, zones, assertion, direction)
-                per_subject.append({"subject": s.source, "status": status,
-                                    "witness": witness, "detail": detail})
+                entry = {"subject": s.source, "status": status,
+                         "witness": witness, "detail": detail}
+                if status == FAILED and ledger is not None:
+                    exc = accepted_for(
+                        ledger, spec["bad"], assertion.get("src"),
+                        assertion.get("dst"), assertion.get("proto"),
+                        assertion.get("ports"), s.source)
+                    if exc is not None:
+                        entry["status"] = ACCEPTED_RISK
+                        entry["accepted"] = {
+                            "id": exc.id, "reason": exc.raw.get("reason", ""),
+                            "approved_by": exc.raw.get("approved_by", ""),
+                            "expires": exc.raw.get("expires", "")}
+                per_subject.append(entry)
             status = _fleet_status(per_subject, all_audited)
             failed_on = [p for p in per_subject if p["status"] == FAILED]
+            accepted_on = [p for p in per_subject
+                           if p["status"] == ACCEPTED_RISK]
             entry = {
                 "assertion": assertion,
                 "direction": direction,
@@ -404,15 +456,22 @@ def build_attestations(subjects: Sequence[Subject],
                 # routing or NAT model this is the strongest sound phrasing.
                 "basis": (spec["basis_ok"] if status == VERIFIED else
                           spec["basis_bad"] if status == FAILED else
+                          "broken, but formally accepted as a time-boxed risk — "
+                          "isolation is NOT proven"
+                          if status == ACCEPTED_RISK else
                           "the audited set was incomplete or could not be decided"),
                 "verified_on": [p["subject"] for p in per_subject
                                 if p["status"] == VERIFIED],
+                "accepted_on": [{"subject": p["subject"],
+                                 "witness": p["witness"],
+                                 "accepted": p["accepted"]}
+                                for p in accepted_on],
                 "failed_on": [{"subject": p["subject"], "witness": p["witness"],
                                "detail": p["detail"]} for p in failed_on],
                 "indeterminate_on": [{"subject": p["subject"], "detail": p["detail"]}
                                      for p in per_subject
                                      if p["status"] == INDETERMINATE],
-                "controls": controls_for(spec["bad"]),
+                "controls": control_refs(spec["bad"]),
             }
             # The single most useful line for a reader: the concrete packet.
             entry["witness"] = failed_on[0]["witness"] if failed_on else ""
@@ -436,7 +495,7 @@ def _control_rollup(findings: Sequence[Finding],
             "framework": fw, "framework_name": FRAMEWORKS.get(fw, fw),
             "control": cid, "title": CONTROL_TITLES.get(fw, {}).get(cid, ""),
             "status": NO_EVIDENCE, "verified": 0, "failed": 0,
-            "indeterminate": 0, "findings": 0,
+            "accepted": 0, "indeterminate": 0, "findings": 0,
         })
 
     for f in findings:
@@ -452,8 +511,9 @@ def _control_rollup(findings: Sequence[Finding],
             elif s["status"] != FAILED:
                 s["status"] = ATTENTION
     for a in attestations:
-        for c in a["controls"]:
-            s = slot(c["framework"], c["control"])
+        for ref in a["controls"]:
+            fw, _, cid = ref.partition(":")
+            s = slot(fw, cid)
             if a["status"] == VERIFIED:
                 s["verified"] += 1
                 if s["status"] == NO_EVIDENCE:
@@ -461,6 +521,12 @@ def _control_rollup(findings: Sequence[Finding],
             elif a["status"] == FAILED:
                 s["failed"] += 1
                 s["status"] = FAILED
+            elif a["status"] == ACCEPTED_RISK:
+                # An owned, expiring breach. It must not read as proven
+                # isolation, and it must not read as an open failure either.
+                s["accepted"] += 1
+                if s["status"] != FAILED:
+                    s["status"] = ACCEPTED_RISK
             else:
                 s["indeterminate"] += 1
                 if s["status"] != FAILED:
@@ -472,7 +538,8 @@ def build_evidence(subjects: Sequence[Subject], *,
                    policy: Optional[dict] = None,
                    policy_source: str = "", policy_raw: Optional[bytes] = None,
                    generator: str = "cli",
-                   generated_at: Optional[str] = None) -> dict:
+                   generated_at: Optional[str] = None,
+                   as_of=None) -> dict:
     """Assemble the evidence artifact for one or many audited configs.
 
     `generator` records WHERE the artifact came from ("cli", "ci", "hosted").
@@ -483,7 +550,9 @@ def build_evidence(subjects: Sequence[Subject], *,
     digest covers the text as submitted to the page.
     """
     subjects = list(subjects)
-    attestations = build_attestations(subjects, policy)
+    ledger = finalize_ledger_after(build_attestations, subjects, policy, as_of)
+    attestations = ledger[1]
+    ledger = ledger[0]
     all_findings = [f for s in subjects for f in s.findings]
     audited = [s for s in subjects if s.audited]
     total_rules = sum(len(s.aces) for s in subjects)
@@ -506,20 +575,31 @@ def build_evidence(subjects: Sequence[Subject], *,
             "hygiene_score": (score(all_findings) if total_rules else None),
             "attestations_verified": sum(a["status"] == VERIFIED for a in attestations),
             "attestations_failed": sum(a["status"] == FAILED for a in attestations),
+            "attestations_accepted": sum(
+                a["status"] == ACCEPTED_RISK for a in attestations),
             "attestations_indeterminate": sum(
                 a["status"] == INDETERMINATE for a in attestations),
             "findings_total": len(all_findings),
         },
         "attestations": attestations,
+        # Risk acceptance is reported as prominently as failure — never as an
+        # absence. An assessor must be able to read exactly what was accepted,
+        # by whom, and when the acceptance lapses.
+        "accepted_risks": ledger.to_dict(),
         "findings": [
             {"subject": s.source, "rule_id": f.rule_id, "kind": f.kind,
              "severity": f.severity, "message": f.message, "rule": f.rule,
              "cited": f.cited, "fix": f.fix, "witness": f.witness,
-             "controls": controls_for(f.kind)}
+             "accepted": f.accepted, "controls": control_refs(f.kind)}
             for s in subjects for f in s.findings
         ],
         "controls": _control_rollup(all_findings, attestations),
         "frameworks": copy.deepcopy(FRAMEWORKS),
+        # Every `controls` ref used above, resolved once.
+        "control_catalog": _control_catalog(
+            [r for a in attestations for r in a["controls"]]
+            + [r for s in subjects for f in s.findings
+               for r in control_refs(f.kind)]),
         "scope": {"limits": list(SCOPE_LIMITS) + (
             [HOSTED_DIGEST_NOTE] if generator == "hosted" else []),
             "disclaimer": DISCLAIMER},
@@ -544,6 +624,16 @@ def build_evidence(subjects: Sequence[Subject], *,
     return art
 
 
+def finalize_ledger_after(build_fn, subjects, policy, as_of):
+    """Evaluate the exception ledger, build attestations against it, then mark
+    in-force exceptions that matched nothing as unused. Returns (ledger,
+    attestations) — the order matters: `unused` is only knowable after every
+    finding has been offered to the ledger."""
+    ledger = evaluate(policy, as_of)
+    attestations = build_fn(subjects, policy, ledger)
+    return finalize(ledger), attestations
+
+
 def to_evidence_json(*args, **kwargs) -> str:
     return json.dumps(build_evidence(*args, **kwargs), indent=2, sort_keys=False)
 
@@ -552,7 +642,22 @@ def to_evidence_json(*args, **kwargs) -> str:
 # human-readable rendering — the auditor does not read JSON
 # --------------------------------------------------------------------------- #
 _STATUS_MARK = {VERIFIED: "PASS", FAILED: "FAIL", INDETERMINATE: "UNKNOWN",
-                ATTENTION: "REVIEW", NO_EVIDENCE: "—"}
+                ACCEPTED_RISK: "ACCEPTED", ATTENTION: "REVIEW",
+                NO_EVIDENCE: "—"}
+
+
+# Rendering caps for a fleet-scale document. NEVER a silent truncation: every
+# capped list says how many were elided and where the complete data lives (the
+# JSON artifact is always complete). A 1,200-row table is not a document a
+# reviewer reads — it is one they close.
+_ROW_CAP = 25
+
+
+def _capped(rows: List[str], total: int, what: str) -> List[str]:
+    if total <= _ROW_CAP:
+        return rows
+    return rows + [f"| … and {total - _ROW_CAP} more {what} "
+                   f"| | | | (see the JSON artifact) |"]
 
 
 def _cell(text: str) -> str:
@@ -575,6 +680,10 @@ def to_evidence_markdown(art: dict, *, title: str = "Segmentation evidence") -> 
     # Verdict up front — the reader should not have to hunt for it.
     if res["attestations_failed"]:
         verdict = f"**FAIL — {res['attestations_failed']} claim(s) disproved.**"
+    elif res.get("attestations_accepted"):
+        verdict = (f"**ACCEPTED RISK — {res['attestations_accepted']} claim(s) "
+                   f"are broken but formally accepted. Isolation is NOT "
+                   f"proven for those.**")
     elif res["attestations_indeterminate"]:
         verdict = (f"**INCOMPLETE — {res['attestations_indeterminate']} claim(s) "
                    f"could not be decided. Nothing is proven for those.**")
@@ -612,6 +721,46 @@ def to_evidence_markdown(art: dict, *, title: str = "Segmentation evidence") -> 
                     out.append(f"- `{_cell(f['subject'])}` {detail}")
                 out.append("")
 
+    acc = art.get("accepted_risks") or {}
+    accepted_claims = [a for a in art["attestations"]
+                       if a["status"] == ACCEPTED_RISK]
+    if accepted_claims or acc.get("expired") or acc.get("invalid") or acc.get("unused"):
+        out += ["## Accepted risk", "",
+                f"Exceptions evaluated on **{acc.get('evaluated_on', '?')}**: "
+                f"{acc.get('applied', 0)} in force, {acc.get('expired', 0)} "
+                f"expired, {acc.get('invalid', 0)} invalid, "
+                f"{acc.get('unused', 0)} unused.", ""]
+    if accepted_claims:
+        out += ["These claims are **broken**. They are not failures of this run "
+                "only because a named owner accepted the risk, and each "
+                "acceptance expires.", "",
+                "| Ticket | Claim | Configs | Accepted by | Expires |",
+                "|---|---|---|---|---|"]
+        # Grouped by TICKET, not by device: one risk acceptance covering 33
+        # devices is one decision a risk committee made, not 33 rows to scroll.
+        grouped: Dict[tuple, List[str]] = {}
+        for a in accepted_claims:
+            for e in a["accepted_on"]:
+                d = e["accepted"]
+                key = (d["id"], a["claim"], d["approved_by"], d["expires"])
+                grouped.setdefault(key, []).append(e["subject"])
+        for (tid, claim, who, exp), subs in sorted(grouped.items()):
+            shown = ", ".join(f"`{_cell(x)}`" for x in sorted(subs)[:3])
+            if len(subs) > 3:
+                shown += f" +{len(subs) - 3} more"
+            out.append(f"| {_cell(tid)} | {_cell(claim)} | {len(subs)}: {shown} "
+                       f"| {_cell(who)} | {_cell(exp)} |")
+        out.append("")
+    lapsed = [e for e in acc.get("exceptions", [])
+              if e["status"] in ("expired", "invalid")]
+    if lapsed:
+        out += ["**Exceptions that did NOT suppress anything** (the underlying "
+                "finding is enforced):", ""]
+        for e in lapsed:
+            out.append(f"- `{_cell(e['id'])}` — {_cell(e['status'])}: "
+                       f"{_cell(e.get('detail', ''))}")
+        out.append("")
+
     if art["controls"]:
         out += ["## Control references", "",
                 "| Framework | Control | Requirement | Result |", "|---|---|---|---|"]
@@ -623,10 +772,15 @@ def to_evidence_markdown(art: dict, *, title: str = "Segmentation evidence") -> 
 
     out += ["## Configs audited", "",
             "| Config | Vendor | Rules | SHA-256 | Status |", "|---|---|---|---|---|"]
-    for s in art["subjects"]:
-        out.append(f"| `{_cell(s['source'])}` | {_cell(s['vendor'])} "
-                   f"| {s['rules_parsed']} | `{s['sha256'][7:19]}…` "
-                   f"| {_cell(s['status'])} |")
+    # Anything not "ok" is shown first and never elided — a config that failed to
+    # parse is the single most important row here, because it is why a claim
+    # could not be verified.
+    subjects = sorted(art["subjects"], key=lambda x: (x["status"] == "ok",
+                                                      x["source"]))
+    rows = [f"| `{_cell(x['source'])}` | {_cell(x['vendor'])} "
+            f"| {x['rules_parsed']} | `{x['sha256'][7:19]}…` "
+            f"| {_cell(x['status'])} |" for x in subjects[:_ROW_CAP]]
+    out += _capped(rows, len(subjects), "config(s)")
     out += ["", "Digests are of the exact bytes audited — re-hash a file with "
                 "`sha256sum` to confirm this report describes it.", ""]
 

@@ -34,6 +34,7 @@ from .parse_nxos import detect as detect_nxos, parse_nxos
 from .parse_panos import detect as detect_panos, parse_panos
 from .pathground import HammerheadReachOracle, path_ground
 from .report import to_json, to_text
+from .riskaccept import apply_to_findings, evaluate, finalize
 from .segcheck import check_segmentation
 
 
@@ -209,6 +210,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"rulehawk: cannot read policy {policy_path!r}: {e}", file=sys.stderr)
             return 2
         seg = check_segmentation(aces, policy)
+        _ledger = evaluate(policy)
+        seg = apply_to_findings(seg, _ledger, source)
+        finalize(_ledger)
+        seg = list(seg) + _ledger.problems
         if hh_snapshot and hh_from:
             oracle = HammerheadReachOracle(hh_snapshot, hh_from)
             seg = path_ground(seg, oracle)
@@ -231,7 +236,11 @@ def main(argv: list[str] | None = None) -> int:
     # imply a clean audit when the input was never read as a firewall config.
     if not n_rules:
         return 2
-    return 1 if any(f.severity in ("critical", "high") for f in findings) else 0
+    # An ACCEPTED finding is reported but does not fail the run — that is what a
+    # time-boxed, attributed risk acceptance is for. It goes red again the day
+    # the acceptance expires, by itself.
+    return 1 if any(f.severity in ("critical", "high") and f.accepted is None
+                    for f in findings) else 0
 
 
 if __name__ == "__main__":
