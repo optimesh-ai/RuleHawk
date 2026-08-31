@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .analyze import Finding, analyze, score
+from .evidence import Subject, build_evidence, to_evidence_markdown
 from .parse import parse_acls
 from .parse_iptables import detect as detect_iptables, parse_iptables
 from .parse_junos import detect as detect_junos, parse_junos
@@ -135,6 +136,16 @@ class FileResult:
     notes: List[str] = field(default_factory=list)
     line_by_id: Dict[Tuple[str, int], int] = field(default_factory=dict)
     error: str = ""
+    # Carried for the evidence artifact: `raw` is the exact bytes read (so the
+    # recorded digest is re-hashable), `aces` lets each policy assertion be
+    # re-checked per file to attribute a failure to the config that caused it.
+    raw: bytes = b""
+    aces: List = field(default_factory=list)
+
+    def to_subject(self) -> Subject:
+        return Subject(source=self.path, raw=self.raw, vendor=self.vendor,
+                       aces=self.aces, findings=self.findings,
+                       notes=self.notes, error=self.error)
 
     @property
     def score(self) -> Optional[int]:
@@ -219,10 +230,13 @@ def _pick_parser(text: str, vendor: str):
 
 def audit_file(path: str, policy: Optional[dict], vendor: str = "auto") -> FileResult:
     """Parse + analyze (+ segment-check) one config file."""
+    # Read BYTES so the evidence digest is of the file an auditor can re-hash.
     try:
-        text = open(path, encoding="utf-8", errors="replace").read()
+        with open(path, "rb") as fh:
+            raw = fh.read()
     except OSError as e:
         return FileResult(path, "?", "error", 0, error=str(e))
+    text = raw.decode("utf-8", errors="replace")
     vlabel, parse_fn = _pick_parser(text, vendor)
     aces, notes = parse_fn(text)
     findings = analyze(aces)
@@ -230,7 +244,8 @@ def audit_file(path: str, policy: Optional[dict], vendor: str = "auto") -> FileR
         findings += check_segmentation(aces, policy)
     line_by_id = {(a.acl, a.seq): a.line for a in aces}
     status = "ok" if aces else "no_rules_parsed"
-    return FileResult(path, vlabel, status, len(aces), findings, notes, line_by_id)
+    return FileResult(path, vlabel, status, len(aces), findings, notes,
+                      line_by_id, raw=raw, aces=aces)
 
 
 # --------------------------------------------------------------------------- #
@@ -737,6 +752,10 @@ options:
                        $GITHUB_STEP_SUMMARY when that env var is set
   --comment PATH       write the sticky PR-comment markdown body
   --json PATH          write the machine aggregate ('-' for stdout)
+  --evidence PATH      write the compliance-evidence artifact ('-' for stdout):
+                       provenance + VERIFIED/FAILED policy attestations +
+                       control references, across every config audited
+  --evidence-md PATH   the same artifact as a readable markdown document
   -q, --quiet          suppress the console report
   -h, --help           show this help
 """
@@ -772,6 +791,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     summary_path = _take(argv, "--summary")
     comment_path = _take(argv, "--comment")
     json_path = _take(argv, "--json")
+    evidence_path = _take(argv, "--evidence")
+    evidence_md_path = _take(argv, "--evidence-md")
 
     if fail_on not in ("critical", "high", "medium", "low", "none"):
         print(f"rulehawk gate: bad --fail-on {fail_on!r}", file=sys.stderr)
@@ -808,9 +829,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     policy: Optional[dict] = None
+    policy_raw: Optional[bytes] = None
     if policy_path:
         try:
-            policy = json.load(open(policy_path, encoding="utf-8"))
+            with open(policy_path, "rb") as _pf:
+                policy_raw = _pf.read()
+            policy = json.loads(policy_raw.decode("utf-8"))
         except (OSError, ValueError) as e:
             print(f"rulehawk gate: cannot read policy {policy_path!r}: {e}",
                   file=sys.stderr)
@@ -830,6 +854,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             _write(sarif_path, to_sarif(gate))
         if json_path:
             _emit(json_path, to_json(gate))
+        if evidence_path or evidence_md_path:
+            art = build_evidence([fr.to_subject() for fr in gate.files],
+                                 policy=policy, policy_source=policy_path or "",
+                                 policy_raw=policy_raw, generator="ci")
+            if evidence_path:
+                _emit(evidence_path, json.dumps(art, indent=2))
+            if evidence_md_path:
+                _emit(evidence_md_path, to_evidence_markdown(art))
         # Step summary: explicit path, else GitHub's env file when present.
         summary_target = summary_path or os.environ.get("GITHUB_STEP_SUMMARY")
         if summary_target:

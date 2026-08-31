@@ -339,7 +339,9 @@ const SAMPLES = {
   nxos:     { cfg: SAMPLE_NXOS,     pol: SAMPLE_POLICY,
     msg: "Cisco NX-OS ACL + PCI policy loaded — Audit to prove CORP reaches PCI on 445 (witness packet) and see a permit killed by an earlier deny-any." },
 };
-const ENGINE_MODULES = ["__init__","model","parse","parse_junos","parse_panos","parse_iptables","parse_nxos","parse_eos","analyze","report","segcheck","pathground"];
+const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
+                        "parse_iptables", "parse_nxos", "parse_eos", "analyze", "report",
+                        "segcheck", "evidence", "pathground"];
 const PYODIDE_VER = "v0.26.4";
 // Fallback (main-thread) analysis stays synchronous, so cap it; the worker path has no cap.
 const FALLBACK_MAX_LINES = 4000;
@@ -399,6 +401,7 @@ from rulehawk.parse_eos import detect as detect_eos, parse_eos
 from rulehawk.analyze import analyze
 from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
+from rulehawk.evidence import Subject, build_evidence, to_evidence_markdown
 if detect_junos(cfg):
     vendor, (aces, notes) = "Juniper Junos", parse_junos(cfg)
 elif detect_panos(cfg):
@@ -413,17 +416,27 @@ else:
     vendor, (aces, notes) = "Cisco IOS / ASA", parse_acls(cfg)
 findings = analyze(aces)
 _pol = pol.strip()
+_policy_obj = None
 if _pol:
     try:
-        findings = findings + check_segmentation(aces, json.loads(_pol))
+        _policy_obj = json.loads(_pol)
+        findings = findings + check_segmentation(aces, _policy_obj)
     except Exception as e:
+        _policy_obj = None
         notes = notes + ["segmentation policy error: " + str(e)]
 # Parsers stamp every ACE with its exact 1-based source line (model.ACE.line),
 # including all ACEs expanded from one object-group line. 0 = unknown -> no jump.
 _rl = {a.acl + ":" + str(a.seq): a.line for a in aces if a.line}
+_subject = Subject(source="pasted-config", raw=cfg.encode("utf-8"),
+                   vendor=vendor, aces=aces, findings=findings, notes=notes)
+_art = build_evidence([_subject], policy=_policy_obj,
+                      policy_source=("pasted-policy" if _policy_obj else ""),
+                      policy_raw=(_pol.encode("utf-8") if _policy_obj else None),
+                      generator="hosted")
 json.dumps({"report_json": json.loads(to_json(findings, notes, len(aces))),
             "report_text": to_text(findings, notes, len(aces)),
-            "rule_lines": _rl, "vendor": vendor})
+            "rule_lines": _rl, "vendor": vendor,
+            "evidence": _art, "evidence_md": to_evidence_markdown(_art)})
 `;
 
 const $ = id => document.getElementById(id);
@@ -435,7 +448,7 @@ let mode = null;          // "worker" | "main"
 let worker = null;
 let pyodide = null;       // only used in main fallback
 let reqId = 0;            // matches worker responses to requests
-let lastResult = { text:"", jsonStr:"", ruleLines:{} };
+let lastResult = { text:"", jsonStr:"", ruleLines:{}, evidence:null, evidenceMd:"" };
 
 // ---- engine boot: prefer Web Worker, fall back to main thread ----
 // Map the worker's additive {type:'progress'} boot posts (and bootMain's own
@@ -479,7 +492,8 @@ async function bootMain(){
       pyodide.FS.writeFile(`rulehawk/${m}.py`, await r.text());
     }
     setStatus(bootProgressHtml({stage:"start"}));
-    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
+    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, rulehawk.analyze, rulehawk.report, rulehawk.segcheck, "
+    + "rulehawk.evidence");
     mode = "main"; ready();
   }catch(e){
     setStatus("Failed to load the engine: " + esc(e.message||e), true);
@@ -535,7 +549,9 @@ function onResult(m, isMain){
   let env;
   try{ env = JSON.parse(m.envelope); }
   catch(e){ setStatus("Could not read analysis result: " + esc(e.message||e), true); return; }
-  lastResult = { text: env.report_text, jsonStr: JSON.stringify(env.report_json, null, 2), ruleLines: env.rule_lines || {} };
+  lastResult = { text: env.report_text, jsonStr: JSON.stringify(env.report_json, null, 2),
+                 ruleLines: env.rule_lines || {},
+                 evidence: env.evidence || null, evidenceMd: env.evidence_md || "" };
   render(env.report_json, env.vendor || "");
   const vlabel = env.vendor ? ` (detected ${esc(env.vendor)})` : "";
   setStatus(`Done — analyzed ${env.report_json.rules_analyzed} rules locally${vlabel}.`);
@@ -620,6 +636,8 @@ function verdictBlock(d, vendor){
         <button class="small" data-act="copy">Copy report</button>
         <button class="small" data-act="json">Download JSON</button>
         <button class="small" data-act="txt">Download .txt</button>
+        <button class="small" data-act="ev-md" title="Audit-ready evidence document: what was audited, its SHA-256, which policy claims passed or failed, and the PCI/NIST/ISO/CIS/SOC 2/HIPAA controls each bears on">Download evidence (.md)</button>
+        <button class="small" data-act="ev-json" title="The same evidence artifact as JSON, for a GRC platform or evidence vault">Evidence (.json)</button>
       </div>
     </div>
   </div>`;
@@ -704,6 +722,15 @@ function render(d, vendor){
     if(b.dataset.act==="copy") copyText(lastResult.text);
     if(b.dataset.act==="json") downloadBlob("rulehawk-report.json","application/json",lastResult.jsonStr);
     if(b.dataset.act==="txt")  downloadBlob("rulehawk-report.txt","text/plain",lastResult.text);
+    if(b.dataset.act==="ev-md"){
+      downloadBlob("rulehawk-evidence.md","text/markdown",lastResult.evidenceMd);
+      track("evidence_download", {format:"md"});
+    }
+    if(b.dataset.act==="ev-json"){
+      downloadBlob("rulehawk-evidence.json","application/json",
+                   JSON.stringify(lastResult.evidence, null, 2));
+      track("evidence_download", {format:"json"});
+    }
   }));
 
   // CTA: outbound "get updates" + (if LEAD_ENDPOINT set) an email opt-in

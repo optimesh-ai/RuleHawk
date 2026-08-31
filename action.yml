@@ -30,6 +30,16 @@ inputs:
     description: 'Post/update a single sticky PR comment with the findings (true|false)'
     required: false
     default: 'true'
+  evidence:
+    description: >-
+      Emit a compliance-evidence artifact (JSON + markdown) for every run:
+      provenance (SHA-256 of each config audited, tool version, timestamp),
+      VERIFIED/FAILED policy attestations, and PCI/NIST/ISO/CIS/SOC 2/HIPAA
+      control references. Paths are exposed as the `evidence-file` and
+      `evidence-md-file` outputs; upload them with actions/upload-artifact to
+      keep a dated audit trail of every change. (true|false)
+    required: false
+    default: 'false'
   upload-sarif:
     description: >-
       Upload SARIF to GitHub code scanning so each finding is annotated on the
@@ -58,6 +68,15 @@ outputs:
   worst-severity:
     description: 'Highest severity found: critical | high | medium | low | none'
     value: ${{ steps.gate.outputs.worst }}
+  evidence-file:
+    description: >-
+      Path to the compliance-evidence JSON artifact (empty unless evidence: true)
+    value: ${{ steps.gate.outputs.evidence }}
+  evidence-md-file:
+    description: >-
+      Path to the evidence artifact rendered as markdown (empty unless
+      evidence: true)
+    value: ${{ steps.gate.outputs.evidence_md }}
   sarif-file:
     description: 'Path to the generated SARIF report'
     value: ${{ steps.gate.outputs.sarif }}
@@ -85,6 +104,7 @@ runs:
         RH_POLICY: ${{ inputs.policy }}
         RH_FAIL_ON: ${{ inputs.fail-on }}
         RH_VENDOR: ${{ inputs.vendor }}
+        RH_EVIDENCE: ${{ inputs.evidence }}
         # Import the engine from the action's own checkout (zero install).
         PYTHONPATH: ${{ github.action_path }}
       run: |
@@ -92,6 +112,12 @@ runs:
         SARIF="${RUNNER_TEMP:-/tmp}/rulehawk.sarif"
         JSON="${RUNNER_TEMP:-/tmp}/rulehawk.json"
         COMMENT="${RUNNER_TEMP:-/tmp}/rulehawk-comment.md"
+        EVIDENCE="${RUNNER_TEMP:-/tmp}/rulehawk-evidence.json"
+        EVIDENCE_MD="${RUNNER_TEMP:-/tmp}/rulehawk-evidence.md"
+        EVIDENCE_ARGS=()
+        if [ "${RH_EVIDENCE}" = "true" ]; then
+          EVIDENCE_ARGS=(--evidence "${EVIDENCE}" --evidence-md "${EVIDENCE_MD}")
+        fi
         POLICY_ARGS=()
         if [ -n "${RH_POLICY}" ]; then POLICY_ARGS=(--policy "${RH_POLICY}"); fi
 
@@ -111,7 +137,8 @@ runs:
           --vendor "${RH_VENDOR}" \
           --sarif "${SARIF}" \
           --json "${JSON}" \
-          --comment "${COMMENT}"
+          --comment "${COMMENT}" \
+          "${EVIDENCE_ARGS[@]}"
         RC=$?
         set +f
 
@@ -126,6 +153,9 @@ runs:
           [ -f "${SARIF}" ]   && echo "sarif=${SARIF}"     || echo "sarif="
           [ -f "${JSON}" ]    && echo "json=${JSON}"       || echo "json="
           [ -f "${COMMENT}" ] && echo "comment=${COMMENT}" || echo "comment="
+          [ -f "${EVIDENCE}" ] && echo "evidence=${EVIDENCE}" || echo "evidence="
+          [ -f "${EVIDENCE_MD}" ] && echo "evidence_md=${EVIDENCE_MD}" \
+                                  || echo "evidence_md="
           echo "exit_code=${RC}"
         } >> "${GITHUB_OUTPUT}"
         python3 - "${JSON}" >> "${GITHUB_OUTPUT}" <<'PY' || true

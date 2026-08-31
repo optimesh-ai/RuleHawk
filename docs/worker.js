@@ -9,7 +9,7 @@
 // parity.py fails the build if this list, the dispatch, or the engine drift apart.
 const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
                         "parse_iptables", "parse_nxos", "parse_eos", "analyze", "report",
-                        "segcheck", "pathground"];
+                        "segcheck", "evidence", "pathground"];
 
 // Build the report envelope: structured JSON + human-readable text + a
 // rule_id -> source-line map so the UI can jump from a finding to its rule.
@@ -30,6 +30,7 @@ from rulehawk.parse_eos import detect as detect_eos, parse_eos
 from rulehawk.analyze import analyze
 from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
+from rulehawk.evidence import Subject, build_evidence, to_evidence_markdown
 if detect_junos(cfg):
     vendor, (aces, notes) = "Juniper Junos", parse_junos(cfg)
 elif detect_panos(cfg):
@@ -44,17 +45,27 @@ else:
     vendor, (aces, notes) = "Cisco IOS / ASA", parse_acls(cfg)
 findings = analyze(aces)
 _pol = pol.strip()
+_policy_obj = None
 if _pol:
     try:
-        findings = findings + check_segmentation(aces, json.loads(_pol))
+        _policy_obj = json.loads(_pol)
+        findings = findings + check_segmentation(aces, _policy_obj)
     except Exception as e:
+        _policy_obj = None
         notes = notes + ["segmentation policy error: " + str(e)]
 # Parsers stamp every ACE with its exact 1-based source line (model.ACE.line),
 # including all ACEs expanded from one object-group line. 0 = unknown -> no jump.
 _rl = {a.acl + ":" + str(a.seq): a.line for a in aces if a.line}
+_subject = Subject(source="pasted-config", raw=cfg.encode("utf-8"),
+                   vendor=vendor, aces=aces, findings=findings, notes=notes)
+_art = build_evidence([_subject], policy=_policy_obj,
+                      policy_source=("pasted-policy" if _policy_obj else ""),
+                      policy_raw=(_pol.encode("utf-8") if _policy_obj else None),
+                      generator="hosted")
 json.dumps({"report_json": json.loads(to_json(findings, notes, len(aces))),
             "report_text": to_text(findings, notes, len(aces)),
-            "rule_lines": _rl, "vendor": vendor})
+            "rule_lines": _rl, "vendor": vendor,
+            "evidence": _art, "evidence_md": to_evidence_markdown(_art)})
 `;
 
 let pyReady = null;
@@ -83,7 +94,8 @@ async function boot() {
   pyodide.runPython("import sys; sys.path.insert(0, '.'); "
     + "import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, "
     + "rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, "
-    + "rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
+    + "rulehawk.analyze, rulehawk.report, rulehawk.segcheck, "
+    + "rulehawk.evidence");
   return pyodide;
 }
 
