@@ -128,9 +128,13 @@ runs:
         # verdict (captured below), and reporting is best-effort — nothing here may
         # abort the step, or a failed gate could be masked as green.
         set +e -f
-        # ${arr[@]+...} guards the empty-array expansion: bash 3.2 (macOS
-        # runners) treats "${POLICY_ARGS[@]}" as unbound under `set -u` and
-        # would abort the step before the verdict file is even written.
+        # ${arr[@]+...} guards EVERY empty-array expansion: bash 3.2 (macOS
+        # runners, still the default `bash` there) treats "${ARR[@]}" on an
+        # empty array as an unbound variable under `set -u` and aborts the step
+        # before the verdict file is even written. Bash 4.4 fixed it, so Linux
+        # runners never see this — which is exactly why it must be guarded here
+        # rather than trusted to CI. tests/test_action.py pins the form AND
+        # executes the command line under the system bash.
         python3 -m rulehawk gate ${RH_CONFIGS} \
           ${POLICY_ARGS[@]+"${POLICY_ARGS[@]}"} \
           --fail-on "${RH_FAIL_ON}" \
@@ -138,7 +142,7 @@ runs:
           --sarif "${SARIF}" \
           --json "${JSON}" \
           --comment "${COMMENT}" \
-          "${EVIDENCE_ARGS[@]}"
+          ${EVIDENCE_ARGS[@]+"${EVIDENCE_ARGS[@]}"}
         RC=$?
         set +f
 

@@ -96,3 +96,49 @@ def test_documented_action_inputs_match_the_manifest():
     for name in _action()["inputs"]:
         assert re.search(rf"`{re.escape(name)}`", doc), \
             f"input {name!r} is undocumented in docs/github-action.md"
+
+
+# --------------------------------------------------------------------------- #
+# bash 3.2 safety — the failure Linux CI structurally cannot catch
+# --------------------------------------------------------------------------- #
+def test_no_unguarded_empty_array_expansion():
+    """`"${ARR[@]}"` on an EMPTY array is an unbound variable under `set -u` in
+    bash 3.2 — still the default `bash` on macOS runners. Bash 4.4 fixed it, so
+    Ubuntu runners pass and macOS aborts the step before the gate verdict is
+    even written. Every array expansion must use `${ARR[@]+"${ARR[@]}"}`.
+
+    Regression: EVIDENCE_ARGS shipped unguarded and broke the macOS dogfood job
+    on the DEFAULT path (evidence off => empty array), two lines below a comment
+    explaining the trap for POLICY_ARGS.
+    """
+    # Strip comment lines first: the guarded form is *documented* in a comment
+    # that necessarily quotes the unsafe one as the counter-example.
+    run = "\n".join(l for l in _run_block(_action()).splitlines()
+                     if not l.lstrip().startswith("#"))
+    unguarded = re.findall(r'(?<!\+)"\$\{([A-Za-z_][A-Za-z0-9_]*)\[@\]\}"', run)
+    assert not unguarded, (
+        f"unguarded empty-array expansion(s) {sorted(set(unguarded))} — bash 3.2 "
+        f"aborts on these under `set -u`. Use ${{ARR[@]+\"${{ARR[@]}}\"}}.")
+
+
+@pytest.mark.skipif(not os.path.exists("/bin/bash"), reason="no /bin/bash")
+def test_gate_command_line_survives_bash_with_set_u():
+    """Execute the SHIPPED command line under the system bash with `set -u` and
+    both arrays empty — the exact shape a default-configured macOS run takes."""
+    run = _run_block(_action())
+    m = re.search(r"(python3 -m rulehawk gate .*?)\n\s*RC=\$\?", run, re.S)
+    assert m, "gate invocation not found in action.yml"
+    # Replace the real invocation with `true` so we test the SHELL expansion,
+    # not the audit: an unbound-variable abort happens before argv is built.
+    cmd = m.group(1).replace("python3 -m rulehawk gate", "true")
+    script = ("set -euo pipefail\n"
+              "RH_CONFIGS=cfg.txt\nRH_FAIL_ON=high\nRH_VENDOR=auto\n"
+              "SARIF=/tmp/s\nJSON=/tmp/j\nCOMMENT=/tmp/c\n"
+              "POLICY_ARGS=()\nEVIDENCE_ARGS=()\n" + cmd + "\necho SHELL_OK\n")
+    proc = subprocess.run(["/bin/bash", "-c", script],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, (
+        f"the shipped gate command line fails under "
+        f"bash {os.popen('/bin/bash -c \"echo $BASH_VERSION\"').read().strip()}"
+        f" with empty arrays:\n{proc.stderr}")
+    assert "SHELL_OK" in proc.stdout
