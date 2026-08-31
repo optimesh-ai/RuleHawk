@@ -204,7 +204,7 @@
   </div>
 
   <div class="card" id="config-card">
-    <label class="fld" for="config">Firewall / ACL config <span class="hint">— Cisco IOS/ASA, Cisco NX-OS, Juniper Junos, Palo Alto PAN-OS, Linux iptables, or Arista EOS · vendor auto-detected · paste, drag &amp; drop a file, or upload</span></label>
+    <label class="fld" for="config">Firewall / ACL config <span class="hint">— Cisco IOS/ASA, Cisco NX-OS, Arista EOS, Juniper Junos, Palo Alto PAN-OS, Linux iptables, or AWS Security Groups (describe-security-groups JSON) · vendor auto-detected · paste, drag &amp; drop a file, or upload</span></label>
     <textarea id="config" spellcheck="false" placeholder="ip access-list extended EDGE_IN&#10; permit tcp any host 203.0.113.10 eq 443&#10; ...&#10;&#10;…or drag a config file onto this box."></textarea>
     <input type="file" id="file" accept=".txt,.cfg,.conf,.acl,.lst,.log,text/plain" style="display:none" />
     <div class="row">
@@ -340,7 +340,7 @@ const SAMPLES = {
     msg: "Cisco NX-OS ACL + PCI policy loaded — Audit to prove CORP reaches PCI on 445 (witness packet) and see a permit killed by an earlier deny-any." },
 };
 const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
-                        "parse_iptables", "parse_nxos", "parse_eos", "analyze", "report",
+                        "parse_iptables", "parse_nxos", "parse_eos", "parse_awssg", "analyze", "report",
                         "segcheck", "evidence", "pathground"];
 const PYODIDE_VER = "v0.26.4";
 // Fallback (main-thread) analysis stays synchronous, so cap it; the worker path has no cap.
@@ -398,6 +398,7 @@ from rulehawk.parse_panos import detect as detect_panos, parse_panos
 from rulehawk.parse_iptables import detect as detect_iptables, parse_iptables
 from rulehawk.parse_nxos import detect as detect_nxos, parse_nxos
 from rulehawk.parse_eos import detect as detect_eos, parse_eos
+from rulehawk.parse_awssg import detect as detect_awssg, parse_awssg
 from rulehawk.analyze import analyze
 from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
@@ -408,6 +409,8 @@ elif detect_panos(cfg):
     vendor, (aces, notes) = "Palo Alto PAN-OS", parse_panos(cfg)
 elif detect_iptables(cfg):
     vendor, (aces, notes) = "Linux iptables", parse_iptables(cfg)
+elif detect_awssg(cfg):
+    vendor, (aces, notes) = "AWS Security Groups", parse_awssg(cfg)
 elif detect_nxos(cfg):
     vendor, (aces, notes) = "Cisco NX-OS", parse_nxos(cfg)
 elif detect_eos(cfg):
@@ -492,7 +495,7 @@ async function bootMain(){
       pyodide.FS.writeFile(`rulehawk/${m}.py`, await r.text());
     }
     setStatus(bootProgressHtml({stage:"start"}));
-    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, rulehawk.analyze, rulehawk.report, rulehawk.segcheck, "
+    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, rulehawk.parse_awssg, rulehawk.analyze, rulehawk.report, rulehawk.segcheck, "
     + "rulehawk.evidence");
     mode = "main"; ready();
   }catch(e){
@@ -768,11 +771,14 @@ function ctaHTML(){
     </form>`;
   }
   return `<div class="cta">
-    <div class="cta-h">RuleHawk audits one config, once.</div>
-    <div class="cta-b">This tool audits Cisco IOS/ASA, Cisco NX-OS, Juniper Junos, Palo Alto PAN-OS,
-      Linux iptables, and Arista EOS today. Want continuous monitoring across every change,
-      still more vendors (AWS Security Groups, FortiOS), and exportable audit evidence for
-      PCI / CMMC? That’s what OptiMesh is building on top of this engine.</div>
+    <div class="cta-h">This audits one config, once.</div>
+    <div class="cta-b">You just got an evidence artifact for this config — provenance, the
+      isolation claims that passed or failed, and the PCI&nbsp;DSS / NIST&nbsp;800-53 /
+      ISO&nbsp;27001 / CIS / SOC&nbsp;2 / HIPAA controls each bears on. The same artifact
+      regenerates across your whole fleet on every pull request via the <b>RuleHawk CI
+      gate</b>, so the audit trail builds itself instead of being reconstructed once a year
+      for an assessor. Want that, plus FortiOS and AWS Network ACLs? That’s what OptiMesh is
+      building on top of this engine.</div>
     <div class="cta-row">${row}</div>
   </div>`;
 }

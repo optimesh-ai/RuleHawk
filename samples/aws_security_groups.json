@@ -1,0 +1,30 @@
+{
+  "SecurityGroups": [
+    {
+      "GroupId": "sg-0web",
+      "GroupName": "web-tier",
+      "VpcId": "vpc-1",
+      "IpPermissions": [
+        {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+         "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+        {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
+         "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+        {"IpProtocol": "-1",
+         "UserIdGroupPairs": [{"GroupId": "sg-0bastion"}]}
+      ],
+      "IpPermissionsEgress": [
+        {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+      ]
+    },
+    {
+      "GroupId": "sg-0db",
+      "GroupName": "pci-db",
+      "IpPermissions": [
+        {"IpProtocol": "tcp", "FromPort": 3306, "ToPort": 3306,
+         "IpRanges": [{"CidrIp": "10.20.0.0/16"}]},
+        {"IpProtocol": "icmp", "FromPort": 8, "ToPort": -1,
+         "IpRanges": [{"CidrIp": "10.0.0.0/8"}]}
+      ]
+    }
+  ]
+}

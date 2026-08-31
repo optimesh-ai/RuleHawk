@@ -26,6 +26,7 @@ import sys
 from .analyze import analyze, score
 from .evidence import Subject, build_evidence, to_evidence_markdown
 from .parse import parse_acls
+from .parse_awssg import detect as detect_awssg, parse_awssg
 from .parse_eos import detect as detect_eos, parse_eos
 from .parse_iptables import detect as detect_iptables, parse_iptables
 from .parse_junos import detect as detect_junos, parse_junos
@@ -58,7 +59,8 @@ options:
   -h, --help           show this help
 
 Vendor is auto-detected: Cisco IOS/ASA, Cisco NX-OS, Arista EOS, Juniper Junos,
-Palo Alto PAN-OS, Linux iptables/ip6tables.
+Palo Alto PAN-OS, Linux iptables/ip6tables, AWS Security Groups
+(`aws ec2 describe-security-groups` JSON).
 
 Single-file mode takes exactly one config file. To audit several at once (e.g.
 a shell glob like `rulehawk configs/*.txt`), use `rulehawk gate <files...>` —
@@ -183,6 +185,9 @@ def main(argv: list[str] | None = None) -> int:
     elif force_iptables or (not forced and detect_iptables(text)):
         aces, notes = parse_iptables(text)
         vendor = "iptables"
+    elif not forced and detect_awssg(text):
+        aces, notes = parse_awssg(text)
+        vendor = "aws-sg"
     elif not forced and detect_nxos(text):
         aces, notes = parse_nxos(text)
         vendor = "nxos"

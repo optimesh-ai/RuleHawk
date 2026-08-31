@@ -173,6 +173,22 @@ section above. For `must_not_reach` entries:
   assertion is never given a PASS until the policy is fixed (a typo must not
   certify isolation over an empty search space).
 
+## AWS Security Groups
+
+A Security Group has no deny rules and no ordering, so a policy assertion means
+the same thing but is proven differently: an assertion PASSES when no rule in the
+group permits the forbidden flow. Two caveats specific to AWS:
+
+- **A flow needs the source's egress AND the destination's ingress.** RuleHawk
+  evaluates each group's ingress and egress as independent contexts, so a
+  reported violation means *a ruleset on the path permits the flow* — the same
+  deliberately over-reporting claim it makes for every vendor, not an end-to-end
+  reachability proof.
+- **A rule sourced from another security group or a prefix list cannot be
+  resolved** from `describe-security-groups` output. Those become one opaque
+  rule, so the affected assertion is `segmentation-indeterminate` — never a PASS.
+  Export the referenced group's members as CIDRs if you need a decisive verdict.
+
 ## Gotchas
 
 - **Zone names must match exactly.** A `src`/`dst` that isn't a key in `zones`

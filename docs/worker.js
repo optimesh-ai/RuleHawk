@@ -8,7 +8,7 @@
 // can never be audited, and the UI must never claim it. tests/test_hosted_
 // parity.py fails the build if this list, the dispatch, or the engine drift apart.
 const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
-                        "parse_iptables", "parse_nxos", "parse_eos", "analyze", "report",
+                        "parse_iptables", "parse_nxos", "parse_eos", "parse_awssg", "analyze", "report",
                         "segcheck", "evidence", "pathground"];
 
 // Build the report envelope: structured JSON + human-readable text + a
@@ -27,6 +27,7 @@ from rulehawk.parse_panos import detect as detect_panos, parse_panos
 from rulehawk.parse_iptables import detect as detect_iptables, parse_iptables
 from rulehawk.parse_nxos import detect as detect_nxos, parse_nxos
 from rulehawk.parse_eos import detect as detect_eos, parse_eos
+from rulehawk.parse_awssg import detect as detect_awssg, parse_awssg
 from rulehawk.analyze import analyze
 from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
@@ -37,6 +38,8 @@ elif detect_panos(cfg):
     vendor, (aces, notes) = "Palo Alto PAN-OS", parse_panos(cfg)
 elif detect_iptables(cfg):
     vendor, (aces, notes) = "Linux iptables", parse_iptables(cfg)
+elif detect_awssg(cfg):
+    vendor, (aces, notes) = "AWS Security Groups", parse_awssg(cfg)
 elif detect_nxos(cfg):
     vendor, (aces, notes) = "Cisco NX-OS", parse_nxos(cfg)
 elif detect_eos(cfg):
@@ -93,7 +96,7 @@ async function boot() {
   progress("start");                         // warm-up import of the engine
   pyodide.runPython("import sys; sys.path.insert(0, '.'); "
     + "import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, "
-    + "rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, "
+    + "rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, rulehawk.parse_awssg, "
     + "rulehawk.analyze, rulehawk.report, rulehawk.segcheck, "
     + "rulehawk.evidence");
   return pyodide;

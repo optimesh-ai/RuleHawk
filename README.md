@@ -150,9 +150,25 @@ For the whole fleet on every PR, set `evidence: true` on the Action — see
 ## Vendors today
 Cisco IOS extended ACLs, Cisco NX-OS access-lists, Cisco ASA access-lists (with
 object-group resolution), Arista EOS access-lists, Juniper Junos firewall filters
-(brace form), Palo Alto PAN-OS security policy (set format), and Linux
-iptables/ip6tables filter rules — vendor auto-detected.
-(Roadmap: FortiGate, AWS Security Groups/NACLs, nftables.)
+(brace form), Palo Alto PAN-OS security policy (set format), Linux
+iptables/ip6tables filter rules, and **AWS Security Groups**
+(`aws ec2 describe-security-groups` JSON) — vendor auto-detected.
+(Roadmap: FortiGate, AWS Network ACLs, nftables.)
+
+```
+aws ec2 describe-security-groups > sgs.json
+rulehawk sgs.json --policy policy.json          # same audit, same evidence
+```
+
+Security Groups are allow-only and order-independent, so the shadowing analysis
+correctly produces nothing for them — but segmentation is *exact* (a permit-only
+ruleset is precisely the union of its permits, which is what the engine's
+implicit default-deny already models), and least-privilege is where the value is:
+`0.0.0.0/0` on 22/3389/3306 is the archetypal cloud exposure. A source RuleHawk
+cannot resolve from the export — a `UserIdGroupPairs` reference to another group,
+or a prefix list — is never dropped and never guessed: it becomes one opaque
+`imprecise` rule, so that part of the space stays **indeterminate** rather than
+silently passing.
 
 ## Scope & limits (what it does *not* model)
 RuleHawk is a fast, sound **config-change gate**, not a network-wide reachability

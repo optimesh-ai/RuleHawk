@@ -46,6 +46,7 @@ from .parse_iptables import detect as detect_iptables, parse_iptables
 from .parse_junos import detect as detect_junos, parse_junos
 from .parse_panos import detect as detect_panos, parse_panos
 from .parse_nxos import detect as detect_nxos, parse_nxos
+from .parse_awssg import detect as detect_awssg, parse_awssg
 from .parse_eos import detect as detect_eos, parse_eos
 from .segcheck import check_segmentation
 
@@ -196,6 +197,8 @@ _VENDORS = {
     "iptables": "iptables", "netfilter": "iptables",
     "nxos": "nxos", "nx-os": "nxos", "nexus": "nxos",
     "eos": "eos", "arista": "eos",
+    "aws": "aws-sg", "aws-sg": "aws-sg", "awssg": "aws-sg",
+    "securitygroups": "aws-sg", "security-groups": "aws-sg",
 }
 
 
@@ -214,6 +217,8 @@ def _pick_parser(text: str, vendor: str):
             return "nxos", parse_nxos
         if v == "eos":
             return "eos", parse_eos
+        if v == "aws-sg":
+            return "aws-sg", parse_awssg
         return "ios-asa", parse_acls
     if detect_junos(text):
         return "junos", parse_junos
@@ -221,6 +226,8 @@ def _pick_parser(text: str, vendor: str):
         return "panos", parse_panos
     if detect_iptables(text):
         return "iptables", parse_iptables
+    if detect_awssg(text):
+        return "aws-sg", parse_awssg
     if detect_nxos(text):
         return "nxos", parse_nxos
     if detect_eos(text):
@@ -744,7 +751,7 @@ options:
   --policy PATH        segmentation policy JSON (zones + must_not_reach)
   --fail-on LEVEL      fail the gate at this severity or worse:
                        critical | high | medium | low | none   (default: high)
-  --vendor V           force a vendor for every file:
+  --vendor V           force a vendor for every file (incl. aws-sg):
                        auto | ios | junos | panos | iptables | nxos | eos
                        (default: auto)
   --sarif PATH         write a SARIF 2.1.0 report (for code scanning)

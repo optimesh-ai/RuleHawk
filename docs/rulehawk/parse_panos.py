@@ -9,10 +9,14 @@ terminating action (`allow` -> permit; `deny`/`drop`/`reset-*` -> deny). So the
 whole existing analysis (the product's real IP) is reused unchanged — this module
 only adds a new *frontend* that emits the same `(List[ACE], notes)` IR.
 
-By contrast AWS Security Groups are stateful, allow-only and ORDER-INDEPENDENT
-(no deny, no sequence) — the shadowing/intent-inversion engine produces nothing
-for them, so they don't fit `model.ACE` without a different analyzer. PAN-OS is
-also the highest enterprise buyer-pull next step: Palo Alto is the #1 enterprise
+AWS Security Groups (added later, see parse_awssg.py) are stateful, allow-only
+and ORDER-INDEPENDENT. That kills intent-inversion for them — with no deny, no
+rule can invert another's intent — but NOT the rest: an allow-only,
+order-independent ruleset is exactly equivalent to permits terminated by the
+implicit default-deny, so segmentation is exact and least-privilege analysis
+(`0.0.0.0/0` on 22/3389/3306) is the most valuable thing to run on one. PAN-OS
+was still the right next step at the time: it is the highest enterprise
+buyer-pull vendor, Palo Alto is the #1 enterprise
 firewall vendor by revenue, and its buyers carry the same PCI/zone
 segmentation-audit need that drives Config Studio — the natural lead-magnet pull.
 
