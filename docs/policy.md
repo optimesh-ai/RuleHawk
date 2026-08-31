@@ -53,7 +53,10 @@ protocol/ports you optionally narrow.
 
 **Valid `proto` values:** `ip` (wildcard — any protocol), `tcp`, `udp`, `icmp`,
 `icmpv6`, and other IP protocols the parsers recognize (`gre`, `esp`, `ah`,
-`ospf`, `sctp`). Use `ip` when *any* reachability is forbidden (the strongest
+`ospf`, `sctp`, `eigrp`, `pim`, `vrrp`, `dccp`, `udplite`). An unrecognized
+protocol **fails closed**: it emits a high-severity `segmentation-error` and the
+assertion is never given a PASS (nor a phantom connectivity failure) — a typo
+like `"tpc"` must not certify isolation over a search space nothing can match. Use `ip` when *any* reachability is forbidden (the strongest
 assertion); use `tcp`/`udp` + `ports` when only specific services are forbidden.
 
 **`ports` is an integer array only** — there is **no range syntax** here (`"80-443"`

@@ -36,6 +36,15 @@ from typing import Dict, List, Optional
 from .analyze import Finding
 from .model import (ACE, ANY_PORTS, _ICMP_PROTOS, _IPNet, _PORTED,
                     _WILDCARD_PROTO, PortRange)
+from .parse import _PROTO_NUM
+
+# Protocols an assertion may name. Derived from what the engine can actually
+# reason about — the wildcards, the ported and ICMP families, and every protocol
+# the Cisco frontend normalizes a IANA number to — so adding protocol support in
+# one place cannot leave this validator behind. Anything else is a policy typo
+# and fails closed (see the proto check in check_segmentation).
+_KNOWN_PROTO = (frozenset(_WILDCARD_PROTO) | frozenset(_PORTED)
+                | frozenset(_ICMP_PROTOS) | frozenset(_PROTO_NUM.values()))
 
 # Rule-visit budget per (assertion x zone-pair x port x probe x ACL) search.
 # Exhaustion returns an INDETERMINATE (fail-closed), never a PASS. Sized for
@@ -353,6 +362,21 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                     f"This assertion was NOT checked — nothing is proven.",
                     ("define the named zone(s) in policy 'zones', or fix the "
                      "typo so src/dst reference existing zones")))
+                continue
+            # Fail closed on a protocol we cannot resolve. This is the same
+            # vacuous-confidence hole as an unknown zone, one field over: a
+            # typo'd proto ("tpc") matches no specific-protocol rule, so the
+            # isolation search finds no leak and reports
+            #   PASS: CORP cannot reach PCI on tpc
+            # — a policy typo certified as proven isolation. must_reach inverts
+            # it into a phantom CONNECTIVITY BROKEN. Neither assertion ran.
+            if proto not in _KNOWN_PROTO:
+                findings.append(_policy_error(
+                    label,
+                    f"CANNOT EVALUATE ({sname} {rel} {dname}): unknown protocol "
+                    f"'{proto}'. This assertion was NOT checked — nothing is "
+                    f"proven. Known protocols: {', '.join(sorted(_KNOWN_PROTO))}.",
+                    "use a known protocol name (or 'ip' for any protocol)"))
                 continue
             ports = _coerce_ports(assertion.get("ports"))
             if ports is None:
