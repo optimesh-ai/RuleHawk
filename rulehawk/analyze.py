@@ -66,6 +66,15 @@ class Finding:
     fix: str = ""
     witness: str = ""   # segmentation: the concrete packet, e.g. "10.20.0.1 -> 10.10.0.1:445 (tcp)"
     line: int = 0       # 1-based source-file line of the offending rule (0 = unknown).
+    # Policy-assertion identity, set by segcheck for must_not_reach/must_reach
+    # findings: {"direction","src","dst","proto","ports"}. Carrying it makes risk
+    # acceptance EXACT — an exception is matched against the assertion the
+    # finding actually came from, never by re-parsing its English message.
+    claim: Optional[dict] = None
+    # Set by riskaccept when an in-force exception covers this finding. The
+    # finding is NOT removed and NOT downgraded; the gate simply stops counting
+    # it as a violation, and every report shows who accepted it and until when.
+    accepted: Optional[dict] = None
 
 
 def _id(a: ACE) -> str:

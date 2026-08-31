@@ -204,7 +204,7 @@
   </div>
 
   <div class="card" id="config-card">
-    <label class="fld" for="config">Firewall / ACL config <span class="hint">— Cisco IOS/ASA, Cisco NX-OS, Juniper Junos, Palo Alto PAN-OS, Linux iptables, or Arista EOS · vendor auto-detected · paste, drag &amp; drop a file, or upload</span></label>
+    <label class="fld" for="config">Firewall / ACL config <span class="hint">— Cisco IOS/ASA, Cisco NX-OS, Arista EOS, Juniper Junos, Palo Alto PAN-OS, Linux iptables, or AWS Security Groups (describe-security-groups JSON) · vendor auto-detected · paste, drag &amp; drop a file, or upload</span></label>
     <textarea id="config" spellcheck="false" placeholder="ip access-list extended EDGE_IN&#10; permit tcp any host 203.0.113.10 eq 443&#10; ...&#10;&#10;…or drag a config file onto this box."></textarea>
     <input type="file" id="file" accept=".txt,.cfg,.conf,.acl,.lst,.log,text/plain" style="display:none" />
     <div class="row">
@@ -339,7 +339,9 @@ const SAMPLES = {
   nxos:     { cfg: SAMPLE_NXOS,     pol: SAMPLE_POLICY,
     msg: "Cisco NX-OS ACL + PCI policy loaded — Audit to prove CORP reaches PCI on 445 (witness packet) and see a permit killed by an earlier deny-any." },
 };
-const ENGINE_MODULES = ["__init__","model","parse","parse_junos","parse_panos","parse_iptables","parse_nxos","parse_eos","analyze","report","segcheck","pathground"];
+const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
+                        "parse_iptables", "parse_nxos", "parse_eos", "parse_awssg", "analyze", "report",
+                        "segcheck", "riskaccept", "evidence", "pathground"];
 const PYODIDE_VER = "v0.26.4";
 // Fallback (main-thread) analysis stays synchronous, so cap it; the worker path has no cap.
 const FALLBACK_MAX_LINES = 4000;
@@ -396,15 +398,19 @@ from rulehawk.parse_panos import detect as detect_panos, parse_panos
 from rulehawk.parse_iptables import detect as detect_iptables, parse_iptables
 from rulehawk.parse_nxos import detect as detect_nxos, parse_nxos
 from rulehawk.parse_eos import detect as detect_eos, parse_eos
+from rulehawk.parse_awssg import detect as detect_awssg, parse_awssg
 from rulehawk.analyze import analyze
 from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
+from rulehawk.evidence import Subject, build_evidence, to_evidence_markdown
 if detect_junos(cfg):
     vendor, (aces, notes) = "Juniper Junos", parse_junos(cfg)
 elif detect_panos(cfg):
     vendor, (aces, notes) = "Palo Alto PAN-OS", parse_panos(cfg)
 elif detect_iptables(cfg):
     vendor, (aces, notes) = "Linux iptables", parse_iptables(cfg)
+elif detect_awssg(cfg):
+    vendor, (aces, notes) = "AWS Security Groups", parse_awssg(cfg)
 elif detect_nxos(cfg):
     vendor, (aces, notes) = "Cisco NX-OS", parse_nxos(cfg)
 elif detect_eos(cfg):
@@ -413,17 +419,27 @@ else:
     vendor, (aces, notes) = "Cisco IOS / ASA", parse_acls(cfg)
 findings = analyze(aces)
 _pol = pol.strip()
+_policy_obj = None
 if _pol:
     try:
-        findings = findings + check_segmentation(aces, json.loads(_pol))
+        _policy_obj = json.loads(_pol)
+        findings = findings + check_segmentation(aces, _policy_obj)
     except Exception as e:
+        _policy_obj = None
         notes = notes + ["segmentation policy error: " + str(e)]
 # Parsers stamp every ACE with its exact 1-based source line (model.ACE.line),
 # including all ACEs expanded from one object-group line. 0 = unknown -> no jump.
 _rl = {a.acl + ":" + str(a.seq): a.line for a in aces if a.line}
+_subject = Subject(source="pasted-config", raw=cfg.encode("utf-8"),
+                   vendor=vendor, aces=aces, findings=findings, notes=notes)
+_art = build_evidence([_subject], policy=_policy_obj,
+                      policy_source=("pasted-policy" if _policy_obj else ""),
+                      policy_raw=(_pol.encode("utf-8") if _policy_obj else None),
+                      generator="hosted")
 json.dumps({"report_json": json.loads(to_json(findings, notes, len(aces))),
             "report_text": to_text(findings, notes, len(aces)),
-            "rule_lines": _rl, "vendor": vendor})
+            "rule_lines": _rl, "vendor": vendor,
+            "evidence": _art, "evidence_md": to_evidence_markdown(_art)})
 `;
 
 const $ = id => document.getElementById(id);
@@ -435,7 +451,7 @@ let mode = null;          // "worker" | "main"
 let worker = null;
 let pyodide = null;       // only used in main fallback
 let reqId = 0;            // matches worker responses to requests
-let lastResult = { text:"", jsonStr:"", ruleLines:{} };
+let lastResult = { text:"", jsonStr:"", ruleLines:{}, evidence:null, evidenceMd:"" };
 
 // ---- engine boot: prefer Web Worker, fall back to main thread ----
 // Map the worker's additive {type:'progress'} boot posts (and bootMain's own
@@ -479,7 +495,8 @@ async function bootMain(){
       pyodide.FS.writeFile(`rulehawk/${m}.py`, await r.text());
     }
     setStatus(bootProgressHtml({stage:"start"}));
-    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, rulehawk.analyze, rulehawk.report, rulehawk.segcheck");
+    pyodide.runPython("import sys; sys.path.insert(0, '.'); import rulehawk.parse, rulehawk.parse_junos, rulehawk.parse_panos, rulehawk.parse_iptables, rulehawk.parse_nxos, rulehawk.parse_eos, rulehawk.parse_awssg, rulehawk.analyze, rulehawk.report, rulehawk.segcheck, rulehawk.riskaccept, "
+    + "rulehawk.evidence");
     mode = "main"; ready();
   }catch(e){
     setStatus("Failed to load the engine: " + esc(e.message||e), true);
@@ -535,7 +552,9 @@ function onResult(m, isMain){
   let env;
   try{ env = JSON.parse(m.envelope); }
   catch(e){ setStatus("Could not read analysis result: " + esc(e.message||e), true); return; }
-  lastResult = { text: env.report_text, jsonStr: JSON.stringify(env.report_json, null, 2), ruleLines: env.rule_lines || {} };
+  lastResult = { text: env.report_text, jsonStr: JSON.stringify(env.report_json, null, 2),
+                 ruleLines: env.rule_lines || {},
+                 evidence: env.evidence || null, evidenceMd: env.evidence_md || "" };
   render(env.report_json, env.vendor || "");
   const vlabel = env.vendor ? ` (detected ${esc(env.vendor)})` : "";
   setStatus(`Done — analyzed ${env.report_json.rules_analyzed} rules locally${vlabel}.`);
@@ -620,6 +639,8 @@ function verdictBlock(d, vendor){
         <button class="small" data-act="copy">Copy report</button>
         <button class="small" data-act="json">Download JSON</button>
         <button class="small" data-act="txt">Download .txt</button>
+        <button class="small" data-act="ev-md" title="Audit-ready evidence document: what was audited, its SHA-256, which policy claims passed or failed, and the PCI/NIST/ISO/CIS/SOC 2/HIPAA controls each bears on">Download evidence (.md)</button>
+        <button class="small" data-act="ev-json" title="The same evidence artifact as JSON, for a GRC platform or evidence vault">Evidence (.json)</button>
       </div>
     </div>
   </div>`;
@@ -704,6 +725,15 @@ function render(d, vendor){
     if(b.dataset.act==="copy") copyText(lastResult.text);
     if(b.dataset.act==="json") downloadBlob("rulehawk-report.json","application/json",lastResult.jsonStr);
     if(b.dataset.act==="txt")  downloadBlob("rulehawk-report.txt","text/plain",lastResult.text);
+    if(b.dataset.act==="ev-md"){
+      downloadBlob("rulehawk-evidence.md","text/markdown",lastResult.evidenceMd);
+      track("evidence_download", {format:"md"});
+    }
+    if(b.dataset.act==="ev-json"){
+      downloadBlob("rulehawk-evidence.json","application/json",
+                   JSON.stringify(lastResult.evidence, null, 2));
+      track("evidence_download", {format:"json"});
+    }
   }));
 
   // CTA: outbound "get updates" + (if LEAD_ENDPOINT set) an email opt-in
@@ -741,11 +771,14 @@ function ctaHTML(){
     </form>`;
   }
   return `<div class="cta">
-    <div class="cta-h">RuleHawk audits one config, once.</div>
-    <div class="cta-b">This tool audits Cisco IOS/ASA, Cisco NX-OS, Juniper Junos, Palo Alto PAN-OS,
-      Linux iptables, and Arista EOS today. Want continuous monitoring across every change,
-      still more vendors (AWS Security Groups, FortiOS), and exportable audit evidence for
-      PCI / CMMC? That’s what OptiMesh is building on top of this engine.</div>
+    <div class="cta-h">This audits one config, once.</div>
+    <div class="cta-b">You just got an evidence artifact for this config — provenance, the
+      isolation claims that passed or failed, and the PCI&nbsp;DSS / NIST&nbsp;800-53 /
+      ISO&nbsp;27001 / CIS / SOC&nbsp;2 / HIPAA controls each bears on. The same artifact
+      regenerates across your whole fleet on every pull request via the <b>RuleHawk CI
+      gate</b>, so the audit trail builds itself instead of being reconstructed once a year
+      for an assessor. Want that, plus FortiOS and AWS Network ACLs? That’s what OptiMesh is
+      building on top of this engine.</div>
     <div class="cta-row">${row}</div>
   </div>`;
 }

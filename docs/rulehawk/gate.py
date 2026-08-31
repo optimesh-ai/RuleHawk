@@ -40,12 +40,15 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .analyze import Finding, analyze, score
+from .evidence import Subject, build_evidence, to_evidence_markdown
 from .parse import parse_acls
 from .parse_iptables import detect as detect_iptables, parse_iptables
 from .parse_junos import detect as detect_junos, parse_junos
 from .parse_panos import detect as detect_panos, parse_panos
 from .parse_nxos import detect as detect_nxos, parse_nxos
+from .parse_awssg import detect as detect_awssg, parse_awssg
 from .parse_eos import detect as detect_eos, parse_eos
+from .riskaccept import apply_to_findings, evaluate, finalize
 from .segcheck import check_segmentation
 
 # Severity ordering shared by the threshold logic, SARIF level mapping, and the
@@ -135,6 +138,16 @@ class FileResult:
     notes: List[str] = field(default_factory=list)
     line_by_id: Dict[Tuple[str, int], int] = field(default_factory=dict)
     error: str = ""
+    # Carried for the evidence artifact: `raw` is the exact bytes read (so the
+    # recorded digest is re-hashable), `aces` lets each policy assertion be
+    # re-checked per file to attribute a failure to the config that caused it.
+    raw: bytes = b""
+    aces: List = field(default_factory=list)
+
+    def to_subject(self) -> Subject:
+        return Subject(source=self.path, raw=self.raw, vendor=self.vendor,
+                       aces=self.aces, findings=self.findings,
+                       notes=self.notes, error=self.error)
 
     @property
     def score(self) -> Optional[int]:
@@ -185,6 +198,8 @@ _VENDORS = {
     "iptables": "iptables", "netfilter": "iptables",
     "nxos": "nxos", "nx-os": "nxos", "nexus": "nxos",
     "eos": "eos", "arista": "eos",
+    "aws": "aws-sg", "aws-sg": "aws-sg", "awssg": "aws-sg",
+    "securitygroups": "aws-sg", "security-groups": "aws-sg",
 }
 
 
@@ -203,6 +218,8 @@ def _pick_parser(text: str, vendor: str):
             return "nxos", parse_nxos
         if v == "eos":
             return "eos", parse_eos
+        if v == "aws-sg":
+            return "aws-sg", parse_awssg
         return "ios-asa", parse_acls
     if detect_junos(text):
         return "junos", parse_junos
@@ -210,6 +227,8 @@ def _pick_parser(text: str, vendor: str):
         return "panos", parse_panos
     if detect_iptables(text):
         return "iptables", parse_iptables
+    if detect_awssg(text):
+        return "aws-sg", parse_awssg
     if detect_nxos(text):
         return "nxos", parse_nxos
     if detect_eos(text):
@@ -217,20 +236,30 @@ def _pick_parser(text: str, vendor: str):
     return "ios-asa", parse_acls
 
 
-def audit_file(path: str, policy: Optional[dict], vendor: str = "auto") -> FileResult:
+def audit_file(path: str, policy: Optional[dict], vendor: str = "auto",
+               ledger=None) -> FileResult:
     """Parse + analyze (+ segment-check) one config file."""
+    # Read BYTES so the evidence digest is of the file an auditor can re-hash.
     try:
-        text = open(path, encoding="utf-8", errors="replace").read()
+        with open(path, "rb") as fh:
+            raw = fh.read()
     except OSError as e:
         return FileResult(path, "?", "error", 0, error=str(e))
+    text = raw.decode("utf-8", errors="replace")
     vlabel, parse_fn = _pick_parser(text, vendor)
     aces, notes = parse_fn(text)
     findings = analyze(aces)
     if policy:
-        findings += check_segmentation(aces, policy)
+        seg = check_segmentation(aces, policy)
+        if ledger is not None:
+            # Risk acceptance is scoped per config, so an exception written for
+            # one device cannot silently cover the whole estate.
+            seg = apply_to_findings(seg, ledger, path)
+        findings += seg
     line_by_id = {(a.acl, a.seq): a.line for a in aces}
     status = "ok" if aces else "no_rules_parsed"
-    return FileResult(path, vlabel, status, len(aces), findings, notes, line_by_id)
+    return FileResult(path, vlabel, status, len(aces), findings, notes,
+                      line_by_id, raw=raw, aces=aces)
 
 
 # --------------------------------------------------------------------------- #
@@ -240,6 +269,7 @@ def audit_file(path: str, policy: Optional[dict], vendor: str = "auto") -> FileR
 class GateResult:
     files: List[FileResult]
     fail_on: str
+    ledger: object = None      # riskaccept.Ledger for this run (set by run_gate)
 
     @property
     def real_findings(self) -> List[Tuple[FileResult, Finding]]:
@@ -279,7 +309,7 @@ class GateResult:
         if self.fail_on == "none":
             return []
         return [(fr, f) for fr, f in self.real_findings
-                if _SEV_RANK.get(f.severity, 0) >= thr]
+                if _SEV_RANK.get(f.severity, 0) >= thr and f.accepted is None]
 
     @property
     def parse_failures(self) -> List[FileResult]:
@@ -313,8 +343,20 @@ class GateResult:
 
 
 def run_gate(paths: List[str], policy: Optional[dict], fail_on: str = "high",
-             vendor: str = "auto") -> GateResult:
-    return GateResult([audit_file(p, policy, vendor) for p in paths], fail_on)
+             vendor: str = "auto", as_of=None) -> GateResult:
+    """Audit every path. One exception ledger is shared across the whole run, so
+    `unused` is judged against the ENTIRE fleet — an exception that matches on
+    device 400 is in use, even though it matched nothing on device 1."""
+    ledger = evaluate(policy, as_of)
+    files = [audit_file(p, policy, vendor, ledger) for p in paths]
+    finalize(ledger)
+    gate = GateResult(files, fail_on)
+    gate.ledger = ledger
+    # Exceptions that did NOT apply are reported against the policy itself.
+    # An INVALID one is high severity: it looks like protection and gives none.
+    if files and ledger.entries:
+        files[0].findings = list(files[0].findings) + ledger.problems
+    return gate
 
 
 # --------------------------------------------------------------------------- #
@@ -729,7 +771,7 @@ options:
   --policy PATH        segmentation policy JSON (zones + must_not_reach)
   --fail-on LEVEL      fail the gate at this severity or worse:
                        critical | high | medium | low | none   (default: high)
-  --vendor V           force a vendor for every file:
+  --vendor V           force a vendor for every file (incl. aws-sg):
                        auto | ios | junos | panos | iptables | nxos | eos
                        (default: auto)
   --sarif PATH         write a SARIF 2.1.0 report (for code scanning)
@@ -737,6 +779,10 @@ options:
                        $GITHUB_STEP_SUMMARY when that env var is set
   --comment PATH       write the sticky PR-comment markdown body
   --json PATH          write the machine aggregate ('-' for stdout)
+  --evidence PATH      write the compliance-evidence artifact ('-' for stdout):
+                       provenance + VERIFIED/FAILED policy attestations +
+                       control references, across every config audited
+  --evidence-md PATH   the same artifact as a readable markdown document
   -q, --quiet          suppress the console report
   -h, --help           show this help
 """
@@ -772,6 +818,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     summary_path = _take(argv, "--summary")
     comment_path = _take(argv, "--comment")
     json_path = _take(argv, "--json")
+    evidence_path = _take(argv, "--evidence")
+    evidence_md_path = _take(argv, "--evidence-md")
 
     if fail_on not in ("critical", "high", "medium", "low", "none"):
         print(f"rulehawk gate: bad --fail-on {fail_on!r}", file=sys.stderr)
@@ -808,9 +856,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     policy: Optional[dict] = None
+    policy_raw: Optional[bytes] = None
     if policy_path:
         try:
-            policy = json.load(open(policy_path, encoding="utf-8"))
+            with open(policy_path, "rb") as _pf:
+                policy_raw = _pf.read()
+            policy = json.loads(policy_raw.decode("utf-8"))
         except (OSError, ValueError) as e:
             print(f"rulehawk gate: cannot read policy {policy_path!r}: {e}",
                   file=sys.stderr)
@@ -830,6 +881,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             _write(sarif_path, to_sarif(gate))
         if json_path:
             _emit(json_path, to_json(gate))
+        if evidence_path or evidence_md_path:
+            art = build_evidence([fr.to_subject() for fr in gate.files],
+                                 policy=policy, policy_source=policy_path or "",
+                                 policy_raw=policy_raw, generator="ci")
+            if evidence_path:
+                _emit(evidence_path, json.dumps(art, indent=2))
+            if evidence_md_path:
+                _emit(evidence_md_path, to_evidence_markdown(art))
         # Step summary: explicit path, else GitHub's env file when present.
         summary_target = summary_path or os.environ.get("GITHUB_STEP_SUMMARY")
         if summary_target:

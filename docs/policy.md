@@ -53,7 +53,10 @@ protocol/ports you optionally narrow.
 
 **Valid `proto` values:** `ip` (wildcard — any protocol), `tcp`, `udp`, `icmp`,
 `icmpv6`, and other IP protocols the parsers recognize (`gre`, `esp`, `ah`,
-`ospf`, `sctp`). Use `ip` when *any* reachability is forbidden (the strongest
+`ospf`, `sctp`, `eigrp`, `pim`, `vrrp`, `dccp`, `udplite`). An unrecognized
+protocol **fails closed**: it emits a high-severity `segmentation-error` and the
+assertion is never given a PASS (nor a phantom connectivity failure) — a typo
+like `"tpc"` must not certify isolation over a search space nothing can match. Use `ip` when *any* reachability is forbidden (the strongest
 assertion); use `tcp`/`udp` + `ports` when only specific services are forbidden.
 
 **`ports` is an integer array only** — there is **no range syntax** here (`"80-443"`
@@ -169,6 +172,75 @@ section above. For `must_not_reach` entries:
   or an unusable `ports` value. RuleHawk **fails closed**: the affected
   assertion is never given a PASS until the policy is fixed (a typo must not
   certify isolation over an empty search space).
+
+## AWS Security Groups
+
+A Security Group has no deny rules and no ordering, so a policy assertion means
+the same thing but is proven differently: an assertion PASSES when no rule in the
+group permits the forbidden flow. Two caveats specific to AWS:
+
+- **A flow needs the source's egress AND the destination's ingress.** RuleHawk
+  evaluates each group's ingress and egress as independent contexts, so a
+  reported violation means *a ruleset on the path permits the flow* — the same
+  deliberately over-reporting claim it makes for every vendor, not an end-to-end
+  reachability proof.
+- **A rule sourced from another security group or a prefix list cannot be
+  resolved** from `describe-security-groups` output. Those become one opaque
+  rule, so the affected assertion is `segmentation-indeterminate` — never a PASS.
+  Export the referenced group's members as CIDRs if you need a decisive verdict.
+
+## Risk acceptance (`exceptions`)
+
+Point this at a real estate of firewalls and the first run is red: our own scale
+test on 300 devices produced **62 pre-existing CRITICAL violations**, none of them
+introduced by the pull request being gated. A gate that is red on day one and
+stays red gets switched off — so the policy can carry *time-boxed, attributed*
+risk acceptances:
+
+```jsonc
+"exceptions": [
+  {
+    "id":          "RISK-4471",              // your ticket
+    "claim":       {"src": "CORP", "dst": "PCI", "proto": "tcp", "ports": [1433]},
+    "subjects":    ["firewall/dc-core-asa.txt"],   // optional; omit = fleet-wide
+    "reason":      "Reporting server requires SQL to the CDE. Compensating control: jump-host allowlist + query audit (SEC-88).",
+    "approved_by": "jane.doe@acme.com",
+    "expires":     "2027-03-31"              // required, and enforced
+  }
+]
+```
+
+This is **not** a suppression list, and the difference is the whole point:
+
+| | ignore-list | RuleHawk exception |
+|---|---|---|
+| the finding | disappears | still reported, with its witness packet |
+| the claim | reads as passing | reads `ACCEPTED_RISK` — never `VERIFIED` |
+| who owns it | nobody | `approved_by`, in the evidence artifact |
+| when it ends | never | `expires` — the gate re-arms itself |
+| if it's stale | invisible forever | reported `unused` |
+
+Five rules are enforced, each pinned by tests:
+
+1. **Nothing disappears.** An accepted finding keeps its kind, severity and
+   witness packet; the artifact gains an `accepted_risks` section naming the
+   ticket, the approver and the expiry. A claim covered only by acceptances is
+   `ACCEPTED_RISK`, never `VERIFIED` — isolation was *not* proven.
+2. **Expiry is mandatory and enforced.** A missing or past `expires` means the
+   exception does not apply: the finding is enforced again and the gate goes red
+   on its own, with no config change.
+3. **Accountability is mandatory.** Missing `id`, `reason` or `approved_by`
+   makes the exception **invalid** — it suppresses nothing and is reported at
+   *high* severity, because an exception that looks like protection and gives
+   none is worse than no exception.
+4. **Anything unparseable fails closed** — a malformed date, a claim that does
+   not name zones, a non-object entry.
+5. **Dead exceptions are surfaced** as `unused`, so the list gets pruned instead
+   of accreting forever.
+
+An exception matches its claim exactly on zones and protocol; a portless
+exception covers every port of that protocol, but a narrow one never waives a
+broader assertion. The accepted risk is the one the approver actually read.
 
 ## Gotchas
 

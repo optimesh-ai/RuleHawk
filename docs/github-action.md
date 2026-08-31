@@ -47,6 +47,7 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 | `fail-on` | `high` | Fail the check at this severity or worse: `critical` \| `high` \| `medium` \| `low` \| `none`. `none` is advisory (never blocks). |
 | `vendor` | `auto` | Force a vendor for every file: `auto` \| `ios` \| `junos` \| `panos` \| `iptables`. |
 | `comment` | `true` | Post/update a single sticky PR comment with the findings. |
+| `evidence` | `false` | Emit a **compliance-evidence artifact** (JSON + markdown) for the run: provenance (SHA-256 of every config audited, tool version, timestamp), `VERIFIED`/`FAILED` policy attestations, and PCI DSS / NIST 800-53 / ISO 27001 / CIS / SOC 2 / HIPAA control references. Paths land in the `evidence-file` / `evidence-md-file` outputs. |
 | `upload-sarif` | `true` | Upload SARIF to code scanning so findings annotate the exact diff line. |
 | `working-directory` | `.` | Directory to run the audit in. |
 | `python-version` | `''` | Optionally set up a specific Python (≥3.9). Empty uses the runner's `python3` — the fast path. |
@@ -58,7 +59,44 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 | `passed` | `true` when no finding met the `fail-on` threshold (and every file parsed). |
 | `score` | Lowest hygiene score (0–100) across the audited files. |
 | `worst-severity` | Highest severity found: `critical` \| `high` \| `medium` \| `low` \| `none`. |
+| `evidence-file` | Path to the compliance-evidence JSON artifact (empty unless `evidence: true`). |
+| `evidence-md-file` | Path to the same artifact rendered as a markdown document (empty unless `evidence: true`). |
 | `sarif-file` | Path to the generated SARIF report. |
+
+## Continuous compliance evidence
+
+Turn on `evidence: true` and upload the artifact to get a dated, hashed audit
+trail that builds itself on every change — instead of reconstructing segmentation
+proof once a year for an assessor:
+
+```yaml
+- uses: optimesh-ai/RuleHawk@v1
+  id: gate
+  with:
+    configs:  firewall/**/*.txt
+    policy:   .rulehawk/policy.json
+    evidence: true
+- uses: actions/upload-artifact@v4
+  if: always()
+  with:
+    name: segmentation-evidence
+    path: |
+      ${{ steps.gate.outputs.evidence-file }}
+      ${{ steps.gate.outputs.evidence-md-file }}
+```
+
+One artifact covers every config in the run, and a failed claim names the config
+that broke it. Three honesty properties are enforced by tests, and matter when an
+assessor reads the output:
+
+* **`VERIFIED` means proved.** Only a passing assertion earns it; with no policy
+  the artifact makes no isolation claim at all and says so.
+* **An unparseable config poisons the run.** If any supplied config fails to
+  parse, *no* claim is marked verified — the leak could be in the file that was
+  never read. The report states that coverage is incomplete.
+* **The claim is scoped to the rulesets audited, never to the network.** With no
+  routing or NAT model, a pass proves "no audited ruleset permits this flow",
+  which is the exact wording the artifact carries.
 
 ## Exit codes / verdict
 

@@ -36,6 +36,15 @@ from typing import Dict, List, Optional
 from .analyze import Finding
 from .model import (ACE, ANY_PORTS, _ICMP_PROTOS, _IPNet, _PORTED,
                     _WILDCARD_PROTO, PortRange)
+from .parse import _PROTO_NUM
+
+# Protocols an assertion may name. Derived from what the engine can actually
+# reason about — the wildcards, the ported and ICMP families, and every protocol
+# the Cisco frontend normalizes a IANA number to — so adding protocol support in
+# one place cannot leave this validator behind. Anything else is a policy typo
+# and fails closed (see the proto check in check_segmentation).
+_KNOWN_PROTO = (frozenset(_WILDCARD_PROTO) | frozenset(_PORTED)
+                | frozenset(_ICMP_PROTOS) | frozenset(_PROTO_NUM.values()))
 
 # Rule-visit budget per (assertion x zone-pair x port x probe x ACL) search.
 # Exhaustion returns an INDETERMINATE (fail-closed), never a PASS. Sized for
@@ -354,6 +363,21 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                     ("define the named zone(s) in policy 'zones', or fix the "
                      "typo so src/dst reference existing zones")))
                 continue
+            # Fail closed on a protocol we cannot resolve. This is the same
+            # vacuous-confidence hole as an unknown zone, one field over: a
+            # typo'd proto ("tpc") matches no specific-protocol rule, so the
+            # isolation search finds no leak and reports
+            #   PASS: CORP cannot reach PCI on tpc
+            # — a policy typo certified as proven isolation. must_reach inverts
+            # it into a phantom CONNECTIVITY BROKEN. Neither assertion ran.
+            if proto not in _KNOWN_PROTO:
+                findings.append(_policy_error(
+                    label,
+                    f"CANNOT EVALUATE ({sname} {rel} {dname}): unknown protocol "
+                    f"'{proto}'. This assertion was NOT checked — nothing is "
+                    f"proven. Known protocols: {', '.join(sorted(_KNOWN_PROTO))}.",
+                    "use a known protocol name (or 'ip' for any protocol)"))
+                continue
             ports = _coerce_ports(assertion.get("ports"))
             if ports is None:
                 findings.append(_policy_error(
@@ -435,7 +459,10 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                         f"flow is dropped at the filter layer.",
                         "",
                         fix=f"permit {hsrc} -> {hdst}{psfx} in the ruleset "
-                            f"governing this path"))
+                            f"governing this path",
+                        claim={"direction": direction, "src": sname,
+                               "dst": dname, "proto": proto,
+                               "ports": assertion.get("ports")}))
                 continue
 
             permit_hit, indet = _probe_space(aces, by_acl, zones[sname],
@@ -467,7 +494,9 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                     fix=(f"deny {sub[0]} -> {sub[1]}{_port_part} "
                          f"before rule {rule.seq}{_line_part}"),
                     witness=f"{swit} -> {dwit}{portsfx} ({probe})",
-                    line=rule.line))
+                    line=rule.line,
+                    claim={"direction": direction, "src": sname, "dst": dname,
+                           "proto": proto, "ports": assertion.get("ports")}))
                 continue
             if indet:
                 sub, rule, acl_name = indet

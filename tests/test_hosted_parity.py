@@ -320,3 +320,44 @@ def test_hosted_fallback_entrypoint_also_matches():
     viol = [f for f in env["report_json"]["findings"]
             if f["kind"] == "segmentation-violation"]
     assert viol and viol[0]["severity"] == "critical"
+
+
+# --------------------------------------------------------------------------- #
+# UI copy must keep up with what the engine actually does
+# --------------------------------------------------------------------------- #
+_VENDOR_UI_TOKENS = {
+    "parse": "cisco", "parse_nxos": "nx-os", "parse_eos": "arista",
+    "parse_junos": "junos", "parse_panos": "pan-os",
+    "parse_iptables": "iptables", "parse_awssg": "aws security groups",
+}
+
+
+def test_ui_supported_copy_names_every_wired_vendor():
+    """The input label is a promise. It went stale once already, when NX-OS and
+    Arista EOS shipped in the CLI and the hosted copy kept quiet."""
+    label = re.search(r'for="config">.*?</label>', _read(_INDEX), re.S).group(0).lower()
+    loaded = set(_engine_modules(_read(_WORKER)))
+    for mod, token in _VENDOR_UI_TOKENS.items():
+        if mod in loaded:
+            assert token in label, (
+                f"{mod} is loaded and dispatched, but the supported-vendor copy "
+                f"never mentions {token!r} — users would not know it works")
+
+
+def test_cta_does_not_sell_shipped_features_as_roadmap():
+    """The results CTA pitches what OptiMesh is building NEXT. It went stale
+    twice: offering NX-OS, then AWS Security Groups and "exportable audit
+    evidence", while each was shipping in the page directly above it."""
+    cta = re.search(r'<div class="cta-b">(.*?)</div>', _read(_INDEX), re.S)
+    assert cta, "results CTA copy not found"
+    parts = cta.group(1).split("Want", 1)
+    assert len(parts) == 2, "CTA no longer states a forward-looking ask"
+    roadmap = parts[1].lower().replace("&nbsp;", " ")
+    loaded = set(_engine_modules(_read(_WORKER)))
+    for mod, token in _VENDOR_UI_TOKENS.items():
+        if mod in loaded:
+            assert token not in roadmap, (
+                f"CTA offers {token!r} as future work, but the tool audits it today")
+    for shipped in ("evidence", "attestation"):
+        assert shipped not in roadmap, (
+            f"CTA offers {shipped!r} as future work, but it ships in this page")

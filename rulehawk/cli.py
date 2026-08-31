@@ -24,7 +24,9 @@ import json
 import sys
 
 from .analyze import analyze, score
+from .evidence import Subject, build_evidence, to_evidence_markdown
 from .parse import parse_acls
+from .parse_awssg import detect as detect_awssg, parse_awssg
 from .parse_eos import detect as detect_eos, parse_eos
 from .parse_iptables import detect as detect_iptables, parse_iptables
 from .parse_junos import detect as detect_junos, parse_junos
@@ -32,6 +34,7 @@ from .parse_nxos import detect as detect_nxos, parse_nxos
 from .parse_panos import detect as detect_panos, parse_panos
 from .pathground import HammerheadReachOracle, path_ground
 from .report import to_json, to_text
+from .riskaccept import apply_to_findings, evaluate, finalize
 from .segcheck import check_segmentation
 
 
@@ -45,6 +48,9 @@ usage:
 
 options:
   --json               emit the machine-readable JSON report instead of text
+  --evidence           emit the compliance-evidence artifact (JSON): provenance,
+                       VERIFIED/FAILED policy attestations, control references
+  --evidence-md        the same artifact as a readable markdown document
   --junos              force the Juniper Junos parser (skip auto-detection)
   --panos              force the Palo Alto PAN-OS parser (skip auto-detection)
   --iptables           force the Linux iptables parser (skip auto-detection)
@@ -54,7 +60,8 @@ options:
   -h, --help           show this help
 
 Vendor is auto-detected: Cisco IOS/ASA, Cisco NX-OS, Arista EOS, Juniper Junos,
-Palo Alto PAN-OS, Linux iptables/ip6tables.
+Palo Alto PAN-OS, Linux iptables/ip6tables, AWS Security Groups
+(`aws ec2 describe-security-groups` JSON).
 
 Single-file mode takes exactly one config file. To audit several at once (e.g.
 a shell glob like `rulehawk configs/*.txt`), use `rulehawk gate <files...>` —
@@ -94,11 +101,14 @@ def main(argv: list[str] | None = None) -> int:
         print(_USAGE)
         return 0
     as_json = "--json" in argv
+    as_evidence_md = "--evidence-md" in argv
+    as_evidence = "--evidence" in argv or as_evidence_md
     force_junos = "--junos" in argv
     force_panos = "--panos" in argv
     force_iptables = "--iptables" in argv
     argv = [a for a in argv
-            if a not in ("--json", "--junos", "--panos", "--iptables")]
+            if a not in ("--json", "--evidence", "--evidence-md", "--junos",
+                         "--panos", "--iptables")]
     hh_snapshot = _take_opt(argv, "--hh-snapshot")
     hh_from = _take_opt(argv, "--hh-from")
     if hh_snapshot == "" or hh_from == "":
@@ -142,10 +152,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if argv and argv[0] != "-":
         try:
-            text = open(argv[0], encoding="utf-8", errors="replace").read()
+            # Read BYTES: the evidence artifact records the digest of exactly
+            # what was audited, so an auditor can re-hash the file and get the
+            # same value. Hashing a decoded copy would not survive that check.
+            with open(argv[0], "rb") as _fh:
+                raw = _fh.read()
         except OSError as e:
             print(f"rulehawk: cannot read {argv[0]!r}: {e}", file=sys.stderr)
             return 2
+        text = raw.decode("utf-8", "replace")
+        source = argv[0]
     else:
         # Read stdin as bytes and decode leniently: a non-UTF-8 config (a
         # latin-1 export, a stray BOM/binary) must degrade like the file path
@@ -156,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
         except (AttributeError, OSError):
             raw = sys.stdin.read().encode("utf-8", "replace")
         text = raw.decode("utf-8", "replace")  # no file, or explicit "-"
+        source = "<stdin>"
 
     # Auto-detect vendor (same precedence order as gate.py _pick_parser).
     # "ios-asa" is the fallback: no positive signal was found.
@@ -169,6 +186,9 @@ def main(argv: list[str] | None = None) -> int:
     elif force_iptables or (not forced and detect_iptables(text)):
         aces, notes = parse_iptables(text)
         vendor = "iptables"
+    elif not forced and detect_awssg(text):
+        aces, notes = parse_awssg(text)
+        vendor = "aws-sg"
     elif not forced and detect_nxos(text):
         aces, notes = parse_nxos(text)
         vendor = "nxos"
@@ -179,19 +199,35 @@ def main(argv: list[str] | None = None) -> int:
         aces, notes = parse_acls(text)
         vendor = "ios-asa"
     findings = analyze(aces)
+    policy = None
+    policy_raw = None
     if policy_path:
         try:
-            policy = json.load(open(policy_path, encoding="utf-8"))
+            with open(policy_path, "rb") as _pf:
+                policy_raw = _pf.read()
+            policy = json.loads(policy_raw.decode("utf-8"))
         except (OSError, ValueError) as e:
             print(f"rulehawk: cannot read policy {policy_path!r}: {e}", file=sys.stderr)
             return 2
         seg = check_segmentation(aces, policy)
+        _ledger = evaluate(policy)
+        seg = apply_to_findings(seg, _ledger, source)
+        finalize(_ledger)
+        seg = list(seg) + _ledger.problems
         if hh_snapshot and hh_from:
             oracle = HammerheadReachOracle(hh_snapshot, hh_from)
             seg = path_ground(seg, oracle)
         findings += seg
     n_rules = len(aces)
-    if as_json:
+    if as_evidence:
+        art = build_evidence(
+            [Subject(source=source, raw=raw, vendor=vendor, aces=aces,
+                     findings=findings, notes=notes)],
+            policy=policy, policy_source=policy_path or "",
+            policy_raw=policy_raw)
+        print(to_evidence_markdown(art) if as_evidence_md
+              else json.dumps(art, indent=2))
+    elif as_json:
         print(to_json(findings, notes, n_rules, vendor))
     else:
         print(to_text(findings, notes, n_rules, vendor))
@@ -200,7 +236,11 @@ def main(argv: list[str] | None = None) -> int:
     # imply a clean audit when the input was never read as a firewall config.
     if not n_rules:
         return 2
-    return 1 if any(f.severity in ("critical", "high") for f in findings) else 0
+    # An ACCEPTED finding is reported but does not fail the run — that is what a
+    # time-boxed, attributed risk acceptance is for. It goes red again the day
+    # the acceptance expires, by itself.
+    return 1 if any(f.severity in ("critical", "high") and f.accepted is None
+                    for f in findings) else 0
 
 
 if __name__ == "__main__":
