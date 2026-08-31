@@ -116,9 +116,10 @@ def test_no_unguarded_empty_array_expansion():
     run = "\n".join(l for l in _run_block(_action()).splitlines()
                      if not l.lstrip().startswith("#"))
     unguarded = re.findall(r'(?<!\+)"\$\{([A-Za-z_][A-Za-z0-9_]*)\[@\]\}"', run)
+    _safe_form = 'use ${ARR[@]+"${ARR[@]}"}'
     assert not unguarded, (
         f"unguarded empty-array expansion(s) {sorted(set(unguarded))} — bash 3.2 "
-        f"aborts on these under `set -u`. Use ${{ARR[@]+\"${{ARR[@]}}\"}}.")
+        f"aborts on these under `set -u`. Fix: {_safe_form}.")
 
 
 @pytest.mark.skipif(not os.path.exists("/bin/bash"), reason="no /bin/bash")
@@ -137,8 +138,9 @@ def test_gate_command_line_survives_bash_with_set_u():
               "POLICY_ARGS=()\nEVIDENCE_ARGS=()\n" + cmd + "\necho SHELL_OK\n")
     proc = subprocess.run(["/bin/bash", "-c", script],
                           capture_output=True, text=True)
+    version = subprocess.run(["/bin/bash", "-c", "echo $BASH_VERSION"],
+                             capture_output=True, text=True).stdout.strip()
     assert proc.returncode == 0, (
-        f"the shipped gate command line fails under "
-        f"bash {os.popen('/bin/bash -c \"echo $BASH_VERSION\"').read().strip()}"
-        f" with empty arrays:\n{proc.stderr}")
+        f"the shipped gate command line fails under bash {version} "
+        f"with empty arrays:{chr(10)}{proc.stderr}")
     assert "SHELL_OK" in proc.stdout
