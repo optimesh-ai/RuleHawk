@@ -23,7 +23,7 @@ inputs:
     required: false
     default: 'high'
   vendor:
-    description: 'Force a vendor for every file: auto | ios | junos | panos | iptables | nxos | eos'
+    description: 'Force a vendor for every file: auto | ios | junos | panos | iptables | nxos | eos | aws-sg'
     required: false
     default: 'auto'
   comment:
@@ -121,6 +121,13 @@ runs:
         POLICY_ARGS=()
         if [ -n "${RH_POLICY}" ]; then POLICY_ARGS=(--policy "${RH_POLICY}"); fi
 
+        # Start clean: every path advertised below is advertised only if THIS
+        # run wrote it, so a file left behind by an earlier gate step in the
+        # same job (RUNNER_TEMP is shared) can never pass as this step's
+        # artifact or verdict.
+        rm -f "${SARIF}" "${JSON}" "${COMMENT}" "${EVIDENCE}" "${EVIDENCE_MD}" \
+              "${RUNNER_TEMP:-/tmp}/rulehawk.rc"
+
         # `set -f` (noglob) hands ** / * patterns to RuleHawk verbatim so its own
         # recursive globber expands them — whitespace still splits multiple
         # patterns into separate arguments.
@@ -214,16 +221,27 @@ runs:
           }
 
     # Re-raise the gate verdict so the check goes red exactly when it should.
+    # Fails CLOSED when the verdict file is missing: that means the gate step
+    # aborted before it could run RuleHawk, and a missing verdict must never
+    # read as "passed".
     - name: Enforce gate verdict
       if: always()
       shell: bash
+      env:
+        # Bound as env, never ${{ }}-inlined into the script body (the same
+        # script-injection hygiene as the comment step).
+        RH_FAIL_ON: ${{ inputs.fail-on }}
+        RH_WORST: ${{ steps.gate.outputs.worst }}
       run: |
-        RC="$(cat "${RUNNER_TEMP:-/tmp}/rulehawk.rc" 2>/dev/null || echo 0)"
-        if [ "${RC}" = "2" ]; then
-          echo "::error title=RuleHawk gate failed (fail-closed)::One or more configs parsed to zero rules — RuleHawk will not certify isolation it could not verify. Check the vendor/format, or set the 'vendor' input."
+        RC="$(cat "${RUNNER_TEMP:-/tmp}/rulehawk.rc" 2>/dev/null || echo missing)"
+        if [ "${RC}" = "missing" ]; then
+          echo "::error title=RuleHawk gate did not complete::No verdict was recorded — the gate step aborted before RuleHawk ran. See the step log above."
+          exit 1
+        elif [ "${RC}" = "2" ]; then
+          echo "::error title=RuleHawk gate failed (fail-closed)::RuleHawk exited 2: a config parsed to zero rules, a 'configs' pattern matched no files, or an input was invalid — it will not certify isolation it could not verify. See the step log; check the vendor/format or set the 'vendor' input."
           exit 1
         elif [ "${RC}" != "0" ]; then
-          echo "::error title=RuleHawk gate failed::Findings at or above '${{ inputs.fail-on }}' block this change — see the job summary and PR comment."
+          echo "::error title=RuleHawk gate failed::Findings at or above '${RH_FAIL_ON}' block this change — see the job summary and PR comment."
           exit 1
         fi
-        echo "RuleHawk gate passed (worst severity: ${{ steps.gate.outputs.worst }})."
+        echo "RuleHawk gate passed (worst severity: ${RH_WORST})."

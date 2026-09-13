@@ -248,23 +248,32 @@ def parse_awssg(text: str) -> Tuple[List[ACE], List[str]]:
                         raw=_raw_text(gid, direction, proto, pr, str(net)),
                         acl=acl, line=gline))
                 if unresolved:
-                    # ONE opaque catch-all for everything we could not resolve.
-                    # Marked imprecise: it can never prove another rule dead and
-                    # never certifies isolation — the remainder stays
-                    # INDETERMINATE rather than silently PASSing.
-                    seq += 1
+                    # One opaque catch-all PER ADDRESS FAMILY for everything we
+                    # could not resolve. Marked imprecise: it can never prove
+                    # another rule dead and never certifies isolation — the
+                    # remainder stays INDETERMINATE rather than silently
+                    # PASSing. A referenced group or prefix list may hold IPv6
+                    # members, and a v4-only any/any can never intersect an
+                    # IPv6 witness (mixed IP versions never intersect), so a
+                    # single v4 marker left the remainder INVISIBLE to every
+                    # IPv6 assertion — a false PASS. ICMP is family-bound: v4
+                    # `icmp` never carries v6 traffic and `icmpv6` never v4.
                     label = ", ".join(sorted(set(unresolved)))
                     notes.append(
                         f"{acl}: unresolved source(s) [{label}] cannot be mapped "
                         f"to addresses from this export — modeled as an opaque "
-                        f"any/any rule (review manually; never reported as "
-                        f"isolated)")
-                    aces.append(ACE(
-                        seq=seq, action="permit", proto=proto,
-                        src=_V4_ANY, dst=_V4_ANY, dst_port=pr,
-                        icmp_type=icmp_type, imprecise=True,
-                        raw=_raw_text(gid, direction, proto, pr, label),
-                        acl=acl, line=gline))
+                        f"any/any rule per address family (review manually; "
+                        f"never reported as isolated)")
+                    fams = {"icmp": (_V4_ANY,), "icmpv6": (_V6_ANY,)}.get(
+                        proto, (_V4_ANY, _V6_ANY))
+                    for any_net in fams:
+                        seq += 1
+                        aces.append(ACE(
+                            seq=seq, action="permit", proto=proto,
+                            src=any_net, dst=any_net, dst_port=pr,
+                            icmp_type=icmp_type, imprecise=True,
+                            raw=_raw_text(gid, direction, proto, pr, label),
+                            acl=acl, line=gline))
                 if not nets and not unresolved:
                     notes.append(f"{acl}: a rule names no source or destination "
                                  f"({perm!r}) — nothing to model")

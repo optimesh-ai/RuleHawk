@@ -1,8 +1,9 @@
 name: RuleHawk CI
 
 # The engine's own gate: run the analysis-engine test suite on every change, and
-# dogfood the composite Action end-to-end on a known-clean sample so the gate
-# wiring itself is exercised in real CI.
+# dogfood the composite Action end-to-end on real samples so the gate wiring
+# itself — outputs, verdict plumbing, the evidence artifact, bash-3.2 safety —
+# is exercised in real CI on both Linux and macOS runners.
 on:
   push:
     branches: [main]
@@ -11,43 +12,56 @@ on:
 permissions:
   contents: read
 
+# One live run per ref: a superseded PR push cancels the stale run; pushes to
+# main are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   tests:
     name: Engine test suite
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ['3.9', '3.12']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install pytest
-        run: python -m pip install --quiet pytest
+      # PyYAML is a TEST dependency only (the engine has none): it is what lets
+      # tests/test_action.py load action.yml. Without it that module
+      # importorskips and the Action wiring — outputs, accepted flags, the
+      # bash-3.2 empty-array guards — is never checked in CI.
+      - name: Install test dependencies
+        run: python -m pip install --quiet pytest pyyaml
+      - name: Verify the Action wiring tests will run (PyYAML importable)
+        run: python -c "import yaml; print('PyYAML', yaml.__version__)"
       - name: Run tests
-        run: python -m pytest -q
+        run: python -m pytest -q -rs
+      # The same check the suite runs (tests/test_vendor_sync.py), kept as its
+      # own step so a drift is named in the job summary.
       - name: Verify the web demo vendored engine is in sync
-        run: |
-          rsync -a --delete --exclude='__pycache__' --exclude='*.pyc' \
-            rulehawk/ /tmp/_engine_check/
-          diff -r /tmp/_engine_check/ docs/rulehawk/ \
-            || (echo "::error::docs/rulehawk drifted — run 'make sync-web'"; exit 1)
+        run: python scripts/check_vendor_sync.py
 
   action-selftest:
     name: Dogfood the Action (composite, end-to-end)
     strategy:
+      fail-fast: false
       matrix:
         # macOS runs bash 3.2 for `shell: bash` — it caught the empty-array
         # `set -u` expansion bug ubuntu (bash 5) never would.
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Use the action from this very checkout (local `./`). A clean sample +
       # the segmentation policy must pass the gate with exit 0 — proving the
       # zero-install PYTHONPATH wiring works on a real runner.
       - name: RuleHawk gate (expect PASS on a clean sample)
+        id: clean
         uses: ./
         with:
           configs: samples/adv_realistic.txt
@@ -57,18 +71,62 @@ jobs:
           comment: false
       # No-policy run exercises the empty POLICY_ARGS path (the bash-3.2 trap).
       - name: RuleHawk gate (expect PASS, no policy input)
+        id: nopolicy
         uses: ./
         with:
           configs: samples/adv_realistic.txt
           fail-on: high
           upload-sarif: false
           comment: false
+      # Evidence run exercises the EVIDENCE_ARGS path and both evidence outputs
+      # — the newest wiring, and the one a compliance consumer relies on.
+      - name: RuleHawk gate (expect PASS, evidence artifact on)
+        id: evidence
+        uses: ./
+        with:
+          configs: samples/adv_realistic.txt
+          policy: samples/policy.json
+          fail-on: high
+          evidence: true
+          upload-sarif: false
+          comment: false
+      - name: Assert the PASS outputs and the evidence artifact
+        env:
+          PASSED: ${{ steps.clean.outputs.passed }}
+          WORST: ${{ steps.clean.outputs.worst-severity }}
+          SCORE: ${{ steps.clean.outputs.score }}
+          SARIF: ${{ steps.clean.outputs.sarif-file }}
+          NOPOLICY_PASSED: ${{ steps.nopolicy.outputs.passed }}
+          NOPOLICY_EVIDENCE: ${{ steps.nopolicy.outputs.evidence-file }}
+          EVIDENCE: ${{ steps.evidence.outputs.evidence-file }}
+          EVIDENCE_MD: ${{ steps.evidence.outputs.evidence-md-file }}
+        run: |
+          set -euo pipefail
+          [ "${PASSED}" = "true" ]          || { echo "::error::outputs.passed should be true, got '${PASSED}'"; exit 1; }
+          [ "${WORST}" = "none" ]           || { echo "::error::outputs.worst-severity should be none, got '${WORST}'"; exit 1; }
+          [[ "${SCORE}" =~ ^[0-9]+$ ]]      || { echo "::error::outputs.score should be numeric, got '${SCORE}'"; exit 1; }
+          [ -s "${SARIF}" ]                 || { echo "::error::outputs.sarif-file should name a non-empty file, got '${SARIF}'"; exit 1; }
+          [ "${NOPOLICY_PASSED}" = "true" ] || { echo "::error::no-policy run should pass, got '${NOPOLICY_PASSED}'"; exit 1; }
+          [ -z "${NOPOLICY_EVIDENCE}" ]     || { echo "::error::evidence-file must be empty when evidence is off, got '${NOPOLICY_EVIDENCE}'"; exit 1; }
+          [ -s "${EVIDENCE}" ]              || { echo "::error::evidence-file should name a non-empty file, got '${EVIDENCE}'"; exit 1; }
+          [ -s "${EVIDENCE_MD}" ]           || { echo "::error::evidence-md-file should name a non-empty file, got '${EVIDENCE_MD}'"; exit 1; }
+          python3 - "${EVIDENCE}" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          assert d["schema"] == "rulehawk.evidence/v1", d["schema"]
+          assert d["tool"]["generator"] == "ci", d["tool"]
+          assert d["coverage"]["complete"] is True, d["coverage"]
+          assert d["result"]["attestations_failed"] == 0, d["result"]
+          assert d["result"]["attestations_verified"] >= 1, d["result"]
+          print("evidence artifact OK:", d["result"])
+          PY
+          echo "PASS path verified: passed=${PASSED}, worst=${WORST}, score=${SCORE}"
 
   action-selftest-fail-path:
     name: Dogfood the Action (FAIL verdict is enforced)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # The rc-file -> Enforce re-raise plumbing must actually turn the check
       # red: run the gate on a sample with known critical findings and assert
       # the step FAILS and the outputs carry the verdict.

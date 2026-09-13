@@ -131,7 +131,7 @@ _KIND_HELP: Dict[str, str] = {
 class FileResult:
     """The audit of one config file."""
     path: str                       # path as given (used in SARIF/locations)
-    vendor: str                     # ios-asa | junos | panos | iptables | nxos | eos
+    vendor: str                     # ios-asa | junos | panos | iptables | nxos | eos | aws-sg
     status: str                     # ok | no_rules_parsed | error
     n_rules: int
     findings: List[Finding] = field(default_factory=list)
@@ -771,8 +771,8 @@ options:
   --policy PATH        segmentation policy JSON (zones + must_not_reach)
   --fail-on LEVEL      fail the gate at this severity or worse:
                        critical | high | medium | low | none   (default: high)
-  --vendor V           force a vendor for every file (incl. aws-sg):
-                       auto | ios | junos | panos | iptables | nxos | eos
+  --vendor V           force a vendor for every file:
+                       auto | ios | junos | panos | iptables | nxos | eos | aws-sg
                        (default: auto)
   --sarif PATH         write a SARIF 2.1.0 report (for code scanning)
   --summary PATH       write the markdown report ('-' for stdout); defaults to
@@ -826,7 +826,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     if vendor != "auto" and vendor not in _VENDORS:
         print(f"rulehawk gate: unknown --vendor {vendor!r} "
-              "(choose: auto | ios | junos | panos | iptables | nxos | eos)",
+              "(choose: auto | ios | junos | panos | iptables | nxos | eos | aws-sg)",
               file=sys.stderr)
         return 2
 

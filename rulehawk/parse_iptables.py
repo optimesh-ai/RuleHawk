@@ -160,7 +160,7 @@ class _Rule:
 
     __slots__ = ("src", "dst", "proto", "sports", "dports", "stateful",
                  "imprecise", "icmp_type", "action", "skip_note", "modules",
-                 "jump_custom", "base_return")
+                 "jump_custom", "base_return", "goto", "state_seen")
 
     def __init__(self) -> None:
         self.src: Optional[_IPNet] = None
@@ -176,6 +176,18 @@ class _Rule:
         self.modules: List[str] = []
         self.jump_custom: Optional[str] = None  # target name of an unmodeled custom-chain jump
         self.base_return = False               # `-j RETURN` (fail-closed in a base transit chain)
+        self.goto = False                      # the jump was `-g`/`--goto`, not `-j`
+        self.state_seen = False                # a --state/--ctstate match was present
+
+    def unconditional(self) -> bool:
+        """True iff the rule carries NO match criterion at all — it fires for
+        every packet that reaches it. Conservative: any address, protocol,
+        port, ICMP type, conntrack state, negation or unmodeled option makes
+        it conditional (a neutral `-m comment` does not)."""
+        return (self.src is None and self.dst is None and self.proto == "ip"
+                and not self.sports and not self.dports
+                and not self.stateful and not self.state_seen
+                and not self.imprecise and self.icmp_type is None)
 
 
 class _Item:
@@ -195,14 +207,19 @@ class _Item:
                  register a pending resolution once ACE indices are known:
                  (target, src, dst, proto, sports, dports, unresolvable). None
                  for every other item.
+      * `chain_end` — an UNCONDITIONAL `-j RETURN`: the chain ends here for
+                 every packet. Expansion stops at this item; later items are
+                 unreachable on the device and are surfaced, not modeled.
     """
 
-    __slots__ = ("r", "line", "jump")
+    __slots__ = ("r", "line", "jump", "chain_end")
 
-    def __init__(self, r: Optional[_Rule], line: int, jump=None) -> None:
+    def __init__(self, r: Optional[_Rule], line: int, jump=None,
+                 chain_end: bool = False) -> None:
         self.r = r
         self.line = line
         self.jump = jump
+        self.chain_end = chain_end
 
 
 _PROTO_NUM = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6",
@@ -225,7 +242,7 @@ _VALUE_OPTS = frozenset({
     "--state", "--ctstate", "--match-set",
     "-i", "--in-interface", "-o", "--out-interface",
     "--icmp-type", "--icmpv6-type", "-m", "--match",
-    "-j", "--jump", "-g", "--goto", "--reject-with",
+    "-j", "--jump", "-g", "--goto", "--reject-with", "--comment",
 })
 
 
@@ -339,6 +356,7 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                              f"to {len(pr)} exact per-port rule(s)")
             i += 2
         elif t in ("--state", "--ctstate"):
+            r.state_seen = True
             states = {s.strip().upper() for s in (nxt or "").split(",") if s.strip()}
             if negate:
                 # `! --ctstate X` matches the COMPLEMENT of X. The common hygiene
@@ -431,11 +449,19 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                 # resolution pass in parse_iptables). Host hooks (INPUT/OUTPUT)
                 # surface the jump only — no decision emitted.
                 r.jump_custom = nxt or ""
+                r.goto = t in ("-g", "--goto")
                 r.skip_note = (f"iptables jump to custom chain `-j {nxt}` in {label} — "
                                f"transit-path jumps are resolved to precise ACEs "
                                f"below if the chain is fully modeled, otherwise "
                                f"kept indeterminate (fail-closed); host "
                                f"INPUT/OUTPUT jumps are surfaced only")
+            i += 2
+        elif t == "--comment":
+            # `-m comment --comment "text"` annotates the rule and never
+            # narrows the match. iptables-save on any Docker / Kubernetes /
+            # firewalld host stamps one on nearly every rule, so reading it as
+            # an unknown narrowing option turned whole rulesets INDETERMINATE
+            # (every commented permit AND deny went imprecise).
             i += 2
         elif t == "--reject-with":
             # REJECT flavor only (iptables-save always writes it) — selects the
@@ -651,6 +677,21 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     """
     default6 = _is_v6(text)
     notes: List[str] = []
+    # `iptables` and `ip6tables` are two independent rulesets on the device
+    # (their INPUT/FORWARD chains are unrelated), but this frontend models ONE
+    # address family per file. With both present the file is read as IPv4:
+    # chain default policies and any ip6tables rule without an explicit IPv6
+    # address come out as 0.0.0.0/0 and can never intersect an IPv6 witness —
+    # so an IPv6 verdict from this file would be a false PASS. Surface it, and
+    # fail closed for IPv6 (an opaque ::/0 marker per base chain, below).
+    mixed_family = bool(re.search(r"(?m)^\s*ip6tables\b", text)
+                        and re.search(r"(?m)^\s*iptables\b", text))
+    if mixed_family:
+        notes.append("both `iptables` and `ip6tables` commands are present — modeled "
+                     "as ONE IPv4 ruleset (chain policies and ip6tables rules without "
+                     "an explicit IPv6 address are read as 0.0.0.0/0). IPv6 is kept "
+                     "INDETERMINATE (fail-closed) here; audit the ip6tables rules in "
+                     "a separate file for a sound IPv6 verdict.")
     chains: List[str] = []                       # chain order of first appearance
     items_by_chain: Dict[str, List[_Item]] = {}  # ordered rule items per chain
     policies: Dict[str, str] = {}                # chain -> permit|deny (from policy)
@@ -667,7 +708,8 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             items_by_chain[ch] = []
             chains.append(ch)
 
-    def parse_one(ch: str, args: List[str], line: int) -> _Item:
+    def parse_one(ch: str, args: List[str], line: int,
+                  unreliable: bool = False) -> _Item:
         """Parse one -A/-I/-R rule body into a chain `_Item` (expansion deferred).
 
         Mirrors the former immediate-expansion logic exactly, but returns an
@@ -678,7 +720,21 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
         ensure_chain(ch)
         label = f"{ch}:{len(items_by_chain[ch]) + 1}"
         r = _parse_rule(args, label, notes)
+        if unreliable:
+            # shlex refused this line (an unbalanced quote, usually inside a
+            # --comment) and it was split on whitespace instead, so words of
+            # the comment may have been read as match options or a target.
+            # Fail closed: KEEP the rule (a dropped ACCEPT is an invisible
+            # hole) but never trust its match space.
+            r.imprecise = True
+            notes.append(f"iptables rule in {label} has an unbalanced quote — "
+                         f"tokenized by whitespace, so its options may be misread; "
+                         f"kept and marked imprecise (verify manually)")
         if r.skip_note is not None:
+            if r.base_return and r.jump_custom is None and r.unconditional():
+                r.skip_note = (f"iptables unconditional `-j RETURN` in {label} — the "
+                               f"chain ends here for every packet (the caller's next "
+                               f"rule / the default policy applies); modeled exactly")
             notes.append(r.skip_note)
             if r.jump_custom is not None and _is_transit(ch):
                 # SOUNDNESS / fail-closed: a jump to a custom chain on the
@@ -701,12 +757,37 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                 # the jump's true match space into "precise" ACEs (a resolved
                 # DENY wider than reality can FALSE-PASS a leak).
                 j_unresolvable = (r.imprecise or r.stateful
-                                  or r.icmp_type is not None)
+                                  or r.icmp_type is not None or r.goto)
+                if r.goto:
+                    # `-g` (goto) differs from `-j` exactly where resolution
+                    # relies on `-j` semantics: a packet that falls off the end
+                    # of the target chain does NOT resume at the next rule here
+                    # — it continues in THIS chain's caller (for a base chain:
+                    # the default policy). Resolving it as a jump would let a
+                    # later rule here decide traffic the policy really decides —
+                    # a FALSE PASS when that policy is ACCEPT. Keep the
+                    # fail-closed placeholder.
+                    notes.append(f"iptables `-g {r.jump_custom}` (goto) in {label}: "
+                                 f"fall-through skips the rest of {ch} (caller / "
+                                 f"default policy applies) — kept indeterminate "
+                                 f"(fail-closed), not resolved like a `-j` jump")
                 r.action = "permit"
                 r.imprecise = True
                 return _Item(r, line, (r.jump_custom, j_src, j_dst, j_proto,
                                        j_sports, j_dports, j_unresolvable))
             if r.jump_custom is None:
+                if r.base_return and r.unconditional():
+                    # An UNCONDITIONAL `-j RETURN` (no match criterion) ends the
+                    # chain exactly where it stands: every later rule is
+                    # unreachable, and the packet continues precisely as if it
+                    # had fallen off the end of the chain — the caller's next
+                    # rule (custom chain) or the default policy (base chain).
+                    # That is the exact model, so no fail-closed placeholder is
+                    # needed and it must NOT block jump resolution (the
+                    # allow-list-then-RETURN / DOCKER-USER idiom). Expansion
+                    # truncates the chain at this marker. A CONDITIONAL RETURN
+                    # keeps the fail-closed handling below.
+                    return _Item(None, line, chain_end=True)
                 # RETURN or NAT target: records that this chain uses control-
                 # flow constructs that prevent full precision modeling of any
                 # parent chain that jumps here. Non-terminating decorators
@@ -775,8 +856,10 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
 
         try:
             toks = shlex.split(rest, comments=False, posix=True)
+            unreliable = False
         except ValueError:
             toks = rest.split()
+            unreliable = True                # see parse_one: fail closed
         if not toks:
             continue
 
@@ -803,15 +886,15 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             if k + 1 < len(toks):
                 ch = toks[k + 1]
                 ensure_chain(ch)
-                items_by_chain[ch].append(parse_one(ch, toks[k + 2:], lineno))
+                items_by_chain[ch].append(parse_one(ch, toks[k + 2:], lineno,
+                                                    unreliable))
         elif "-I" in toks or "--insert" in toks:
             # Insert at 1-based position N (no index => the very front). iptables
             # evaluates the inserted rule BEFORE whatever rule currently sits at
             # position N, so we SPLICE it into the chain's ordered item list at
             # that slot — first-match order is thereby modeled (ACE `seq` is
             # assigned in list order at expansion). N past the end appends; N < 1
-            # is treated as 1 (front). The compensating "position not modeled"
-            # note is retained (contract of the transit-jump-edge tests).
+            # is treated as 1 (front).
             k = toks.index("-I") if "-I" in toks else toks.index("--insert")
             if k + 1 < len(toks):
                 ch = toks[k + 1]
@@ -820,13 +903,18 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                 if args and args[0].isdigit():
                     pos = int(args[0])          # capture the position, not drop it
                     args = args[1:]
-                notes.append(f"iptables `-I {ch}` insert in {ch} appended at end for "
-                             f"analysis — original insert position not modeled (verify)")
                 ensure_chain(ch)
-                item = parse_one(ch, args, lineno)
+                item = parse_one(ch, args, lineno, unreliable)
                 lst = items_by_chain[ch]
                 idx = 0 if pos is None else max(0, min(pos - 1, len(lst)))
                 lst.insert(idx, item)
+                # The note must describe what the model DOES: the insert is
+                # spliced at its slot (an earlier build appended it at the end
+                # and said so; that wording outlived the fix).
+                notes.append(f"iptables `-I {ch}{'' if pos is None else ' ' + str(pos)}` "
+                             f"insert modeled at position {idx + 1} of {ch} "
+                             f"(first-match order honored; it evaluates before "
+                             f"whatever held that slot)")
         elif "-P" in toks or "--policy" in toks:
             k = toks.index("-P") if "-P" in toks else toks.index("--policy")
             if k + 2 < len(toks):
@@ -843,15 +931,20 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                 if args and args[0].isdigit():
                     pos = int(args[0])
                     args = args[1:]
-                notes.append(f"iptables `-R {ch}` replace position not modeled "
-                             f"(verify) — rule appended at end for analysis")
                 ensure_chain(ch)
-                item = parse_one(ch, args, lineno)
+                item = parse_one(ch, args, lineno, unreliable)
                 lst = items_by_chain[ch]
                 if pos is not None and 1 <= pos <= len(lst):
                     lst[pos - 1] = item
+                    notes.append(f"iptables `-R {ch} {pos}` replace modeled in place: "
+                                 f"the new rule inherits position {pos} of {ch} "
+                                 f"(first-match order honored)")
                 else:
                     lst.append(item)
+                    notes.append(f"iptables `-R {ch}"
+                                 f"{'' if pos is None else ' ' + str(pos)}` replace "
+                                 f"position {'missing' if pos is None else 'out of range'}"
+                                 f" — rule appended at end of {ch} (verify)")
         elif "-D" in toks or "--delete" in toks:
             # Delete: removal not modeled — the deleted rule (if parsed earlier)
             # stays in the analysis. Surfaced, never silent.
@@ -900,7 +993,19 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     for ch in chains:
         aces_ch: List[ACE] = []
         seq = 0
-        for item in items_by_chain[ch]:
+        items = items_by_chain[ch]
+        for k, item in enumerate(items):
+            if item.chain_end:
+                # Unconditional RETURN: the chain ends here. Anything after it
+                # is never evaluated on the device — surface it, do not model
+                # it (a dead rule modeled live would misstate first-match).
+                dead = sum(1 for it in items[k + 1:] if it.r is not None)
+                if dead:
+                    notes.append(f"iptables chain {ch}: {dead} rule(s) after an "
+                                 f"unconditional `-j RETURN` are unreachable "
+                                 f"(never evaluated) — not modeled; delete or "
+                                 f"reorder them")
+                break
             if item.r is None:
                 continue                       # position holder — no ACE emitted
             ph_start = len(aces_ch)
@@ -985,6 +1090,19 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             notes.append(f"iptables base chain {ch} has rules but no explicit default "
                          f"policy in this config — default not modeled (paste the "
                          f"`:{ch} POLICY` line / `-P {ch} ...` to audit the fall-through)")
+        if mixed_family and chain_aces and ch in _BASE_CHAINS:
+            # Fail closed for IPv6 in a mixed file (see `mixed_family` above):
+            # an opaque, imprecise ::/0 marker makes every IPv6 witness search
+            # INDETERMINATE instead of a false PASS. It never intersects an
+            # IPv4 rectangle, so IPv4 verdicts stay exact, and being imprecise
+            # it can never prove a rule dead or fire an any/any finding.
+            seqs[ch] += 1
+            chain_aces.append(ACE(
+                seq=seqs[ch], action="permit", proto="ip", src=_ANY6, dst=_ANY6,
+                imprecise=True,
+                raw=f"{ch}: ip6tables rules in a mixed iptables/ip6tables file "
+                    f"(IPv6 modeled as indeterminate)",
+                acl=ch, line=0, transit=_is_transit(ch)))
         entries.extend(chain_aces)
 
     # iptables base chains (INPUT/FORWARD/OUTPUT) are INDEPENDENT first-match
@@ -995,7 +1113,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     # FORWARD permit (the soundness fix). Surface the chain inventory so the FORWARD
     # scoping is visible to an auditor.
     chains_with_rules = [c for c in chains if any(
-        "policy" not in a.raw for a in by_chain[c])]
+        it.r is not None for it in items_by_chain[c])]
     if len(chains_with_rules) > 1:
         notes.append("multiple iptables chains present "
                      f"({', '.join(chains_with_rules)}); they are independent "

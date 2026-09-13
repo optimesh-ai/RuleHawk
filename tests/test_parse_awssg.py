@@ -164,9 +164,13 @@ def test_a_permission_with_several_cidrs_expands_to_several_rules():
 ])
 def test_unresolvable_source_becomes_an_opaque_imprecise_rule(perm, label):
     aces, notes = parse_awssg(_sg(perm))
-    assert len(aces) == 1
-    assert aces[0].imprecise, "an unresolved source must never be modelled exactly"
-    assert aces[0].src.prefixlen == 0, "it must widen to ANY, never narrow"
+    # One opaque marker PER ADDRESS FAMILY: the referenced group / prefix list
+    # may hold IPv6 members, and a v4-only marker can never intersect a v6
+    # witness (it would leave every IPv6 assertion a false PASS).
+    assert sorted(a.src.version for a in aces) == [4, 6]
+    assert all(a.imprecise for a in aces), \
+        "an unresolved source must never be modelled exactly"
+    assert all(a.src.prefixlen == 0 for a in aces), "it must widen to ANY, never narrow"
     assert any(label in n for n in notes), "it must be surfaced, never silent"
 
 

@@ -19,7 +19,8 @@ _NOTES_CAP = 200
 # Canonical human-readable list of every vendor format RuleHawk can parse.
 # Kept in one place so the zero-rules error message and docs stay in sync.
 _SUPPORTED_VENDORS = (
-    "Cisco IOS/ASA, NX-OS, Arista EOS, Juniper Junos, Palo Alto PAN-OS, iptables"
+    "Cisco IOS/ASA, NX-OS, Arista EOS, Juniper Junos, Palo Alto PAN-OS, "
+    "iptables, AWS Security Groups"
 )
 
 
