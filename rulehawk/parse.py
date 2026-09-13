@@ -32,7 +32,8 @@ import ipaddress
 import re
 from typing import List, Optional, Tuple
 
-from .model import ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet
+from .model import (ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet,
+                    _PORTED)
 
 # IANA protocol numbers Cisco IOS/ASA/NX-OS/EOS accept verbatim in the proto
 # slot (`permit 47 ...` == `permit gre ...`). Cisco keeps the raw number in the
@@ -115,6 +116,14 @@ _NARROWING_QUALS = {"fragments", "time-range", "dscp", "tos", "precedence",
 # never mistaken for an ICMP type (`time-range WORKHOURS` is not type
 # "WORKHOURS"). `ttl` takes an operator plus value(s) and is handled inline.
 _QUAL_ARGC = {"time-range": 1, "dscp": 1, "tos": 1, "precedence": 1}
+# Surfaced whenever a port operator could not be modeled exactly (an `eq` /
+# `range` / `neq` service name outside the named-port table, or a degenerate
+# `gt 65535` / `lt 0`): the unmodeled port(s) are treated as ANY and the ACE
+# is marked imprecise. Widening silently left no audit trail — the only trace
+# was a segmentation INDETERMINATE with no stated cause.
+_PORT_OP_NOTE = ("port operator not modeled exactly (unknown service name or "
+                 "degenerate bound) — unmodeled port(s) treated as ANY, marked "
+                 "imprecise, verify manually: ")
 
 _ANY_NET = ipaddress.ip_network("0.0.0.0/0")
 _ANY6_NET = ipaddress.ip_network("::/0")
@@ -332,7 +341,13 @@ def _parse_port_op(tokens: List[str], i: int) -> Tuple[List[PortRange], int, boo
 
 def _entry_tokens(line: str) -> List[str]:
     s = line.strip()
-    s = re.sub(r"^\d+\s+", "", s)                                  # IOS seq num
+    # Leading sequence number: the bare IOS/NX-OS/EOS form (`10 permit ...`)
+    # and the IOS IPv6 form (`sequence 10 permit ...` — `show running-config`
+    # renders EVERY `ipv6 access-list` entry with the explicit keyword).
+    # Leaving the keyword in place made toks[0] "sequence", not an action, so
+    # every v6 entry was dropped as "unparsed": a SUBSET model of the ACL that
+    # false-PASSed IPv6 segmentation assertions while the v4 ACLs parsed fine.
+    s = re.sub(r"(?i)^(?:sequence\s+)?\d+\s+", "", s)
     # ASA prefix: name, optional `line N` (from `show access-list`), optional
     # `extended`/`standard` (parse_acls has already noted which one it was).
     s = re.sub(r"(?i)^access-list\s+\S+\s+(?:line\s+\d+\s+)?(?:extended\s+|standard\s+)?",
@@ -457,6 +472,15 @@ def _expand_proto(p: Optional[str]) -> Optional[List[str]]:
         return ["tcp", "udp"]
     if p in ("tcp", "udp", "icmp", "ip", "ipv6"):
         return [p]
+    # Other IANA protocols a service object can name — `service-object gre` /
+    # `service-object esp` / `service-object 50` are the VPN idiom in nearly
+    # every ASA config. Each is an exact, port-less protocol space that
+    # covers()/segcheck already compare by name, so resolving it is exact.
+    # Only the numbers and names the Cisco frontend itself normalizes are
+    # accepted; any other token stays fail-closed (never minted as a proto).
+    n = _norm_proto(p)
+    if p in _PROTO_NUM or n in _PROTO_NUM.values():
+        return [n]
     return None                              # unknown -> fail closed
 
 
@@ -499,8 +523,8 @@ def _svc_members(rest: List[str], header_proto: Optional[str]) -> List[Tuple]:
         if t0 in _PORT_OPS:                  # port-object: proto from the header
             protos = _expand_proto(header_proto)
             pr = _svc_port(rest, 0)
-            if protos is None or pr is None:
-                return [("bad",)]
+            if protos is None or pr is None or any(p not in _PORTED for p in protos):
+                return [("bad",)]            # ports on a port-less proto -> fail closed
             return [("svc", p, pr) for p in protos]
         protos = _expand_proto(t0)           # service-object PROTO ...
         if protos is None:
@@ -513,7 +537,10 @@ def _svc_members(rest: List[str], header_proto: Optional[str]) -> List[Tuple]:
         if idx >= len(rest):                 # protocol only -> any port
             return [("svc", p, ANY_PORTS) for p in protos]
         pr = _svc_port(rest, idx)
-        if pr is None:
+        if pr is None or any(p not in _PORTED for p in protos):
+            # Unparseable port operator, or a port on a port-less protocol
+            # (covers()/segcheck ignore ports there, so the member would claim
+            # the whole protocol) -> fail closed.
             return [("bad",)]
         return [("svc", p, pr) for p in protos]
     except (ValueError, IndexError):
@@ -778,6 +805,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     if srcs is None:
         return None
     imprecise = imp_s
+    port_imprecise = False                   # a port operator we could not model exactly
     ported = proto in ("tcp", "udp") if proto else True
 
     # Optional source port (only a literal operator; a source SERVICE group is
@@ -786,6 +814,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     if i < n and ported and toks[i].lower() in _PORT_OPS:
         src_ports, i, imp_sp, _ = _parse_port_op(toks, i)
         imprecise = imprecise or imp_sp
+        port_imprecise = port_imprecise or imp_sp
     elif i < n and _is_svc_ref(toks, i, defs):
         return None
 
@@ -824,6 +853,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     elif i < n and ported and toks[i].lower() in _PORT_OPS:
         dst_ports, i, imp_dp, _ = _parse_port_op(toks, i)
         imprecise = imprecise or imp_dp
+        port_imprecise = port_imprecise or imp_dp
         combos = [(proto, dp) for dp in dst_ports]
     else:
         combos = [(proto or "ip", ANY_PORTS)]
@@ -843,6 +873,8 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     # token stays unknown (fail closed below).
     icmp_type = _canon_icmp_type(type_tok) if proto in ("icmp", "icmpv6") else None
     rnotes: List[str] = []
+    if port_imprecise:
+        rnotes.append(_PORT_OP_NOTE + raw)
     if narrowing:
         # Same soundness rule as _parse_entry: a narrowed ACE modeled full-width
         # could shadow a real leak (deny) or fake one (permit) — fail closed.
@@ -926,6 +958,16 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             nm = m.group(1)
             line_std = bool(m.group(2)) or (nm.isdigit() and (
                 1 <= int(nm) <= 99 or 1300 <= int(nm) <= 1999))
+        if re.match(r"(?i)^evaluate\s+\S+", stripped):
+            # IOS reflexive ACL: `evaluate NAME` splices in the dynamic
+            # return-traffic entries that `reflect NAME` permits created. They
+            # match mirrored sessions only (return traffic, like `established`),
+            # so they never decide a NEW flow and cannot prove a rule dead —
+            # but the line must be surfaced, never dropped without a trace.
+            notes.append(f"IOS reflexive ACL `{stripped}` in {current_acl}: "
+                         f"dynamic return-traffic entries not modeled (stateful, "
+                         f"never a new-flow decision) — verify manually")
+            continue
         if not re.search(r"(?i)\b(permit|deny)\b", stripped):
             continue
         toks = _entry_tokens(raw.strip())
@@ -1004,7 +1046,7 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     return entries, notes
 
 
-_SEQ_PREFIX = re.compile(r"^\s*(\d+)\s")
+_SEQ_PREFIX = re.compile(r"(?i)^\s*(?:sequence\s+)?(\d+)\s")
 
 
 def _reorder_by_sequence(entries: List[ACE], notes: List[str]) -> List[ACE]:
@@ -1086,13 +1128,18 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0,
     # "prove" isolation the device doesn't enforce; a dropped `exec` port can
     # hide a real leak). Fail closed: mark imprecise and surface a note.
     unknown = list(extra_unknown)
-    if type_tok is not None and proto != "icmp":
+    if type_tok is not None and icmp_type is None:
+        # Mirrors _resolve_entry: the first free token is the modeled ICMP type
+        # for BOTH ICMP families (`permit 58 any any 128` is icmpv6 type 128,
+        # not an unknown qualifier); only a non-ICMP proto makes it unknown.
         unknown.insert(0, type_tok)
     imprecise = (imp_s or imp_d or imp_sp or imp_dp or bool(narrowing)
                  or bool(unknown))
     notes: List[str] = []
     if imp_s or imp_d:
         notes.append(f"imprecise mask (treated conservatively): {raw}")
+    if imp_sp or imp_dp:
+        notes.append(_PORT_OP_NOTE + raw)
     if narrowing:
         notes.append("match-narrowing qualifier "
                      + "/".join(sorted(set(narrowing)))

@@ -13,8 +13,8 @@ math or the fail-closed gates are caught by observable verdicts:
      imprecise and segcheck fails closed to INDETERMINATE;
   4. disjoint dst-port / src-port ranges — zero resolved ACEs; partial
      overlap — the intersected range, exactly;
-  5. `-I CHAIN [pos]` insert — parsed, appended at end, and the
-     compensating 'insert position not modeled (verify)' note is present
+  5. `-I CHAIN [pos]` insert — spliced at its slot (first-match order
+     modeled) and the note names the modeled position
      (the ONLY mitigation for the front-insert under-approximation);
   6. command-form `-t nat` — zero ACEs plus the filter-space-only note;
   7. `-N CUSTOM` declaration then a transit jump into it — resolves;
@@ -266,22 +266,26 @@ def test_partial_dport_overlap_resolves_to_exact_intersection():
     assert ":445" in viol[0].witness
 
 
-# ── (5) -I insert: appended at end, compensating note pinned ──────────────────
+# ── (5) -I insert: spliced at its slot, note names the modeled position ──────
 
 def test_insert_with_position_parsed_and_note_present():
-    """`-I FORWARD 1 ... -j DROP` — iptables inserts at the FRONT; RuleHawk
-    appends at the END. The 'insert position not modeled (verify)' note is the
-    ONLY mitigation for that under-approximation, so it must be pinned. The
-    numeric position token must be dropped, not parsed as a match option."""
+    """`-I FORWARD 1 ... -j DROP` — iptables inserts at the FRONT and RuleHawk
+    splices the rule into that slot (first-match order modeled). The note must
+    say exactly that: an earlier build appended the insert at the end and said
+    so, and that wording outlived the fix — a note claiming "position not
+    modeled" over a correctly modeled position misleads the auditor. The
+    numeric position token must be consumed, not parsed as a match option."""
     cfg = (
         "iptables -P FORWARD ACCEPT\n"
         "iptables -I FORWARD 1 -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp"
         " --dport 445 -j DROP\n"
     )
     aces, notes = parse_iptables(cfg)
-    assert any("insert" in n and "appended at end" in n
-               and "insert position not modeled (verify)" in n
-               for n in notes), "the compensating -I note is the only mitigation"
+    assert any("-I FORWARD 1" in n and "modeled at position 1" in n
+               and "first-match order honored" in n
+               for n in notes), "the -I note must name the modeled position"
+    assert not any("-I" in n and "not modeled" in n for n in notes), \
+        "stale 'position not modeled' wording must not survive the fix"
     fwd = _fwd_non_policy(aces)
     assert len(fwd) == 1
     ace = fwd[0]
@@ -306,7 +310,7 @@ def test_insert_without_position_also_parsed():
     assert len(fwd) == 1
     assert fwd[0].action == "permit" and fwd[0].dst_port.lo == 22
     assert str(fwd[0].src) == "10.20.0.0/16"
-    assert any("insert position not modeled" in n for n in notes)
+    assert any("`-I FORWARD`" in n and "modeled at position 1" in n for n in notes)
 
 
 # ── (6) command-form -t nat → skipped with the filter-space-only note ─────────
@@ -367,9 +371,10 @@ def test_new_chain_declaration_then_jump_resolves_precisely():
 def test_unbalanced_quote_falls_back_and_fails_closed():
     """A rule line with an unbalanced quote (a real-world `--comment "don't`)
     breaks shlex; the whitespace-split fallback must KEEP the rule (an ACCEPT
-    silently dropped would be an invisible hole) and the stray comment tokens
-    surface as unmodeled options → the ACE is imprecise → the segmentation
-    verdict fails closed to INDETERMINATE, never a PASS."""
+    silently dropped would be an invisible hole) but cannot be trusted — the
+    comment's words may be read as options or a target — so the line is
+    flagged unreliable → the ACE is imprecise → the segmentation verdict fails
+    closed to INDETERMINATE, never a PASS."""
     cfg = (
         "*filter\n"
         ":FORWARD DROP [0:0]\n"
@@ -382,8 +387,8 @@ def test_unbalanced_quote_falls_back_and_fails_closed():
     assert len(fwd) == 1, "unbalanced-quote rule must not be silently dropped"
     ace = fwd[0]
     assert ace.action == "permit" and ace.dst_port.lo == 445
-    assert ace.imprecise is True, "unmodeled comment tokens must fail closed"
-    assert any("unmodeled iptables option" in n for n in notes)
+    assert ace.imprecise is True, "an unreliably tokenized line must fail closed"
+    assert any("unbalanced quote" in n and "imprecise" in n for n in notes)
     kinds = {f.kind for f in check_segmentation(aces, _POLICY)}
     assert "segmentation-ok" not in kinds, \
         "imprecise permit for the forbidden flow must not PASS"

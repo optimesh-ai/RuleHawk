@@ -577,13 +577,15 @@ def test_nat_table_save_form_rules_emit_no_ace():
     assert any("nat" in n.lower() and "not modeled" in n for n in notes)
 
 
-def test_replace_noted_and_appended():
+def test_replace_noted_and_modeled_in_place():
     cfg = ("iptables -P INPUT DROP\n"
            "iptables -A INPUT -p tcp --dport 22 -j ACCEPT\n"
            "iptables -R INPUT 1 -p tcp --dport 2222 -j ACCEPT\n")
     aces, notes = parse_iptables(cfg)
     assert any(a.action == "permit" and a.dst_port.lo == 2222 for a in aces)
-    assert any("replace position not modeled" in n for n in notes)
+    # The replaced rule is gone and the replacement holds its slot.
+    assert not any(a.dst_port.lo == 22 for a in aces)
+    assert any("-R INPUT 1" in n and "modeled in place" in n for n in notes)
 
 
 def test_flush_clears_accumulated_rules():
