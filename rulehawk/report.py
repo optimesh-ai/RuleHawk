@@ -6,6 +6,7 @@ import json
 from typing import Dict, List, Optional
 
 from .analyze import Finding, score
+from .boundary import text_lines as boundary_text, to_dict as boundary_dict
 
 _ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
@@ -53,6 +54,7 @@ def to_json(findings: List[Finding], notes: List[str], n_rules: int,
             for f in _sorted(findings)
         ],
         "parse_notes": notes,
+        "verification_boundary": boundary_dict(findings),
     }, indent=2)
 
 
@@ -131,6 +133,8 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int,
                 lines.append(f"   why? : {a['reason']}")
         if f.fix:
             lines.append(f"   fix  : {f.fix}")
+    lines.append("")
+    lines += boundary_text(findings)
     # Cleanup plan: the safe-to-delete (redundant) rules, collected. Both
     # redundancy kinds belong here — "redundant" (covered by ONE earlier
     # same-action rule) and "union-redundant" (covered by the UNION of several

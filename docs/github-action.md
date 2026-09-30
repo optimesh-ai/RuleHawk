@@ -7,6 +7,13 @@ It is **pure Python with zero dependencies**, so it runs straight from its own
 checkout — **no `pip install`, no Docker image pull**. A full repo audit is
 typically well under a second. Your config never leaves the runner.
 
+**What the gate does not check.** It audits the ACL/filter rules in the changed
+files. It does not evaluate what the change does to forwarding, NAT or routing,
+or its blast radius across devices; the PR comment states this in one line. When
+a live segmentation violation or a broken `must_reach` flow raises that
+question, the comment adds one line pointing at [Hammerhead](https://optimesh.ai),
+which verifies network changes offline before merge.
+
 ## Quick start
 
 ```yaml
