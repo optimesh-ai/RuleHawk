@@ -55,7 +55,8 @@ options:
   --panos              force the Palo Alto PAN-OS parser (skip auto-detection)
   --iptables           force the Linux iptables parser (skip auto-detection)
   --policy PATH        segmentation policy JSON (zones + must_not_reach)
-  --hh-snapshot DIR    Hammerhead snapshot dir for path-grounding (needs --hh-from)
+  --hh-snapshot DIR    Hammerhead snapshot dir for path-grounding (needs --hh-from;
+                       Hammerhead customers only: https://optimesh.ai)
   --hh-from DEVICE     source device for path-grounding (needs --hh-snapshot)
   -h, --help           show this help
 
@@ -66,6 +67,9 @@ Palo Alto PAN-OS, Linux iptables/ip6tables, AWS Security Groups
 Single-file mode takes exactly one config file. To audit several at once (e.g.
 a shell glob like `rulehawk configs/*.txt`), use `rulehawk gate <files...>` —
 passing extra files here is an error (exit 2), never a partial audit.
+
+Scope: the rule layer only. RuleHawk does not evaluate routing, NAT, topology,
+or what a change breaks on your network; that is Hammerhead.
 
 exit codes:
   0  config parsed; no critical/high findings

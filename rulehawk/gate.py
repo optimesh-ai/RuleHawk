@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .analyze import Finding, analyze, score
+from .boundary import (HAMMERHEAD_CTA, HAMMERHEAD_URL,
+                       markdown_lines as boundary_markdown, triggers)
 from .evidence import Subject, build_evidence, to_evidence_markdown
 from .parse import parse_acls
 from .parse_iptables import detect as detect_iptables, parse_iptables
@@ -624,6 +626,15 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
                  f"{counts['low']} |")
     lines.append("")
 
+    # The audited files are a proposed change, but only its rule layer was
+    # checked. The overlay says so on every run; a reachability finding
+    # escalates it to the Hammerhead stop below the witness table.
+    all_findings = [f for fr in gate.files for f in fr.findings]
+    walled = bool(triggers(all_findings))
+    if not walled:
+        lines += boundary_markdown(all_findings, change=True)
+        lines.append("")
+
     # Segmentation witnesses get their own callout — the headline value.
     seg = [(fr, f) for fr, f in gate.real_findings
            if f.kind == "segmentation-violation"]
@@ -638,6 +649,9 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
         for fr, f in seg:
             loc = f"`{_sarif_uri(fr.path)}:{fr.line_of(f)}`"
             lines.append(f"| `{f.witness}` | {loc} | {f.fix} |")
+        lines.append("")
+    if walled:
+        lines += boundary_markdown(all_findings, change=True)
         lines.append("")
 
     # Per-file breakdown.
@@ -682,11 +696,11 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
                 lines.append(f"  fix: _{f.fix}_  ")
         if ok:
             lines.append("")
-            lines.append("Segmentation proven: "
+            lines.append("Segmentation proven: (rule layer) "
                          + ", ".join(f"`{f.rule_id.replace('!->', ' → ')}`" for f in ok))
         if conn_ok:
             lines.append("")
-            lines.append("Connectivity proven (must_reach): "
+            lines.append("Connectivity proven (must_reach, rule layer): "
                          + ", ".join(f"`{f.witness}`" for f in conn_ok))
         if fr.notes:
             lines += _notes_block(fr.notes)
@@ -755,6 +769,11 @@ def to_console(gate: GateResult) -> str:
     else:
         out.append(f"  VERDICT: FAIL — {len(gate.violations)} finding(s) "
                    f">= {gate.fail_on} (threshold --fail-on {gate.fail_on})")
+    out.append("  SCOPE  : rule layer only — forwarding/NAT/routing impact of "
+               "this change not evaluated")
+    if triggers(f for fr in gate.files for f in fr.findings):
+        out.append(f"  NEXT   : proving delivery on the live topology needs "
+                   f"Hammerhead — {HAMMERHEAD_CTA}: {HAMMERHEAD_URL}")
     out.append("=" * 68)
     return "\n".join(out)
 
