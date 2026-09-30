@@ -176,6 +176,18 @@
     padding:8px 11px;min-width:210px;color:var(--text);background:var(--surface)}
   .cta-form input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var(--accent)}
   .cta-msg{font-size:12.5px;color:var(--ok);font-weight:500}
+
+  /* verification boundary: hard stop after a reachability finding */
+  .wall{margin:4px 0 20px;border:1px solid var(--crit-bd);border-left:5px solid var(--crit);
+    border-radius:6px;padding:18px 20px;background:var(--surface)}
+  .wall-k{font-size:10.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--crit);margin-bottom:6px}
+  .wall-h{font-size:16px;font-weight:600;color:var(--text);margin-bottom:7px}
+  .wall-b{font-size:13.5px;color:var(--text);margin-bottom:10px;max-width:700px}
+  .wall-list{font-size:13px;color:var(--muted);margin:0 0 14px;padding-left:18px;max-width:700px}
+  .wall-list li{margin:3px 0}
+  .wall-btn{display:inline-block;font-size:14px;font-weight:600;text-decoration:none;
+    background:var(--crit);color:#fff;border:1px solid var(--crit);border-radius:4px;padding:10px 16px}
+  .wall-btn:hover{filter:brightness(.9)}
   a{color:var(--accent)}
   @media (max-width:640px){
     .wrap{padding:24px 16px 48px}
@@ -193,7 +205,7 @@
     <svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 4 6v6c0 5 3.5 7.5 8 10 4.5-2.5 8-5 8-10V6l-8-4z"/><path d="m9 12 2 2 4-4"/></svg>
     <div>
       <h1>RuleHawk</h1>
-      <p class="sub">Firewall &amp; segmentation auditor — paste or upload a config, get verifiable findings in seconds.</p>
+      <p class="sub">Free firewall &amp; ACL hygiene auditor — paste or upload a config, get verifiable rule-layer findings in seconds.</p>
     </div>
     <a class="ghlink" href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">View on GitHub</a>
   </header>
@@ -224,7 +236,7 @@
     <details class="adv">
       <summary>Segmentation policy (optional) — prove zones can't reach each other</summary>
       <p style="font-size:13px;color:var(--muted);margin:11px 0 8px">
-        Declare zones and <code>must_not_reach</code> rules; RuleHawk proves isolation or returns the concrete <b>witness packet</b> the ACL wrongly permits — audit-grade evidence.</p>
+        Declare zones and <code>must_not_reach</code> rules; RuleHawk proves the ACL isolates them or returns the concrete <b>witness packet</b> the ACL wrongly permits — audit-grade evidence for the rule layer.</p>
       <textarea id="policy" spellcheck="false" placeholder='{"zones":{"PCI":["10.10.0.0/16"],"CORP":["10.20.0.0/16"]},"must_not_reach":[{"src":"CORP","dst":"PCI","proto":"tcp","ports":[445,3389,22]}]}'></textarea>
       <div class="row"><button id="samplePolicy" class="linkbtn">load sample policy</button></div>
     </details>
@@ -341,7 +353,7 @@ const SAMPLES = {
 };
 const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
                         "parse_iptables", "parse_nxos", "parse_eos", "parse_awssg", "analyze", "report",
-                        "segcheck", "riskaccept", "evidence", "pathground"];
+                        "segcheck", "riskaccept", "evidence", "pathground", "boundary"];
 const PYODIDE_VER = "v0.26.4";
 // Fallback (main-thread) analysis stays synchronous, so cap it; the worker path has no cap.
 const FALLBACK_MAX_LINES = 4000;
@@ -356,7 +368,9 @@ const FALLBACK_MAX_LINES = 4000;
 // analytics" for the field-by-field contract.
 const ANALYTICS_ENDPOINT = "";   // e.g. "https://telemetry.optimesh.ai/e" — empty = disabled
 const LEAD_ENDPOINT      = "";   // optional: enables the results "notify me" email field
-const WAITLIST_URL       = "https://github.com/optimesh-ai/RuleHawk";  // where the results CTA points
+// Fallback only: the engine's report JSON carries verification_boundary.url
+// (rulehawk/boundary.py HAMMERHEAD_URL), which wins when present.
+const HAMMERHEAD_URL     = "https://optimesh.ai";
 
 // ?ref= identifies the OUTREACH recipient (e.g. ?ref=acme-netlead), not the user
 // or their config. It rides along on every event so you can see which outreach
@@ -701,10 +715,18 @@ function render(d, vendor){
     const cls = hasViol ? "fail" : (hasInd ? "warn" : "pass");
     const label = hasViol ? "Segmentation failed — a forbidden flow is permitted"
                 : hasInd  ? "Segmentation indeterminate — manual review needed"
-                : "Segmentation holds — no permitted flow violates the policy";
+                : "Segmentation holds at the rule layer — no permitted flow violates the policy";
     html += `<div class="segpanel"><div class="seghdr">Segmentation policy</div>
       <div class="segbanner ${cls}">${label}</div>`
       + seg.map(findingHTML).join("") + `</div>`;
+  }
+
+  // Hard stop: a reachability finding is where the rule-layer audit ends.
+  // Rendered above the hygiene findings, not after them.
+  const vb = d.verification_boundary || {};
+  if(vb.hammerhead_required){
+    html += wallHTML(vb);
+    track("wall_view", {});
   }
 
   if(!rest.length && !seg.length){
@@ -716,7 +738,7 @@ function render(d, vendor){
     html += rest.map(findingHTML).join("");
   }
   html += notesHTML(d.parse_notes);
-  html += ctaHTML();
+  html += ctaHTML(vb);
   box.innerHTML = html;
 
   // wire dynamic buttons
@@ -736,7 +758,7 @@ function render(d, vendor){
     }
   }));
 
-  // CTA: outbound "get updates" + (if LEAD_ENDPOINT set) an email opt-in
+  // CTAs: outbound Hammerhead access + (if LEAD_ENDPOINT set) an email opt-in
   box.querySelectorAll("[data-cta]").forEach(b =>
     b.addEventListener("click", () => track("cta_click", {target: b.dataset.cta})));
   const lead = box.querySelector("[data-lead]");
@@ -760,9 +782,28 @@ function notesHTML(notes, all){
     + shown.slice(0,20).map(n=>`<code>${esc(n)}</code>`).join("<br>") + `</div>`;
 }
 
-// ---- results call-to-action: turn a one-shot audit into the product funnel ----
-function ctaHTML(){
-  let row = `<a class="cta-btn" href="${esc(WAITLIST_URL)}" target="_blank" rel="noopener" data-cta="updates">Get updates →</a>`;
+// ---- the verification boundary: free rule-layer audit -> Hammerhead ----
+function hhUrl(vb){ return (vb && vb.url) || HAMMERHEAD_URL; }
+
+// Shown only when the engine says a finding needs real reachability to answer
+// (rulehawk/boundary.py). Copy comes from the engine so CLI, CI and page agree.
+function wallHTML(vb){
+  return `<div class="wall" role="alert">
+    <div class="wall-k">Hammerhead required to go further</div>
+    <div class="wall-h">${esc(vb.headline || "")}</div>
+    <div class="wall-b">${esc(vb.message || "")}</div>
+    <ul class="wall-list">
+      <li><b>RuleHawk (free):</b> the rule is wrong, with the witness packet and the fix at the ACL.</li>
+      <li><b>Hammerhead:</b> whether that packet is delivered on your live topology, and what any change (including the fix) breaks across routing, NAT and other devices, before you push.</li>
+    </ul>
+    <div class="cta-row">
+      <a class="wall-btn" href="${esc(hhUrl(vb))}" target="_blank" rel="noopener" data-cta="hammerhead-wall">${esc(vb.cta || "Request Hammerhead access")} →</a>
+    </div>
+  </div>`;
+}
+
+function ctaHTML(vb){
+  let row = `<a class="cta-btn" href="${esc(hhUrl(vb))}" target="_blank" rel="noopener" data-cta="hammerhead">Request Hammerhead access →</a>`;
   if(LEAD_ENDPOINT){
     row += `<form class="cta-form" data-lead>
       <input type="email" required placeholder="you@company.com" aria-label="Work email" />
@@ -771,14 +812,13 @@ function ctaHTML(){
     </form>`;
   }
   return `<div class="cta">
-    <div class="cta-h">This audits one config, once.</div>
-    <div class="cta-b">You just got an evidence artifact for this config — provenance, the
-      isolation claims that passed or failed, and the PCI&nbsp;DSS / NIST&nbsp;800-53 /
-      ISO&nbsp;27001 / CIS / SOC&nbsp;2 / HIPAA controls each bears on. The same artifact
-      regenerates across your whole fleet on every pull request via the <b>RuleHawk CI
-      gate</b>, so the audit trail builds itself instead of being reconstructed once a year
-      for an assessor. Want that, plus FortiOS and AWS Network ACLs? That’s what OptiMesh is
-      building on top of this engine.</div>
+    <div class="cta-h">RuleHawk checks the rules. It does not check what a change breaks.</div>
+    <div class="cta-b">This was a rule-layer audit: shadowed and dead rules, any-any, exposed
+      services, segmentation witnesses, and the evidence artifact for this config. It did not
+      evaluate routing, NAT or topology, so it cannot tell you whether a flow is actually
+      delivered, or what editing these rules breaks elsewhere on your network.
+      Want that answered before you push — offline, fail-closed, across every device the change
+      touches? That’s Hammerhead, OptiMesh’s network-change verification.</div>
     <div class="cta-row">${row}</div>
   </div>`;
 }
