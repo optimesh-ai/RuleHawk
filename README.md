@@ -3,6 +3,10 @@
 **Paste your firewall/ACL config → get a ranked list of dead, shadowed, and
 dangerously-permissive rules in seconds.** No agent, no integration, no account.
 
+RuleHawk tells you a rule is wrong and shows the packet that proves it. It
+audits the rule layer only, so it does not tell you what a change breaks on your
+network; see [*Where RuleHawk stops*](#where-rulehawk-stops-and-hammerhead-starts).
+
 ```
 python -m rulehawk samples/ios_acl.txt                         # human report
 python -m rulehawk samples/ios_acl.txt --json                  # machine/CI report
@@ -14,8 +18,8 @@ pip install -e .   # then:  rulehawk acl.txt
 Exit code is non-zero when a critical/high finding exists → drop it in CI.
 
 ## CI gate — audit a whole repo on every PR (GitHub Action)
-Keep your firewall configs in git and let RuleHawk gate every change. The
-`rulehawk gate` subcommand audits many files at once and emits a SARIF report
+Keep your firewall configs in git and let RuleHawk check the rule layer of every
+change. The `rulehawk gate` subcommand audits many files at once and emits a SARIF report
 (inline diff annotations), a sticky PR comment, and a job summary; it fails the
 check at a severity threshold you choose:
 
@@ -48,9 +52,12 @@ could not verify. See [`docs/github-action.md`](docs/github-action.md) for all
 inputs/outputs and the [worked example repo](https://github.com/optimesh-ai/acme-firewall-configs)
 for a copy-pasteable setup with a live bad-PR demo.
 
+The gate audits the **rules in the changed files**, not the change's effect on
+forwarding, and every PR comment says so in one line.
+
 ## Segmentation-intent (the audit/compliance layer)
-Declare zones + `must_not_reach` rules in a JSON policy, and RuleHawk proves
-isolation or reports a **concrete witness packet** the ACL wrongly permits — the
+Declare zones + `must_not_reach` rules in a JSON policy, and RuleHawk proves the
+ACL isolates them or reports a **concrete witness packet** the ACL wrongly permits — the
 auditor-grade evidence a manual review or a $100k AlgoSec deploy produces today:
 
 ```
@@ -70,9 +77,10 @@ ruleset permits **fails the gate** (`connectivity-broken`, high) before the
 rollout ships instead of during it. Filter-layer proof only — routing/NAT and
 the proxy itself are out of scope (see *Scope & limits*).
 
-### Path-grounded segmentation (Hammerhead)
-If you have a [Hammerhead](https://github.com/optimesh-ai/hammerhead) snapshot of
-the network, RuleHawk can verify each segmentation-violation witness against
+### Path-grounded segmentation (Hammerhead customers)
+This requires a licensed [Hammerhead](https://optimesh.ai) install and a
+Hammerhead snapshot of the network; RuleHawk alone cannot do it. With both,
+RuleHawk can verify each segmentation-violation witness against
 Hammerhead's forwarding model (`hammerhead reachability`), so violations on
 routing paths that can't actually deliver the packet are suppressed to
 informational, while confirmed leaks are stamped **path-confirmed**:
@@ -170,16 +178,37 @@ or a prefix list — is never dropped and never guessed: it becomes one opaque
 `imprecise` rule, so that part of the space stays **indeterminate** rather than
 silently passing.
 
+## Where RuleHawk stops (and Hammerhead starts)
+
+| Question | RuleHawk (free, Apache-2.0) | Hammerhead |
+|---|---|---|
+| Which rules are shadowed, dead, redundant, any-any, or expose risky services? | Yes | — |
+| Does this ACL permit a flow my policy forbids? (witness packet) | Yes, per ruleset | Yes |
+| Is that packet actually delivered across routing, NAT and topology? | No | Yes |
+| What does this change (or the fix) break, before I push? | No | Yes |
+| Blast radius of a change across multiple devices | No | Yes |
+
+Every report states that scope (JSON: `verification_boundary`). When a result
+raises a question only a forwarding model can answer (a live segmentation
+violation, or a broken `must_reach` flow) the report adds one "next step" line
+pointing at [Hammerhead](https://optimesh.ai). It stays quiet for hygiene-only
+results, for `*-indeterminate` findings (those need the rule fixed, not a
+forwarding model), for accepted risks, and for findings Hammerhead has already
+path-grounded.
+
 ## Scope & limits (what it does *not* model)
-RuleHawk is a fast, sound **config-change gate**, not a network-wide reachability
-simulator. It reasons about the **layer-3/4 packet space** only
+RuleHawk is a fast, sound **rule-layer gate** for config changes, not a
+network-wide reachability or change-impact verifier. It reasons about the
+**layer-3/4 packet space** only
 `(action, proto, src-net, dst-net, src-port, dst-port, icmp-type)`:
 - **NAT is not modeled** — it audits the filter (ACL/policy) layer; verify address
   translation separately (ASA `nat`/`static` are out of scope; the iptables `nat`
   table is surfaced as a note).
 - **No routing/topology** — each config is an independent first-match context, so a
   `segmentation-violation` means "a ruleset on the path permits the forbidden flow,"
-  not a full end-to-end reachability proof (that's [Batfish](https://github.com/batfish/batfish)).
+  not a full end-to-end reachability proof (that needs a forwarding model such as
+  [Batfish](https://github.com/batfish/batfish), or [Hammerhead](https://optimesh.ai)
+  to also verify a change offline before you push).
 - **L7/identity** (PAN-OS app-ID, source-user), `time-range`, `inactive`, interface
   bindings, and fragments are over-approximated/treated conservatively and surfaced
   as notes — RuleHawk errs toward over-reporting and **fails closed**, never toward a
@@ -205,7 +234,10 @@ is **off by default** — set two constants at the top of the `<script>` in
   - `scan_run` — that an audit ran, a coarse size **bucket** (e.g. `50-199`,
     never the exact count), and whether a segmentation policy was used.
     **Never the config, never the findings.**
-  - `cta_click` / `lead_capture` — interaction with the results call-to-action.
+  - `wall_view` — the "what RuleHawk can't tell you" panel was shown (no
+    finding details attached).
+  - `cta_click` / `lead_capture` — interaction with the results call-to-action
+    (`target` is `ci-gate`, `hammerhead` or `hammerhead-wall`).
 
   Point it at any collector: a Cloudflare Worker, a Plausible/Umami proxy, or
   your own endpoint.
@@ -233,6 +265,7 @@ Apache-2.0 — see `LICENSE`.
 - `rulehawk/analyze.py` — the rule-space analysis engine (the core IP).
 - `rulehawk/segcheck.py` — segmentation-intent proof (witness packets).
 - `rulehawk/pathground.py` — Hammerhead path-grounding of segmentation witnesses (`--hh-snapshot`/`--hh-from`).
+- `rulehawk/boundary.py` — the verification boundary: the scope every report states, and when a finding needs a forwarding model.
 - `rulehawk/report.py` — text + JSON reports.
 - `rulehawk/gate.py` — the CI gate: multi-file audit → SARIF + PR comment + summary.
 - `rulehawk/cli.py` — `python -m rulehawk` (+ the `gate` subcommand).

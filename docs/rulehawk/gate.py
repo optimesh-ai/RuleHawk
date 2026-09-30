@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .analyze import Finding, analyze, score
+from .boundary import HAMMERHEAD_URL, markdown_lines as boundary_markdown, triggers
 from .evidence import Subject, build_evidence, to_evidence_markdown
 from .parse import parse_acls
 from .parse_iptables import detect as detect_iptables, parse_iptables
@@ -615,6 +616,9 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
     lines.append("")
     lines.append(verdict)
     lines.append("")
+    lines.append("<sub>Rule-layer audit: routing, NAT and topology are not "
+                 "evaluated.</sub>")
+    lines.append("")
     # Headline metrics row.
     score_txt = f"{sc}/100" if sc is not None else "—"
     lines.append(f"| Score | Files | Rules | Critical | High | Medium | Low |")
@@ -638,6 +642,12 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
         for fr, f in seg:
             loc = f"`{_sarif_uri(fr.path)}:{fr.line_of(f)}`"
             lines.append(f"| `{f.witness}` | {loc} | {f.fix} |")
+        lines.append("")
+    # A finding only a forwarding model can answer gets one "next step" line;
+    # everything else stays quiet (see boundary.py for what triggers it).
+    handoff = boundary_markdown(f for fr in gate.files for f in fr.findings)
+    if handoff:
+        lines += handoff
         lines.append("")
 
     # Per-file breakdown.
@@ -682,11 +692,11 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
                 lines.append(f"  fix: _{f.fix}_  ")
         if ok:
             lines.append("")
-            lines.append("Segmentation proven: "
+            lines.append("Segmentation proven (rule layer): "
                          + ", ".join(f"`{f.rule_id.replace('!->', ' → ')}`" for f in ok))
         if conn_ok:
             lines.append("")
-            lines.append("Connectivity proven (must_reach): "
+            lines.append("Connectivity proven (must_reach, rule layer): "
                          + ", ".join(f"`{f.witness}`" for f in conn_ok))
         if fr.notes:
             lines += _notes_block(fr.notes)
@@ -755,6 +765,11 @@ def to_console(gate: GateResult) -> str:
     else:
         out.append(f"  VERDICT: FAIL — {len(gate.violations)} finding(s) "
                    f">= {gate.fail_on} (threshold --fail-on {gate.fail_on})")
+    out.append("  SCOPE  : rule layer only; routing, NAT and topology not "
+               "evaluated")
+    if triggers(f for fr in gate.files for f in fr.findings):
+        out.append(f"  NEXT   : delivery and change impact need a forwarding "
+                   f"model: Hammerhead, {HAMMERHEAD_URL}")
     out.append("=" * 68)
     return "\n".join(out)
 
