@@ -78,8 +78,8 @@ rollout ships instead of during it. Filter-layer proof only — routing/NAT and
 the proxy itself are out of scope (see *Scope & limits*).
 
 ### Path-grounded segmentation (Hammerhead)
-If you have a [Hammerhead](https://github.com/optimesh-ai/hammerhead) snapshot of
-the network, RuleHawk can verify each segmentation-violation witness against
+If you have a Hammerhead snapshot of the network (Hammerhead is licensed
+separately with [Hammerhead Team or Enterprise](https://optimesh.ai/#pricing)), RuleHawk can verify each segmentation-violation witness against
 Hammerhead's forwarding model (`hammerhead reachability`), so violations on
 routing paths that can't actually deliver the packet are suppressed to
 informational, while confirmed leaks are stamped **path-confirmed**:
@@ -231,7 +231,8 @@ The privacy banner on the page auto-discloses usage counting **only when
 sync.
 
 ## License
-Apache-2.0 — see `LICENSE`.
+RuleHawk is Apache-2.0 — see `LICENSE`. This licence covers RuleHawk only;
+Hammerhead is proprietary and licensed separately.
 
 ## Layout
 - `rulehawk/model.py` — normalized ACE + `covers()` (packet-space containment).

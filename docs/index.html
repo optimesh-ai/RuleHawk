@@ -195,12 +195,12 @@
       <h1>Hammerhead firewall audit</h1>
       <p class="sub">Free, from Optimesh — paste or upload a config, get verifiable findings in seconds. Formerly RuleHawk.</p>
     </div>
-    <a class="ghlink" href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">View on GitHub</a>
+    <a class="ghlink" href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">RuleHawk on GitHub</a>
   </header>
 
   <div class="privacy">
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-    <span><b>Runs entirely in your browser.</b> Configs are analyzed locally via WebAssembly — your config and its findings are <b>never uploaded or stored</b>. <span id="usage-note"></span>Same open-source engine you can <a href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">read and run yourself</a>.</span>
+    <span><b>Runs entirely in your browser.</b> Configs are analyzed locally via WebAssembly — your config and its findings are <b>never uploaded or stored</b>. <span id="usage-note"></span>The same open-source RuleHawk engine you can <a href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">read and run yourself</a>.</span>
   </div>
 
   <div class="card" id="config-card">
@@ -235,7 +235,7 @@
   <footer>
     <div>Prefer the terminal? Runs locally, scriptable, CI-ready:</div>
     <div class="cli"><code>pipx install git+https://github.com/optimesh-ai/RuleHawk.git</code><br>then <code>rulehawk acl.txt --json</code></div>
-    <div>Open-source (Apache-2.0) · <a href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">github.com/optimesh-ai/RuleHawk</a> · exits non-zero on critical/high for CI gating.</div>
+    <div>RuleHawk is open-source (Apache-2.0) · <a href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">github.com/optimesh-ai/RuleHawk</a> · exits non-zero on critical/high for CI gating.</div>
   </footer>
 </div>
 
@@ -778,7 +778,7 @@ function ctaHTML(){
       <code>rulehawk</code> CLI and GitHub Action repeat this audit on every pull request.
       Want a verdict on what a change does to the whole network, not just the rules it
       touches? <b>Hammerhead Team</b> models routing, reachability and segmentation across
-      every device and gives each change a pass, fail or unknown. 14-day trial.</div>
+      the devices in your model and gives each change a pass, fail or unknown. 14-day trial.</div>
     <div class="cta-row">${row}</div>
   </div>`;
 }
