@@ -224,7 +224,7 @@
     <details class="adv">
       <summary>Segmentation policy (optional) — prove zones can't reach each other</summary>
       <p style="font-size:13px;color:var(--muted);margin:11px 0 8px">
-        Declare zones and <code>must_not_reach</code> rules; RuleHawk proves isolation or returns the concrete <b>witness packet</b> the ACL wrongly permits — audit-grade evidence.</p>
+        Declare zones and <code>must_not_reach</code> rules; the audit checks isolation against the rulesets you supply, or returns the concrete <b>witness packet</b> the ACL wrongly permits. Routing and NAT are not modeled.</p>
       <textarea id="policy" spellcheck="false" placeholder='{"zones":{"PCI":["10.10.0.0/16"],"CORP":["10.20.0.0/16"]},"must_not_reach":[{"src":"CORP","dst":"PCI","proto":"tcp","ports":[445,3389,22]}]}'></textarea>
       <div class="row"><button id="samplePolicy" class="linkbtn">load sample policy</button></div>
     </details>
@@ -356,7 +356,7 @@ const FALLBACK_MAX_LINES = 4000;
 // analytics" for the field-by-field contract.
 const ANALYTICS_ENDPOINT = "";   // e.g. "https://telemetry.optimesh.ai/e" — empty = disabled
 const LEAD_ENDPOINT      = "";   // optional: enables the results "notify me" email field
-const WAITLIST_URL       = "https://optimesh.ai/#pricing";  // where the results CTA points: the Hammerhead Team trial
+const WAITLIST_URL       = "https://optimesh.ai/#trial";  // where the results CTA points: the Hammerhead Team trial request
 
 // ?ref= identifies the OUTREACH recipient (e.g. ?ref=acme-netlead), not the user
 // or their config. It rides along on every event so you can see which outreach
@@ -762,7 +762,7 @@ function notesHTML(notes, all){
 
 // ---- results call-to-action: turn a one-shot audit into the product funnel ----
 function ctaHTML(){
-  let row = `<a class="cta-btn" href="${esc(WAITLIST_URL)}" target="_blank" rel="noopener" data-cta="team-trial">Start a Hammerhead Team trial →</a>`;
+  let row = `<a class="cta-btn" href="${esc(WAITLIST_URL)}" target="_blank" rel="noopener" data-cta="team-trial">Request a 14-day Team trial →</a>`;
   if(LEAD_ENDPOINT){
     row += `<form class="cta-form" data-lead>
       <input type="email" required placeholder="you@company.com" aria-label="Work email" />
@@ -774,11 +774,11 @@ function ctaHTML(){
     <div class="cta-h">This audits one config, once.</div>
     <div class="cta-b">You just got an evidence artifact for this config — provenance, the
       isolation claims that passed or failed, and the PCI&nbsp;DSS / NIST&nbsp;800-53 /
-      ISO&nbsp;27001 / CIS / SOC&nbsp;2 / HIPAA controls each bears on. The same artifact
-      regenerates across your whole fleet on every pull request with <b>Hammerhead Team</b>,
-      so the audit trail builds itself instead of being reconstructed once a year for an
-      assessor. Want a verdict on what a change breaks, not just on the rules it touches?
-      Team also simulates routing and reachability across every device. 14-day trial.</div>
+      ISO&nbsp;27001 / CIS / SOC&nbsp;2 / HIPAA controls each bears on. The free
+      <code>rulehawk</code> CLI and GitHub Action repeat this audit on every pull request.
+      Want a verdict on what a change does to the whole network, not just the rules it
+      touches? <b>Hammerhead Team</b> models routing, reachability and segmentation across
+      every device and gives each change a pass, fail or unknown. 14-day trial.</div>
     <div class="cta-row">${row}</div>
   </div>`;
 }
