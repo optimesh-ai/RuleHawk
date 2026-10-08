@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>RuleHawk — firewall &amp; segmentation auditor</title>
+<title>Hammerhead firewall audit — free, in your browser</title>
 <meta name="description" content="Paste or upload a Cisco IOS / ASA, Cisco NX-OS, Juniper Junos, Palo Alto PAN-OS, Linux iptables, or Arista EOS config and get a ranked list of dead, shadowed, redundant, and dangerously-permissive rules in seconds. Vendor is auto-detected. Runs entirely in your browser — your config never leaves your machine." />
 <!--
   RuleHawk web tool — 100% client-side.
@@ -192,8 +192,8 @@
   <header class="top">
     <svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 4 6v6c0 5 3.5 7.5 8 10 4.5-2.5 8-5 8-10V6l-8-4z"/><path d="m9 12 2 2 4-4"/></svg>
     <div>
-      <h1>RuleHawk</h1>
-      <p class="sub">Firewall &amp; segmentation auditor — paste or upload a config, get verifiable findings in seconds.</p>
+      <h1>Hammerhead firewall audit</h1>
+      <p class="sub">Free, from Optimesh — paste or upload a config, get verifiable findings in seconds. Formerly RuleHawk.</p>
     </div>
     <a class="ghlink" href="https://github.com/optimesh-ai/RuleHawk" target="_blank" rel="noopener">View on GitHub</a>
   </header>
@@ -356,7 +356,7 @@ const FALLBACK_MAX_LINES = 4000;
 // analytics" for the field-by-field contract.
 const ANALYTICS_ENDPOINT = "";   // e.g. "https://telemetry.optimesh.ai/e" — empty = disabled
 const LEAD_ENDPOINT      = "";   // optional: enables the results "notify me" email field
-const WAITLIST_URL       = "https://github.com/optimesh-ai/RuleHawk";  // where the results CTA points
+const WAITLIST_URL       = "https://optimesh.ai/#pricing";  // where the results CTA points: the Hammerhead Team trial
 
 // ?ref= identifies the OUTREACH recipient (e.g. ?ref=acme-netlead), not the user
 // or their config. It rides along on every event so you can see which outreach
@@ -463,7 +463,7 @@ function bootProgressHtml(m){
   if(m.stage === "engine"){
     const total = (+m.total > 0) ? +m.total : ENGINE_MODULES.length;
     const n = Math.min((+m.loaded || 0) + 1, total);
-    return '<span class="spin"></span>Loading RuleHawk engine (' + n + '/' + total + ')…';
+    return '<span class="spin"></span>Loading the audit engine (' + n + '/' + total + ')…';
   }
   if(m.stage === "start") return '<span class="spin"></span>Starting engine…';
   return '<span class="spin"></span>Loading analysis engine…';
@@ -762,7 +762,7 @@ function notesHTML(notes, all){
 
 // ---- results call-to-action: turn a one-shot audit into the product funnel ----
 function ctaHTML(){
-  let row = `<a class="cta-btn" href="${esc(WAITLIST_URL)}" target="_blank" rel="noopener" data-cta="updates">Get updates →</a>`;
+  let row = `<a class="cta-btn" href="${esc(WAITLIST_URL)}" target="_blank" rel="noopener" data-cta="team-trial">Start a Hammerhead Team trial →</a>`;
   if(LEAD_ENDPOINT){
     row += `<form class="cta-form" data-lead>
       <input type="email" required placeholder="you@company.com" aria-label="Work email" />
@@ -775,10 +775,10 @@ function ctaHTML(){
     <div class="cta-b">You just got an evidence artifact for this config — provenance, the
       isolation claims that passed or failed, and the PCI&nbsp;DSS / NIST&nbsp;800-53 /
       ISO&nbsp;27001 / CIS / SOC&nbsp;2 / HIPAA controls each bears on. The same artifact
-      regenerates across your whole fleet on every pull request via the <b>RuleHawk CI
-      gate</b>, so the audit trail builds itself instead of being reconstructed once a year
-      for an assessor. Want that, plus FortiOS and AWS Network ACLs? That’s what OptiMesh is
-      building on top of this engine.</div>
+      regenerates across your whole fleet on every pull request with <b>Hammerhead Team</b>,
+      so the audit trail builds itself instead of being reconstructed once a year for an
+      assessor. Want a verdict on what a change breaks, not just on the rules it touches?
+      Team also simulates routing and reachability across every device. 14-day trial.</div>
     <div class="cta-row">${row}</div>
   </div>`;
 }

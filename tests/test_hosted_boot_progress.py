@@ -115,7 +115,7 @@ def test_index_maps_all_three_stages_to_distinct_text():
     for stage in _STAGES:
         assert f'"{stage}"' in body, f"stage {stage!r} has no status mapping"
     assert "Downloading analysis runtime" in body       # honest: it IS a download
-    assert "Loading RuleHawk engine (" in body          # honest: N-of-total count
+    assert "Loading the audit engine (" in body          # honest: N-of-total count
     assert "Starting engine" in body
     # total falls back to the pinned module list, never a made-up number
     assert "ENGINE_MODULES.length" in body
