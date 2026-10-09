@@ -52,7 +52,7 @@ A bad change that opens CORP→PCI on SMB/445 gets blocked with the witness pack
 `10.20.0.1 -> 10.10.0.1:445` annotated on the exact line. A file that parses to
 **zero** rules **fails closed** (exit 2) — RuleHawk never certifies isolation it
 could not verify. See [`docs/github-action.md`](docs/github-action.md) for all
-inputs/outputs and the [worked example repo](https://github.com/optimesh-ai/acme-firewall-configs)
+inputs/outputs and the [worked example repo](https://github.com/optimesh-ai/rulehawk-demo)
 for a copy-pasteable setup with a live bad-PR demo.
 
 ## Segmentation-intent (the audit/compliance layer)

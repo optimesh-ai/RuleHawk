@@ -36,7 +36,7 @@ jobs:
 ```
 
 A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
-[`acme-firewall-configs`](https://github.com/optimesh-ai/acme-firewall-configs) repo.
+[`rulehawk-demo`](https://github.com/optimesh-ai/rulehawk-demo) repo.
 
 ## Inputs
 
