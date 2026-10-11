@@ -206,7 +206,7 @@
   <div class="card" id="config-card">
     <label class="fld" for="config">Firewall / ACL config <span class="hint">— Cisco IOS/ASA, Cisco NX-OS, Arista EOS, Juniper Junos, Palo Alto PAN-OS, Linux iptables, or AWS Security Groups (describe-security-groups JSON) · vendor auto-detected · paste, drag &amp; drop a file, or upload</span></label>
     <textarea id="config" spellcheck="false" placeholder="ip access-list extended EDGE_IN&#10; permit tcp any host 203.0.113.10 eq 443&#10; ...&#10;&#10;…or drag a config file onto this box."></textarea>
-    <input type="file" id="file" accept=".txt,.cfg,.conf,.acl,.lst,.log,text/plain" style="display:none" />
+    <input type="file" id="file" accept=".txt,.cfg,.conf,.acl,.lst,.log,.json,text/plain,application/json" style="display:none" />
     <div class="row">
       <button class="primary" id="audit" disabled>Audit</button>
       <button id="upload">Upload file</button>
@@ -225,7 +225,7 @@
       <summary>Segmentation policy (optional) — prove zones can't reach each other</summary>
       <p style="font-size:13px;color:var(--muted);margin:11px 0 8px">
         Declare zones and <code>must_not_reach</code> rules; the audit checks isolation against the rulesets you supply, or returns the concrete <b>witness packet</b> the ACL wrongly permits. Routing and NAT are not modeled.</p>
-      <textarea id="policy" spellcheck="false" placeholder='{"zones":{"PCI":["10.10.0.0/16"],"CORP":["10.20.0.0/16"]},"must_not_reach":[{"src":"CORP","dst":"PCI","proto":"tcp","ports":[445,3389,22]}]}'></textarea>
+      <textarea id="policy" aria-label="Segmentation policy (JSON)" spellcheck="false" placeholder='{"zones":{"PCI":["10.10.0.0/16"],"CORP":["10.20.0.0/16"]},"must_not_reach":[{"src":"CORP","dst":"PCI","proto":"tcp","ports":[445,3389,22]}]}'></textarea>
       <div class="row"><button id="samplePolicy" class="linkbtn">load sample policy</button></div>
     </details>
   </div>
