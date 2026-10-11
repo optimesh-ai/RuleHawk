@@ -5,7 +5,7 @@
 > and this open-source package and its GitHub Action stay free and keep working under
 > the `rulehawk` name. To check what a change does across your whole network (routing,
 > reachability and segmentation, not just rules), see
-> [Hammerhead Team](https://optimesh.ai/#pricing).
+> [Hammerhead](https://optimesh.ai/#pricing) (plans start free; access is by request).
 
 **Paste your firewall/ACL config → get a ranked list of dead, shadowed, and
 dangerously-permissive rules in seconds.** No agent, no integration, no account.
@@ -79,7 +79,7 @@ the proxy itself are out of scope (see *Scope & limits*).
 
 ### Path-grounded segmentation (Hammerhead)
 If you have a Hammerhead snapshot of the network (Hammerhead is licensed
-separately with [Hammerhead Team or Enterprise](https://optimesh.ai/#pricing)), RuleHawk can verify each segmentation-violation witness against
+separately; see [Hammerhead pricing](https://optimesh.ai/#pricing)), RuleHawk can verify each segmentation-violation witness against
 Hammerhead's forwarding model (`hammerhead reachability`), so violations on
 routing paths that can't actually deliver the packet are suppressed to
 informational, while confirmed leaks are stamped **path-confirmed**:

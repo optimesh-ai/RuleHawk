@@ -356,7 +356,7 @@ const FALLBACK_MAX_LINES = 4000;
 // analytics" for the field-by-field contract.
 const ANALYTICS_ENDPOINT = "";   // e.g. "https://telemetry.optimesh.ai/e" — empty = disabled
 const LEAD_ENDPOINT      = "";   // optional: enables the results "notify me" email field
-const WAITLIST_URL       = "https://optimesh.ai/#trial";  // where the results CTA points: the Hammerhead Team trial request
+const WAITLIST_URL       = "https://optimesh.ai/#trial";  // where the results CTA points: the Hammerhead access request form
 
 // ?ref= identifies the OUTREACH recipient (e.g. ?ref=acme-netlead), not the user
 // or their config. It rides along on every event so you can see which outreach
@@ -762,7 +762,7 @@ function notesHTML(notes, all){
 
 // ---- results call-to-action: turn a one-shot audit into the product funnel ----
 function ctaHTML(){
-  let row = `<a class="cta-btn" href="${esc(WAITLIST_URL)}" target="_blank" rel="noopener" data-cta="team-trial">Request a 14-day Team trial →</a>`;
+  let row = `<a class="cta-btn" href="${esc(WAITLIST_URL)}" target="_blank" rel="noopener" data-cta="request-access">Request Hammerhead access →</a>`;
   if(LEAD_ENDPOINT){
     row += `<form class="cta-form" data-lead>
       <input type="email" required placeholder="you@company.com" aria-label="Work email" />
@@ -777,8 +777,9 @@ function ctaHTML(){
       ISO&nbsp;27001 / CIS / SOC&nbsp;2 / HIPAA controls each bears on. The free
       <code>rulehawk</code> CLI and GitHub Action repeat this audit on every pull request.
       Want a verdict on what a change does to the whole network, not just the rules it
-      touches? <b>Hammerhead Team</b> models routing, reachability and segmentation across
-      the devices in your model and gives each change a pass, fail or unknown. 14-day trial.</div>
+      touches? <b>Hammerhead</b> models routing, reachability and segmentation across
+      the devices in your model and gives each change a pass, fail or unknown. Plans start
+      free; access is by request.</div>
     <div class="cta-row">${row}</div>
   </div>`;
 }
