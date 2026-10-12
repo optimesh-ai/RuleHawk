@@ -9,7 +9,7 @@
 // parity.py fails the build if this list, the dispatch, or the engine drift apart.
 const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
                         "parse_iptables", "parse_nxos", "parse_eos", "parse_awssg", "analyze", "report",
-                        "segcheck", "riskaccept", "evidence", "pathground"];
+                        "segcheck", "riskaccept", "evidence", "pathground", "boundary"];
 
 // Build the report envelope: structured JSON + human-readable text + a
 // rule_id -> source-line map so the UI can jump from a finding to its rule.

@@ -104,9 +104,9 @@ definition in version control next to the configs):
 **Scope caveat (read this):** `connectivity-ok` proves the **filter layer does
 not block the flow** in the audited configs. RuleHawk does not model routing,
 NAT, or the proxy itself (see the README's *Scope & limits*) — it is the
-firewall-side precheck, not an end-to-end path proof. For path grounding
-against a forwarding model, combine with `--hh-snapshot`/`--hh-from`
-(Hammerhead path-grounding).
+firewall-side precheck, not an end-to-end path proof. Path grounding against a
+forwarding model needs [Hammerhead](https://optimesh.ai); Hammerhead customers
+can combine it with `--hh-snapshot`/`--hh-from`.
 
 ## Examples
 

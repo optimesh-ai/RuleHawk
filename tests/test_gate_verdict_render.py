@@ -134,7 +134,7 @@ def test_pass_verdict_rendered_in_markdown_and_console(tmp_path):
     assert "**PASS** — no findings at or above `high`." in md
     assert "✅" in md and "FAIL" not in md
     # the proven isolation is celebrated, not hidden
-    assert "Segmentation proven:" in md
+    assert "Segmentation proven (rule layer):" in md
     # privacy promise footer is always present
     assert "never leaves your infrastructure" in md
 
