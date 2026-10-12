@@ -36,7 +36,9 @@ from typing import Dict, Iterable, List
 
 from .analyze import Finding
 
-HAMMERHEAD_URL = "https://optimesh.ai"
+# Hammerhead needs a licence for every command, so the handoff points at the
+# access request form, not a download.
+HAMMERHEAD_URL = "https://optimesh.ai/#trial"
 
 NOT_EVALUATED = ("routing", "nat", "topology", "change-impact")
 
@@ -56,7 +58,8 @@ _NEXT = {
     ),
 }
 
-_HH_TAIL = "Hammerhead verifies that offline, before you push"
+_HH_TAIL = ("Hammerhead verifies that offline, before you push "
+            "(access by request)")
 
 # Stamps pathground.py appends once Hammerhead has seen a witness.
 # tests/test_boundary.py runs every Reach verdict through path_ground, so a
@@ -112,7 +115,7 @@ def markdown_lines(findings: Iterable[Finding]) -> List[str]:
     if not step:
         return []
     return [f"> **Next:** {step} [Hammerhead]({HAMMERHEAD_URL}) verifies that "
-            "offline, before merge."]
+            "offline, before merge (access by request)."]
 
 
 def _wrap(text: str, width: int, indent: str = "") -> List[str]:

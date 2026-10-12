@@ -192,7 +192,7 @@ def test_hosted_page_ctas():
     html = _index()
     assert f'const HAMMERHEAD_URL     = "{_HH}"' in html
     assert "WAITLIST_URL" not in html and "Get updates" not in html
-    for target in ("ci-gate", "hammerhead", "hammerhead-wall"):
+    for target in ("ci-gate", "request-access", "hammerhead-wall"):
         assert f'data-cta="{target}"' in html
     wall = html[html.index("function wallHTML"):html.index("function ctaHTML")]
     assert 'role="alert"' not in wall

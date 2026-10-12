@@ -1,5 +1,12 @@
 # RuleHawk
 
+> **RuleHawk is now the Hammerhead firewall audit.** The same engine runs free in
+> your browser at [optimesh-ai.github.io/RuleHawk](https://optimesh-ai.github.io/RuleHawk/),
+> and this open-source package and its GitHub Action stay free and keep working under
+> the `rulehawk` name. To check what a change does across your whole network (routing,
+> reachability and segmentation, not just rules), see
+> [Hammerhead](https://optimesh.ai/#pricing) (plans start free; access is by request).
+
 **Paste your firewall/ACL config → get a ranked list of dead, shadowed, and
 dangerously-permissive rules in seconds.** No agent, no integration, no account.
 
@@ -49,7 +56,7 @@ A bad change that opens CORP→PCI on SMB/445 gets blocked with the witness pack
 `10.20.0.1 -> 10.10.0.1:445` annotated on the exact line. A file that parses to
 **zero** rules **fails closed** (exit 2) — RuleHawk never certifies isolation it
 could not verify. See [`docs/github-action.md`](docs/github-action.md) for all
-inputs/outputs and the [worked example repo](https://github.com/optimesh-ai/acme-firewall-configs)
+inputs/outputs and the [worked example repo](https://github.com/optimesh-ai/rulehawk-demo)
 for a copy-pasteable setup with a live bad-PR demo.
 
 The gate audits the **rules in the changed files**, not the change's effect on
@@ -78,9 +85,10 @@ rollout ships instead of during it. Filter-layer proof only — routing/NAT and
 the proxy itself are out of scope (see *Scope & limits*).
 
 ### Path-grounded segmentation (Hammerhead customers)
-This requires a licensed [Hammerhead](https://optimesh.ai) install and a
-Hammerhead snapshot of the network; RuleHawk alone cannot do it. With both,
-RuleHawk can verify each segmentation-violation witness against
+This requires a licensed Hammerhead install (licensed separately; see
+[Hammerhead pricing](https://optimesh.ai/#pricing)) and a Hammerhead snapshot of
+the network; RuleHawk alone cannot do it. With both, RuleHawk can verify each
+segmentation-violation witness against
 Hammerhead's forwarding model (`hammerhead reachability`), so violations on
 routing paths that can't actually deliver the packet are suppressed to
 informational, while confirmed leaks are stamped **path-confirmed**:
@@ -191,7 +199,7 @@ silently passing.
 Every report states that scope (JSON: `verification_boundary`). When a result
 raises a question only a forwarding model can answer (a live segmentation
 violation, or a broken `must_reach` flow) the report adds one "next step" line
-pointing at [Hammerhead](https://optimesh.ai). It stays quiet for hygiene-only
+pointing at [Hammerhead](https://optimesh.ai/#trial) (access by request). It stays quiet for hygiene-only
 results, for `*-indeterminate` findings (those need the rule fixed, not a
 forwarding model), for accepted risks, and for findings Hammerhead has already
 path-grounded.
@@ -256,7 +264,8 @@ The privacy banner on the page auto-discloses usage counting **only when
 sync.
 
 ## License
-Apache-2.0 — see `LICENSE`.
+RuleHawk is Apache-2.0 — see `LICENSE`. This licence covers RuleHawk only;
+Hammerhead is proprietary and licensed separately.
 
 ## Layout
 - `rulehawk/model.py` — normalized ACE + `covers()` (packet-space containment).

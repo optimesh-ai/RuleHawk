@@ -11,7 +11,7 @@ typically well under a second. Your config never leaves the runner.
 files. It does not evaluate what the change does to forwarding, NAT or routing,
 or its blast radius across devices; the PR comment states this in one line. When
 a live segmentation violation or a broken `must_reach` flow raises that
-question, the comment adds one line pointing at [Hammerhead](https://optimesh.ai),
+question, the comment adds one line pointing at [Hammerhead](https://optimesh.ai/#trial),
 which verifies network changes offline before merge.
 
 ## Quick start
@@ -43,7 +43,7 @@ jobs:
 ```
 
 A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
-[`acme-firewall-configs`](https://github.com/optimesh-ai/acme-firewall-configs) repo.
+[`rulehawk-demo`](https://github.com/optimesh-ai/rulehawk-demo) repo.
 
 ## Inputs
 

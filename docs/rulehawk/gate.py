@@ -769,7 +769,7 @@ def to_console(gate: GateResult) -> str:
                "evaluated")
     if triggers(f for fr in gate.files for f in fr.findings):
         out.append(f"  NEXT   : delivery and change impact need a forwarding "
-                   f"model: Hammerhead, {HAMMERHEAD_URL}")
+                   f"model: Hammerhead (access by request), {HAMMERHEAD_URL}")
     out.append("=" * 68)
     return "\n".join(out)
 
