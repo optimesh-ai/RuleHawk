@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from html.parser import HTMLParser
 
 import pytest
 
@@ -159,6 +160,46 @@ def test_index_fallback_analyze_py_untouched_by_progress():
 _NODE = shutil.which("node")
 
 
+_JS_TYPES = {"", "text/javascript", "application/javascript", "module"}
+
+
+class _InlineScripts(HTMLParser):
+    """Collect the bodies of inline JavaScript <script> elements.
+
+    An HTML parser rather than a regex, so tag case, attributes and
+    `</script >` spellings are all handled. External (src=) scripts and
+    non-JS types (e.g. JSON-LD) are skipped: they are not ours to parse.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.blocks: list[str] = []
+        self._buf: list[str] | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "script":
+            return
+        a = dict(attrs)
+        if a.get("src") is None and (a.get("type") or "").strip().lower() in _JS_TYPES:
+            self._buf = []
+
+    def handle_data(self, data):
+        if self._buf is not None:
+            self._buf.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "script" and self._buf is not None:
+            self.blocks.append("".join(self._buf))
+            self._buf = None
+
+
+def _inline_scripts(html: str) -> list[str]:
+    parser = _InlineScripts()
+    parser.feed(html)
+    parser.close()
+    return parser.blocks
+
+
 @pytest.mark.skipif(_NODE is None, reason="node not available for syntax check")
 def test_worker_js_parses():
     r = subprocess.run([_NODE, "--check", _WORKER], capture_output=True, text=True)
@@ -167,8 +208,7 @@ def test_worker_js_parses():
 
 @pytest.mark.skipif(_NODE is None, reason="node not available for syntax check")
 def test_index_inline_scripts_parse():
-    index = _read(_INDEX)
-    blocks = re.findall(r"<script>(.*?)</script>", index, re.S)
+    blocks = _inline_scripts(_read(_INDEX))
     assert blocks, "no inline script blocks found"
     for i, block in enumerate(blocks):
         with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
