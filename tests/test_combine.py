@@ -326,3 +326,14 @@ def test_a_single_report_that_fits_github_is_byte_identical(tmp_path):
     body, verdict = combine.render([p])
     assert body == "<!-- rulehawk-gate -->\n" + md
     assert verdict == "FAIL"
+
+
+def test_a_record_without_its_attempt_or_job_is_not_counted(tmp_path):
+    """The re-run and failed-job rules key on attempt and job; a record that
+    leaves either out cannot be placed, so it is UNKNOWN, not defaulted."""
+    for field in ("attempt", "job"):
+        p = _record(tmp_path, f"no-{field}")
+        rec = json.load(open(p))
+        del rec[field]
+        open(p, "w").write(json.dumps(rec))
+        assert combine.render([p])[1] == "UNKNOWN", field
