@@ -64,6 +64,32 @@ def _resolve(value, inputs: dict, step_outputs: dict, action_path: str) -> str:
     return re.sub(r"\$\{\{(.*?)\}\}", sub, value)
 
 
+def _eval_if(cond, inputs: dict, step_outputs: dict) -> bool:
+    """Evaluate the `if:` shapes action.yml uses, as on a pull_request event.
+    Only `a && b && ...` of these clauses; anything else is a harness gap."""
+    if cond is None:
+        return True
+    for clause in str(cond).split("&&"):
+        c = clause.strip()
+        if c in ("always()", "!cancelled()"):
+            continue
+        if c.startswith("(github.event_name =="):
+            continue                      # the harness simulates a PR event
+        m = re.fullmatch(r"inputs\.([\w-]+) (==|!=) '([^']*)'", c)
+        if m:
+            same = inputs.get(m.group(1), "") == m.group(3)
+            if same != (m.group(2) == "=="):
+                return False
+            continue
+        m = re.fullmatch(r"steps\.([\w-]+)\.outputs\.([\w-]+) != ''", c)
+        if m:
+            if not step_outputs.get(m.group(1), {}).get(m.group(2), ""):
+                return False
+            continue
+        raise AssertionError(f"test harness cannot evaluate if: {c!r}")
+    return True
+
+
 def _defaults(action: dict, given: dict) -> dict:
     inputs = {k: str(v.get("default", "")) for k, v in action["inputs"].items()}
     inputs.update(given)
@@ -80,6 +106,8 @@ def _run_invocation(action: dict, given: dict, runner_temp: str, cwd: str,
     comment_env = None
     for i, step in enumerate(action["runs"]["steps"]):
         sid = step.get("id") or f"_step{i}"
+        if not _eval_if(step.get("if"), inputs, step_outputs):
+            continue
         env = {k: _resolve(v, inputs, step_outputs, action_path)
                for k, v in (step.get("env") or {}).items()}
         if "run" in step:
@@ -93,6 +121,11 @@ def _run_invocation(action: dict, given: dict, runner_temp: str, cwd: str,
             full_env.pop("GITHUB_STEP_SUMMARY", None)
             wd = os.path.join(cwd, _resolve(step.get("working-directory", "."),
                                             inputs, step_outputs, action_path))
+            if not os.path.isdir(wd):
+                # The runner fails a step whose working-directory is missing
+                # before its script starts.
+                step_outputs[sid] = {"__rc__": 1}
+                continue
             proc = subprocess.run([_BASH, "-c", step["run"]], cwd=wd, env=full_env,
                                   capture_output=True, text=True)
             step_outputs[sid] = _read_outputs(out_file)
@@ -147,6 +180,7 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
 
 def _run_comment_script(script: str, env: dict, comments: list, tmp: str) -> list:
+    os.makedirs(tmp, exist_ok=True)
     state_p = os.path.join(tmp, "state.json")
     script_p = os.path.join(tmp, "script.js")
     harness_p = os.path.join(tmp, "harness.js")
@@ -229,3 +263,54 @@ def test_the_sticky_comment_is_found_past_the_first_100_comments(tmp_path):
         f"expected an update of comment 120, got {writes}")
     assert not [c for c in calls if c[0] == "create"], \
         f"a second sticky comment was created: {calls}"
+
+
+@needs_node_and_bash
+def test_a_gate_step_that_cannot_start_does_not_leave_a_pass_standing(tmp_path):
+    """The first check passes and comments PASS. The second cannot even start
+    (its working-directory is missing). The comment must not stay PASS."""
+    action = _load(_ACTION)
+    runner_temp = str(tmp_path / "runner")
+    os.makedirs(runner_temp)
+    work = str(tmp_path / "ws")
+    shutil.copytree(os.path.join(_ROOT, "samples"), os.path.join(work, "samples"))
+    posted = []
+    for given in ({"configs": "samples/adv_realistic.txt", "policy": "samples/policy.json",
+                   "upload-sarif": "false"},
+                  {"configs": "samples/adv_realistic.txt", "policy": "samples/policy.json",
+                   "upload-sarif": "false", "working-directory": "no-such-dir"}):
+        inv = _run_invocation(action, given, runner_temp, work)
+        env = inv["comment_step_env"]
+        if env is not None:
+            calls = _run_comment_script(env["__script__"], env, [],
+                                        str(tmp_path / f"c{len(posted)}"))
+            posted.append(_posted_body(calls))
+    assert posted, "nothing was ever posted"
+    final = posted[-1]
+    head = next(l for l in final.splitlines() if l.startswith("## "))
+    assert "✅" not in head, (
+        f"the PR still reads PASS although a check never ran:\n{head}")
+    assert "UNKNOWN" in final
+
+
+@needs_node_and_bash
+def test_another_bots_marked_comment_does_not_capture_the_verdict(tmp_path):
+    """Only the workflow's own comment (github-actions[bot]) is updated."""
+    action = _load(_ACTION)
+    runner_temp = str(tmp_path / "runner")
+    os.makedirs(runner_temp)
+    work = str(tmp_path / "ws")
+    shutil.copytree(os.path.join(_ROOT, "samples"), os.path.join(work, "samples"))
+    inv = _run_invocation(action, {"configs": "samples/ios_acl.txt",
+                                   "policy": "samples/policy.json",
+                                   "upload-sarif": "false"}, runner_temp, work)
+    env = inv["comment_step_env"]
+    comments = [
+        {"id": 5, "body": f"{_MARKER}\nquoted by another bot",
+         "user": {"login": "other-bot[bot]", "type": "Bot"}},
+        {"id": 9, "body": f"{_MARKER}\n## ✅ old verdict",
+         "user": {"login": "github-actions[bot]", "type": "Bot"}},
+    ]
+    calls = _run_comment_script(env["__script__"], env, comments, str(tmp_path))
+    writes = [c for c in calls if c[0] in ("update", "create")]
+    assert writes and writes[-1][0] == "update" and writes[-1][1] == 9, writes

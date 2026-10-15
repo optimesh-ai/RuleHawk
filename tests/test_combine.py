@@ -178,3 +178,91 @@ def test_cli_is_reachable_as_a_subcommand(tmp_path):
     from rulehawk import cli
     a = _result(tmp_path, "a.json", _DIRTY, label="one")
     assert cli.main(["combine", a, "-q"]) == 1
+
+
+def _record(tmp_path, name, **over) -> str:
+    """A hand-written result record, for the shapes the gate never writes."""
+    rec = {"schema": "rulehawk.result/v1", "label": name, "job": "j", "attempt": 1,
+           "passed": True, "exit_code": 0, "fail_on": "high", "worst": "none",
+           "violations": 0, "parse_failures": 0,
+           "markdown": "## ✅ RuleHawk firewall gate\n\n**PASS** — fine."}
+    rec.update(over)
+    p = tmp_path / f"{name}.json"
+    p.write_text(json.dumps(rec))
+    return str(p)
+
+
+def test_a_boolean_exit_code_is_not_a_pass(tmp_path):
+    p = _record(tmp_path, "boolcode", exit_code=False)
+    assert combine.render([p])[1] == "UNKNOWN"
+
+
+def test_a_pass_claim_with_findings_at_the_threshold_is_not_a_pass(tmp_path):
+    p = _record(tmp_path, "liar", violations=3)
+    assert combine.render([p])[1] == "UNKNOWN"
+
+
+def test_a_pass_claim_with_unparsed_files_is_not_a_pass(tmp_path):
+    p = _record(tmp_path, "unparsed", parse_failures=1)
+    assert combine.render([p])[1] == "UNKNOWN"
+    # ...except under the advisory threshold, which never blocks.
+    q = _record(tmp_path, "advisory", parse_failures=1, fail_on="none")
+    assert combine.render([q])[1] == "PASS"
+
+
+def test_a_record_missing_its_counts_is_not_a_pass(tmp_path):
+    p = _record(tmp_path, "bare")
+    rec = json.load(open(p))
+    del rec["violations"], rec["parse_failures"], rec["fail_on"]
+    open(p, "w").write(json.dumps(rec))
+    assert combine.render([p])[1] == "UNKNOWN"
+
+
+def test_a_report_that_contradicts_its_verdict_is_unknown(tmp_path):
+    """A FAIL record carrying a PASS report must not post that report."""
+    p = _record(tmp_path, "mixed", passed=False, exit_code=1, violations=1)
+    body, verdict = combine.render([p])
+    assert verdict == "UNKNOWN"
+    assert "✅" not in _headline(body)
+
+
+def test_a_single_oversized_report_still_fits(tmp_path):
+    big = "## ❌ RuleHawk firewall gate\n\n**FAIL** — x.\n\n" + ("- finding\n" * 30000)
+    p = _record(tmp_path, "huge", passed=False, exit_code=1, violations=1, markdown=big)
+    body, verdict = combine.render([p])
+    assert len(body) <= combine.MAX_COMMENT_CHARS
+    assert verdict == "FAIL" and "FAIL" in _headline(body)
+
+
+def test_a_failed_gate_job_whose_results_show_no_failure_is_unknown(tmp_path):
+    """Re-run: the job failed again but its new result never uploaded, so only
+    the first attempt's PASS is left. The failed job makes that UNKNOWN."""
+    old = _result(tmp_path, "old.json", _CLEAN, label="egress", job="egress")
+    seg = _result(tmp_path, "seg.json", _CLEAN, label="seg", job="segmentation")
+    needs = {"egress": {"result": "failure", "outputs": {}},
+             "segmentation": {"result": "success", "outputs": {}}}
+    body, verdict = combine.render([old, seg], expect=2, needs=needs)
+    assert verdict == "UNKNOWN"
+    assert "egress" in body and "failure" in body
+
+
+def test_a_failed_job_that_reported_its_failure_is_plain_fail(tmp_path):
+    bad = _result(tmp_path, "bad.json", _DIRTY, label="egress", job="egress")
+    needs = {"egress": {"result": "failure"}}
+    body, verdict = combine.render([bad], expect=1, needs=needs)
+    assert verdict == "FAIL"
+    assert "job egress" not in body
+
+
+def test_a_failed_job_that_runs_no_rulehawk_check_is_ignored(tmp_path):
+    ok = _result(tmp_path, "ok.json", _CLEAN, label="seg", job="segmentation")
+    needs = {"segmentation": {"result": "success"}, "lint": {"result": "failure"}}
+    assert combine.render([ok], expect=1, needs=needs)[1] == "PASS"
+
+
+def test_cli_needs(tmp_path):
+    old = _result(tmp_path, "old.json", _CLEAN, label="egress", job="egress")
+    needs = json.dumps({"egress": {"result": "cancelled"}})
+    assert combine.main([old, "--needs", needs, "-q"]) == 2
+    assert combine.main([old, "--needs", "[1]", "-q"]) == 2
+    assert combine.main([old, "--needs", "{nope", "-q"]) == 2

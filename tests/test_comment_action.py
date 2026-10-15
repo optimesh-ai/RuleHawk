@@ -38,10 +38,11 @@ def _results(tmp_path, *specs) -> str:
     return str(d)
 
 
-def _run(tmp_path, results: str, expect: str):
+def _run(tmp_path, results: str, expect: str, jobs: str = ""):
     runner = tmp_path / "runner"
     runner.mkdir(exist_ok=True)
-    return _run_invocation(_manifest(), {"expect": expect, "results": results},
+    return _run_invocation(_manifest(), {"expect": expect, "results": results,
+                                         "jobs": jobs},
                            str(runner), str(tmp_path), action_path=_DIR)
 
 
@@ -50,6 +51,8 @@ def test_manifest_wiring():
     assert a["runs"]["using"] == "composite"
     assert a["inputs"]["expect"].get("required") is True, \
         "expect must be required: without it a missing job cannot be noticed"
+    assert a["inputs"]["jobs"].get("required") is True, \
+        "jobs must be required: without it a stale re-run PASS cannot be noticed"
     used = set(re.findall(r"inputs\.([\w-]+)", yaml.dump(a)))
     assert not used - set(a["inputs"]), used - set(a["inputs"])
     run = "\n".join(s.get("run", "") for s in a["runs"]["steps"])
@@ -114,3 +117,22 @@ def test_every_check_passing_passes(tmp_path):
     assert run["outputs"]["combine"]["verdict"] == "PASS"
     enforce = [v for k, v in run["outputs"].items() if k.startswith("_step")]
     assert enforce[-1]["__rc__"] == 0
+
+
+@needs_node_and_bash
+def test_a_gate_job_that_failed_without_a_failing_result_is_unknown(tmp_path):
+    import json
+    d = tmp_path / "results"
+    d.mkdir()
+    for job, label in (("egress", "Egress"), ("segmentation", "Segmentation")):
+        os.environ["GITHUB_JOB"] = job
+        try:
+            gate.main([os.path.join(_S, "adv_realistic.txt"), "--policy",
+                       os.path.join(_S, "policy.json"), "--label", label,
+                       "--result", str(d / f"{job}.json"), "-q"])
+        finally:
+            os.environ.pop("GITHUB_JOB", None)
+    jobs = json.dumps({"egress": {"result": "failure", "outputs": {}},
+                       "segmentation": {"result": "success", "outputs": {}}})
+    run = _run(tmp_path, str(d), "2", jobs)
+    assert run["outputs"]["combine"]["verdict"] == "UNKNOWN"
