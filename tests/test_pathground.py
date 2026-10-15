@@ -483,3 +483,122 @@ def test_oracle_non_timeout_errors_do_not_trip_breaker(tmp_path):
     w2 = Witness("10.20.0.9", "10.10.0.9", "tcp", 3389)
     assert orc(w2) is Reach.REACHABLE  # breaker not tripped; probe ran
     assert state["calls"] == 2
+
+
+# --- hammerhead v0.2.2: exit 3 = answer printed over a DEGRADED model --------
+#
+# Since hammerhead #158 every forwarding query (traceroute included) exits 3
+# after printing its answer when the snapshot's coverage is degraded, with a
+# `coverage` block in the JSON. The verdict stays INDETERMINATE (a query surface
+# is never more confident than the gate), but the finding must say WHY: the
+# unread forwarding-relevant lines and the devices they sit on.
+
+def _degraded_trace(disposition, degraded=True, blockers=None, unparsed=None,
+                    affected=None):
+    doc = json.loads(_trace(disposition))
+    if unparsed is None:
+        unparsed = {"R2": ["feature bgp", "system jumbomtu 9216"],
+                    "R5": ["router rip"]}
+    if affected is None:
+        affected = sorted(unparsed)
+    if blockers is None:
+        blockers = [{"blocker": "unparsed_forwarding_relevant", "device": d,
+                     "lines": ls} for d, ls in sorted(unparsed.items())]
+    doc["coverage"] = {"status": "degraded" if degraded else "complete",
+                       "degraded": degraded,
+                       "affected_devices": affected,
+                       "unparsed_forwarding_relevant": unparsed,
+                       "blockers": blockers}
+    return json.dumps(doc)
+
+
+def test_oracle_exit3_degraded_delivered_is_indeterminate_with_reason(tmp_path):
+    # A Delivered answer over a degraded model is NOT a confirmation.
+    orc = _oracle_with(tmp_path, 3, _degraded_trace("Delivered"))
+    assert orc(_W) is Reach.INDETERMINATE
+    reason = orc.indeterminate_reason(_W)
+    assert reason is not None
+    assert "degraded" in reason
+    assert "R2" in reason and "R5" in reason
+    assert "feature bgp" in reason
+    assert "3 forwarding-relevant line(s)" in reason
+
+
+def test_oracle_exit3_degraded_no_route_never_downgrades(tmp_path):
+    # "No route" over a degraded model must not suppress a leak either.
+    orc = _oracle_with(tmp_path, 3, _degraded_trace("No route at R7"))
+    assert orc(_W) is Reach.INDETERMINATE
+    assert orc.indeterminate_reason(_W) is not None
+
+
+def test_oracle_exit3_without_degraded_coverage_is_a_generic_failure(tmp_path):
+    for i, body in enumerate((_trace("Delivered"),
+                              _degraded_trace("Delivered", degraded=False),
+                              "not json",
+                              json.dumps(["coverage"]))):
+        d = tmp_path / f"case{i}"
+        d.mkdir()
+        orc = _oracle_with(d, 3, body)
+        assert orc(_W) is Reach.INDETERMINATE, body
+        assert orc.indeterminate_reason(_W) is None, body
+
+
+def test_oracle_other_nonzero_exit_carries_no_coverage_reason(tmp_path):
+    orc = _oracle_with(tmp_path, 2, _degraded_trace("Delivered"))
+    assert orc(_W) is Reach.INDETERMINATE
+    assert orc.indeterminate_reason(_W) is None
+
+
+def test_oracle_degraded_reason_survives_the_memo(tmp_path):
+    calls = []
+    d = tmp_path / "snap"
+    d.mkdir()
+    (d / "r1.cfg").write_text("interface Gi0/0\n")
+
+    def runner(argv):
+        calls.append(argv)
+        return _FakeProc(3, _degraded_trace("Delivered"))
+
+    orc = HammerheadReachOracle(str(d), "R1", runner=runner)
+    assert orc(_W) is Reach.INDETERMINATE
+    assert orc(_W) is Reach.INDETERMINATE
+    assert len(calls) == 1
+    assert "R2" in orc.indeterminate_reason(_W)
+
+
+def test_oracle_degraded_estate_wide_gap_names_the_blocker_kinds(tmp_path):
+    body = _degraded_trace(
+        "Delivered", unparsed={}, affected=[],
+        blockers=[{"blocker": "acquisition_incomplete", "file": "x.cfg"}])
+    orc = _oracle_with(tmp_path, 3, body)
+    assert orc(_W) is Reach.INDETERMINATE
+    reason = orc.indeterminate_reason(_W)
+    assert "acquisition_incomplete" in reason
+    assert "estate-wide" in reason
+
+
+def test_oracle_degraded_reason_is_bounded(tmp_path):
+    unparsed = {f"D{i:02d}": [f"line {j}" for j in range(30)] for i in range(40)}
+    orc = _oracle_with(tmp_path, 3, _degraded_trace("Delivered", unparsed=unparsed))
+    assert orc(_W) is Reach.INDETERMINATE
+    reason = orc.indeterminate_reason(_W)
+    assert "1200 forwarding-relevant line(s)" in reason
+    assert "more" in reason
+    assert len(reason) < 600
+
+
+def test_path_ground_names_the_coverage_blockers_on_a_degraded_snapshot(tmp_path):
+    orc = _oracle_with(tmp_path, 3, _degraded_trace("Delivered"))
+    after = path_ground(_seg_findings(), orc)
+    for f in after:
+        if f.kind == "segmentation-violation":
+            assert f.severity == "critical"  # fail closed: kept at full severity
+            assert "[PATH-GROUNDING INDETERMINATE]" in f.message
+            assert "degraded" in f.message and "R2" in f.message
+            assert "PATH-CONFIRMED" not in f.message
+
+
+def test_path_ground_keeps_the_generic_note_for_a_plain_oracle():
+    after = path_ground(_seg_findings(), _const_oracle(Reach.INDETERMINATE))
+    viol = next(f for f in after if f.kind == "segmentation-violation")
+    assert "NAT-in-path, an inexpressible witness" in viol.message
