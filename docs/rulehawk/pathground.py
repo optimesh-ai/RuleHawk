@@ -1,6 +1,7 @@
 """Path-grounding — kill infeasible-routing-path false positives in segmentation
 findings by routing each concrete witness packet through Hammerhead's forwarding
-model (per-device FIB / reachability; checked against real FRR routers: 137 of 138 routes agree).
+model (per-device FIB / reachability; 138 of 138 routes match real FRR on our
+10-router lab, run 38685150242).
 
 WHY (the adoption killer this removes). RuleHawk's `segcheck` is topology-blind:
 it proves a *single* ordered ACL permits a forbidden witness flow (first-match
