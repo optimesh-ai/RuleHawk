@@ -358,6 +358,14 @@ class HammerheadReachOracle:
 # unread lines cannot bloat every finding's message.
 _REASON_DEVICES = 5
 _REASON_KINDS = 4
+_REASON_VALUE_CHARS = 48   # one device name, blocker kind or config line
+_REASON_TOTAL_CHARS = 520  # the whole note before its fixed pointer: <= 600 in all
+
+
+def _clip(value: object, limit: int = _REASON_VALUE_CHARS) -> str:
+    """`value` as a string of at most `limit` characters ("…" marks a cut)."""
+    text = str(value)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def _degraded_coverage(coverage: object) -> Optional[str]:
@@ -370,7 +378,7 @@ def _degraded_coverage(coverage: object) -> Optional[str]:
     unparsed = coverage.get("unparsed_forwarding_relevant")
     unparsed = unparsed if isinstance(unparsed, dict) else {}
     per_device = sorted(
-        (str(dev), [str(l) for l in lines])
+        (_clip(dev), [str(l) for l in lines])
         for dev, lines in unparsed.items()
         if isinstance(lines, list) and lines
     )
@@ -379,10 +387,10 @@ def _degraded_coverage(coverage: object) -> Optional[str]:
     kinds: Dict[str, int] = {}
     for b in blockers:
         kind = b.get("blocker") if isinstance(b, dict) else None
-        kind = str(kind) if kind else "unnamed"
+        kind = _clip(kind) if kind else "unnamed"
         kinds[kind] = kinds.get(kind, 0) + 1
     affected = coverage.get("affected_devices")
-    affected = [str(d) for d in affected] if isinstance(affected, list) else []
+    affected = [_clip(d) for d in affected] if isinstance(affected, list) else []
 
     parts = ["Hammerhead answered, but its model of this snapshot is degraded "
              "(coverage unknown), so the answer is not used"]
@@ -395,7 +403,7 @@ def _degraded_coverage(coverage: object) -> Optional[str]:
             shown += f", +{more} more device(s)"
         first_dev, first_lines = per_device[0]
         parts.append(f"{total} forwarding-relevant line(s) unread on {shown}, "
-                     f"e.g. {first_dev}: `{first_lines[0][:80]}`")
+                     f"e.g. {first_dev}: `{_clip(first_lines[0])}`")
     elif affected:
         shown = ", ".join(affected[:_REASON_DEVICES])
         more = len(affected) - _REASON_DEVICES
@@ -410,7 +418,8 @@ def _degraded_coverage(coverage: object) -> Optional[str]:
         if len(ordered) > _REASON_KINDS:
             shown += f", +{len(ordered) - _REASON_KINDS} more kind(s)"
         parts.append(f"blockers: {shown}")
-    return "; ".join(parts) + " (run `hammerhead preflight SNAP SNAP` for the full list)"
+    note = _clip("; ".join(parts), _REASON_TOTAL_CHARS)
+    return note + " (run `hammerhead preflight SNAP SNAP` for the full list)"
 
 
 def _probe_instantiates_witness(w: Witness) -> bool:
