@@ -1,0 +1,121 @@
+name: 'RuleHawk combined PR comment'
+description: >-
+  Combine every RuleHawk check in a workflow run into one sticky PR comment,
+  headed by the worst verdict. Run it in a job that needs your gate jobs.
+author: 'OptiMesh'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+# Usage: each gate step sets `share-results: true` and `comment: false`; then
+#
+#   verdict:
+#     needs: [segmentation, egress]
+#     if: ${{ !cancelled() }}
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: optimesh-ai/RuleHawk/comment@v1
+#         with:
+#           expect: 3          # one per gate step that shares its result
+#
+# FAIL if any check failed; UNKNOWN if fewer than `expect` checks reported (a
+# job crashed, was cancelled or skipped) or a result could not be read; PASS
+# only when every expected check reported and passed.
+
+inputs:
+  expect:
+    description: >-
+      How many checks must report: one per gate step with share-results: true.
+      Fewer results make the verdict UNKNOWN, never PASS.
+    required: true
+  results:
+    description: >-
+      Result files or directories to combine, whitespace separated. Empty (the
+      default) downloads this run's rulehawk-results-* artifacts.
+    required: false
+    default: ''
+  comment:
+    description: 'Post/update the sticky PR comment on pull_request events (true|false)'
+    required: false
+    default: 'true'
+  fail:
+    description: 'Fail this step unless the combined verdict is PASS (true|false)'
+    required: false
+    default: 'true'
+
+outputs:
+  verdict:
+    description: 'PASS | FAIL | UNKNOWN: the worst verdict across every check'
+    value: ${{ steps.combine.outputs.verdict }}
+  comment-file:
+    description: 'Path to the combined comment body (markdown)'
+    value: ${{ steps.combine.outputs.comment }}
+
+runs:
+  using: 'composite'
+  steps:
+    # Every attempt's artifacts: after "re-run failed jobs" the jobs that passed
+    # keep their first-attempt results, and `rulehawk combine` keeps only the
+    # newest attempt of each check.
+    - name: Download this run's RuleHawk results
+      if: inputs.results == ''
+      continue-on-error: true      # none found -> combine reports UNKNOWN
+      uses: actions/download-artifact@v4
+      with:
+        pattern: rulehawk-results-*
+        path: ${{ runner.temp }}/rulehawk-combine-in
+        merge-multiple: true
+
+    - name: Combine every check
+      id: combine
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/..
+        RH_EXPECT: ${{ inputs.expect }}
+        RH_RESULTS: ${{ inputs.results }}
+      run: |
+        set -u
+        IN="${RH_RESULTS:-${RUNNER_TEMP:-/tmp}/rulehawk-combine-in}"
+        BODY="${RUNNER_TEMP:-/tmp}/rulehawk-combined-comment.md"
+        rm -f "${BODY}"
+        # noglob: the inputs are paths, split on whitespace only.
+        set +e -f
+        python3 -m rulehawk combine ${IN} --expect "${RH_EXPECT}" --comment "${BODY}"
+        RC=$?
+        set +f
+        case "${RC}" in
+          0) VERDICT=PASS ;;
+          1) VERDICT=FAIL ;;
+          *) VERDICT=UNKNOWN ;;
+        esac
+        if [ ! -s "${BODY}" ]; then
+          VERDICT=UNKNOWN
+          printf '%s\n## ❌ RuleHawk firewall gate: UNKNOWN\n\nThe checks could not be combined into a comment; see the job log.\n' \
+            '<!-- rulehawk-gate -->' > "${BODY}"
+        fi
+        { echo "verdict=${VERDICT}"; echo "comment=${BODY}"; } >> "${GITHUB_OUTPUT}"
+
+    - name: Sticky PR comment
+      if: always() && inputs.comment == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && steps.combine.outputs.comment != ''
+      continue-on-error: true
+      uses: actions/github-script@v9
+      env:
+        RH_COMMENT_PATH: ${{ steps.combine.outputs.comment }}
+        RH_STICKY_JS: ${{ github.action_path }}/sticky.js
+      with:
+        script: |
+          const sticky = require(process.env.RH_STICKY_JS);
+          await sticky({github, context, core, bodyPath: process.env.RH_COMMENT_PATH,
+                        issueNumber: context.payload.pull_request.number});
+
+    - name: Enforce the combined verdict
+      if: always() && inputs.fail == 'true'
+      shell: bash
+      env:
+        RH_VERDICT: ${{ steps.combine.outputs.verdict }}
+      run: |
+        if [ "${RH_VERDICT}" != "PASS" ]; then
+          echo "::error title=RuleHawk combined verdict: ${RH_VERDICT:-UNKNOWN}::Not every RuleHawk check in this run passed — see the PR comment and each job's summary."
+          exit 1
+        fi
+        echo "Every RuleHawk check in this run passed."

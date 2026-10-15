@@ -93,9 +93,10 @@ def _run_invocation(action: dict, given: dict, runner_temp: str, cwd: str,
             full_env.pop("GITHUB_STEP_SUMMARY", None)
             wd = os.path.join(cwd, _resolve(step.get("working-directory", "."),
                                             inputs, step_outputs, action_path))
-            subprocess.run([_BASH, "-c", step["run"]], cwd=wd, env=full_env,
-                           capture_output=True, text=True)
+            proc = subprocess.run([_BASH, "-c", step["run"]], cwd=wd, env=full_env,
+                                  capture_output=True, text=True)
             step_outputs[sid] = _read_outputs(out_file)
+            step_outputs[sid]["__rc__"] = proc.returncode
         elif "github-script" in str(step.get("uses", "")) and \
                 "comment" in str(step.get("name", "")).lower():
             comment_env = env

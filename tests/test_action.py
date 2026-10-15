@@ -134,8 +134,8 @@ def test_gate_command_line_survives_bash_with_set_u():
     cmd = m.group(1).replace("python3 -m rulehawk gate", "true")
     script = ("set -euo pipefail\n"
               "RH_CONFIGS=cfg.txt\nRH_FAIL_ON=high\nRH_VENDOR=auto\n"
-              "SARIF=/tmp/s\nJSON=/tmp/j\nCOMMENT=/tmp/c\n"
-              "POLICY_ARGS=()\nEVIDENCE_ARGS=()\n" + cmd + "\necho SHELL_OK\n")
+              "SARIF=/tmp/s\nJSON=/tmp/j\nCOMMENT=/tmp/c\nRESULT=/tmp/r\n"
+              "POLICY_ARGS=()\nLABEL_ARGS=()\nEVIDENCE_ARGS=()\n" + cmd + "\necho SHELL_OK\n")
     proc = subprocess.run(["/bin/bash", "-c", script],
                           capture_output=True, text=True)
     version = subprocess.run(["/bin/bash", "-c", "echo $BASH_VERSION"],

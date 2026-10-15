@@ -27,9 +27,26 @@ inputs:
     required: false
     default: 'auto'
   comment:
-    description: 'Post/update a single sticky PR comment with the findings (true|false)'
+    description: >-
+      Post/update a single sticky PR comment with the findings (true|false).
+      Several gate steps in one job share the one comment, headed by the worst
+      verdict. Across jobs, set this to false and combine with
+      optimesh-ai/RuleHawk/comment (see share-results).
     required: false
     default: 'true'
+  label:
+    description: >-
+      A short name for this check in the PR comment, e.g. "PCI segmentation".
+      Defaults to the configs and policy it checked.
+    required: false
+    default: ''
+  share-results:
+    description: >-
+      Upload this check's result as a workflow artifact, so a job that runs
+      optimesh-ai/RuleHawk/comment can combine every check of the run into one
+      PR comment headed by the worst verdict (true|false).
+    required: false
+    default: 'false'
   evidence:
     description: >-
       Emit a compliance-evidence artifact (JSON + markdown) for every run:
@@ -80,6 +97,11 @@ outputs:
   sarif-file:
     description: 'Path to the generated SARIF report'
     value: ${{ steps.gate.outputs.sarif }}
+  result-file:
+    description: >-
+      Path to this check's result record (what `rulehawk combine` and
+      optimesh-ai/RuleHawk/comment read)
+    value: ${{ steps.gate.outputs.result }}
 
 runs:
   using: 'composite'
@@ -105,6 +127,7 @@ runs:
         RH_FAIL_ON: ${{ inputs.fail-on }}
         RH_VENDOR: ${{ inputs.vendor }}
         RH_EVIDENCE: ${{ inputs.evidence }}
+        RH_LABEL: ${{ inputs.label }}
         # Import the engine from the action's own checkout (zero install).
         PYTHONPATH: ${{ github.action_path }}
       run: |
@@ -120,6 +143,21 @@ runs:
         fi
         POLICY_ARGS=()
         if [ -n "${RH_POLICY}" ]; then POLICY_ARGS=(--policy "${RH_POLICY}"); fi
+        LABEL_ARGS=()
+        if [ -n "${RH_LABEL}" ]; then LABEL_ARGS=(--label "${RH_LABEL}"); fi
+
+        # One result record per gate step, kept for the whole job (RUNNER_TEMP
+        # is emptied at the start of every job, never between steps). The
+        # comment step combines every record in the job, so a later passing
+        # check cannot replace an earlier failing one on the PR. A placeholder
+        # is written first: if this step dies before RuleHawk reports, the
+        # combined comment shows this check as UNKNOWN, never as missing.
+        RESULT_DIR="${RUNNER_TEMP:-/tmp}/rulehawk-results"
+        mkdir -p "${RESULT_DIR}"
+        RESULT_N=$(( $(find "${RESULT_DIR}" -name '*.json' | wc -l) + 1 ))
+        RESULT_ID="$(printf '%s-%04d-%s%s' "${GITHUB_JOB:-job}" "${RESULT_N}" "${RANDOM}" "${RANDOM}")"
+        RESULT="${RESULT_DIR}/${RESULT_ID}.json"
+        printf '{"schema": "rulehawk.result/v1", "pending": true}\n' > "${RESULT}"
 
         # Start clean: every path advertised below is advertised only if THIS
         # run wrote it, so a file left behind by an earlier gate step in the
@@ -149,6 +187,8 @@ runs:
           --sarif "${SARIF}" \
           --json "${JSON}" \
           --comment "${COMMENT}" \
+          --result "${RESULT}" \
+          ${LABEL_ARGS[@]+"${LABEL_ARGS[@]}"} \
           ${EVIDENCE_ARGS[@]+"${EVIDENCE_ARGS[@]}"}
         RC=$?
         set +f
@@ -164,6 +204,9 @@ runs:
           [ -f "${SARIF}" ]   && echo "sarif=${SARIF}"     || echo "sarif="
           [ -f "${JSON}" ]    && echo "json=${JSON}"       || echo "json="
           [ -f "${COMMENT}" ] && echo "comment=${COMMENT}" || echo "comment="
+          [ -f "${RESULT}" ] && echo "result=${RESULT}" || echo "result="
+          echo "result_id=${RESULT_ID}"
+          echo "result_dir=${RESULT_DIR}"
           [ -f "${EVIDENCE}" ] && echo "evidence=${EVIDENCE}" || echo "evidence="
           [ -f "${EVIDENCE_MD}" ] && echo "evidence_md=${EVIDENCE_MD}" \
                                   || echo "evidence_md="
@@ -188,37 +231,59 @@ runs:
         sarif_file: ${{ steps.gate.outputs.sarif }}
         category: rulehawk
 
+    # Hand this check's result to a later job that combines every check of the
+    # run into one comment (optimesh-ai/RuleHawk/comment). Best-effort: if the
+    # upload fails, that job finds one result too few and says UNKNOWN.
+    - name: Share the result with a combining job
+      if: always() && inputs.share-results == 'true' && steps.gate.outputs.result != ''
+      continue-on-error: true
+      uses: actions/upload-artifact@v4
+      with:
+        name: rulehawk-results-${{ github.run_attempt }}-${{ steps.gate.outputs.result_id }}
+        path: ${{ steps.gate.outputs.result }}
+        retention-days: 7
+        if-no-files-found: error
+
+    # The comment body: every check this job has run so far, headed by the
+    # worst verdict. With one check it is exactly that check's report.
+    - name: Combine this job's checks
+      id: combine
+      if: always() && inputs.comment == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && steps.gate.outputs.result_dir != ''
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}
+        RH_RESULT_DIR: ${{ steps.gate.outputs.result_dir }}
+      run: |
+        BODY="${RUNNER_TEMP:-/tmp}/rulehawk-combined-comment.md"
+        rm -f "${BODY}"
+        python3 -m rulehawk combine "${RH_RESULT_DIR}" --comment "${BODY}" \
+          --summary /dev/null -q || true
+        # No body means the combine itself broke: say so rather than leave the
+        # previous verdict standing.
+        if [ ! -s "${BODY}" ]; then
+          printf '%s\n## ❌ RuleHawk firewall gate: UNKNOWN\n\nThis job'"'"'s checks could not be combined into a comment; see the job log.\n' \
+            '<!-- rulehawk-gate -->' > "${BODY}"
+        fi
+        echo "comment=${BODY}" >> "${GITHUB_OUTPUT}"
+
     # Post / update ONE sticky comment so reviewers see the verdict + witnesses in
     # the conversation. continue-on-error keeps fork PRs (read-only token) green
     # on the comment step — the check + SARIF still gate the merge.
     - name: Sticky PR comment
-      if: always() && inputs.comment == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && steps.gate.outputs.comment != ''
+      if: always() && inputs.comment == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && steps.combine.outputs.comment != ''
       continue-on-error: true
       uses: actions/github-script@v9
       env:
         # Passed via env, not ${{ }}-interpolated into JS source — the value is
         # runner-generated today, but inlining is the canonical script-injection
         # shape and one refactor away from being exploitable.
-        RH_COMMENT_PATH: ${{ steps.gate.outputs.comment }}
+        RH_COMMENT_PATH: ${{ steps.combine.outputs.comment }}
+        RH_STICKY_JS: ${{ github.action_path }}/comment/sticky.js
       with:
         script: |
-          const fs = require('fs');
-          const marker = '<!-- rulehawk-gate -->';
-          let body = '';
-          try { body = fs.readFileSync(process.env.RH_COMMENT_PATH, 'utf8'); }
-          catch (e) { core.warning('no comment body: ' + e); return; }
-          const {owner, repo} = context.repo;
-          const issue_number = context.payload.pull_request.number;
-          const {data: comments} = await github.rest.issues.listComments(
-            {owner, repo, issue_number, per_page: 100});
-          const mine = comments.find(c => c.body && c.body.includes(marker));
-          if (mine) {
-            await github.rest.issues.updateComment(
-              {owner, repo, comment_id: mine.id, body});
-          } else {
-            await github.rest.issues.createComment(
-              {owner, repo, issue_number, body});
-          }
+          const sticky = require(process.env.RH_STICKY_JS);
+          await sticky({github, context, core, bodyPath: process.env.RH_COMMENT_PATH,
+                        issueNumber: context.payload.pull_request.number});
 
     # Re-raise the gate verdict so the check goes red exactly when it should.
     # Fails CLOSED when the verdict file is missing: that means the gate step

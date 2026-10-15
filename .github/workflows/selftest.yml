@@ -151,3 +151,108 @@ jobs:
           [ "${PASSED}" = "false" ]    || { echo "::error::outputs.passed should be false, got '${PASSED}'"; exit 1; }
           [ "${WORST}" = "critical" ]  || { echo "::error::outputs.worst-severity should be critical, got '${WORST}'"; exit 1; }
           echo "FAIL path verified: outcome=${OUTCOME}, passed=${PASSED}, worst=${WORST}"
+
+  # One PR comment for several checks: the headline is the WORST verdict, so a
+  # passing check can never hide a failing one. Same-job: every gate step's
+  # result stays in the job's results dir for the comment to combine.
+  combined-same-job:
+    name: Dogfood one verdict for several checks (one job)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Dirty check (expect FAIL)
+        continue-on-error: true
+        uses: ./
+        with:
+          configs: samples/ios_acl.txt
+          policy: samples/policy.json
+          label: dirty
+          upload-sarif: false
+          comment: false
+      - name: Clean check (expect PASS)
+        uses: ./
+        with:
+          configs: samples/adv_realistic.txt
+          policy: samples/policy.json
+          label: clean
+          upload-sarif: false
+          comment: false
+      - name: The job's combined verdict is FAIL
+        run: |
+          set -u
+          set +e
+          python3 -m rulehawk combine "${RUNNER_TEMP}/rulehawk-results" --comment combined.md -q
+          RC=$?
+          set -e
+          [ "${RC}" = "1" ] || { echo "::error::expected FAIL (exit 1), got ${RC}"; exit 1; }
+          grep -q '^## ❌ RuleHawk firewall gate: FAIL' combined.md
+          grep -q '| clean | ✅ PASS |' combined.md
+          grep -q '| dirty | ❌ FAIL' combined.md
+          echo "same-job combine verified"
+
+  # Across jobs: each gate shares its result as an artifact and one job
+  # combines them with ./comment.
+  share-dirty:
+    name: Dogfood shared result (dirty)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./
+        continue-on-error: true      # the FAIL is the point; keep the job green
+        with:
+          configs: samples/ios_acl.txt
+          policy: samples/policy.json
+          label: dirty
+          upload-sarif: false
+          comment: false
+          share-results: true
+  share-clean:
+    name: Dogfood shared result (clean)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./
+        with:
+          configs: samples/adv_realistic.txt
+          policy: samples/policy.json
+          label: clean
+          upload-sarif: false
+          comment: false
+          share-results: true
+  combined-across-jobs:
+    name: Dogfood the combining action (./comment)
+    needs: [share-dirty, share-clean]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Combine both jobs (expect FAIL)
+        id: both
+        continue-on-error: true
+        uses: ./comment
+        with:
+          expect: 2
+          comment: false
+      - name: A job too few (expect UNKNOWN)
+        id: missing
+        continue-on-error: true
+        uses: ./comment
+        with:
+          expect: 3
+          comment: false
+      - name: Assert the combined verdicts
+        env:
+          BOTH: ${{ steps.both.outputs.verdict }}
+          BOTH_OUTCOME: ${{ steps.both.outcome }}
+          BOTH_FILE: ${{ steps.both.outputs.comment-file }}
+          MISSING: ${{ steps.missing.outputs.verdict }}
+          MISSING_OUTCOME: ${{ steps.missing.outcome }}
+        run: |
+          set -euo pipefail
+          [ "${BOTH}" = "FAIL" ]              || { echo "::error::expected FAIL, got '${BOTH}'"; exit 1; }
+          [ "${BOTH_OUTCOME}" = "failure" ]   || { echo "::error::the FAIL did not fail the step"; exit 1; }
+          [ "${MISSING}" = "UNKNOWN" ]        || { echo "::error::expected UNKNOWN, got '${MISSING}'"; exit 1; }
+          [ "${MISSING_OUTCOME}" = "failure" ] || { echo "::error::the UNKNOWN did not fail the step"; exit 1; }
+          grep -q '| clean | ✅ PASS |' "${BOTH_FILE}"
+          grep -q '| dirty | ❌ FAIL' "${BOTH_FILE}"
+          echo "across-jobs combine verified: ${BOTH}, ${MISSING}"

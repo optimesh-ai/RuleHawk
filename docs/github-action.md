@@ -53,7 +53,9 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 | `policy` | `''` | Path to a segmentation policy JSON (zones + `must_not_reach`; see [`policy.md`](policy.md)). Omit for hygiene checks only. |
 | `fail-on` | `high` | Fail the check at this severity or worse: `critical` \| `high` \| `medium` \| `low` \| `none`. `none` is advisory (never blocks). |
 | `vendor` | `auto` | Force a vendor for every file: `auto` \| `ios` \| `junos` \| `panos` \| `iptables` \| `nxos` \| `eos` \| `aws-sg`. |
-| `comment` | `true` | Post/update a single sticky PR comment with the findings. |
+| `comment` | `true` | Post/update a single sticky PR comment with the findings. Several gate steps in one job share that one comment, headed by the worst verdict (see [Several checks on one PR](#several-checks-on-one-pr)). |
+| `label` | `''` | A short name for this check in the PR comment, e.g. `PCI segmentation`. Defaults to the configs and policy it checked. |
+| `share-results` | `false` | Upload this check's result as a workflow artifact, so a later job running `optimesh-ai/RuleHawk/comment` can put every check of the run in one comment. |
 | `evidence` | `false` | Emit a **compliance-evidence artifact** (JSON + markdown) for the run: provenance (SHA-256 of every config audited, tool version, timestamp), `VERIFIED`/`FAILED` policy attestations, and PCI DSS / NIST 800-53 / ISO 27001 / CIS / SOC 2 / HIPAA control references. Paths land in the `evidence-file` / `evidence-md-file` outputs. |
 | `upload-sarif` | `true` | Upload SARIF to code scanning so findings annotate the exact diff line. |
 | `working-directory` | `.` | Directory to run the audit in. |
@@ -69,6 +71,75 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 | `evidence-file` | Path to the compliance-evidence JSON artifact (empty unless `evidence: true`). |
 | `evidence-md-file` | Path to the same artifact rendered as a markdown document (empty unless `evidence: true`). |
 | `sarif-file` | Path to the generated SARIF report. |
+| `result-file` | Path to this check's result record, the input to `rulehawk combine` and `optimesh-ai/RuleHawk/comment`. |
+
+## Several checks on one PR
+
+A PR is often checked more than once: hygiene and segmentation over every
+config, and a connectivity proof over the configs that own an egress path. The
+PR still gets **one** comment, and its headline is the **worst** verdict:
+**FAIL** if any check failed, **UNKNOWN** if a check that should have reported
+did not, **PASS** only when every check passed. A passing check never hides a
+failing one.
+
+**Several gate steps in one job** need nothing extra. Each step's comment
+includes every check the job has run so far, so the comment the last step
+posts covers them all:
+
+```yaml
+steps:
+  - uses: actions/checkout@v4
+  - uses: optimesh-ai/RuleHawk@v1
+    with: {configs: 'firewall/**/*.txt', policy: .rulehawk/segmentation.json, label: Segmentation}
+  - uses: optimesh-ai/RuleHawk@v1
+    if: always()            # run the second proof even when the first fails
+    with: {configs: firewall/edge.cfg, policy: .rulehawk/egress.json, label: Egress}
+```
+
+**Checks in separate jobs** each post to the same comment, so with `comment:
+true` in parallel jobs the last job to finish replaces the others' verdict. Set
+`comment: false` and `share-results: true` on every gate step, and add one job
+that combines them:
+
+```yaml
+jobs:
+  segmentation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: optimesh-ai/RuleHawk@v1
+        with: {configs: 'firewall/**/*.txt', policy: .rulehawk/segmentation.json,
+               label: Segmentation, comment: false, share-results: true}
+  egress:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: optimesh-ai/RuleHawk@v1
+        with: {configs: firewall/edge.cfg, policy: .rulehawk/egress.json,
+               label: Egress, comment: false, share-results: true, upload-sarif: false}
+  verdict:
+    needs: [segmentation, egress]
+    if: ${{ !cancelled() }}         # report a failed job too, not only a green run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: optimesh-ai/RuleHawk/comment@v1
+        with:
+          expect: 2                 # one per gate step that shares its result
+```
+
+`optimesh-ai/RuleHawk/comment` inputs:
+
+| Input | Default | Description |
+|---|---|---|
+| `expect` | — (**required**) | How many checks must report: one per gate step with `share-results: true`. Fewer make the verdict `UNKNOWN`, never `PASS`, so a crashed, cancelled or skipped job cannot read as a pass. |
+| `results` | `''` | Result files or directories to combine. Empty downloads this run's `rulehawk-results-*` artifacts. |
+| `comment` | `true` | Post/update the sticky PR comment on `pull_request` events. |
+| `fail` | `true` | Fail the step unless the combined verdict is `PASS`. |
+
+Its outputs are `verdict` (`PASS` \| `FAIL` \| `UNKNOWN`) and `comment-file`.
+After *Re-run failed jobs*, only the newest attempt of each check counts. The
+same combination runs locally: `rulehawk combine results/ --expect 2 --comment
+comment.md` (exit 0 PASS, 1 FAIL, 2 UNKNOWN).
 
 ## Continuous compliance evidence
 
@@ -122,8 +193,8 @@ SARIF and posts the comment first, so the gate always reports its value.
   finding (exact for all five vendors, thanks to per-rule line tracking). They show
   in the *Files changed* tab and the Security tab, bucketed by severity.
 - **A single sticky comment** — one comment per PR, updated in place each push
-  (keyed by a hidden `<!-- rulehawk-gate -->` marker), led by the segmentation
-  witness packets.
+  (keyed by a hidden `<!-- rulehawk-gate -->` marker on a comment the workflow's
+  own token wrote), led by the worst verdict and the segmentation witness packets.
 - **A job summary** — the full report on the run page (`$GITHUB_STEP_SUMMARY`).
 
 ## Permissions & fork PRs
