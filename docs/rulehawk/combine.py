@@ -183,36 +183,47 @@ def collect(paths: Sequence[str], expect: Optional[int] = None,
     leaves the previous attempt's PASS behind), so its PASS is not proof."""
     files, checks = _result_files(paths)
     loaded = [_load(f) for f in files]
-    # A re-run attempt replaces that same check from an older attempt. Within
-    # one attempt nothing is dropped: two results with the same label there are
-    # different runs (a matrix), and neither may hide the other. When only some
-    # legs of a matrix were re-run, the newest attempt has fewer results than
-    # an older one; the older surplus stands in for the legs not re-run. Which
-    # leg was re-run cannot be told, so the surplus kept is the WORST of the
-    # older results: a re-run can never let a pass stand over a failure.
-    # (A distinct `label` per matrix leg makes this exact.)
-    by_key: Dict[Tuple[str, str], List[Check]] = {}
+    # Only each job's newest attempt counts. A job that re-ran replaces ALL of
+    # its older results: a check it ran before but not this time (skipped on
+    # the re-run, say) is not still passing. Matrix legs share a job id, so
+    # after re-running only some legs the others' results do not count either:
+    # a leg that was not re-run cannot be told from a skipped check, and the
+    # verdict stays UNKNOWN until the whole job re-runs. Within one attempt
+    # nothing is dropped: same-label results there are different legs.
+    newest: Dict[str, int] = {}
     for c in loaded:
         if c.reported:
-            by_key.setdefault((c.job, c.label), []).append(c)
+            newest[c.job] = max(newest.get(c.job, c.attempt), c.attempt)
+    # Older results the newest attempt did not replace check for check (same
+    # label, as many times) are set aside VISIBLY: UNKNOWN, never silent.
+    now: Dict[Tuple[str, str], int] = {}
+    before: Dict[Tuple[str, str, int], int] = {}
+    for c in loaded:
+        if not c.reported:
+            continue
+        if c.attempt == newest[c.job]:
+            now[(c.job, c.label)] = now.get((c.job, c.label), 0) + 1
         else:
-            checks.append(c)
-    for key in sorted(by_key, key=lambda k: min(loaded.index(c) for c in by_key[k])):
-        group = by_key[key]
-        top = max(c.attempt for c in group)
-        kept = [c for c in group if c.attempt == top]
-        older: Dict[int, List[Check]] = {}
-        for c in group:
-            if c.attempt < top:
-                older.setdefault(c.attempt, []).append(c)
-        if older:
-            widest = max(older.values(), key=len)   # the most legs an attempt ran
-            surplus = len(widest) - len(kept)
-            if surplus > 0:
-                pool = sorted((c for a in older.values() for c in a),
-                              key=lambda c: (-_RANK[c.verdict], -c.attempt))
-                kept += pool[:surplus]
-        checks.extend(sorted(kept, key=loaded.index))
+            k = (c.job, c.label, c.attempt)
+            before[k] = before.get(k, 0) + 1
+    gaps: Dict[Tuple[str, str], int] = {}
+    for (job, label, _attempt), n in before.items():
+        gap = n - now.get((job, label), 0)
+        if gap > 0:
+            gaps[(job, label)] = max(gaps.get((job, label), 0), gap)
+    unreplaced: Dict[str, int] = {}
+    for (job, _label), gap in gaps.items():
+        unreplaced[job] = unreplaced.get(job, 0) + gap
+    for c in loaded:
+        if c.reported and c.attempt < newest[c.job]:
+            continue
+        checks.append(c)
+    for job, n in sorted(unreplaced.items()):
+        checks.append(Check(
+            label=f"job {job or '(unnamed)'}", verdict="UNKNOWN",
+            detail=(f"its attempt {newest[job]} re-ran fewer checks than an earlier "
+                    f"attempt; {n} earlier result(s) set aside. Re-run the whole "
+                    f"job to check them")))
     for job, info in sorted((needs or {}).items()):
         result = info.get("result") if isinstance(info, dict) else None
         if result == "success":
@@ -325,7 +336,7 @@ def render_checks(checks: List[Check]) -> Tuple[str, str]:
     # has, so existing one-check workflows see no change.
     if len(checks) == 1 and checks[0].reported:
         body = f"{_COMMENT_MARKER}\n{checks[0].markdown.rstrip(chr(10))}"
-        if _length(body) <= GITHUB_COMMENT_LIMIT:
+        if _length(body + "\n") <= GITHUB_COMMENT_LIMIT:   # posted with a newline
             return body, worst
     for level in ("all", "failing", "table", "rows"):
         body = _render_many(checks, worst, level)

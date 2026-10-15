@@ -139,9 +139,10 @@ jobs:
 | `fail` | `true` | Fail the step unless the combined verdict is `PASS`. |
 
 Its outputs are `verdict` (`PASS` \| `FAIL` \| `UNKNOWN`) and `comment-file`.
-After *Re-run failed jobs*, only the newest attempt of each check counts. In a
-matrix, give each leg its own `label` (e.g. `label: egress-${{ matrix.site }}`)
-so a re-run of one leg replaces exactly that leg's result. Do not put
+After *Re-run failed jobs*, only each job's newest attempt counts: a job that
+re-ran replaces all of its earlier results, so a check skipped on the re-run
+is not still passing. Matrix legs share one job id, so re-running only some
+legs leaves the verdict `UNKNOWN` until the whole job re-runs. Do not put
 `continue-on-error` on a gate step that shares its result: it would also hide a
 failed upload, and on a re-run the previous attempt's result would stand. The
 same combination runs locally: `rulehawk combine results/ --expect 2 --comment
