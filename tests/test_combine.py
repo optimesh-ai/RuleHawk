@@ -337,3 +337,14 @@ def test_a_record_without_its_attempt_or_job_is_not_counted(tmp_path):
         del rec[field]
         open(p, "w").write(json.dumps(rec))
         assert combine.render([p])[1] == "UNKNOWN", field
+
+
+def test_an_unwritable_summary_does_not_split_the_verdict_from_the_comment(tmp_path):
+    """The step summary is a convenience. Failing to write it must not turn a
+    PASS exit code into UNKNOWN while a PASS comment is posted (or vice versa):
+    the exit code and the comment always say the same thing."""
+    a = _result(tmp_path, "a.json", _CLEAN, label="one")
+    out = tmp_path / "c.md"
+    rc = combine.main([a, "--comment", str(out), "--summary", str(tmp_path), "-q"])
+    body = out.read_text(encoding="utf-8")
+    assert rc == 0 and "✅" in _headline(body)
