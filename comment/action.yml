@@ -100,6 +100,11 @@ runs:
           1) VERDICT=FAIL ;;
           *) VERDICT=UNKNOWN ;;
         esac
+        # Belt and braces: a body that reads PASS beside a verdict that is not
+        # PASS is replaced, never posted.
+        if [ -s "${BODY}" ] && [ "${VERDICT}" != "PASS" ] && grep -q '^## ✅' "${BODY}"; then
+          rm -f "${BODY}"
+        fi
         if [ ! -s "${BODY}" ]; then
           VERDICT=UNKNOWN
           printf '%s\n## ❌ RuleHawk firewall gate: UNKNOWN\n\nThe checks could not be combined into a comment; see the job log.\n' \
