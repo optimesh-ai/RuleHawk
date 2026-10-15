@@ -237,27 +237,50 @@ jobs:
           expect: 2
           jobs: ${{ toJSON(needs) }}
           comment: false
-      - name: A job too few (expect UNKNOWN)
-        id: missing
+      # FAIL outranks UNKNOWN: a missing check beside a failing one is FAIL,
+      # and the comment still names the shortfall.
+      - name: A failure and a job too few (expect FAIL)
+        id: worst
         continue-on-error: true
         uses: ./comment
         with:
           expect: 3
           jobs: ${{ toJSON(needs) }}
           comment: false
+      - name: Fetch only the clean job's result
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rulehawk-results-*-share-clean-*
+          path: ${{ runner.temp }}/rulehawk-clean-only
+          merge-multiple: true
+      - name: A job too few, nothing failing (expect UNKNOWN)
+        id: missing
+        continue-on-error: true
+        uses: ./comment
+        with:
+          expect: 2
+          jobs: ${{ toJSON(needs) }}
+          results: ${{ runner.temp }}/rulehawk-clean-only
+          comment: false
       - name: Assert the combined verdicts
         env:
           BOTH: ${{ steps.both.outputs.verdict }}
           BOTH_OUTCOME: ${{ steps.both.outcome }}
           BOTH_FILE: ${{ steps.both.outputs.comment-file }}
+          WORST: ${{ steps.worst.outputs.verdict }}
+          WORST_FILE: ${{ steps.worst.outputs.comment-file }}
           MISSING: ${{ steps.missing.outputs.verdict }}
+          MISSING_FILE: ${{ steps.missing.outputs.comment-file }}
           MISSING_OUTCOME: ${{ steps.missing.outcome }}
         run: |
           set -euo pipefail
           [ "${BOTH}" = "FAIL" ]              || { echo "::error::expected FAIL, got '${BOTH}'"; exit 1; }
           [ "${BOTH_OUTCOME}" = "failure" ]   || { echo "::error::the FAIL did not fail the step"; exit 1; }
+          [ "${WORST}" = "FAIL" ]             || { echo "::error::expected FAIL to outrank UNKNOWN, got '${WORST}'"; exit 1; }
+          grep -q 'expected 3 check(s), found 2' "${WORST_FILE}"
           [ "${MISSING}" = "UNKNOWN" ]        || { echo "::error::expected UNKNOWN, got '${MISSING}'"; exit 1; }
+          if grep -q '^## ✅' "${MISSING_FILE}"; then echo "::error::a shortfall read PASS"; exit 1; fi
           [ "${MISSING_OUTCOME}" = "failure" ] || { echo "::error::the UNKNOWN did not fail the step"; exit 1; }
           grep -q '| clean | ✅ PASS |' "${BOTH_FILE}"
           grep -q '| dirty | ❌ FAIL' "${BOTH_FILE}"
-          echo "across-jobs combine verified: ${BOTH}, ${MISSING}"
+          echo "across-jobs combine verified: ${BOTH}, ${WORST}, ${MISSING}"
