@@ -198,7 +198,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./
-        continue-on-error: true      # the FAIL is the point; keep the job green
+        # The FAIL is the point; keep the job green. (Outside this self-test,
+        # continue-on-error on a sharing gate step would also hide a failed
+        # upload; see docs/github-action.md.)
+        continue-on-error: true
         with:
           configs: samples/ios_acl.txt
           policy: samples/policy.json

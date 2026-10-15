@@ -139,7 +139,11 @@ jobs:
 | `fail` | `true` | Fail the step unless the combined verdict is `PASS`. |
 
 Its outputs are `verdict` (`PASS` \| `FAIL` \| `UNKNOWN`) and `comment-file`.
-After *Re-run failed jobs*, only the newest attempt of each check counts. The
+After *Re-run failed jobs*, only the newest attempt of each check counts. In a
+matrix, give each leg its own `label` (e.g. `label: egress-${{ matrix.site }}`)
+so a re-run of one leg replaces exactly that leg's result. Do not put
+`continue-on-error` on a gate step that shares its result: it would also hide a
+failed upload, and on a re-run the previous attempt's result would stand. The
 same combination runs locally: `rulehawk combine results/ --expect 2 --comment
 comment.md` (exit 0 PASS, 1 FAIL, 2 UNKNOWN). The comment is only ever written by
 the workflow's `GITHUB_TOKEN` (`github-actions[bot]`), and only that account's

@@ -35,11 +35,32 @@ from .gate import FOOTER, RESULT_SCHEMA, _COMMENT_MARKER
 # previous verdict standing on the PR, so the body is kept well under the limit
 # by trimming detail — never the verdict or the per-check table.
 MAX_COMMENT_CHARS = 60000
+GITHUB_COMMENT_LIMIT = 65536
+
+
+def _length(text: str) -> int:
+    """Length as GitHub counts it (UTF-16 code units: an emoji counts 2)."""
+    return len(text.encode("utf-16-le")) // 2
 
 _RANK = {"PASS": 0, "UNKNOWN": 1, "FAIL": 2}
 _ICON = {"PASS": "✅", "UNKNOWN": "❌", "FAIL": "❌"}
 _EXIT = {"PASS": 0, "FAIL": 1, "UNKNOWN": 2}
 _FAIL_ON = ("critical", "high", "medium", "low", "none")
+_SEVERITIES = ("critical", "high", "medium", "low", "info", "none")
+
+
+def _report_verdict(md: str) -> Optional[str]:
+    """PASS / FAIL as the report itself states it — its title icon AND its
+    verdict line must agree — or None when they do not."""
+    lines = [l for l in md.splitlines() if l.strip()]
+    if len(lines) < 2:
+        return None
+    title, line = lines[0], lines[1]
+    if title.startswith("## ✅ ") and line.startswith("**PASS**"):
+        return "PASS"
+    if title.startswith("## ❌ ") and line.startswith("**FAIL"):
+        return "FAIL"
+    return None
 
 
 def _is_int(v) -> bool:
@@ -120,20 +141,21 @@ def _load(path: str) -> Check:
     label, md = rec.get("label"), rec.get("markdown")
     attempt, fail_on = rec.get("attempt", 1), rec.get("fail_on")
     n, pf, job = rec.get("violations"), rec.get("parse_failures"), rec.get("job", "")
+    worst = rec.get("worst")
     if not (isinstance(passed, bool) and _is_int(code) and _is_int(attempt)
             and _is_int(n) and _is_int(pf) and isinstance(label, str)
             and isinstance(md, str) and isinstance(job, str)
-            and fail_on in _FAIL_ON):
+            and fail_on in _FAIL_ON and worst in _SEVERITIES):
         return Check(label=name, verdict="UNKNOWN",
                      detail=f"`{name}` is an incomplete result record")
     if passed:
         # PASS only when every field agrees: exit 0, nothing at the threshold,
         # every file parsed (advisory `none` never blocks), a passing report.
         ok = (code == 0 and n == 0 and (pf == 0 or fail_on == "none")
-              and md.startswith("## ✅ "))
+              and _report_verdict(md) == "PASS")
         verdict, detail = "PASS", f"no findings at or above `{fail_on}`"
     else:
-        ok = code in (1, 2) and md.startswith("## ❌ ")
+        ok = code in (1, 2) and _report_verdict(md) == "FAIL"
         verdict = "FAIL"
         if code == 2 and not n:
             detail = (f"fail-closed: {pf} file(s) parsed to zero rules" if pf
@@ -163,16 +185,34 @@ def collect(paths: Sequence[str], expect: Optional[int] = None,
     loaded = [_load(f) for f in files]
     # A re-run attempt replaces that same check from an older attempt. Within
     # one attempt nothing is dropped: two results with the same label there are
-    # different runs (a matrix), and neither may hide the other.
-    newest: Dict[Tuple[str, str], int] = {}
+    # different runs (a matrix), and neither may hide the other. When only some
+    # legs of a matrix were re-run, the newest attempt has fewer results than
+    # an older one; the older surplus stands in for the legs not re-run. Which
+    # leg was re-run cannot be told, so the surplus kept is the WORST of the
+    # older results: a re-run can never let a pass stand over a failure.
+    # (A distinct `label` per matrix leg makes this exact.)
+    by_key: Dict[Tuple[str, str], List[Check]] = {}
     for c in loaded:
         if c.reported:
-            key = (c.job, c.label)
-            newest[key] = max(newest.get(key, c.attempt), c.attempt)
-    for c in loaded:
-        if c.reported and c.attempt < newest[(c.job, c.label)]:
-            continue
-        checks.append(c)
+            by_key.setdefault((c.job, c.label), []).append(c)
+        else:
+            checks.append(c)
+    for key in sorted(by_key, key=lambda k: min(loaded.index(c) for c in by_key[k])):
+        group = by_key[key]
+        top = max(c.attempt for c in group)
+        kept = [c for c in group if c.attempt == top]
+        older: Dict[int, List[Check]] = {}
+        for c in group:
+            if c.attempt < top:
+                older.setdefault(c.attempt, []).append(c)
+        if older:
+            widest = max(older.values(), key=len)   # the most legs an attempt ran
+            surplus = len(widest) - len(kept)
+            if surplus > 0:
+                pool = sorted((c for a in older.values() for c in a),
+                              key=lambda c: (-_RANK[c.verdict], -c.attempt))
+                kept += pool[:surplus]
+        checks.extend(sorted(kept, key=loaded.index))
     for job, info in sorted((needs or {}).items()):
         result = info.get("result") if isinstance(info, dict) else None
         if result == "success":
@@ -265,7 +305,7 @@ def _render_many(checks: List[Check], worst: str, detail: str) -> str:
     shown: List[str] = []
     for i in order:
         trial = assemble([], note, shown + [rows[i]])
-        if len(trial) > MAX_COMMENT_CHARS - 200:
+        if _length(trial) > MAX_COMMENT_CHARS - 200:
             break
         shown.append(rows[i])
     hidden = len(rows) - len(shown)
@@ -285,11 +325,11 @@ def render_checks(checks: List[Check]) -> Tuple[str, str]:
     # has, so existing one-check workflows see no change.
     if len(checks) == 1 and checks[0].reported:
         body = f"{_COMMENT_MARKER}\n{checks[0].markdown.rstrip(chr(10))}"
-        if len(body) <= MAX_COMMENT_CHARS:
+        if _length(body) <= GITHUB_COMMENT_LIMIT:
             return body, worst
     for level in ("all", "failing", "table", "rows"):
         body = _render_many(checks, worst, level)
-        if len(body) <= MAX_COMMENT_CHARS:
+        if _length(body) <= MAX_COMMENT_CHARS:
             return body, worst
     return body, worst
 

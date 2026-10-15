@@ -241,11 +241,12 @@ runs:
         category: rulehawk
 
     # Hand this check's result to a later job that combines every check of the
-    # run into one comment (optimesh-ai/RuleHawk/comment). Best-effort: if the
-    # upload fails, that job finds one result too few and says UNKNOWN.
+    # run into one comment (optimesh-ai/RuleHawk/comment). A failed upload
+    # fails the job: the combining job then sees a failed job whose results
+    # show no failure and says UNKNOWN, rather than trusting a result from an
+    # earlier attempt.
     - name: Share the result with a combining job
       if: always() && inputs.share-results == 'true' && steps.reserve.outputs.result != ''
-      continue-on-error: true
       uses: actions/upload-artifact@v4
       with:
         name: rulehawk-results-${{ github.run_attempt }}-${{ steps.reserve.outputs.result_id }}
