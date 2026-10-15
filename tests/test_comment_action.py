@@ -136,3 +136,15 @@ def test_a_gate_job_that_failed_without_a_failing_result_is_unknown(tmp_path):
                        "segmentation": {"result": "success", "outputs": {}}})
     run = _run(tmp_path, str(d), "2", jobs)
     assert run["outputs"]["combine"]["verdict"] == "UNKNOWN"
+
+
+def test_a_failed_upload_is_not_hidden_inside_the_gate_action():
+    """If sharing the result fails, the job must fail: the combining job then
+    sees a failed job with no failing result and says UNKNOWN."""
+    with open(os.path.join(_ROOT, "action.yml"), encoding="utf-8") as fh:
+        main = yaml.safe_load(fh)
+    upload = [s for s in main["runs"]["steps"]
+              if "upload-artifact" in str(s.get("uses", ""))]
+    assert upload, "the gate action has no result upload step"
+    assert not upload[0].get("continue-on-error"), \
+        "a failed upload would leave the previous attempt's result standing"

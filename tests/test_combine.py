@@ -266,3 +266,49 @@ def test_cli_needs(tmp_path):
     assert combine.main([old, "--needs", needs, "-q"]) == 2
     assert combine.main([old, "--needs", "[1]", "-q"]) == 2
     assert combine.main([old, "--needs", "{nope", "-q"]) == 2
+
+
+def test_a_record_without_a_valid_worst_severity_is_not_a_pass(tmp_path):
+    p = _record(tmp_path, "noworst")
+    rec = json.load(open(p))
+    del rec["worst"]
+    open(p, "w").write(json.dumps(rec))
+    assert combine.render([p])[1] == "UNKNOWN"
+    q = _record(tmp_path, "bogus", worst="catastrophic")
+    assert combine.render([q])[1] == "UNKNOWN"
+
+
+def test_a_fail_record_whose_report_says_pass_in_the_verdict_line_is_unknown(tmp_path):
+    md = "## ❌ RuleHawk firewall gate\n\n**PASS** — no findings at or above `high`."
+    p = _record(tmp_path, "mixed2", passed=False, exit_code=1, violations=1, markdown=md)
+    body, verdict = combine.render([p])
+    assert verdict == "UNKNOWN"
+    assert "**PASS**" not in body
+
+
+def test_rerunning_one_matrix_leg_keeps_the_other_legs_result(tmp_path):
+    """Two legs share job id and label. Re-running one must not discard the
+    other leg's result (which would read as a missing check)."""
+    a1 = _result(tmp_path, "a1.json", _CLEAN, label="egress", job="m", attempt="1")
+    b1 = _result(tmp_path, "b1.json", _CLEAN, label="egress", job="m", attempt="1")
+    a2 = _result(tmp_path, "a2.json", _CLEAN, label="egress", job="m", attempt="2")
+    body, verdict = combine.render([a1, b1, a2], expect=2)
+    assert verdict == "PASS", body
+
+
+def test_rerunning_a_passing_matrix_leg_cannot_hide_a_failing_one(tmp_path):
+    """We cannot tell which leg was re-run, so the older result that stands in
+    for the other leg is the worst one: never a pass over a failure."""
+    a1 = _result(tmp_path, "a1.json", _CLEAN, label="egress", job="m", attempt="1")
+    b1 = _result(tmp_path, "b1.json", _DIRTY, label="egress", job="m", attempt="1")
+    a2 = _result(tmp_path, "a2.json", _CLEAN, label="egress", job="m", attempt="2")
+    assert combine.render([a1, b1, a2], expect=2)[1] == "FAIL"
+
+
+def test_a_single_report_that_fits_github_is_byte_identical(tmp_path):
+    """Up to GitHub's limit the one-check comment is exactly the old one."""
+    md = "## ❌ RuleHawk firewall gate\n\n**FAIL** — x.\n\n" + "x" * 64000
+    p = _record(tmp_path, "fits", passed=False, exit_code=1, violations=1, markdown=md)
+    body, verdict = combine.render([p])
+    assert body == "<!-- rulehawk-gate -->\n" + md
+    assert verdict == "FAIL"
