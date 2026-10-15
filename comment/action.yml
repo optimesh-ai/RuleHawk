@@ -64,6 +64,13 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    # A download that fails must not leave an earlier invocation's records
+    # standing in for this one's.
+    - name: Start from an empty results directory
+      if: inputs.results == ''
+      shell: bash
+      run: rm -rf "${RUNNER_TEMP:-/tmp}/rulehawk-combine-in"
+
     # Every attempt's artifacts: after "re-run failed jobs" the jobs that passed
     # keep their first-attempt results, and `rulehawk combine` keeps only the
     # newest attempt of each check.
@@ -87,7 +94,10 @@ runs:
       run: |
         set -u
         IN="${RH_RESULTS:-${RUNNER_TEMP:-/tmp}/rulehawk-combine-in}"
-        BODY="${RUNNER_TEMP:-/tmp}/rulehawk-combined-comment.md"
+        # A path of its own: a later invocation in the job must not overwrite
+        # this one's comment-file output.
+        BODY="$(mktemp "${RUNNER_TEMP:-/tmp}/rulehawk-combined-comment-XXXXXX")" \
+          || BODY="${RUNNER_TEMP:-/tmp}/rulehawk-combined-comment-$$-${RANDOM}"
         rm -f "${BODY}"
         # noglob: the inputs are paths, split on whitespace only.
         set +e -f
