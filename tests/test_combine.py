@@ -286,23 +286,37 @@ def test_a_fail_record_whose_report_says_pass_in_the_verdict_line_is_unknown(tmp
     assert "**PASS**" not in body
 
 
-def test_rerunning_one_matrix_leg_keeps_the_other_legs_result(tmp_path):
-    """Two legs share job id and label. Re-running one must not discard the
-    other leg's result (which would read as a missing check)."""
-    a1 = _result(tmp_path, "a1.json", _CLEAN, label="egress", job="m", attempt="1")
-    b1 = _result(tmp_path, "b1.json", _CLEAN, label="egress", job="m", attempt="1")
-    a2 = _result(tmp_path, "a2.json", _CLEAN, label="egress", job="m", attempt="2")
+def test_a_check_skipped_on_a_rerun_does_not_keep_its_old_pass(tmp_path):
+    """Attempt 1 ran checks A and B (both passed; the job then failed later).
+    Attempt 2 ran only A. B's attempt-1 PASS is stale: it must not count."""
+    a1 = _result(tmp_path, "a1.json", _CLEAN, label="A", job="j", attempt="1")
+    b1 = _result(tmp_path, "b1.json", _CLEAN, label="B", job="j", attempt="1")
+    a2 = _result(tmp_path, "a2.json", _CLEAN, label="A", job="j", attempt="2")
     body, verdict = combine.render([a1, b1, a2], expect=2)
-    assert verdict == "PASS", body
+    assert verdict == "UNKNOWN", body
 
 
-def test_rerunning_a_passing_matrix_leg_cannot_hide_a_failing_one(tmp_path):
-    """We cannot tell which leg was re-run, so the older result that stands in
-    for the other leg is the worst one: never a pass over a failure."""
+def test_rerunning_one_matrix_leg_is_unknown_until_every_leg_reruns(tmp_path):
+    """Matrix legs share a job id, so a leg that was not re-run cannot be told
+    from a check that was skipped: the older results do not count, and the
+    verdict is UNKNOWN (never a stale PASS) until the whole job re-runs."""
     a1 = _result(tmp_path, "a1.json", _CLEAN, label="egress", job="m", attempt="1")
     b1 = _result(tmp_path, "b1.json", _DIRTY, label="egress", job="m", attempt="1")
     a2 = _result(tmp_path, "a2.json", _CLEAN, label="egress", job="m", attempt="2")
-    assert combine.render([a1, b1, a2], expect=2)[1] == "FAIL"
+    body, verdict = combine.render([a1, b1, a2], expect=2)
+    assert verdict == "UNKNOWN", body
+
+
+def test_a_single_report_at_the_limit_still_fits_once_posted(tmp_path):
+    """The posted body ends with a newline; that newline counts."""
+    head = "## ❌ RuleHawk firewall gate\n\n**FAIL** — x.\n\n"
+    marker = "<!-- rulehawk-gate -->\n"
+    pad = combine.GITHUB_COMMENT_LIMIT - combine._length(marker + head)
+    p = _record(tmp_path, "edge", passed=False, exit_code=1, violations=1,
+                markdown=head + "x" * pad)
+    out = tmp_path / "c.md"
+    combine.main([p, "--comment", str(out), "-q"])
+    assert combine._length(out.read_text(encoding="utf-8")) <= combine.GITHUB_COMMENT_LIMIT
 
 
 def test_a_single_report_that_fits_github_is_byte_identical(tmp_path):
