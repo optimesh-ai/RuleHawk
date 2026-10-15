@@ -139,8 +139,9 @@ def _load(path: str) -> Check:
                      detail="the check started but never reported a result")
     passed, code = rec.get("passed"), rec.get("exit_code")
     label, md = rec.get("label"), rec.get("markdown")
-    attempt, fail_on = rec.get("attempt", 1), rec.get("fail_on")
-    n, pf, job = rec.get("violations"), rec.get("parse_failures"), rec.get("job", "")
+    # No defaults: the re-run and failed-job rules key on attempt and job.
+    attempt, fail_on = rec.get("attempt"), rec.get("fail_on")
+    n, pf, job = rec.get("violations"), rec.get("parse_failures"), rec.get("job")
     worst = rec.get("worst")
     if not (isinstance(passed, bool) and _is_int(code) and _is_int(attempt)
             and _is_int(n) and _is_int(pf) and isinstance(label, str)
