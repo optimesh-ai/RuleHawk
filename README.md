@@ -196,6 +196,10 @@ silently passing.
 | What does this change (or the fix) break, before I push? | No | Yes |
 | Blast radius of a change across multiple devices | No | Yes |
 
+**Checking changes, not just rules?** [Hammerhead](https://optimesh.ai) runs the
+change against a model of your whole network (routing, reachability and
+segmentation) and tells you what it breaks before you push.
+
 Every report states that scope (JSON: `verification_boundary`). When a result
 raises a question only a forwarding model can answer (a live segmentation
 violation, or a broken `must_reach` flow) the report adds one "next step" line
