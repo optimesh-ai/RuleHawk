@@ -45,6 +45,7 @@ usage:
   rulehawk - [options]                     read the config from stdin
   cat config | rulehawk [options]          piped stdin also works
   rulehawk gate <file-or-glob>... [...]    multi-file CI gate (`rulehawk gate --help`)
+  rulehawk combine <results>... [...]      one PR comment for several gate runs
 
 options:
   --json               emit the machine-readable JSON report instead of text
@@ -96,6 +97,9 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Subcommand: `rulehawk gate ...` runs the multi-file CI gate (SARIF, PR
     # comment, severity threshold). Everything else is the single-file report.
+    if argv and argv[0] == "combine":
+        from .combine import main as combine_main
+        return combine_main(argv[1:])
     if argv and argv[0] == "gate":
         from .gate import main as gate_main
         return gate_main(argv[1:])

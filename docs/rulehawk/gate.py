@@ -577,6 +577,8 @@ def to_json(gate: GateResult) -> str:
 # Markdown report (Step Summary + PR comment share this body)
 # --------------------------------------------------------------------------- #
 _COMMENT_MARKER = "<!-- rulehawk-gate -->"   # sticky-comment find/replace anchor
+FOOTER = (f"<sub>RuleHawk runs entirely inside your runner — your config never "
+          f"leaves your infrastructure. · [docs]({_REPO_URL})</sub>")
 
 # Brand voice: flat, no decorative emoji (matches the de-vibed Carbon web UI).
 # A single ✅/❌ for the binary verdict is kept — it mirrors report.to_text and is
@@ -704,8 +706,7 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
         lines.append("")
 
     lines.append("")
-    lines.append(f"<sub>RuleHawk runs entirely inside your runner — your config "
-                 f"never leaves your infrastructure. · [docs]({_REPO_URL})</sub>")
+    lines.append(FOOTER)
     return "\n".join(lines)
 
 
@@ -722,6 +723,64 @@ def _notes_block(notes: List[str], cap: int = 25) -> List[str]:
 
 def comment_body(gate: GateResult) -> str:
     return f"{_COMMENT_MARKER}\n{to_markdown(gate)}"
+
+
+# --------------------------------------------------------------------------- #
+# result record — one per gate run, combined into one PR comment by
+# `rulehawk combine` (rulehawk/combine.py)
+# --------------------------------------------------------------------------- #
+RESULT_SCHEMA = "rulehawk.result/v1"
+
+
+def _run_identity() -> Tuple[str, int]:
+    """The CI job and run attempt this gate ran in (empty / 1 outside CI)."""
+    try:
+        attempt = int(os.environ.get("GITHUB_RUN_ATTEMPT") or 1)
+    except ValueError:
+        attempt = 1
+    return os.environ.get("GITHUB_JOB", ""), attempt
+
+
+def to_result(gate: GateResult, label: str) -> str:
+    """The machine record `rulehawk combine` reads: the verdict, the numbers
+    behind it, and the full markdown report for the PR comment."""
+    job, attempt = _run_identity()
+    return json.dumps({
+        "schema": RESULT_SCHEMA,
+        "label": label,
+        "job": job,
+        "attempt": attempt,
+        "passed": gate.passed,
+        "exit_code": gate.exit_code(),
+        "fail_on": gate.fail_on,
+        "worst": gate.worst,
+        "violations": len(gate.violations),
+        "parse_failures": len(gate.parse_failures),
+        "markdown": to_markdown(gate),
+    }, indent=2)
+
+
+def _failed_result(label: str, fail_on: str, reason: str) -> str:
+    """A record for a gate that stopped before auditing anything (bad input,
+    no files matched): it FAILS closed, like the exit code."""
+    job, attempt = _run_identity()
+    md = (f"## ❌ RuleHawk firewall gate\n\n**FAIL (fail-closed)** — the gate "
+          f"stopped before auditing: {reason}\n\n{FOOTER}")
+    return json.dumps({
+        "schema": RESULT_SCHEMA, "label": label, "job": job, "attempt": attempt,
+        "passed": False, "exit_code": 2, "fail_on": fail_on, "worst": "none",
+        "violations": 0, "parse_failures": 0, "markdown": md,
+    }, indent=2)
+
+
+def _write_atomic(path: str, content: str) -> None:
+    """Write via a temp file + rename, so a reader never sees half a record."""
+    if path == "-":
+        print(content)
+        return
+    tmp = f"{path}.tmp-{os.getpid()}"
+    _write(tmp, content)
+    os.replace(tmp, path)
 
 
 # --------------------------------------------------------------------------- #
@@ -793,6 +852,9 @@ options:
   --summary PATH       write the markdown report ('-' for stdout); defaults to
                        $GITHUB_STEP_SUMMARY when that env var is set
   --comment PATH       write the sticky PR-comment markdown body
+  --result PATH        write this run's result record, for `rulehawk combine`
+  --label TEXT         name this check in a combined comment (default: the
+                       file patterns and the policy)
   --json PATH          write the machine aggregate ('-' for stdout)
   --evidence PATH      write the compliance-evidence artifact ('-' for stdout):
                        provenance + VERIFIED/FAILED policy attestations +
@@ -835,40 +897,51 @@ def main(argv: Optional[List[str]] = None) -> int:
     json_path = _take(argv, "--json")
     evidence_path = _take(argv, "--evidence")
     evidence_md_path = _take(argv, "--evidence-md")
+    result_path = _take(argv, "--result")
+    label = _take(argv, "--label")
+
+    def _label() -> str:
+        if label:
+            return label
+        pats = " ".join(a for a in argv if not a.startswith("-"))
+        return pats + (f" · {policy_path}" if policy_path else "")
+
+    def stop(reason: str) -> int:
+        """Usage/input error: exit 2 (fail-closed), and when a result record
+        was asked for, record the failure so a combined comment cannot read
+        this check as missing or passed."""
+        print(f"rulehawk gate: {reason}", file=sys.stderr)
+        if result_path:
+            try:
+                _write_atomic(result_path, _failed_result(_label(), fail_on, reason))
+            except OSError as e:
+                print(f"rulehawk gate: cannot write output: {e}", file=sys.stderr)
+        return 2
 
     if fail_on not in ("critical", "high", "medium", "low", "none"):
-        print(f"rulehawk gate: bad --fail-on {fail_on!r}", file=sys.stderr)
-        return 2
+        return stop(f"bad --fail-on {fail_on!r}")
     if vendor != "auto" and vendor not in _VENDORS:
-        print(f"rulehawk gate: unknown --vendor {vendor!r} "
-              "(choose: auto | ios | junos | panos | iptables | nxos | eos | aws-sg)",
-              file=sys.stderr)
-        return 2
+        return stop(f"unknown --vendor {vendor!r} "
+                    "(choose: auto | ios | junos | panos | iptables | nxos | eos | aws-sg)")
 
     # Anything still flag-shaped is an unknown option. Silently dropping it made
     # `--fail-onn low` run at the default threshold with `low` as a (dead) file
     # pattern — the user's intent ignored twice over.
     unknown = [a for a in argv if a.startswith("-") and a != "-"]
     if unknown:
-        print(f"rulehawk gate: unknown option(s): {' '.join(unknown)}",
-              file=sys.stderr)
         print(_USAGE, file=sys.stderr)
-        return 2
+        return stop(f"unknown option(s): {' '.join(unknown)}")
 
     patterns = [a for a in argv if not a.startswith("-")]
     if not patterns:
-        print("rulehawk gate: no config files/globs given", file=sys.stderr)
-        return 2
+        return stop("no config files/globs given")
     paths, unmatched = discover(patterns)
     if unmatched:
         # Fail closed: a pattern matching nothing means a config that is never
         # audited. Do not run a partial gate and call it green.
-        print(f"rulehawk gate: no files matched pattern(s): "
-              f"{', '.join(unmatched)}", file=sys.stderr)
-        return 2
+        return stop(f"no files matched pattern(s): {', '.join(unmatched)}")
     if not paths:
-        print(f"rulehawk gate: no files matched {patterns}", file=sys.stderr)
-        return 2
+        return stop(f"no files matched {patterns}")
 
     policy: Optional[dict] = None
     policy_raw: Optional[bytes] = None
@@ -878,16 +951,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 policy_raw = _pf.read()
             policy = json.loads(policy_raw.decode("utf-8"))
         except (OSError, ValueError) as e:
-            print(f"rulehawk gate: cannot read policy {policy_path!r}: {e}",
-                  file=sys.stderr)
-            return 2
+            return stop(f"cannot read policy {policy_path!r}: {e}")
 
     gate = run_gate(paths, policy, fail_on, vendor)
 
     # When a machine artifact is written to stdout ('-'), the human console
     # report must NOT interleave with it (that corrupts the JSON/markdown a
     # pipe consumes). Route the console to stderr in that case.
-    stdout_machine = "-" in (json_path, summary_path, sarif_path, comment_path)
+    stdout_machine = "-" in (json_path, summary_path, sarif_path, comment_path,
+                             result_path)
     if not quiet:
         print(to_console(gate), file=(sys.stderr if stdout_machine else sys.stdout))
 
@@ -910,6 +982,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             _emit(summary_target, to_markdown(gate), append=(summary_path is None))
         if comment_path:
             _write(comment_path, comment_body(gate))
+        if result_path:
+            _write_atomic(result_path, to_result(gate, _label()))
     except OSError as e:
         # An unwritable output path must read as an infra/usage error (2), not
         # as "findings blocked this change" (1) or a traceback.
