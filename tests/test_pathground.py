@@ -602,3 +602,21 @@ def test_path_ground_keeps_the_generic_note_for_a_plain_oracle():
     after = path_ground(_seg_findings(), _const_oracle(Reach.INDETERMINATE))
     viol = next(f for f in after if f.kind == "segmentation-violation")
     assert "NAT-in-path, an inexpressible witness" in viol.message
+
+
+def test_oracle_degraded_reason_bounds_each_value_and_the_whole(tmp_path):
+    # A pathological device name or blocker kind must not bloat every finding.
+    huge = "D" * 100_000
+    body = _degraded_trace(
+        "Delivered", unparsed={huge: ["x" * 100_000]},
+        blockers=[{"blocker": "k" * 100_000, "device": huge}])
+    orc = _oracle_with(tmp_path, 3, body)
+    assert orc(_W) is Reach.INDETERMINATE
+    reason = orc.indeterminate_reason(_W)
+    assert reason is not None and len(reason) <= 600
+    body = _degraded_trace("Delivered", unparsed={}, affected=[huge] * 3)
+    d = tmp_path / "affected"
+    d.mkdir()
+    orc = _oracle_with(d, 3, body)
+    assert orc(_W) is Reach.INDETERMINATE
+    assert len(orc.indeterminate_reason(_W)) <= 600
