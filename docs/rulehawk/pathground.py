@@ -32,10 +32,13 @@ forwarding model:
                      critical/high band), rule reference preserved.
   * INDETERMINATE  -> NAT in the snapshot (documented Hammerhead symbolic-NAT
                      gap), unknown device, query error, no model, a witness the
-                     probe cannot express (IPv6, exotic proto), or any trace
+                     probe cannot express (IPv6, exotic proto), any trace
                      disposition that is not a destination-FIB proof (ACL-denied,
-                     blackholed, loop, uRPF drop...). FAIL CLOSED: keep the
-                     finding at full severity, annotated.
+                     blackholed, loop, uRPF drop...), or a DEGRADED model
+                     (hammerhead >= 0.2.2 exits 3 after the answer when it could
+                     not read part of the snapshot; the note then names the
+                     unread lines and devices). FAIL CLOSED: keep the finding at
+                     full severity, annotated.
 
 The probe is `hammerhead traceroute` carrying the witness's own proto and dst
 port, NOT a fixed tcp/80 packet: a reachability check that probes tcp/80 would
@@ -126,7 +129,9 @@ def path_ground(findings: List[Finding], oracle: Oracle) -> List[Finding]:
         elif verdict is Reach.REACHABLE:
             out.append(_confirm(f))
         else:
-            out.append(_annotate_indeterminate(f))
+            reason_for = getattr(oracle, "indeterminate_reason", None)
+            reason = reason_for(w) if callable(reason_for) else None
+            out.append(_annotate_indeterminate(f, reason))
     return out
 
 
@@ -161,15 +166,21 @@ def _confirm(f: Finding) -> Finding:
     )
 
 
-def _annotate_indeterminate(f: Finding) -> Finding:
-    """Keep the finding at full severity; note that grounding was inconclusive."""
-    return dataclasses.replace(
-        f,
-        message=f.message + " [PATH-GROUNDING INDETERMINATE] NAT-in-path, an "
-                            "inexpressible witness, an ACL-denied probe, or "
-                            "unmodeled forwarding — reported conservatively "
-                            "(fail-closed).",
-    )
+def _annotate_indeterminate(f: Finding, reason: Optional[str] = None) -> Finding:
+    """Keep the finding at full severity; note that grounding was inconclusive.
+
+    `reason` is the oracle's specific cause when it has one (today: Hammerhead
+    answered over a degraded model and named what it could not read); without
+    one the generic note lists the possible causes."""
+    if reason:
+        note = (" [PATH-GROUNDING INDETERMINATE] " + reason
+                + " — reported conservatively (fail-closed).")
+    else:
+        note = (" [PATH-GROUNDING INDETERMINATE] NAT-in-path, an "
+                "inexpressible witness, an ACL-denied probe, or "
+                "unmodeled forwarding — reported conservatively "
+                "(fail-closed).")
+    return dataclasses.replace(f, message=f.message + note)
 
 
 # --- Production oracle: shell out to the Hammerhead CLI ---------------------
@@ -212,6 +223,11 @@ class HammerheadReachOracle:
                          not, so an ACL deny of the probe does not prove the
                          witness undeliverable.
 
+    Exit codes: 0 is an answer; 3 (hammerhead >= 0.2.2) is an answer over a
+    degraded model, whatever its disposition, and maps to INDETERMINATE with
+    the coverage block's account in `indeterminate_reason`; a 3 without a
+    degraded coverage block, and any other code, is a tool failure.
+
     `runner` is injectable so the JSON-parse / error-handling logic is unit
     testable without the compiled binary. It receives the argv list and must
     return an object with `.returncode` (int) and `.stdout` (str); the default
@@ -243,8 +259,16 @@ class HammerheadReachOracle:
         self._nat_present = _snapshot_has_nat(snapshot_dir)
         # Deterministic per (witness, snapshot) -> safe to memoize verdicts.
         self._memo: Dict[Witness, Reach] = {}
+        # Why a memoized INDETERMINATE is indeterminate, when the CLI said so.
+        self._reasons: Dict[Witness, str] = {}
         # Set on the first TimeoutExpired; short-circuits all later probes.
         self._probe_timed_out = False
+
+    def indeterminate_reason(self, w: Witness) -> Optional[str]:
+        """The specific cause of `w`'s INDETERMINATE verdict, or None when the
+        cause is one of the generic ones (NAT, error, inexpressible witness,
+        a disposition that proves nothing)."""
+        return self._reasons.get(w)
 
     def _subprocess_runner(self, argv: List[str]) -> "subprocess.CompletedProcess":
         return subprocess.run(argv, capture_output=True, text=True,
@@ -276,11 +300,26 @@ class HammerheadReachOracle:
             return Reach.INDETERMINATE
         except (OSError, subprocess.SubprocessError):
             return Reach.INDETERMINATE
-        if getattr(proc, "returncode", 1) != 0:
+        returncode = getattr(proc, "returncode", 1)
+        if returncode not in (0, 3):
             return Reach.INDETERMINATE
         try:
             doc = json.loads(proc.stdout)
         except (ValueError, TypeError):
+            return Reach.INDETERMINATE
+        if not isinstance(doc, dict):
+            return Reach.INDETERMINATE
+        # hammerhead >= 0.2.2 exits 3 AFTER printing the answer when the
+        # snapshot's coverage is degraded (lines it could not model). The
+        # answer comes from an incomplete model, so it neither confirms nor
+        # downgrades anything: INDETERMINATE, with the CLI's own account of
+        # what it could not read. A 3 without a degraded coverage block is
+        # not that contract and stays a generic tool failure.
+        degraded = _degraded_coverage(doc.get("coverage"))
+        if degraded is not None:
+            self._reasons[w] = degraded
+            return Reach.INDETERMINATE
+        if returncode != 0:
             return Reach.INDETERMINATE
         disposition = doc.get("disposition")
         if not isinstance(disposition, str):
@@ -313,6 +352,65 @@ class HammerheadReachOracle:
                 return None
             argv += ["--dport", str(w.port)]
         return argv
+
+
+# Bounds on the degraded-coverage note, so one snapshot with hundreds of
+# unread lines cannot bloat every finding's message.
+_REASON_DEVICES = 5
+_REASON_KINDS = 4
+
+
+def _degraded_coverage(coverage: object) -> Optional[str]:
+    """A one-line account of a degraded `coverage` block from `hammerhead
+    traceroute --format json`, or None when the block is absent, malformed, or
+    not degraded. Names the unread forwarding-relevant lines per device (the
+    most common cause) and the blocker kinds, bounded in length."""
+    if not isinstance(coverage, dict) or coverage.get("degraded") is not True:
+        return None
+    unparsed = coverage.get("unparsed_forwarding_relevant")
+    unparsed = unparsed if isinstance(unparsed, dict) else {}
+    per_device = sorted(
+        (str(dev), [str(l) for l in lines])
+        for dev, lines in unparsed.items()
+        if isinstance(lines, list) and lines
+    )
+    blockers = coverage.get("blockers")
+    blockers = blockers if isinstance(blockers, list) else []
+    kinds: Dict[str, int] = {}
+    for b in blockers:
+        kind = b.get("blocker") if isinstance(b, dict) else None
+        kind = str(kind) if kind else "unnamed"
+        kinds[kind] = kinds.get(kind, 0) + 1
+    affected = coverage.get("affected_devices")
+    affected = [str(d) for d in affected] if isinstance(affected, list) else []
+
+    parts = ["Hammerhead answered, but its model of this snapshot is degraded "
+             "(coverage unknown), so the answer is not used"]
+    if per_device:
+        total = sum(len(lines) for _, lines in per_device)
+        shown = ", ".join(f"{dev} ({len(lines)})"
+                          for dev, lines in per_device[:_REASON_DEVICES])
+        more = len(per_device) - _REASON_DEVICES
+        if more > 0:
+            shown += f", +{more} more device(s)"
+        first_dev, first_lines = per_device[0]
+        parts.append(f"{total} forwarding-relevant line(s) unread on {shown}, "
+                     f"e.g. {first_dev}: `{first_lines[0][:80]}`")
+    elif affected:
+        shown = ", ".join(affected[:_REASON_DEVICES])
+        more = len(affected) - _REASON_DEVICES
+        if more > 0:
+            shown += f", +{more} more device(s)"
+        parts.append(f"affected device(s): {shown}")
+    else:
+        parts.append("the gap is estate-wide")
+    if kinds:
+        ordered = sorted(kinds.items())
+        shown = ", ".join(f"{k} x{n}" for k, n in ordered[:_REASON_KINDS])
+        if len(ordered) > _REASON_KINDS:
+            shown += f", +{len(ordered) - _REASON_KINDS} more kind(s)"
+        parts.append(f"blockers: {shown}")
+    return "; ".join(parts) + " (run `hammerhead preflight SNAP SNAP` for the full list)"
 
 
 def _probe_instantiates_witness(w: Witness) -> bool:

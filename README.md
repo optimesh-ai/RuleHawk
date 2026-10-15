@@ -89,7 +89,7 @@ This requires a licensed Hammerhead install (licensed separately; see
 [Hammerhead pricing](https://optimesh.ai/#pricing)) and a Hammerhead snapshot of
 the network; RuleHawk alone cannot do it. With both, RuleHawk can verify each
 segmentation-violation witness against
-Hammerhead's forwarding model (`hammerhead reachability`), so violations on
+Hammerhead's forwarding model (`hammerhead traceroute`), so violations on
 routing paths that can't actually deliver the packet are suppressed to
 informational, while confirmed leaks are stamped **path-confirmed**:
 
@@ -101,7 +101,9 @@ rulehawk config.txt --policy policy.json --hh-snapshot DIR --hh-from DEVICE
 witness packet originates from. **Soundness rule:** only a deterministic,
 NAT-free "not delivered" verdict ever downgrades a finding — NAT on the path, an
 oracle error, or an unknown device all **fail closed** and the violation is kept
-(see `rulehawk/pathground.py`).
+(see `rulehawk/pathground.py`). So does a degraded model: from Hammerhead 0.2.2,
+when Hammerhead could not read part of the snapshot it still answers but exits 3,
+and RuleHawk keeps the violation and names the unread lines and devices in it.
 
 ## Compliance evidence (`--evidence`)
 A finding is not evidence. Auditors and GRC platforms need to know *what was
