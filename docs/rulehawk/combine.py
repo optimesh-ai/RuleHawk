@@ -12,10 +12,12 @@ worst verdict:
     PASS     every expected check reported and passed
 
 usage:
-  rulehawk combine <result-file-or-dir>... [--expect N] [--comment PATH]
-                   [--summary PATH] [-q]
+  rulehawk combine <result-file-or-dir>... [--expect N] [--needs JSON]
+                   [--comment PATH] [--summary PATH] [-q]
 
-Directories are searched recursively for *.json. Exit code: 0 PASS, 1 FAIL,
+--needs takes the combining job's `toJSON(needs)`: a gate job that did not
+succeed, but whose results show no failure, is UNKNOWN. Directories are
+searched recursively for *.json. Exit code: 0 PASS, 1 FAIL,
 2 UNKNOWN (or a usage error).
 """
 
@@ -37,9 +39,28 @@ MAX_COMMENT_CHARS = 60000
 _RANK = {"PASS": 0, "UNKNOWN": 1, "FAIL": 2}
 _ICON = {"PASS": "✅", "UNKNOWN": "❌", "FAIL": "❌"}
 _EXIT = {"PASS": 0, "FAIL": 1, "UNKNOWN": 2}
+_FAIL_ON = ("critical", "high", "medium", "low", "none")
 
-_USAGE = __doc__.split("usage:", 1)[1].split("Directories", 1)[0]
-_USAGE = "rulehawk combine — one PR comment for every check in a run\n\nusage:" + _USAGE
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+_USAGE = """rulehawk combine — one PR comment for every check in a run
+
+usage:
+  rulehawk combine <result-file-or-dir>... [--expect N] [--needs JSON]
+                   [--comment PATH] [--summary PATH] [-q]
+
+  --expect N       N checks must report; fewer make the verdict UNKNOWN
+  --needs JSON     the combining job's toJSON(needs): a gate job that did not
+                   succeed, but whose results show no failure, is UNKNOWN
+  --comment PATH   write the sticky PR-comment body
+  --summary PATH   write the report (default: $GITHUB_STEP_SUMMARY when set)
+  -q, --quiet      no console report
+
+Directories are searched recursively for *.json.
+Exit code: 0 PASS, 1 FAIL, 2 UNKNOWN (or a usage error).
+"""
 
 
 @dataclass
@@ -97,21 +118,23 @@ def _load(path: str) -> Check:
                      detail="the check started but never reported a result")
     passed, code = rec.get("passed"), rec.get("exit_code")
     label, md = rec.get("label"), rec.get("markdown")
-    attempt = rec.get("attempt", 1)
-    if not (isinstance(passed, bool) and isinstance(code, int)
-            and isinstance(label, str) and isinstance(md, str)
-            and isinstance(attempt, int) and not isinstance(attempt, bool)):
+    attempt, fail_on = rec.get("attempt", 1), rec.get("fail_on")
+    n, pf, job = rec.get("violations"), rec.get("parse_failures"), rec.get("job", "")
+    if not (isinstance(passed, bool) and _is_int(code) and _is_int(attempt)
+            and _is_int(n) and _is_int(pf) and isinstance(label, str)
+            and isinstance(md, str) and isinstance(job, str)
+            and fail_on in _FAIL_ON):
         return Check(label=name, verdict="UNKNOWN",
                      detail=f"`{name}` is an incomplete result record")
-    fail_on = str(rec.get("fail_on", ""))
-    if passed and code == 0:
+    if passed:
+        # PASS only when every field agrees: exit 0, nothing at the threshold,
+        # every file parsed (advisory `none` never blocks), a passing report.
+        ok = (code == 0 and n == 0 and (pf == 0 or fail_on == "none")
+              and md.startswith("## ✅ "))
         verdict, detail = "PASS", f"no findings at or above `{fail_on}`"
-    elif passed or code == 0:
-        # The two fields disagree: trust neither.
-        verdict, detail = "UNKNOWN", f"`{name}` reports an inconsistent verdict"
     else:
+        ok = code in (1, 2) and md.startswith("## ❌ ")
         verdict = "FAIL"
-        n, pf = rec.get("violations", 0), rec.get("parse_failures", 0)
         if code == 2 and not n:
             detail = (f"fail-closed: {pf} file(s) parsed to zero rules" if pf
                       else "fail-closed: the gate could not audit its input")
@@ -119,14 +142,23 @@ def _load(path: str) -> Check:
             detail = f"{n} finding(s) at or above `{fail_on}`"
             if pf:
                 detail += f", plus {pf} unparseable file(s)"
+    if not ok:
+        # The fields disagree with each other or with the report: trust none.
+        return Check(label=label or name, verdict="UNKNOWN",
+                     detail=f"`{name}` reports an inconsistent verdict")
     return Check(label=label or name, verdict=verdict, detail=detail,
-                 markdown=md, job=str(rec.get("job", "")), attempt=attempt,
-                 reported=True)
+                 markdown=md, job=job, attempt=attempt, reported=True)
 
 
-def collect(paths: Sequence[str], expect: Optional[int] = None) -> List[Check]:
+def collect(paths: Sequence[str], expect: Optional[int] = None,
+            needs: Optional[Dict[str, dict]] = None) -> List[Check]:
     """Load every result, keep only the newest run attempt of each check, and
-    add an UNKNOWN entry for each expected check that never reported."""
+    add an UNKNOWN entry for each expected check that never reported.
+
+    `needs` is the combining job's `needs` context (`toJSON(needs)`). A gate
+    job that did not succeed but whose results show no failure is UNKNOWN:
+    its newest attempt may not have reported (a re-run whose upload failed
+    leaves the previous attempt's PASS behind), so its PASS is not proof."""
     files, checks = _result_files(paths)
     loaded = [_load(f) for f in files]
     # A re-run attempt replaces that same check from an older attempt. Within
@@ -141,6 +173,16 @@ def collect(paths: Sequence[str], expect: Optional[int] = None) -> List[Check]:
         if c.reported and c.attempt < newest[(c.job, c.label)]:
             continue
         checks.append(c)
+    for job, info in sorted((needs or {}).items()):
+        result = info.get("result") if isinstance(info, dict) else None
+        if result == "success":
+            continue
+        mine = [c for c in checks if c.reported and c.job == job]
+        if mine and not any(c.verdict == "FAIL" for c in mine):
+            checks.append(Check(
+                label=f"job {job}", verdict="UNKNOWN",
+                detail=(f"the job ended `{result}`, but its results show no "
+                        f"failure: they may be from an earlier attempt")))
     reported = sum(1 for c in checks if c.reported)
     if expect is not None and reported < expect:
         checks.append(Check(
@@ -231,9 +273,10 @@ def _render_many(checks: List[Check], worst: str, detail: str) -> str:
                     shown)
 
 
-def render(paths: Sequence[str], expect: Optional[int] = None) -> Tuple[str, str]:
+def render(paths: Sequence[str], expect: Optional[int] = None,
+           needs: Optional[Dict[str, dict]] = None) -> Tuple[str, str]:
     """(comment body, worst verdict) for every result under `paths`."""
-    return render_checks(collect(paths, expect))
+    return render_checks(collect(paths, expect, needs))
 
 
 def render_checks(checks: List[Check]) -> Tuple[str, str]:
@@ -241,7 +284,9 @@ def render_checks(checks: List[Check]) -> Tuple[str, str]:
     # A single reported check reads exactly as the single-gate comment always
     # has, so existing one-check workflows see no change.
     if len(checks) == 1 and checks[0].reported:
-        return f"{_COMMENT_MARKER}\n{checks[0].markdown.rstrip(chr(10))}", worst
+        body = f"{_COMMENT_MARKER}\n{checks[0].markdown.rstrip(chr(10))}"
+        if len(body) <= MAX_COMMENT_CHARS:
+            return body, worst
     for level in ("all", "failing", "table", "rows"):
         body = _render_many(checks, worst, level)
         if len(body) <= MAX_COMMENT_CHARS:
@@ -274,6 +319,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         expect_s = _take(argv, "--expect")
         comment_path = _take(argv, "--comment")
         summary_path = _take(argv, "--summary")
+        needs_s = _take(argv, "--needs")
     except ValueError as e:
         print(f"rulehawk combine: {e}", file=sys.stderr)
         return 2
@@ -284,6 +330,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                   f"{expect_s!r}", file=sys.stderr)
             return 2
         expect = int(expect_s)
+    needs: Optional[Dict[str, dict]] = None
+    if needs_s is not None and needs_s.strip():
+        try:
+            needs = json.loads(needs_s)
+        except ValueError as e:
+            print(f"rulehawk combine: --needs is not JSON: {e}", file=sys.stderr)
+            return 2
+        if not isinstance(needs, dict):
+            print("rulehawk combine: --needs must be a JSON object (toJSON(needs))",
+                  file=sys.stderr)
+            return 2
     unknown = [a for a in argv if a.startswith("-")]
     if unknown:
         print(f"rulehawk combine: unknown option(s): {' '.join(unknown)}",
@@ -294,7 +351,7 @@ def main(argv: Optional[List[str]] = None) -> int:
               file=sys.stderr)
         return 2
 
-    checks = collect(argv, expect)
+    checks = collect(argv, expect, needs)
     body, worst = render_checks(checks)
     if not quiet:
         for c in checks:

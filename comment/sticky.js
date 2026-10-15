@@ -6,28 +6,21 @@
 //   const sticky = require(process.env.RH_STICKY_JS);
 //   await sticky({github, context, core, bodyPath, issueNumber});
 //
-// The comment is found by its hidden marker, among comments this token's
-// identity wrote: a person quoting the marker must not capture the verdict,
-// and an update GitHub refuses (someone else's comment) would leave the old
-// verdict standing.
+// The comment is found by its hidden marker among comments the workflow's
+// GITHUB_TOKEN wrote (both actions always post with it, as
+// github-actions[bot]). A person or another bot quoting the marker must not
+// capture the verdict: GitHub would refuse the update, or another account's
+// comment would carry it, and RuleHawk's own comment would keep the old one.
 'use strict';
 
 const fs = require('fs');
 
 const MARKER = '<!-- rulehawk-gate -->';
 
-async function ownLogin(github) {
-  // A personal access token can say who it is. GITHUB_TOKEN and GitHub App
-  // installation tokens cannot (403), and post as a Bot account.
-  try {
-    const {data} = await github.rest.users.getAuthenticated();
-    return (data && data.login) || null;
-  } catch (e) {
-    return null;
-  }
-}
+const AUTHOR = 'github-actions[bot]';
 
-module.exports = async function sticky({github, context, core, bodyPath, issueNumber}) {
+module.exports = async function sticky({github, context, core, bodyPath, issueNumber,
+                                        author = AUTHOR}) {
   let body;
   try {
     body = fs.readFileSync(bodyPath, 'utf8');
@@ -40,9 +33,8 @@ module.exports = async function sticky({github, context, core, bodyPath, issueNu
   // and missing it would post a second comment under a stale first one.
   const comments = await github.paginate(github.rest.issues.listComments,
     {owner, repo, issue_number: issueNumber, per_page: 100});
-  const login = await ownLogin(github);
-  const ours = (c) => Boolean(c && c.body && c.body.includes(MARKER) && c.user &&
-    (login ? c.user.login === login : c.user.type === 'Bot'));
+  const ours = (c) => Boolean(c && c.body && c.body.includes(MARKER) &&
+    c.user && c.user.login === author);
   const mine = comments.find(ours);
   if (mine) {
     await github.rest.issues.updateComment({owner, repo, comment_id: mine.id, body});

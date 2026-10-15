@@ -232,6 +232,7 @@ jobs:
         uses: ./comment
         with:
           expect: 2
+          jobs: ${{ toJSON(needs) }}
           comment: false
       - name: A job too few (expect UNKNOWN)
         id: missing
@@ -239,6 +240,7 @@ jobs:
         uses: ./comment
         with:
           expect: 3
+          jobs: ${{ toJSON(needs) }}
           comment: false
       - name: Assert the combined verdicts
         env:

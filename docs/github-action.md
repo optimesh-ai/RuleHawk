@@ -125,6 +125,7 @@ jobs:
       - uses: optimesh-ai/RuleHawk/comment@v1
         with:
           expect: 2                 # one per gate step that shares its result
+          jobs: ${{ toJSON(needs) }}
 ```
 
 `optimesh-ai/RuleHawk/comment` inputs:
@@ -132,6 +133,7 @@ jobs:
 | Input | Default | Description |
 |---|---|---|
 | `expect` | — (**required**) | How many checks must report: one per gate step with `share-results: true`. Fewer make the verdict `UNKNOWN`, never `PASS`, so a crashed, cancelled or skipped job cannot read as a pass. |
+| `jobs` | — (**required**) | Pass `${{ toJSON(needs) }}`. A gate job that did not succeed, but whose results show no failure (a re-run whose result never uploaded leaves the first attempt's PASS behind), makes the verdict `UNKNOWN`. |
 | `results` | `''` | Result files or directories to combine. Empty downloads this run's `rulehawk-results-*` artifacts. |
 | `comment` | `true` | Post/update the sticky PR comment on `pull_request` events. |
 | `fail` | `true` | Fail the step unless the combined verdict is `PASS`. |
@@ -139,7 +141,9 @@ jobs:
 Its outputs are `verdict` (`PASS` \| `FAIL` \| `UNKNOWN`) and `comment-file`.
 After *Re-run failed jobs*, only the newest attempt of each check counts. The
 same combination runs locally: `rulehawk combine results/ --expect 2 --comment
-comment.md` (exit 0 PASS, 1 FAIL, 2 UNKNOWN).
+comment.md` (exit 0 PASS, 1 FAIL, 2 UNKNOWN). The comment is only ever written by
+the workflow's `GITHUB_TOKEN` (`github-actions[bot]`), and only that account's
+marked comment is updated.
 
 ## Continuous compliance evidence
 

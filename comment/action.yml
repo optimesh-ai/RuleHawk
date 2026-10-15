@@ -17,16 +17,26 @@ branding:
 #       - uses: optimesh-ai/RuleHawk/comment@v1
 #         with:
 #           expect: 3          # one per gate step that shares its result
+#           jobs: ${{ toJSON(needs) }}
 #
 # FAIL if any check failed; UNKNOWN if fewer than `expect` checks reported (a
-# job crashed, was cancelled or skipped) or a result could not be read; PASS
-# only when every expected check reported and passed.
+# job crashed, was cancelled or skipped), a result could not be read, or a gate
+# job did not succeed although its results show no failure; PASS only when
+# every expected check reported and passed.
 
 inputs:
   expect:
     description: >-
       How many checks must report: one per gate step with share-results: true.
       Fewer results make the verdict UNKNOWN, never PASS.
+    required: true
+  jobs:
+    description: >-
+      The combining job's needs context, as JSON: pass the expression
+      toJSON(needs). A gate
+      job that did not succeed, but whose results show no failure (say, a
+      re-run whose result never uploaded, leaving the first attempt's PASS),
+      makes the verdict UNKNOWN.
     required: true
   results:
     description: >-
@@ -72,6 +82,7 @@ runs:
       env:
         PYTHONPATH: ${{ github.action_path }}/..
         RH_EXPECT: ${{ inputs.expect }}
+        RH_NEEDS: ${{ inputs.jobs }}
         RH_RESULTS: ${{ inputs.results }}
       run: |
         set -u
@@ -80,7 +91,8 @@ runs:
         rm -f "${BODY}"
         # noglob: the inputs are paths, split on whitespace only.
         set +e -f
-        python3 -m rulehawk combine ${IN} --expect "${RH_EXPECT}" --comment "${BODY}"
+        python3 -m rulehawk combine ${IN} --expect "${RH_EXPECT}" --needs "${RH_NEEDS}" \
+          --comment "${BODY}"
         RC=$?
         set +f
         case "${RC}" in
