@@ -167,3 +167,39 @@ def test_a_pass_body_beside_a_failing_exit_is_never_posted(tmp_path):
     assert run["outputs"]["combine"]["verdict"] == "UNKNOWN"
     body = open(run["outputs"]["combine"]["comment"], encoding="utf-8").read()
     assert "✅" not in body and "UNKNOWN" in body
+
+
+@needs_node_and_bash
+def test_a_second_invocation_does_not_overwrite_the_first_comment_file(tmp_path):
+    """Two combining steps in one job: each one's comment-file output must
+    still hold its own body after the other runs."""
+    runner = tmp_path / "runner"
+    runner.mkdir()
+    fail = _results(tmp_path, ("ios_acl.txt", "Dirty"))
+    first = _run_invocation(_manifest(), {"expect": "1", "results": fail, "jobs": ""},
+                            str(runner), str(tmp_path), action_path=_DIR)
+    (tmp_path / "results").rename(tmp_path / "results-first")
+    clean = _results(tmp_path, ("adv_realistic.txt", "Clean"))
+    second = _run_invocation(_manifest(), {"expect": "1", "results": clean, "jobs": ""},
+                             str(runner), str(tmp_path), action_path=_DIR)
+    assert first["outputs"]["combine"]["verdict"] == "FAIL"
+    assert second["outputs"]["combine"]["verdict"] == "PASS"
+    body = open(first["outputs"]["combine"]["comment"], encoding="utf-8").read()
+    assert body.splitlines()[1].startswith("## ❌"), body
+
+
+@needs_node_and_bash
+def test_results_left_by_an_earlier_invocation_are_not_combined_again(tmp_path):
+    """If this invocation's download fails, a record an earlier invocation
+    downloaded must not stand in for it."""
+    runner = tmp_path / "runner"
+    runner.mkdir()
+    stale = runner / "rulehawk-combine-in"
+    stale.mkdir()
+    gate.main([os.path.join(_S, "adv_realistic.txt"), "--policy",
+               os.path.join(_S, "policy.json"), "--label", "Old",
+               "--result", str(stale / "old.json"), "-q"])
+    # results '' -> the download step (not executed here: as if it failed).
+    run = _run_invocation(_manifest(), {"expect": "1", "results": "", "jobs": ""},
+                          str(runner), str(tmp_path), action_path=_DIR)
+    assert run["outputs"]["combine"]["verdict"] == "UNKNOWN"
