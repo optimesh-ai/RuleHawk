@@ -1,0 +1,180 @@
+"""`rulehawk combine`: one sticky comment for every check in a run.
+
+The headline is the WORST verdict across the checks: FAIL beats UNKNOWN beats
+PASS. A check that was expected but left no readable result is UNKNOWN, so a
+crashed, cancelled or skipped job can never read as a pass.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+from rulehawk import combine, gate
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_S = os.path.join(_ROOT, "samples")
+_POLICY = os.path.join(_S, "policy.json")
+_DIRTY = os.path.join(_S, "ios_acl.txt")      # critical findings -> FAIL
+_CLEAN = os.path.join(_S, "adv_realistic.txt")  # passes the policy
+
+
+def _result(tmp_path, name, config, *, label=None, job="j", attempt="1") -> str:
+    out = str(tmp_path / name)
+    argv = [config, "--policy", _POLICY, "--result", out, "-q"]
+    if label:
+        argv += ["--label", label]
+    env_before = dict(os.environ)
+    os.environ["GITHUB_JOB"] = job
+    os.environ["GITHUB_RUN_ATTEMPT"] = attempt
+    try:
+        gate.main(argv)
+    finally:
+        os.environ.clear()
+        os.environ.update(env_before)
+    return out
+
+
+def _headline(body: str) -> str:
+    return next(l for l in body.splitlines() if l.startswith("## "))
+
+
+def test_gate_writes_a_result_record(tmp_path):
+    p = _result(tmp_path, "r.json", _DIRTY)
+    rec = json.load(open(p))
+    assert rec["schema"] == "rulehawk.result/v1"
+    assert rec["passed"] is False and rec["exit_code"] == 1
+    assert rec["job"] == "j" and rec["attempt"] == 1
+    # Default label names what was checked: the patterns and the policy.
+    assert _DIRTY in rec["label"] and _POLICY in rec["label"]
+    assert rec["markdown"].startswith("## ❌ RuleHawk firewall gate")
+
+
+def test_one_result_renders_exactly_the_single_gate_comment(tmp_path):
+    """Existing single-check users must see the comment they always saw."""
+    p = _result(tmp_path, "r.json", _DIRTY)
+    body, verdict = combine.render([p])
+    g = gate.run_gate([_DIRTY], json.load(open(_POLICY)), "high", "auto")
+    assert body == gate.comment_body(g)
+    assert verdict == "FAIL"
+
+
+def test_a_failing_check_beside_a_passing_one_heads_the_comment_with_fail(tmp_path):
+    a = _result(tmp_path, "a.json", _CLEAN, label="segmentation")
+    b = _result(tmp_path, "b.json", _DIRTY, label="egress")
+    body, verdict = combine.render([a, b])
+    assert verdict == "FAIL"
+    assert body.startswith(gate._COMMENT_MARKER)
+    head = _headline(body)
+    assert "❌" in head and "FAIL" in head and "✅" not in head
+    # Every check appears in the summary table with its own verdict.
+    assert "| segmentation | ✅ PASS |" in body
+    assert "| egress | ❌ FAIL" in body
+    # The failing check's full report, witness packets included, is on the PR.
+    assert "10.20.0.1 -> 10.10.0.1:445" in body
+
+
+def test_two_passing_checks_pass(tmp_path):
+    a = _result(tmp_path, "a.json", _CLEAN, label="one")
+    b = _result(tmp_path, "b.json", _CLEAN, label="two")
+    body, verdict = combine.render([a, b], expect=2)
+    assert verdict == "PASS"
+    assert "✅" in _headline(body) and "PASS" in _headline(body)
+
+
+def test_a_missing_expected_check_is_unknown_never_pass(tmp_path):
+    a = _result(tmp_path, "a.json", _CLEAN, label="one")
+    b = _result(tmp_path, "b.json", _CLEAN, label="two")
+    body, verdict = combine.render([a, b], expect=3)
+    assert verdict == "UNKNOWN"
+    head = _headline(body)
+    assert "UNKNOWN" in head and "✅" not in head
+    assert "expected 3" in body and "found 2" in body
+
+
+def test_fail_outranks_unknown(tmp_path):
+    a = _result(tmp_path, "a.json", _DIRTY, label="one")
+    body, verdict = combine.render([a], expect=2)
+    assert verdict == "FAIL"
+
+
+def test_an_unreadable_result_is_unknown(tmp_path):
+    a = _result(tmp_path, "a.json", _CLEAN, label="one")
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    body, verdict = combine.render([a, str(bad)])
+    assert verdict == "UNKNOWN"
+    assert "bad.json" in body
+
+
+def test_a_result_with_the_wrong_shape_is_unknown(tmp_path):
+    a = _result(tmp_path, "a.json", _CLEAN, label="one")
+    odd = tmp_path / "odd.json"
+    odd.write_text(json.dumps({"schema": "rulehawk.result/v1", "passed": "yes"}))
+    body, verdict = combine.render([a, str(odd)])
+    assert verdict == "UNKNOWN"
+
+
+def test_no_results_at_all_is_unknown(tmp_path):
+    body, verdict = combine.render([str(tmp_path)])
+    assert verdict == "UNKNOWN"
+    assert "✅" not in _headline(body)
+
+
+def test_a_directory_is_searched_recursively(tmp_path):
+    d = tmp_path / "artifacts" / "job-a"
+    d.mkdir(parents=True)
+    _result(d, "a.json", _DIRTY, label="one")
+    body, verdict = combine.render([str(tmp_path / "artifacts")])
+    assert verdict == "FAIL"
+
+
+def test_a_rerun_attempt_replaces_the_same_check_from_an_older_attempt(tmp_path):
+    """Re-running a job writes a second result for the same check; only the
+    newest attempt of that check counts. Other checks keep theirs."""
+    old = _result(tmp_path, "old.json", _DIRTY, label="egress", job="e", attempt="1")
+    new = _result(tmp_path, "new.json", _CLEAN, label="egress", job="e", attempt="2")
+    seg = _result(tmp_path, "seg.json", _CLEAN, label="seg", job="s", attempt="1")
+    body, verdict = combine.render([old, new, seg], expect=2)
+    assert verdict == "PASS", body
+    assert body.count("| egress |") == 1
+
+
+def test_the_same_check_twice_in_one_attempt_is_kept_twice(tmp_path):
+    """Two results with the same label in the SAME attempt (a matrix, say) are
+    different runs, not a retry: both count, so neither can hide the other."""
+    a = _result(tmp_path, "a.json", _CLEAN, label="same", job="m")
+    b = _result(tmp_path, "b.json", _DIRTY, label="same", job="m")
+    body, verdict = combine.render([a, b])
+    assert verdict == "FAIL"
+
+
+def test_an_oversized_comment_keeps_the_verdict_and_every_row(tmp_path):
+    """GitHub rejects comments over 65,536 characters; a rejected update would
+    leave the previous verdict standing. Trim the detail, never the verdict."""
+    paths = []
+    for i in range(40):
+        paths.append(_result(tmp_path, f"r{i}.json", _DIRTY, label=f"check-{i}"))
+    body, verdict = combine.render(paths)
+    assert len(body) <= combine.MAX_COMMENT_CHARS
+    assert verdict == "FAIL" and "FAIL" in _headline(body)
+    for i in range(40):
+        assert f"| check-{i} |" in body
+
+
+def test_cli_exit_codes_and_comment_file(tmp_path):
+    a = _result(tmp_path, "a.json", _CLEAN, label="one")
+    b = _result(tmp_path, "b.json", _DIRTY, label="two")
+    out = tmp_path / "c.md"
+    assert combine.main([a, "--comment", str(out), "-q"]) == 0
+    assert combine.main([a, b, "--comment", str(out), "-q"]) == 1
+    assert out.read_text().startswith(gate._COMMENT_MARKER)
+    assert combine.main([a, "--expect", "2", "--comment", str(out), "-q"]) == 2
+    assert "UNKNOWN" in out.read_text()
+    assert combine.main(["--expect", "x", a]) == 2
+
+
+def test_cli_is_reachable_as_a_subcommand(tmp_path):
+    from rulehawk import cli
+    a = _result(tmp_path, "a.json", _DIRTY, label="one")
+    assert cli.main(["combine", a, "-q"]) == 1
