@@ -148,3 +148,22 @@ def test_a_failed_upload_is_not_hidden_inside_the_gate_action():
     assert upload, "the gate action has no result upload step"
     assert not upload[0].get("continue-on-error"), \
         "a failed upload would leave the previous attempt's result standing"
+
+
+@needs_node_and_bash
+def test_a_pass_body_beside_a_failing_exit_is_never_posted(tmp_path):
+    """Belt and braces: if combine ever wrote a PASS body yet exited non-zero,
+    the posted comment must not read PASS."""
+    action = _manifest()
+    step = next(s for s in action["runs"]["steps"] if s.get("id") == "combine")
+    stub = ("rh_stub() { printf '<!-- rulehawk-gate -->\\n## ✅ RuleHawk firewall gate: PASS\\n'"
+            " > \"${BODY}\"; return 1; }\n")
+    step["run"] = step["run"].replace("python3 -m rulehawk combine", "rh_stub")
+    step["run"] = step["run"].replace("set -u\n", "set -u\n" + stub, 1)
+    runner = tmp_path / "runner"
+    runner.mkdir()
+    run = _run_invocation(action, {"expect": "1", "results": str(tmp_path), "jobs": ""},
+                          str(runner), str(tmp_path), action_path=_DIR)
+    assert run["outputs"]["combine"]["verdict"] == "UNKNOWN"
+    body = open(run["outputs"]["combine"]["comment"], encoding="utf-8").read()
+    assert "✅" not in body and "UNKNOWN" in body
