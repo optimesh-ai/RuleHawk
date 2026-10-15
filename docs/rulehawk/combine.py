@@ -409,18 +409,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         for c in checks:
             print(f"  [{c.verdict:7}] {c.label}: {c.detail}")
         print(f"  VERDICT: {worst} ({len(checks)} check(s))")
-    try:
-        if comment_path:
-            with open(comment_path, "w", encoding="utf-8") as fh:
-                fh.write(body + "\n")
-        summary_target = summary_path or os.environ.get("GITHUB_STEP_SUMMARY")
-        if summary_target:
+    # The step summary is a convenience: failing to write it is a warning, so
+    # the exit code and the comment body can never disagree.
+    summary_target = summary_path or os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_target:
+        try:
             with open(summary_target, "a" if summary_path is None else "w",
                       encoding="utf-8") as fh:
                 fh.write(body.split("\n", 1)[1] + "\n")
-    except OSError as e:
-        print(f"rulehawk combine: cannot write output: {e}", file=sys.stderr)
-        return 2
+        except OSError as e:
+            print(f"rulehawk combine: warning: cannot write the summary: {e}",
+                  file=sys.stderr)
+    if comment_path:
+        try:
+            with open(comment_path, "w", encoding="utf-8") as fh:
+                fh.write(body + "\n")
+        except OSError as e:
+            print(f"rulehawk combine: cannot write the comment: {e}", file=sys.stderr)
+            return 2
     return _EXIT[worst]
 
 
