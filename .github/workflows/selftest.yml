@@ -39,6 +39,16 @@ jobs:
         run: python -m pip install --quiet pytest pyyaml
       - name: Verify the Action wiring tests will run (PyYAML importable)
         run: python -c "import yaml; print('PyYAML', yaml.__version__)"
+      # The MCP server is the optional `mcp` extra (MCP SDK, Python 3.10+). On
+      # 3.9 the marker installs the engine alone and tests/test_mcp_stdio.py
+      # importorskips; on 3.12 the stdio integration test must actually run.
+      - name: Install the package with the MCP extra
+        run: python -m pip install --quiet -e ".[mcp]"
+      - name: Verify the MCP stdio tests will run (MCP SDK importable, 3.12)
+        if: matrix.python-version == '3.12'
+        run: |
+          python -c "import mcp, importlib.metadata as m; print('mcp', m.version('mcp'))"
+          rulehawk-mcp --version
       - name: Run tests
         run: python -m pytest -q -rs
       # The same check the suite runs (tests/test_vendor_sync.py), kept as its

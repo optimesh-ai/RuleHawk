@@ -46,6 +46,8 @@ usage:
   cat config | rulehawk [options]          piped stdin also works
   rulehawk gate <file-or-glob>... [...]    multi-file CI gate (`rulehawk gate --help`)
   rulehawk combine <results>... [...]      one PR comment for several gate runs
+  rulehawk mcp                             the MCP server over stdio (same as
+                                           `rulehawk-mcp`; needs the mcp extra)
 
 options:
   --json               emit the machine-readable JSON report instead of text
@@ -103,6 +105,9 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "gate":
         from .gate import main as gate_main
         return gate_main(argv[1:])
+    if argv and argv[0] == "mcp":
+        from .mcp_server import main as mcp_main
+        return mcp_main(argv[1:])
     # Help first: `rulehawk --help` / `-h` must print usage and exit 0, never
     # be mistaken for a config-file path (mirrors gate.py's pattern).
     if "-h" in argv or "--help" in argv:
