@@ -62,6 +62,80 @@ for a copy-pasteable setup with a live bad-PR demo.
 The gate audits the **rules in the changed files**, not the change's effect on
 forwarding, and every PR comment says so in one line.
 
+## Use it from an agent (MCP server + skill)
+RuleHawk ships a local MCP server, so an agent can audit a firewall change
+before it pushes it. It runs over stdio, reads only the files you point it at,
+makes no network calls and writes nothing.
+
+```
+pip install "rulehawk[mcp] @ git+https://github.com/optimesh-ai/RuleHawk"   # Python 3.10+
+rulehawk-mcp --version
+```
+
+| Tool | What it does |
+|---|---|
+| `rulehawk_audit` | Audit a config file or a directory: verdict `PASS` / `FAIL` / `INCOMPLETE` / `ERROR`, the blocking findings, and what was and wasn't analysed |
+| `rulehawk_list_findings` | Every finding, worst first, filterable by severity and kind, each with a stable id |
+| `rulehawk_explain_finding` | One finding by id (rule, source line, witness, fix), or what a finding kind means |
+| `rulehawk_compare` | Before vs after (files or directories): the findings a change introduces or resolves, and the rules it adds |
+| `rulehawk_supported_inputs` | The formats RuleHawk reads and what it does not model |
+
+Every result carries a `coverage` block (files analysed, files **not**
+analysed and why, config lines the parser could not model) and the scope
+statement: rule layer only, routing/NAT/topology not evaluated. A file no
+parser recognises makes the result `INCOMPLETE`, never `PASS`.
+`rulehawk_compare` is a rule-layer finding delta matched on rule text, not a
+forwarding diff. Set `RULEHAWK_MCP_ROOT` to refuse paths outside one directory.
+Pass absolute paths: relative ones resolve against the server's working
+directory.
+
+**Claude Desktop** (`claude_desktop_config.json`). Use the absolute path to
+`rulehawk-mcp` (`which rulehawk-mcp`), since Desktop does not use your shell's
+`PATH`:
+
+```json
+{
+  "mcpServers": {
+    "rulehawk": {
+      "command": "/absolute/path/to/venv/bin/rulehawk-mcp",
+      "env": { "RULEHAWK_MCP_ROOT": "/absolute/path/to/firewall-configs" }
+    }
+  }
+}
+```
+
+**Claude Code**:
+
+```
+claude mcp add --transport stdio --env RULEHAWK_MCP_ROOT="$PWD" rulehawk -- rulehawk-mcp
+```
+
+**Cursor** (`~/.cursor/mcp.json`, or `.cursor/mcp.json` in a project):
+
+```json
+{
+  "mcpServers": {
+    "rulehawk": {
+      "command": "rulehawk-mcp",
+      "env": { "RULEHAWK_MCP_ROOT": "/absolute/path/to/firewall-configs" }
+    }
+  }
+}
+```
+
+No install step: with [uv](https://docs.astral.sh/uv/), any of the above can
+use `"command": "uvx"` and
+`"args": ["--from", "rulehawk[mcp] @ git+https://github.com/optimesh-ai/RuleHawk", "rulehawk-mcp"]`.
+
+**The skill.** [`skills/rulehawk-preflight/SKILL.md`](skills/rulehawk-preflight/SKILL.md)
+teaches an agent to run the audit before it pushes an ACL or firewall change,
+and to stop on a high or critical finding, or on input RuleHawk could not
+read, unless a human overrides. Copy the folder into your agent's skills
+directory (for Claude Code, `~/.claude/skills/` or `.claude/skills/`).
+
+A RuleHawk pass is a rule-layer result. For full network verification (routing,
+NAT, what a change breaks), Optimesh offers Hammerhead, by request.
+
 ## Segmentation-intent (the audit/compliance layer)
 Declare zones + `must_not_reach` rules in a JSON policy, and RuleHawk proves the
 ACL isolates them or reports a **concrete witness packet** the ACL wrongly permits — the
@@ -284,6 +358,8 @@ Hammerhead is proprietary and licensed separately.
 - `rulehawk/report.py` — text + JSON reports.
 - `rulehawk/gate.py` — the CI gate: multi-file audit → SARIF + PR comment + summary.
 - `rulehawk/cli.py` — `python -m rulehawk` (+ the `gate` subcommand).
+- `rulehawk/mcp_server.py` — the MCP server (`rulehawk-mcp`, the optional `mcp` extra); not loaded by the hosted tool.
+- `skills/rulehawk-preflight/` — the agent skill that runs the audit before a firewall change is pushed.
 - `action.yml` — the composite GitHub Action (see `docs/github-action.md`).
 - `tests/` — correctness tests for the analysis engine and the gate.
 - `scripts/check_vendor_sync.py` — stdlib-only sync guard (called by the test suite).
@@ -304,3 +380,5 @@ serves a stale parser while the CLI is already fixed — this has happened befor
 
 CI enforces this automatically: `tests/test_vendor_sync.py` runs on every
 `python -m pytest` invocation and will fail the build if any `.py` file drifts.
+
+<!-- mcp-name: io.github.optimesh-ai/rulehawk -->
