@@ -61,6 +61,9 @@ options:
   --hh-snapshot DIR    Hammerhead snapshot dir for path-grounding (needs --hh-from
                        and a Hammerhead install)
   --hh-from DEVICE     source device for path-grounding (needs --hh-snapshot)
+  --hh-ingress NAME    interface of --hh-from the probes are received on, passed
+                       as `hammerhead traceroute --ingress` (a Cisco ASA decides
+                       traffic by it; without it such probes stay INDETERMINATE)
   -h, --help           show this help
 
 Vendor is auto-detected: Cisco IOS/ASA, Cisco NX-OS, Arista EOS, Juniper Junos,
@@ -124,12 +127,20 @@ def main(argv: list[str] | None = None) -> int:
                          "--panos", "--iptables")]
     hh_snapshot = _take_opt(argv, "--hh-snapshot")
     hh_from = _take_opt(argv, "--hh-from")
+    hh_ingress = _take_opt(argv, "--hh-ingress")
     if hh_snapshot == "" or hh_from == "":
         print("rulehawk: --hh-snapshot and --hh-from each require a value",
               file=sys.stderr)
         return 2
+    if hh_ingress == "":
+        print("rulehawk: --hh-ingress requires an interface name", file=sys.stderr)
+        return 2
     if bool(hh_snapshot) != bool(hh_from):
         print("rulehawk: path-grounding needs BOTH --hh-snapshot and --hh-from",
+              file=sys.stderr)
+        return 2
+    if hh_ingress and not hh_snapshot:
+        print("rulehawk: --hh-ingress needs --hh-snapshot and --hh-from",
               file=sys.stderr)
         return 2
     policy_path = None
@@ -228,7 +239,8 @@ def main(argv: list[str] | None = None) -> int:
         finalize(_ledger)
         seg = list(seg) + _ledger.problems
         if hh_snapshot and hh_from:
-            oracle = HammerheadReachOracle(hh_snapshot, hh_from)
+            oracle = (HammerheadReachOracle(hh_snapshot, hh_from, ingress=hh_ingress)
+                      if hh_ingress else HammerheadReachOracle(hh_snapshot, hh_from))
             seg = path_ground(seg, oracle)
         findings += seg
     n_rules = len(aces)

@@ -249,9 +249,16 @@ class HammerheadReachOracle:
 
     def __init__(self, snapshot_dir: str, from_device: str,
                  binary: str = "hammerhead", timeout: float = 60.0,
-                 runner: Optional[Callable[[List[str]], "subprocess.CompletedProcess"]] = None):
+                 runner: Optional[Callable[[List[str]], "subprocess.CompletedProcess"]] = None,
+                 ingress: Optional[str] = None):
         self.snapshot_dir = snapshot_dir
         self.from_device = from_device
+        # The interface of `from_device` the probe is received on, passed as
+        # `hammerhead traceroute --ingress`. A Cisco ASA decides traffic by
+        # its received interface (security levels); without one, Hammerhead
+        # answers a host-sourced probe from an ASA Unknown (exit 3), which
+        # maps to INDETERMINATE. Never inferred: only what the user names.
+        self.ingress = ingress
         self.binary = binary
         self.timeout = timeout
         self._runner = runner or self._subprocess_runner
@@ -345,6 +352,8 @@ class HammerheadReachOracle:
         argv = [self.binary, "traceroute", self.snapshot_dir,
                 "--from", self.from_device, "--src", w.src, "--dst", w.dst,
                 "--format", "json"]
+        if self.ingress:
+            argv += ["--ingress", self.ingress]
         if w.proto in _PROBE_PROTOS:
             argv += ["--proto", w.proto]
         if w.proto in ("tcp", "udp") and w.port is not None:
