@@ -179,6 +179,12 @@ oracle error, or an unknown device all **fail closed** and the violation is kept
 when Hammerhead could not read part of the snapshot it still answers but exits 3,
 and RuleHawk keeps the violation and names the unread lines and devices in it.
 
+When `DEVICE` is a Cisco ASA, Hammerhead decides the witness by the interface
+the packet arrives on (interface security levels), so a host-sourced probe with
+no received interface is Unknown and the violation is kept. Name that interface
+with `--hh-ingress NAME` (the ASA `nameif`, e.g. `inside`); RuleHawk passes it as
+`hammerhead traceroute --ingress NAME` and never picks one itself.
+
 ## Compliance evidence (`--evidence`)
 A finding is not evidence. Auditors and GRC platforms need to know *what was
 audited, when, with which tool*, which *requirement* it speaks to, and — the part
