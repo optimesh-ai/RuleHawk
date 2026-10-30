@@ -115,11 +115,14 @@ def test_unknown_then_action_is_surfaced():
 
 
 def test_set_format_is_surfaced_not_silent():
+    # The set-display form is now rebuilt and modeled (tests/test_junos_set_form.py);
+    # it must still be surfaced, and a port match without a protocol stays
+    # imprecise exactly as in the brace form.
     setcfg = ("set firewall family inet filter F term T from destination-port 445\n"
               "set firewall family inet filter F term T then discard\n")
     aces, notes = parse_junos(setcfg)
-    assert aces == []
-    assert any("set" in n.lower() and "show configuration" in n for n in notes)
+    assert len(aces) == 1 and aces[0].action == "deny" and aces[0].imprecise
+    assert any("set'-display form" in n for n in notes)
 
 
 _POLICY = {

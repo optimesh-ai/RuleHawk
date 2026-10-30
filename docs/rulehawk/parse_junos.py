@@ -68,7 +68,9 @@ IPv6 literal (surfaced as a note); pure-v4 behavior is unchanged.
 from __future__ import annotations
 
 import ipaddress
+import dataclasses
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -750,24 +752,163 @@ def _walk(toks: List[str], entries: List[ACE], notes: List[str],
             i += 1
 
 
+_SET_FW_RE = re.compile(
+    r"^\s*(set|deactivate|delete|insert)\s+(?:logical-systems\s+(\S+)\s+)?firewall\s+(.*)$", re.M)
+
+
+def _set_to_brace(text: str):
+    """Rebuild the brace form from `show configuration | display set` lines
+    under `firewall`, so the brace-form parser (and every guard in it) reads
+    them. Returns (brace_text, line_map, notes) — line_map maps a line of the
+    rebuilt text to the source line of the set statement that started it — or
+    None when the set lines use a form we cannot replay exactly (then the file
+    stays unsupported/INCOMPLETE rather than modeled in a guessed order).
+
+    The `set` display lists statements in configuration order, so terms keep
+    their first-appearance order. `deactivate ... term T` / `... filter F`
+    become `inactive:`; `delete`/`insert` of a whole term are replayed. Every
+    `from`/`then` statement becomes one leaf (`source-address X;`), which the
+    brace parser reads the same as the bracketed list form."""
+    filters = {}          # (ls, family, name) -> {"leaves": [], "terms": {}, ...}
+    order = []
+    notes: List[str] = []
+    for lineno, ln in enumerate(text.splitlines(), 1):
+        m = _SET_FW_RE.match(ln)
+        if not m:
+            continue
+        verb, ls, rest = m.group(1), m.group(2), m.group(3)
+        try:
+            toks = shlex.split(rest)
+        except ValueError:
+            toks = rest.split()
+        fam = "inet"
+        if toks[:1] == ["family"] and len(toks) >= 2:
+            fam, toks = toks[1], toks[2:]
+        if toks[:1] != ["filter"] or len(toks) < 2:
+            continue                              # policer, prefix-action, ...
+        key = (ls, fam, toks[1])
+        body = toks[2:]
+        if key not in filters:
+            if verb != "set":
+                return None
+            filters[key] = {"leaves": [], "terms": {}, "inactive": False, "line": lineno}
+            order.append(key)
+        f = filters[key]
+        if not body:
+            if verb == "deactivate":
+                f["inactive"] = True
+            elif verb == "delete":
+                del filters[key]
+                order.remove(key)
+            continue
+        if body[0] != "term":
+            if verb != "set":
+                return None
+            f["leaves"].append(" ".join(body))
+            continue
+        if len(body) < 2:
+            return None
+        tname, tb = body[1], body[2:]
+        terms = f["terms"]
+        if verb == "insert":
+            # insert ... term A (before|after) term B
+            if len(tb) != 3 or tb[0] not in ("before", "after") or tb[1] != "term" \
+                    or tname not in terms or tb[2] not in terms:
+                return None
+            item = terms.pop(tname)
+            keys = list(terms)
+            k = keys.index(tb[2]) + (1 if tb[0] == "after" else 0)
+            keys.insert(k, tname)
+            terms[tname] = item
+            f["terms"] = {kk: terms[kk] for kk in keys}
+            continue
+        if verb == "delete":
+            if tb or tname not in terms:
+                return None                       # partial delete: can't replay safely
+            del terms[tname]
+            continue
+        t = terms.setdefault(tname, {"from": [], "then": [], "other": [],
+                                     "inactive": False, "line": lineno})
+        if verb == "deactivate":
+            if tb:
+                return None
+            t["inactive"] = True
+            continue
+        if not tb:
+            continue
+        if tb[0] in ("from", "then") and len(tb) >= 2:
+            t[tb[0]].append(" ".join(_q(x) for x in tb[1:]))
+        else:
+            t["other"].append(" ".join(_q(x) for x in tb))
+    if not order:
+        return None
+    out, line_map = ["firewall {"], {}
+    for key in order:
+        ls, fam, name = key
+        f = filters[key]
+        fname = f"{ls}/{name}" if ls else name
+        out.append(f"family {fam} {{")
+        line_map[len(out) + 1] = f["line"]
+        out.append(("inactive: " if f["inactive"] else "") + f"filter {fname} {{ "
+                   + " ".join(lf + ";" for lf in f["leaves"]))
+        for tname, t in f["terms"].items():
+            parts = []
+            if t["from"]:
+                parts.append("from { " + " ".join(x + ";" for x in t["from"]) + " }")
+            if t["then"]:
+                parts.append("then { " + " ".join(x + ";" for x in t["then"]) + " }")
+            parts += [x + ";" for x in t["other"]]
+            line_map[len(out) + 1] = t["line"]
+            out.append(("inactive: " if t["inactive"] else "")
+                       + f"term {tname} {{ " + " ".join(parts) + " }")
+        out.append("} }")
+    out.append("}")
+    notes.append(f"Junos 'set'-display form: {len(order)} firewall filter(s) "
+                 f"rebuilt from set statements in configuration order")
+    return "\n".join(out) + "\n", line_map, notes
+
+
+def _q(tok: str) -> str:
+    return f'"{tok}"' if (not tok or any(c in tok for c in " {};#")) else tok
+
+
 def parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
     """Parse Junos firewall filters in `text`; return (entries, notes).
 
     Same contract as `parse.parse_acls`, so `analyze`/`check_segmentation`
     consume the result unchanged.
     """
-    toks = _tokenize(text)
-    term_lines = _term_line_map(text)
     entries: List[ACE] = []
     notes: List[str] = []
-    _walk(toks, entries, notes, term_lines, None)
+    rebuilt = None
+    if not re.search(r"\bfilter\s+\S+\s*\{", text) and _SET_FW_RE.search(text):
+        rebuilt = _set_to_brace(text)
+    if rebuilt is not None:
+        brace, line_map, notes = rebuilt
+        if re.search(r"(?m)^\s*set\s+apply-groups\s", text) and \
+                re.search(r"(?m)^\s*set\s+groups\s+\S+\s+firewall\s", text):
+            # A configuration group carrying firewall statements is applied:
+            # it can inject terms we do not replay. Every filter gets the
+            # brace parser's apply-groups guard (opaque leading ACE).
+            brace = re.sub(r"(filter \S+ \{ )", r"\1apply-groups SET-GROUPS; ", brace)
+            notes.append("Junos `set groups ... firewall` with `set apply-groups`: "
+                         "inherited firewall statements are not replayed — "
+                         "filters kept INDETERMINATE where they could apply")
+        toks = _tokenize(brace)
+        term_lines = _term_line_map(brace)
+        _walk(toks, entries, notes, term_lines, None)
+        entries = [dataclasses.replace(a, line=line_map.get(a.line, 0)) for a in entries]
+    else:
+        toks = _tokenize(text)
+        term_lines = _term_line_map(text)
+        _walk(toks, entries, notes, term_lines, None)
 
     if _SRX_POLICY_RE.search(text):
         notes.append("Junos SRX security policies (from-zone/to-zone) present — "
                      "zone-based security policies are not yet modeled; only "
                      "`firewall filter` terms are audited. Review the policies "
                      "manually.")
-    if not entries and re.search(r"\bset\b.*\bfilter\b", text):
+    if not entries and rebuilt is None and re.search(r"\bset\b.*\bfilter\b", text):
         notes.append("Junos 'set'-display format detected but not yet supported — "
                      "paste the curly-brace `show configuration` form to audit it.")
     return entries, notes

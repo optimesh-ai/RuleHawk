@@ -924,6 +924,54 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     return aces, rnotes + [note]
 
 
+# Commands that contain permit/deny but are not packet filters.
+_NON_FILTER_HDR = re.compile(
+    r"(?i)^(?:route-map\s|ipv?6?\s*prefix-list\s|ip\s+prefix-list\s|"
+    r"ipv6\s+prefix-list\s|ip\s+(?:extcommunity|community|large-community)-list\s|"
+    r"ip\s+as-path\s|mac\s+access-list\s|xlate\s|same-security-traffic\s|"
+    r"no\s+arp\s|description\s)")
+
+_ASA_NAME_RE = re.compile(r"(?im)^\s*name\s+(\S+)\s+(\S+)")
+
+
+def _apply_asa_names(text: str) -> Tuple[str, int]:
+    """ASA `name ADDRESS ALIAS` (under `names`) lets ACLs and objects use ALIAS
+    for ADDRESS. Substitute it, token-exact, in access-list and object lines
+    (where an unknown word otherwise fails the ACE closed as imprecise). Only
+    aliases bound to a literal IP address are used, and an alias that is also
+    a keyword we parse is never substituted."""
+    names = {}
+    for m in _ASA_NAME_RE.finditer(text):
+        addr, alias = m.group(1), m.group(2)
+        try:
+            ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if alias.lower() in _ALIAS_RESERVED or alias in names:
+            continue
+        names[alias] = addr
+    if not names:
+        return text, 0
+    out = []
+    for ln in text.splitlines():
+        st = ln.lstrip().lower()
+        if st.startswith(("access-list ", "permit ", "deny ", "host ", "subnet ",
+                          "range ", "network-object ")):
+            toks = ln.split(" ")
+            # never rewrite an ACL / object / group NAME that happens to equal
+            # an alias — only address operands
+            ln = " ".join(t if (k and toks[k - 1].lower() in (
+                "access-list", "object", "object-group", "time-range"))
+                else names.get(t, t) for k, t in enumerate(toks))
+        out.append(ln)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else ""), len(names)
+
+
+_ALIAS_RESERVED = frozenset({"any", "any4", "any6", "host", "object", "object-group",
+                             "interface", "eq", "neq", "lt", "gt", "range", "log",
+                             "permit", "deny", "ip", "tcp", "udp", "icmp"})
+
+
 def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     """Parse all ACLs in `text`; return (entries, notes).
 
@@ -932,10 +980,15 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     """
     entries: List[ACE] = []
     notes: List[str] = []
+    text, n_alias = _apply_asa_names(text)
+    if n_alias:
+        notes.append(f"ASA `name` aliases resolved: {n_alias} name(s) substituted "
+                     f"with their address")
     defs = _collect_defs(text)               # pass 1: object-group / object defs
     current_acl = "(unnamed)"
     cur_v6 = cur_std = False                 # family/kind of the current named ACL
     seq = 0
+    in_other = False                         # inside a non-filter block (see below)
     for lineno, raw in enumerate(text.splitlines(), 1):
         stripped = raw.strip()
         if not stripped or stripped.startswith("!"):
@@ -943,10 +996,26 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
         m = re.match(r"(?i)^(ip|ipv6)\s+access-list\s+(?:(extended|standard)\s+)?(\S+)",
                      stripped)
         if m:
+            in_other = False
             current_acl, seq = m.group(3), 0
             cur_v6 = m.group(1).lower() == "ipv6"
             cur_std = (m.group(2) or "").lower() == "standard"
             continue
+        if _NON_FILTER_HDR.match(stripped):
+            # Routing policy (route-map / prefix-list / community-list /
+            # as-path) and ASA global knobs that merely contain the words
+            # permit/deny are not packet filters. A block header starts a
+            # non-filter context: its indented `seq N permit ...` lines belong
+            # to it, never to the last IP ACL.
+            in_other = raw[:1] not in (" ", "\t")
+            if stripped.lower().startswith("mac access-list"):
+                notes.append(f"L2 {stripped} not modeled (MAC filtering is out "
+                             f"of scope; its entries are not IP rules)")
+            continue
+        if in_other:
+            if raw[:1] in (" ", "\t"):
+                continue                     # body line of a non-filter block
+            in_other = False
         line_v6, line_std = cur_v6, cur_std
         m = re.match(r"(?i)^access-list\s+(\S+)\s+(?:line\s+\d+\s+)?(standard\s+)?",
                      stripped)
