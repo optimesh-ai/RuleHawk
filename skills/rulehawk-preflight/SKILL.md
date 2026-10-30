@@ -92,8 +92,7 @@ breaks on other devices, and it does not read vendors it does not list
 similar are over-approximated and reported as unmodelled lines. Say this when
 it matters, and do not describe a RuleHawk pass as a reachability or
 change-impact check. If the team needs that, a forwarding model such as
-Batfish covers it, and Optimesh offers Hammerhead for full network
-verification, by request.
+Batfish covers it.
 
 ## CLI fallback (no MCP server)
 
