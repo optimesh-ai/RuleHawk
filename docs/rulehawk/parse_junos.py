@@ -121,11 +121,20 @@ def detect(text: str) -> bool:
     Requires the brace-form signature (`filter NAME {` ... `term` ... `then`) so
     a Cisco ACL — which has none of these keywords — is never misrouted here.
     """
-    return bool(
-        re.search(r"\bfilter\s+\S+\s*\{", text)
-        and re.search(r"\bterm\b", text)
-        and re.search(r"\bthen\b", text)
-    )
+    if (re.search(r"\bfilter\s+\S+\s*\{", text)
+            and re.search(r"\bterm\b", text)
+            and re.search(r"\bthen\b", text)):
+        return True
+    # Other unmistakably-Junos signatures. Routing them here (where the
+    # unsupported part is surfaced and an unparsed file stays INCOMPLETE)
+    # matters: the Cisco fallback read an SRX policy comment ("Deny to bad
+    # destinations.") as an ACE and reported a file it never analysed as ok.
+    return bool(_SRX_POLICY_RE.search(text)
+                or re.search(r"(?m)^\s*set\s+(?:security|firewall)\s+\S", text))
+
+
+# SRX zone-based security policies (hierarchical or `set` form).
+_SRX_POLICY_RE = re.compile(r"\bfrom-zone\s+\S+\s+to-zone\s+\S+")
 
 
 # --- tokenizer / block readers --------------------------------------------
@@ -753,6 +762,11 @@ def parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
     notes: List[str] = []
     _walk(toks, entries, notes, term_lines, None)
 
+    if _SRX_POLICY_RE.search(text):
+        notes.append("Junos SRX security policies (from-zone/to-zone) present — "
+                     "zone-based security policies are not yet modeled; only "
+                     "`firewall filter` terms are audited. Review the policies "
+                     "manually.")
     if not entries and re.search(r"\bset\b.*\bfilter\b", text):
         notes.append("Junos 'set'-display format detected but not yet supported — "
                      "paste the curly-brace `show configuration` form to audit it.")

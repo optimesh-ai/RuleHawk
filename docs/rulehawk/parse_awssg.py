@@ -71,6 +71,25 @@ _V4_ANY = ipaddress.ip_network("0.0.0.0/0")
 _V6_ANY = ipaddress.ip_network("::/0")
 
 
+def _load(text: str) -> Tuple[Any, int]:
+    """json.loads, tolerating a non-JSON preamble (a saved terminal session:
+    `### cmd: aws ec2 describe-security-groups ---` before the output). Returns
+    (document, number of preamble lines skipped). Raises ValueError."""
+    try:
+        return json.loads(text), 0
+    except ValueError as first:
+        lines = text.splitlines()
+        for k, ln in enumerate(lines[:20]):
+            if ln.lstrip()[:1] in ("{", "["):
+                if k == 0:
+                    break
+                try:
+                    return json.loads("\n".join(lines[k:])), k
+                except ValueError:
+                    break
+        raise first
+
+
 def detect(text: str) -> bool:
     """True for `aws ec2 describe-security-groups` JSON.
 
@@ -78,11 +97,10 @@ def detect(text: str) -> bool:
     shape. A Network ACL export is ordered and has denies, so it must NOT be
     routed here and silently read as allow-only.
     """
-    head = text.lstrip()[:1]
-    if head not in ("{", "["):
+    if text.lstrip()[:1] not in ("{", "[") and "describe-security-groups" not in text[:2000]:
         return False
     try:
-        doc = json.loads(text)
+        doc, _ = _load(text)
     except ValueError:
         return False
     groups = _groups_of(doc)
@@ -93,11 +111,34 @@ def detect(text: str) -> bool:
                for g in groups if isinstance(g, dict))
 
 
+def _nested_groups(doc: Any, depth: int = 0) -> List[dict]:
+    """Every `SecurityGroups` list nested anywhere in a wrapper document (a
+    tool's `{"result": {...}}` envelope, a dump keyed by command)."""
+    out: List[dict] = []
+    if depth > 6:
+        return out
+    if isinstance(doc, dict):
+        for k, v in doc.items():
+            if k == "SecurityGroups" and isinstance(v, list):
+                out.extend(v)
+            else:
+                out.extend(_nested_groups(v, depth + 1))
+    elif isinstance(doc, list):
+        for v in doc:
+            if isinstance(v, (dict, list)):
+                out.extend(_nested_groups(v, depth + 1))
+    return out
+
+
 def _groups_of(doc: Any) -> Optional[List[dict]]:
-    """The group list, from either the CLI envelope or a bare array."""
+    """The group list, from the CLI envelope, a bare array, or a wrapper that
+    nests one or more `SecurityGroups` arrays."""
     if isinstance(doc, dict):
         groups = doc.get("SecurityGroups")
-        return groups if isinstance(groups, list) else None
+        if isinstance(groups, list):
+            return groups
+        nested = _nested_groups(doc)
+        return nested or None
     if isinstance(doc, list):
         return doc
     return None
@@ -205,12 +246,18 @@ def parse_awssg(text: str) -> Tuple[List[ACE], List[str]]:
     """Parse `describe-security-groups` JSON -> (ACEs, notes)."""
     notes: List[str] = []
     try:
-        doc = json.loads(text)
+        doc, skipped = _load(text)
     except ValueError as e:
         return [], [f"not valid JSON: {e}"]
+    if skipped:
+        notes.append(f"skipped {skipped} non-JSON preamble line(s) before the "
+                     f"describe-security-groups output")
     groups = _groups_of(doc)
     if groups is None:
         return [], ["no SecurityGroups array found in the JSON document"]
+    if isinstance(doc, dict) and not isinstance(doc.get("SecurityGroups"), list):
+        notes.append(f"SecurityGroups found nested inside a wrapper document "
+                     f"({len(groups)} group(s)); audited as one estate")
 
     lines = _line_index(text)
     aces: List[ACE] = []
