@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .analyze import Finding, analyze, score
-from .boundary import HAMMERHEAD_URL, markdown_lines as boundary_markdown, triggers
+from .boundary import markdown_lines as boundary_markdown, triggers
 from .evidence import Subject, build_evidence, to_evidence_markdown
 from .parse import parse_acls
 from .parse_iptables import detect as detect_iptables, parse_iptables
@@ -880,8 +880,8 @@ def to_console(gate: GateResult) -> str:
     out.append("  SCOPE  : rule layer only; routing, NAT and topology not "
                "evaluated")
     if triggers(f for fr in gate.files for f in fr.findings):
-        out.append(f"  NEXT   : delivery and change impact need a forwarding "
-                   f"model: Hammerhead (access by request), {HAMMERHEAD_URL}")
+        out.append("  NEXT   : delivery and change impact need a forwarding "
+                   "model (e.g. Batfish)")
     out.append("=" * 68)
     return "\n".join(out)
 

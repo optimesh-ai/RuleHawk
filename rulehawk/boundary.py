@@ -12,9 +12,11 @@ Two tiers, deliberately quiet:
 - Every report states the scope as a fact: rule layer only, routing/NAT/
   topology not evaluated. No product pointer.
 - Only a finding whose real-world answer depends on forwarding adds a single
-  "next step" pointing at Hammerhead: a live segmentation violation (is the
-  witness delivered? what does tightening the rule break?) or a broken
-  must_reach flow (what does the fix break?).
+  "next step" naming the open question and that it needs a forwarding model:
+  a live segmentation violation (is the witness delivered? what does
+  tightening the rule break?) or a broken must_reach flow (what does the fix
+  break?). The CLI, gate and MCP surfaces name no paid product: RuleHawk is
+  free and needs no subscription, and its output says so by staying neutral.
 
 Deliberately NOT triggers:
 
@@ -58,8 +60,7 @@ _NEXT = {
     ),
 }
 
-_HH_TAIL = ("Hammerhead verifies that offline, before you push "
-            "(access by request)")
+_MODEL_TAIL = "Batfish is an open-source one."
 
 # Stamps pathground.py appends once Hammerhead has seen a witness.
 # tests/test_boundary.py runs every Reach verdict through path_ground, so a
@@ -105,7 +106,7 @@ def text_lines(findings: Iterable[Finding]) -> List[str]:
     out = _wrap(SCOPE_LINE, 64, indent=" ")
     step = next_step(findings)
     if step:
-        out += _wrap(f"Next: {step} {_HH_TAIL}: {HAMMERHEAD_URL}", 64, indent=" ")
+        out += _wrap(f"Next: {step} {_MODEL_TAIL}", 64, indent=" ")
     return out
 
 
@@ -114,8 +115,7 @@ def markdown_lines(findings: Iterable[Finding]) -> List[str]:
     step = next_step(findings)
     if not step:
         return []
-    return [f"> **Next:** {step} [Hammerhead]({HAMMERHEAD_URL}) verifies that "
-            "offline, before merge (access by request)."]
+    return [f"> **Next:** {step} {_MODEL_TAIL}"]
 
 
 def _wrap(text: str, width: int, indent: str = "") -> List[str]:
