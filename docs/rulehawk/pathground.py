@@ -92,7 +92,8 @@ Oracle = Callable[[Witness], Reach]
 # segcheck emits: f"{swit} -> {dwit}{portsfx} ({proto})", portsfx = f":{port}".
 # e.g. "10.20.0.1 -> 10.10.0.1:445 (tcp)"  or  "10.20.0.1 -> 10.10.0.1 (ip)"
 _WITNESS_RE = re.compile(
-    r"^\s*(?P<src>\S+?)\s*->\s*(?P<dst>[^:\s]+)(?::(?P<port>\d+))?\s*\((?P<proto>\w+)\)\s*$"
+    r"^\s*(?P<src>[^:\s]+?)(?::(?P<sport>\d+))?\s*->\s*(?P<dst>[^:\s]+)"
+    r"(?::(?P<port>\d+))?\s*\((?P<proto>\w+)(?:\s+[^)]*)?\)\s*$"
 )
 
 

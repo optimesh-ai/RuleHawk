@@ -139,6 +139,40 @@ def _witness_port(dpr: PortRange) -> int:
     return dpr.lo if dpr.lo > 0 else min(1, dpr.hi)
 
 
+# Concrete ICMP types tried, in order, when the permitted region is "every type
+# except some" — the witness must name one the region really contains.
+_WITNESS_ICMP_TYPES = ("echo", "echo-reply", "unreachable", "time-exceeded",
+                       "parameter-problem", "redirect", "source-quench",
+                       "timestamp-request", "timestamp-reply",
+                       "router-advertisement", "router-solicitation")
+
+
+def _witness_str(sub, probe: str, port: Optional[int]) -> str:
+    """The witness packet for a PROVED region `sub` = (src-net, dst-net,
+    src-ports, dst-ports, icmp-type), as `src[:sport] -> dst[:dport] (proto
+    [icmp-type])`. Every field the region constrains is named: a witness that
+    leaves out a constrained source port or ICMP type describes packets the
+    rule does NOT match (replayed on a real device they are dropped — found by
+    the kernel differential oracle). Unconstrained fields stay implicit, so the
+    common form `10.20.0.1 -> 10.10.0.1:445 (tcp)` is unchanged."""
+    swit, dwit = _witness_host(sub[0]), _witness_host(sub[1])
+    if port is None and probe in _PORTED:
+        port = _witness_port(sub[3])
+    ssfx = ""
+    if probe in _PORTED and not sub[2].is_any():
+        ssfx = f":{_witness_port(sub[2])}"
+    dsfx = f":{port}" if port is not None else ""
+    label = probe
+    if probe in _ICMP_PROTOS:
+        tag, v = sub[4]
+        if tag == "eq":
+            label = f"{probe} {v}"
+        elif v:
+            pick = next((t for t in _WITNESS_ICMP_TYPES if t not in v), None)
+            label = f"{probe} {pick}" if pick else f"{probe} (type not in {sorted(v)})"
+    return f"{swit}{ssfx} -> {dwit}{dsfx} ({label})"
+
+
 class _Budget:
     __slots__ = ("left",)
 
@@ -417,17 +451,15 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                                    proto, ports)
                 kind, info = res
                 if kind == "ok":
-                    rule, probe, swit, dwit, wport = info
-                    portsfx = f":{wport}" if wport is not None else ""
+                    rule, wit = info
                     _line_part = f" (line {rule.line})" if rule.line else ""
                     findings.append(Finding(
                         f"{rule.acl}:{rule.seq}", "connectivity-ok", "info",
                         f"CONNECTIVITY OK ({sname} must reach {dname}{scope}): "
                         f"the ENTIRE flow space is provably permitted — e.g. "
-                        f"rule {rule.seq}{_line_part} permits "
-                        f"{swit} -> {dwit}{portsfx} ({probe}).",
+                        f"rule {rule.seq}{_line_part} permits {wit}.",
                         rule.raw,
-                        witness=f"{swit} -> {dwit}{portsfx} ({probe})",
+                        witness=wit,
                         line=rule.line))
                 elif kind == "indeterminate":
                     rule, acl_name = info
@@ -470,14 +502,10 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
 
             if permit_hit:
                 sub, rule, probe, port = permit_hit
-                swit, dwit = _witness_host(sub[0]), _witness_host(sub[1])
-                # The witness must be a REAL packet, concrete in the port
-                # dimension too: for a portless ported assertion, pick a
-                # representative from the sub-rectangle PROVED permitted.
-                wport = port
-                if wport is None and probe in _PORTED:
-                    wport = _witness_port(sub[3])
-                portsfx = f":{wport}" if wport is not None else ""
+                # The witness must be a REAL packet, concrete in every
+                # dimension the proved sub-rectangle constrains (dst port for a
+                # portless ported assertion, source port, ICMP type).
+                wit = _witness_str(sub, probe, port)
                 _line_part = f" (line {rule.line})" if rule.line else ""
                 # Paste-ready fix: the actual intersecting CIDRs
                 # (engine-proven, sub ⊆ zone ∩ rule), scoped to the ASSERTED
@@ -488,12 +516,11 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                     f"{rule.acl}:{rule.seq}", "segmentation-violation",
                     "critical",
                     f"SEGMENTATION VIOLATION ({sname} must not reach "
-                    f"{dname}): the ACL PERMITS {swit} -> {dwit}{portsfx} "
-                    f"({probe}) via rule {rule.seq}.",
+                    f"{dname}): the ACL PERMITS {wit} via rule {rule.seq}.",
                     rule.raw,
                     fix=(f"deny {sub[0]} -> {sub[1]}{_port_part} "
                          f"before rule {rule.seq}{_line_part}"),
-                    witness=f"{swit} -> {dwit}{portsfx} ({probe})",
+                    witness=wit,
                     line=rule.line,
                     claim={"direction": direction, "src": sname, "dst": dname,
                            "proto": proto, "ports": assertion.get("ports")}))
@@ -599,7 +626,7 @@ def _prove_reach(aces: List[ACE], by_acl: Dict[str, List[ACE]],
     transit context permits the ENTIRE flow space (every src-subnet x
     dst-subnet x port) with NO denied hole — a permit covering only part of a
     zone leaves the rest as a reported hole (the false-ok this guards). Returns:
-      ("ok",            (rule, probe, swit, dwit, wport))
+      ("ok",            (rule, witness-string))
       ("indeterminate", (rule_or_None, acl_name))
       ("broken",        (hole_src, hole_dst, hole_port, probe))
     Preference order: ok > indeterminate > broken. A single scoped context (the
@@ -628,10 +655,7 @@ def _prove_reach(aces: List[ACE], by_acl: Dict[str, List[ACE]],
                     p = _search(acl_aces, 0, probe, rect, _Budget(_MAX_VISITS))
                     if p and p[0] == "permit":
                         _, sub, rule = p
-                        wport = port if port is not None else (
-                            _witness_port(sub[3]) if probe in _PORTED else None)
-                        witness = (rule, probe, _witness_host(sub[0]),
-                                   _witness_host(sub[1]), wport)
+                        witness = (rule, _witness_str(sub, probe, port))
                 continue
             kind, sub, rule = res
             if kind == "indeterminate":
