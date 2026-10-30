@@ -43,6 +43,7 @@ from typing import Dict, List, Optional, Tuple
 from .analyze import Finding, analyze, score
 from .boundary import markdown_lines as boundary_markdown, triggers
 from .evidence import Subject, build_evidence, to_evidence_markdown
+from .model import strip_pager
 from .parse import parse_acls
 from .parse_iptables import detect as detect_iptables, parse_iptables
 from .parse_junos import detect as detect_junos, parse_junos
@@ -297,7 +298,7 @@ def audit_file(path: str, policy: Optional[dict], vendor: str = "auto",
             raw = fh.read()
     except OSError as e:
         return FileResult(path, "?", "error", 0, error=str(e))
-    text = raw.decode("utf-8", errors="replace")
+    text = strip_pager(raw.decode("utf-8", errors="replace"))
     vlabel, parse_fn = _pick_parser(text, vendor)
     aces, notes = parse_fn(text)
     findings = analyze(aces)

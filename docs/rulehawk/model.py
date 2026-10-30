@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import dataclasses
 import ipaddress
+import re
 from typing import Optional, Union
 
 _IPNet = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
@@ -226,3 +227,34 @@ def _compatible_coverer(a: ACE, b: ACE) -> bool:
 def covered_dimensions(a: ACE, b: ACE) -> "tuple[bool, bool]":
     """(does a span all of b.src, does a span all of b.dst) — reuses _net_covers."""
     return _net_covers(a.src, b.src), _net_covers(a.dst, b.dst)
+
+
+# --------------------------------------------------------------------------- #
+# terminal pager artifacts
+# --------------------------------------------------------------------------- #
+# A config captured from an interactive session (`show running-config` without
+# `terminal length 0`) carries the pager prompt and the backspaces that erased
+# it, often on the same line as the next config line:
+#     " --More-- \b\b\b\b\b\b\b\b\b\b          \b\b\b\b\b\b\b\b\b\b deny ip ..."
+# Left in, that line is unparseable and its rule is lost (surfaced only as an
+# unparsed note). Removing the prompt recovers the rule exactly. Only a prompt
+# at the start of a line is touched, and never a newline, so every line number
+# a finding cites is unchanged.
+_PAGER = re.compile(
+    r"^[ \t]*(?:-{2,}[ \t]*\(?[ \t]*more(?:[ \t]+\d+%)?[ \t]*\)?[ \t]*-{2,}"
+    r"|<-{2,}[ \t]*more[ \t]*-{2,}>)[ \t\x08]*",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def strip_pager(text: str) -> str:
+    """Remove `--More--`-style pager prompts (Cisco, Arista, ASA `<--- More
+    --->`, Junos `---(more 45%)---`) and their backspace runs."""
+    if "more" not in text and "More" not in text and "MORE" not in text:
+        return text
+
+    def _sub(m: "re.Match") -> str:
+        end = m.end()
+        rest = m.string[end:end + 1]
+        # Keep an entry indented (it continues a named ACL / policy block).
+        return " " if rest and rest not in "\r\n" else ""
+    return _PAGER.sub(_sub, text)

@@ -26,6 +26,7 @@ import sys
 
 from .analyze import analyze, score
 from .evidence import Subject, build_evidence, to_evidence_markdown
+from .model import strip_pager
 from .parse import parse_acls
 from .parse_awssg import detect as detect_awssg, parse_awssg
 from .parse_eos import detect as detect_eos, parse_eos
@@ -190,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"rulehawk: cannot read {argv[0]!r}: {e}", file=sys.stderr)
             return 2
-        text = raw.decode("utf-8", "replace")
+        text = strip_pager(raw.decode("utf-8", "replace"))
         source = argv[0]
     else:
         # Read stdin as bytes and decode leniently: a non-UTF-8 config (a
@@ -201,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
             raw = sys.stdin.buffer.read()
         except (AttributeError, OSError):
             raw = sys.stdin.read().encode("utf-8", "replace")
-        text = raw.decode("utf-8", "replace")  # no file, or explicit "-"
+        text = strip_pager(raw.decode("utf-8", "replace"))  # no file, or explicit "-"
         source = "<stdin>"
 
     # Auto-detect vendor (same precedence order as gate.py _pick_parser).
