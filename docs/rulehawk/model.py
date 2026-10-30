@@ -14,7 +14,9 @@ covering rule:
                    space we widened could recommend deleting a load-bearing rule.
   * `stateful`   — `established` matches only return traffic (ACK/RST), so it
                    does not "cover" a new-flow rule.
-`covers()` returns False whenever `a` is imprecise or stateful.
+  * `state_limited` — a conntrack state match that includes NEW but not every
+                   state: exact for new flows, but other-state packets pass it.
+`covers()` returns False whenever `a` is imprecise, stateful or state_limited.
 
 PARSER CONTRACT (load-bearing for every frontend): an ACE's modeled space must
 be a SUPERSET of the rule's true match space — parsers must WIDEN, never narrow.
@@ -101,6 +103,12 @@ class ACE:
     # FORWARD permit in the segmentation witness search. Non-transit ACEs stay
     # available for hygiene analysis (shadow/least-privilege), just not the
     # inter-zone witness. Default True keeps single-context vendors unchanged.
+    state_limited: bool = False       # matches only SOME connection-tracking
+    # states, NEW among them (iptables `--ctstate NEW` / `--state
+    # NEW,ESTABLISHED`). Exact for connection-initiating packets — the ones
+    # segmentation asks about — but a strict SUBSET of all packets: packets in
+    # the other states pass it and reach later rules. So, like `stateful`, it
+    # must never prove another rule dead (covers() refuses it as the coverer).
 
     @property
     def src_any(self) -> bool:
@@ -132,8 +140,9 @@ def _net_covers(a: _IPNet, b: _IPNet) -> bool:
 
 def covers(a: ACE, b: ACE) -> bool:
     """True iff a's match-space is a (sound) superset of b's (a ⊇ b)."""
-    if a.imprecise or a.stateful:
-        # a's space is not exact — refuse to prove anything dead from it.
+    if a.imprecise or a.stateful or a.state_limited:
+        # a's space is not exact (or not all-state) — refuse to prove anything
+        # dead from it.
         return False
     if b.imprecise and b.proto in _PORTED and not (
             b.src_port.is_any() and b.dst_port.is_any()):
@@ -201,7 +210,7 @@ def _compatible_coverer(a: ACE, b: ACE) -> bool:
     """True iff `a` may join a union that proves `b` dead: exact, and every
     dimension EXCEPT the IP rectangle already covers `b` (mirrors covers()'s
     soundness gates), so only IP coverage remains to prove."""
-    if a.imprecise or a.stateful:
+    if a.imprecise or a.stateful or a.state_limited:
         return False
     if not _proto_covers(a.proto, b.proto):
         return False
