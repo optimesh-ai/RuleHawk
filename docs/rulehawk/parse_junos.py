@@ -67,12 +67,13 @@ IPv6 literal (surfaced as a note); pure-v4 behavior is unchanged.
 
 from __future__ import annotations
 
+import contextvars
 import ipaddress
 import dataclasses
 import re
 import shlex
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .model import ACE, ANY_PORTS, _PORTED, PortRange, _IPNet
 from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
@@ -332,9 +333,91 @@ class _Match:
                                        # emission is blocked.
 
 
-def _parse_from(from_toks: List[str], label: str, notes: List[str]) -> _Match:
+# `policy-options prefix-list NAME` definitions of the config being parsed:
+# name -> list of prefixes, or None when the list can't be replayed exactly
+# (apply-path, inactive, conflicting definitions, non-prefix entries).
+_PREFIX_LISTS: contextvars.ContextVar[Dict[str, Optional[List[str]]]] = \
+    contextvars.ContextVar("_PREFIX_LISTS", default={})
+
+_PL_BRACE_RE = re.compile(r'(inactive:\s*)?(?<![\w-])prefix-list\s+"?([^\s{;"]+)"?\s*\{([^{}]*)\}')
+_PL_SET_RE = re.compile(r'(?m)^\s*(set|delete|deactivate|activate)\s+(?:logical-systems\s+\S+\s+)?'
+                        r'policy-options\s+prefix-list\s+"?([^\s"]+)"?(?:\s+(.*?))?\s*$')
+
+
+def _is_prefix(v: str) -> bool:
+    try:
+        ipaddress.ip_network(v, strict=False)
+        return True
+    except ValueError:
+        return False
+
+
+def _collect_prefix_lists(text: str) -> Dict[str, Optional[List[str]]]:
+    out: Dict[str, Optional[List[str]]] = {}
+
+    def put(name: str, vals: Optional[List[str]]) -> None:
+        if name in out and out[name] != vals:
+            out[name] = None                  # conflicting definitions
+        else:
+            out[name] = vals
+
+    body_text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    body_text = re.sub(r"(?m)#.*$", "", body_text)
+    for m in _PL_BRACE_RE.finditer(body_text):
+        items = [x.strip() for x in m.group(3).split(";") if x.strip()]
+        ok = not m.group(1) and all(_is_prefix(x) for x in items)
+        put(m.group(2), items if ok else None)
+    set_lists: Dict[str, Optional[List[str]]] = {}
+    for m in _PL_SET_RE.finditer(text):
+        verb, name, rest = m.group(1), m.group(2), (m.group(3) or "").strip()
+        cur = set_lists.setdefault(name, [])
+        if verb != "set" or cur is None or not _is_prefix(rest):
+            set_lists[name] = None
+        else:
+            cur.append(rest)
+    for name, vals in set_lists.items():
+        put(name, vals)
+    return out
+
+
+def _resolve_prefix_lists(vals: List[str], family: Optional[str]) -> Optional[List[str]]:
+    """Prefixes of the named lists in the filter's family, or None if any part
+    can't be replayed exactly (the caller then keeps the imprecise path)."""
+    if not vals or "except" in vals:
+        return None
+    defs = _PREFIX_LISTS.get()
+    out: List[str] = []
+    for name in vals:
+        items = defs.get(name.strip('"'))
+        if items is None:
+            return None
+        for it in items:
+            v = ipaddress.ip_network(it, strict=False).version
+            if family == "inet" and v != 4 or family == "inet6" and v != 6:
+                continue              # Junos ignores other-family entries
+            out.append(it)
+    return out or None
+
+
+def _parse_from(from_toks: List[str], label: str, notes: List[str],
+                family: Optional[str] = None) -> _Match:
     m = _Match()
+    seen_src = seen_dst = 0
     for key, vals in _read_conditions(from_toks):
+        if key in ("source-prefix-list", "destination-prefix-list"):
+            pfx = _resolve_prefix_lists(vals, family)
+            if pfx is not None:
+                key, vals = ("source-address" if key.startswith("source")
+                             else "destination-address"), pfx
+        if key == "source-address":
+            seen_src += 1
+        elif key == "destination-address":
+            seen_dst += 1
+        if seen_src > 1 or seen_dst > 1:
+            # Junos ANDs separate match conditions; RuleHawk unions the nets
+            # (a superset): never claim it exact.
+            m.imprecise = True
+            m.other_imprecise = True
         if key in ("source-address",):
             nets, imp, has_unres, has_exc = _addrs(vals, label, notes)
             m.srcs += nets
@@ -473,7 +556,7 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
                      + (" (marked imprecise: an unmodeled/redirecting then-action "
                         "may change the outcome)" if uncertain else ""))
 
-    m = _parse_from(from_toks, label, notes)
+    m = _parse_from(from_toks, label, notes, family)
     # Family-aware fallback: a missing src/dst matches EVERYTHING in the
     # filter's address family. Emitting a v4 0.0.0.0/0 for an inet6 term made
     # the ACE unable to match any v6 witness (mixed IP versions never
@@ -897,6 +980,14 @@ def parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
     Same contract as `parse.parse_acls`, so `analyze`/`check_segmentation`
     consume the result unchanged.
     """
+    tok = _PREFIX_LISTS.set(_collect_prefix_lists(text))
+    try:
+        return _parse_junos(text)
+    finally:
+        _PREFIX_LISTS.reset(tok)
+
+
+def _parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
     entries: List[ACE] = []
     notes: List[str] = []
     rebuilt = None
