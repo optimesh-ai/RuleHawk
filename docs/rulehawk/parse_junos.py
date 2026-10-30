@@ -104,8 +104,15 @@ _TERMINATING = {"accept": "permit", "discard": "deny", "reject": "deny"}
 _THEN_MODIFIERS = {
     "count", "log", "syslog", "policer", "forwarding-class", "loss-priority",
     "dscp", "sample", "port-mirror", "three-color-policer", "service-accounting",
-    "routing-instance", "ipsec-sa",
+    "ipsec-sa",
 }
+
+# `then` actions that FORWARD the packet somewhere other than the normal
+# lookup (filter-based forwarding). For reachability the packet is let through,
+# but where it lands is not modeled: an implicit-accept term carrying one is
+# emitted as an imprecise permit.
+_THEN_REDIRECT = {"routing-instance", "next-hop-group", "next-ip", "next-ip6",
+                  "next-interface", "topology"}
 
 # Common IP protocol numbers, so `protocol 6` reads the same as `protocol tcp`.
 _PROTO_NUM = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6",
@@ -389,10 +396,12 @@ def _parse_from(from_toks: List[str], label: str, notes: List[str]) -> _Match:
 
 
 def _parse_then(then_toks: List[str], label: str,
-                notes: List[str]) -> Tuple[Optional[str], bool]:
-    """Return (action or None, fallthrough). First terminating action wins."""
+                notes: List[str]) -> Tuple[Optional[str], bool, bool]:
+    """Return (action or None, fallthrough, uncertain). First terminating
+    action wins; `uncertain` is set by an unmodeled or redirecting action."""
     action: Optional[str] = None
     fallthrough = False
+    uncertain = False
     for st in _split_semicolons(then_toks):
         if not st:
             continue
@@ -404,9 +413,12 @@ def _parse_then(then_toks: List[str], label: str,
             fallthrough = True
         elif head in _THEN_MODIFIERS:
             continue
+        elif head in _THEN_REDIRECT:
+            uncertain = True
         else:
+            uncertain = True
             notes.append(f"unmodeled Junos then-action '{head}' in {label}")
-    return action, fallthrough
+    return action, fallthrough, uncertain
 
 
 def _raw(tname: str, action: str, proto: str, s: _IPNet, d: _IPNet,
@@ -444,15 +456,22 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
         else:
             i += 1
 
-    action, fallthrough = _parse_then(then_toks, label, notes)
+    action, fallthrough, uncertain = _parse_then(then_toks, label, notes)
+    implicit_uncertain = False
     if action is None:
         if fallthrough:
             notes.append(f"Junos term {label} only falls through (`then next term`) "
                          f"— not modeled as a decision (match order may shift)")
-        else:
-            notes.append(f"Junos term {label} has no terminating action "
-                         f"(accept/discard/reject) — skipped")
-        return seq
+            return seq
+        # Junos: a term with no `then`, or with only nonterminating actions
+        # (count/log/policer/...), ACCEPTS what it matches. Skipping it let
+        # those packets fall through to later terms (a false "blocked").
+        action = "permit"
+        implicit_uncertain = uncertain
+        notes.append(f"Junos term {label} has no terminating action — modeled as "
+                     f"the device's implicit accept"
+                     + (" (marked imprecise: an unmodeled/redirecting then-action "
+                        "may change the outcome)" if uncertain else ""))
 
     m = _parse_from(from_toks, label, notes)
     # Family-aware fallback: a missing src/dst matches EVERYTHING in the
@@ -466,8 +485,8 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
     protos = m.protos or ["ip"]
     sports = m.sports or [ANY_PORTS]
     dports = m.dports or [ANY_PORTS]
-    imprecise = m.imprecise
-    other_imprecise = m.other_imprecise
+    imprecise = m.imprecise or implicit_uncertain
+    other_imprecise = m.other_imprecise or implicit_uncertain
 
     if (m.sports or m.dports) and any(p not in _PORTED for p in protos):
         # covers()/segcheck ignore ports on a non-port-carrying protocol
