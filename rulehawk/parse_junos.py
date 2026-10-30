@@ -539,6 +539,25 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
         else:
             i += 1
 
+    conds = _read_conditions(from_toks)
+    keys = [k for k, _ in conds]
+    if keys.count("port") == 1 and not any(
+            k in keys for k in ("source-port", "destination-port", "source-port-except",
+                                "destination-port-except", "port-except")):
+        # `port X` = source port X OR destination port X: emit the term twice,
+        # once per direction. The union of the two is exactly the match space.
+        def _toks(cs):
+            out: List[str] = []
+            for k, vs in cs:
+                out += [k, "[", *vs, "]", ";"] if vs else [k, ";"]
+            return out
+        for direction in ("source-port", "destination-port"):
+            body = ["from", "{", *_toks([(direction if k == "port" else k, v)
+                                         for k, v in conds]), "}",
+                    "then", "{", *then_toks, "}"]
+            seq = _parse_term(fname, tname, body, seq, entries, notes, line, family)
+        return seq
+
     action, fallthrough, uncertain = _parse_then(then_toks, label, notes)
     implicit_uncertain = False
     if action is None:
