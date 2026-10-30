@@ -47,7 +47,8 @@ from typing import Dict, List, Optional, Tuple
 from . import __version__
 from .analyze import Finding
 from .boundary import to_dict as boundary_dict
-from .gate import _KIND_HELP, _SEV_ORDER, _SEV_RANK, FileResult, run_gate
+from .gate import (_KIND_HELP, _SEV_ORDER, _SEV_RANK, _VENDORS, FileResult,
+                   _pick_parser, no_rules_reason, run_gate)
 
 # Limits keep one call bounded; anything beyond them is reported as not
 # analysed, never dropped.
@@ -56,6 +57,12 @@ MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_NOTES_PER_FILE = 20
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 1000
+# The shadowing analysis compares rules pairwise within one ACL, so its cost
+# grows with the square of the largest ACL (about 25 s at 10,000 rules on a
+# laptop). A bigger ACL is reported as not analysed (INCOMPLETE, never PASS)
+# rather than leaving the agent's tool call hanging. Override with the
+# RULEHAWK_MCP_MAX_ACL_RULES environment variable.
+DEFAULT_MAX_ACL_RULES = 10000
 
 _FAIL_ON = ("critical", "high", "medium", "low", "none")
 
@@ -90,6 +97,19 @@ class InputError(ValueError):
     """A request the tools refuse (bad path, bad argument). Reported to the
     agent as an ERROR result, never raised through the protocol."""
 
+    def __init__(self, msg: str, code: str = "bad_argument", hint: str = ""):
+        super().__init__(msg)
+        self.code = code
+        self.hint = hint
+
+
+def _max_acl_rules() -> int:
+    try:
+        n = int(os.environ.get("RULEHAWK_MCP_MAX_ACL_RULES", ""))
+    except ValueError:
+        return DEFAULT_MAX_ACL_RULES
+    return n if n > 0 else DEFAULT_MAX_ACL_RULES
+
 
 # --------------------------------------------------------------------------- #
 # input resolution
@@ -100,14 +120,33 @@ def _root() -> Optional[str]:
 
 
 def _resolve(path: str, what: str = "path") -> str:
+    """Absolute, symlink-resolved path. A relative path resolves against
+    RULEHAWK_MCP_ROOT when it is set, else against the server's working
+    directory (which an MCP client chooses, so absolute paths are safer)."""
     if not isinstance(path, str) or not path.strip():
-        raise InputError(f"{what} is required")
-    p = os.path.realpath(os.path.expanduser(path.strip()))
+        raise InputError(f"{what} is required", "path_required",
+                         f"pass the absolute path of a config file or directory as {what}")
+    raw = os.path.expanduser(path.strip())
     root = _root()
+    base = root or os.getcwd()
+    p = os.path.realpath(os.path.join(base, raw))
     if root and p != root and not p.startswith(root + os.sep):
-        raise InputError(f"{what} {path!r} is outside RULEHAWK_MCP_ROOT ({root})")
+        raise InputError(
+            f"{what} {path!r} resolves to {p}, outside RULEHAWK_MCP_ROOT ({root})",
+            "path_outside_root",
+            f"pass a path under {root}, or restart the server with "
+            "RULEHAWK_MCP_ROOT set to a directory that contains the file")
     if not os.path.exists(p):
-        raise InputError(f"{what} {path!r} does not exist")
+        if os.path.isabs(raw):
+            hint = "check the path; it must exist on the machine running rulehawk-mcp"
+        elif root:
+            hint = (f"relative paths resolve against RULEHAWK_MCP_ROOT ({root}); "
+                    "pass an absolute path")
+        else:
+            hint = (f"relative paths resolve against the server's working "
+                    f"directory ({base}); pass an absolute path")
+        raise InputError(f"{what} {path!r} does not exist (looked for {p})",
+                         "path_not_found", hint)
     return p
 
 
@@ -139,7 +178,8 @@ def _collect(path: str, what: str = "path") -> Tuple[str, List[str], List[dict]]
                 f"{hidden} hidden file(s)/directory(ies) (names starting with "
                 "'.') were not read")})
     else:
-        raise InputError(f"{what} {path!r} is neither a file nor a directory")
+        raise InputError(f"{what} {path!r} is neither a file nor a directory",
+                         "path_not_found", "pass a regular file or a directory")
     files: List[str] = []
     for c in candidates:
         if len(files) >= MAX_FILES:
@@ -169,26 +209,43 @@ def _load_policy(policy_path: str) -> Tuple[Optional[dict], Optional[str]]:
         with open(p, "rb") as fh:
             policy = json.loads(fh.read().decode("utf-8"))
     except (OSError, ValueError) as e:
-        raise InputError(f"cannot read policy {policy_path!r}: {e}")
+        raise InputError(f"cannot read policy {policy_path!r}: {e}",
+                         "policy_unreadable",
+                         "policy_path must be a JSON segmentation policy; see "
+                         "docs/policy.md, or omit policy_path")
     if not isinstance(policy, dict):
-        raise InputError(f"policy {policy_path!r} must be a JSON object")
+        raise InputError(f"policy {policy_path!r} must be a JSON object",
+                         "policy_unreadable", "see docs/policy.md for the schema")
     return policy, p
 
 
 def _check_choice(value: str, choices, what: str) -> str:
     v = (value or "").strip().lower()
     if v not in choices:
-        raise InputError(f"{what} must be one of {', '.join(choices)}; got {value!r}")
+        raise InputError(f"{what} must be one of {', '.join(choices)}; got {value!r}",
+                         "bad_argument", f"use one of: {', '.join(choices)}")
     return v
+
+
+def _check_vendor(value: str) -> str:
+    """auto, a vendor id, or a common alias (cisco, juniper, paloalto...)."""
+    v = (value or "auto").strip().lower()
+    if v == "auto":
+        return v
+    if v in _VENDORS:
+        return _VENDORS[v]
+    raise InputError(f"vendor must be one of {', '.join(_VENDOR_CHOICES)}; got {value!r}",
+                     "bad_argument",
+                     "leave vendor as auto unless detection picked the wrong parser")
 
 
 def _limit(n) -> int:
     try:
         n = int(n)
     except (TypeError, ValueError):
-        raise InputError("limit must be an integer")
+        raise InputError("limit must be an integer", "bad_argument")
     if n < 1:
-        raise InputError("limit must be at least 1")
+        raise InputError("limit must be at least 1", "bad_argument")
     return min(n, MAX_LIMIT)
 
 
@@ -258,11 +315,14 @@ def _coverage(gate, base: str, skipped: List[dict]) -> dict:
                 "unmodelled_lines_total": len(notes),
             })
         elif fr.status == "no_rules_parsed":
-            not_analysed.append({"path": _rel(fr.path, base), "reason": (
-                "no firewall rules recognised: not a supported vendor format "
-                "(see rulehawk_supported_inputs), or not a config"),
-                "detector_guess": fr.vendor,
-                "parser_notes": list(fr.notes)[:5]})
+            not_analysed.append({
+                "path": _rel(fr.path, base),
+                "reason": "no rules parsed: " + no_rules_reason(fr, gate.vendor),
+                "parser_tried": fr.vendor,
+                "parser_notes": list(fr.notes)[:5],
+                "hint": ("check it is a supported format "
+                         "(rulehawk_supported_inputs); a config with no ACLs "
+                         "or firewall policy has nothing to audit")})
         else:
             not_analysed.append({"path": _rel(fr.path, base),
                                  "reason": f"cannot read: {fr.error}"})
@@ -300,21 +360,57 @@ def _scope(findings) -> dict:
             "needs_path_verification_because": b["triggered_by"]}
 
 
-def _error(tool: str, msg: str) -> dict:
-    return {"tool": tool, "rulehawk_version": __version__, "verdict": "ERROR",
-            "error": msg, "coverage": {"state": "incomplete",
-                                       "explanation": "nothing was analysed"},
-            "scope": {"statement": SCOPE_STATEMENT}}
+def _error(tool: str, msg: str, code: str = "bad_argument", hint: str = "") -> dict:
+    out = {"tool": tool, "rulehawk_version": __version__, "verdict": "ERROR",
+           "error": msg, "error_code": code}
+    if hint:
+        out["hint"] = hint
+    out["coverage"] = {"state": "incomplete", "explanation": "nothing was analysed"}
+    out["scope"] = {"statement": SCOPE_STATEMENT}
+    return out
+
+
+def _input_error(tool: str, e: InputError) -> dict:
+    return _error(tool, str(e), e.code, e.hint)
+
+
+def _over_budget(files: List[str], vendor: str) -> Tuple[List[str], List[dict]]:
+    """Split off files whose largest ACL is too big to analyse in one call."""
+    cap = _max_acl_rules()
+    keep: List[str] = []
+    skipped: List[dict] = []
+    for p in files:
+        try:
+            with open(p, "rb") as fh:
+                text = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            keep.append(p)          # audit_file reports the read error itself
+            continue
+        _, parse_fn = _pick_parser(text, vendor)
+        per_acl = Counter(a.acl for a in parse_fn(text)[0])
+        biggest = max(per_acl.values()) if per_acl else 0
+        if biggest > cap:
+            acl = max(per_acl, key=per_acl.get)
+            skipped.append({"path": p, "reason": (
+                f"ACL {acl!r} has {biggest} rules, over the per-call limit of "
+                f"{cap} (analysis time grows with the square of the ACL size)"),
+                "hint": ("run the CLI instead (`rulehawk FILE`), which has no "
+                         "limit, or raise RULEHAWK_MCP_MAX_ACL_RULES in the "
+                         "server's environment")})
+        else:
+            keep.append(p)
+    return keep, skipped
 
 
 def _run(path: str, policy_path: str, vendor: str, fail_on: str,
          what: str = "path"):
-    vendor = _check_choice(vendor or "auto", _VENDOR_CHOICES, "vendor")
+    vendor = _check_vendor(vendor)
     fail_on = _check_choice(fail_on or "high", _FAIL_ON, "fail_on")
     policy, _ = _load_policy(policy_path)
     base, files, skipped = _collect(path, what)
+    files, too_big = _over_budget(files, vendor)
     gate = run_gate(files, policy, fail_on=fail_on, vendor=vendor)
-    return gate, base, skipped, fail_on, policy is not None
+    return gate, base, skipped + too_big, fail_on, policy is not None
 
 
 def _verdict(gate, coverage: dict, fail_on: str) -> Tuple[str, str]:
@@ -326,7 +422,8 @@ def _verdict(gate, coverage: dict, fail_on: str) -> Tuple[str, str]:
         return "INCOMPLETE", (f"{coverage['files_not_analysed']} input(s) not "
                               "analysed; nothing unanalysed can pass")
     if fail_on == "none":
-        return "PASS", "advisory run (fail_on=none): nothing blocks"
+        return "ADVISORY", ("fail_on=none: nothing blocks, so no PASS is given; "
+                            "read findings_by_severity")
     return "PASS", f"no finding at or above fail_on={fail_on}"
 
 
@@ -340,7 +437,7 @@ def audit(path: str, policy_path: str = "", vendor: str = "auto",
         gate, base, skipped, fail_on, has_policy = _run(
             path, policy_path, vendor, fail_on)
     except InputError as e:
-        return _error("rulehawk_audit", str(e))
+        return _input_error("rulehawk_audit", e)
     cov = _coverage(gate, base, skipped)
     verdict, why = _verdict(gate, cov, fail_on)
     all_findings = [f for fr in gate.files for f in fr.findings]
@@ -378,7 +475,7 @@ def list_findings(path: str, policy_path: str = "", vendor: str = "auto",
         unknown = sorted(want - set(_KIND_HELP) - {"segmentation-infeasible-path"})
         gate, base, skipped, _, has_policy = _run(path, policy_path, vendor, "high")
     except InputError as e:
-        return _error("rulehawk_list_findings", str(e))
+        return _input_error("rulehawk_list_findings", e)
     floor = _SEV_RANK[min_sev]
     pairs = [(fr, f) for fr in gate.files for f in fr.findings
              if _SEV_RANK.get(f.severity, 0) >= floor
@@ -422,20 +519,31 @@ def explain_finding(finding_id: str = "", path: str = "", kind: str = "",
     k = (kind or "").strip()
     if not fid:
         if not k:
-            return _error(tool, "give finding_id (with path) or kind")
+            return _error(tool, "give finding_id (with path) or kind",
+                          "bad_argument",
+                          "pass finding_id plus the path it came from, or a kind "
+                          "such as dangerous-exposure")
         if k not in _KIND_HELP:
-            out = _error(tool, f"unknown kind {k!r}")
+            out = _error(tool, f"unknown kind {k!r}", "bad_argument",
+                         "use one of known_kinds")
             out["known_kinds"] = sorted(_KIND_HELP)
             return out
         return {"tool": tool, "rulehawk_version": __version__, "kind": k,
                 "explanation": _KIND_HELP[k],
                 "scope": {"statement": SCOPE_STATEMENT}}
     if not re.fullmatch(r"RH-[0-9a-f]{12}", fid):
-        return _error(tool, f"finding_id {fid!r} is not a RuleHawk id (RH-xxxxxxxxxxxx)")
+        return _error(tool, f"finding_id {fid!r} is not a RuleHawk id (RH-xxxxxxxxxxxx)",
+                      "bad_argument",
+                      "use an id field from rulehawk_audit or rulehawk_list_findings")
+    if not (path or "").strip():
+        return _error(tool, "finding_id needs path: the same config file or "
+                      "directory the finding came from", "path_required",
+                      "re-send with path (and policy_path, if the finding came "
+                      "from a policy run)")
     try:
         gate, base, skipped, _, _ = _run(path, policy_path, vendor, "high")
     except InputError as e:
-        return _error(tool, str(e))
+        return _input_error(tool, e)
     for fr in gate.files:
         for f in fr.findings:
             if make_finding_id(fr.path, f) != fid:
@@ -451,7 +559,10 @@ def explain_finding(finding_id: str = "", path: str = "", kind: str = "",
                 "scope": _scope([f]),
             }
     out = _error(tool, (f"no finding {fid} in {path!r}: the file changed since "
-                        "the id was issued, or a different path/policy was used"))
+                        "the id was issued, or a different path/policy was used"),
+                 "finding_not_found",
+                 "call rulehawk_list_findings again with the same path and "
+                 "policy_path to get current ids")
     out["found"] = False
     out["coverage"] = _coverage(gate, base, skipped)
     return out
@@ -479,19 +590,26 @@ def compare(before: str, after: str, policy_path: str = "",
     """Findings the `after` config introduces relative to `before`."""
     tool = "rulehawk_compare"
     try:
-        vendor_c = _check_choice(vendor or "auto", _VENDOR_CHOICES, "vendor")
+        vendor_c = _check_vendor(vendor)
         fail_on = _check_choice(fail_on or "high", _FAIL_ON, "fail_on")
         policy, _ = _load_policy(policy_path)
         rb, ra = _resolve(before, "before"), _resolve(after, "after")
         if os.path.isfile(rb) != os.path.isfile(ra):
-            raise InputError("before and after must both be files or both be directories")
+            raise InputError("before and after must both be files or both be directories",
+                             "bad_argument",
+                             "pass two files, or two directories whose files "
+                             "pair by relative path")
         b_base, b_files, b_skip = _collect(before, "before")
         a_base, a_files, a_skip = _collect(after, "after")
+        b_run, b_big = _over_budget(b_files, vendor_c)
+        a_run, a_big = _over_budget(a_files, vendor_c)
+        b_skip, a_skip = b_skip + b_big, a_skip + a_big
+        too_big = {d["path"] for d in b_big + a_big}
     except InputError as e:
-        return _error(tool, str(e))
+        return _input_error(tool, e)
     thr = _SEV_RANK.get(fail_on, 99) if fail_on != "none" else 99
-    b_gate = run_gate(b_files, policy, fail_on, vendor_c)
-    a_gate = run_gate(a_files, policy, fail_on, vendor_c)
+    b_gate = run_gate(b_run, policy, fail_on, vendor_c)
+    a_gate = run_gate(a_run, policy, fail_on, vendor_c)
     b_by = {fr.path: fr for fr in b_gate.files}
     a_by = {fr.path: fr for fr in a_gate.files}
     pairs = _pair_files(b_base, b_files, a_base, a_files,
@@ -504,13 +622,17 @@ def compare(before: str, after: str, policy_path: str = "",
                  "after": _rel(ap, a_base) if ap else None}
         b_ok = bfr is not None and bfr.status == "ok"
         a_ok = afr is not None and afr.status == "ok"
-        if afr is None:
+        if ap is None:
             entry["change"] = "removed"
-        elif bfr is None:
+        elif bp is None:
             entry["change"] = "added"
         else:
             entry["change"] = "modified"
-        if afr is not None and not a_ok:
+        if bp in too_big or ap in too_big:
+            entry["comparable"] = False
+            entry["reason"] = ("over the per-call ACL size limit (see "
+                               "coverage.not_analysed); not compared")
+        elif afr is not None and not a_ok:
             entry["comparable"] = False
             entry["reason"] = "after file not analysed (no rules recognised or unreadable)"
         elif bfr is not None and not b_ok:
@@ -564,6 +686,9 @@ def compare(before: str, after: str, policy_path: str = "",
     elif not_comparable or a_cov["state"] == "incomplete" or b_cov["state"] == "incomplete":
         verdict, why = "INCOMPLETE", ("at least one file could not be analysed "
                                       "on both sides; no all-clear is given")
+    elif fail_on == "none":
+        verdict, why = "ADVISORY", (f"fail_on=none: nothing blocks; "
+                                    f"{len(introduced)} finding(s) introduced")
     else:
         verdict, why = "NO_NEW_RISK", (
             f"no new finding at or above fail_on={fail_on}"
@@ -609,6 +734,7 @@ def supported_inputs() -> dict:
         "not_modelled": NOT_MODELLED,
         "limits": {"max_files_per_call": MAX_FILES,
                    "max_file_bytes": MAX_FILE_BYTES,
+                   "max_rules_per_acl": _max_acl_rules(),
                    "hidden_files": "names starting with '.' are not read"},
         "guarantees": [
             "read-only: no file is written",
@@ -626,8 +752,9 @@ def supported_inputs() -> dict:
 INSTRUCTIONS = (
     "RuleHawk audits firewall/ACL rulesets locally (rule layer only). Before "
     "pushing an ACL or firewall change, call rulehawk_audit (or rulehawk_compare "
-    "with the running and candidate configs). Treat verdict FAIL, "
-    "INTRODUCES_RISK, INCOMPLETE or ERROR as a stop, and show the human the "
+    "with the running and candidate configs), using absolute paths. Only PASS "
+    "and NO_NEW_RISK are an all-clear. Treat FAIL, INTRODUCES_RISK, "
+    "INCOMPLETE, ADVISORY or ERROR as a stop, and show the human the "
     "blocking findings and the coverage.not_analysed list. RuleHawk does not "
     "model routing, NAT or topology, so a PASS is not a reachability proof."
 )
@@ -651,15 +778,20 @@ def build_server():
         """Audit a firewall/ACL config file, or every file in a directory, for
         shadowed, redundant, over-permissive and risky-exposure rules (and,
         with policy_path, segmentation violations with a witness packet).
+        Start here.
 
-        Returns verdict PASS / FAIL / INCOMPLETE / ERROR, the blocking findings
-        (severity >= fail_on), and a coverage block listing every file analysed,
-        every file NOT analysed and why, and lines the parser could not model.
+        Returns verdict PASS / FAIL / INCOMPLETE / ERROR (ADVISORY when
+        fail_on=none), the blocking findings (severity >= fail_on, each with
+        file, line, rule and fix), and a coverage block listing every file
+        analysed, every file NOT analysed and why, and lines the parser could
+        not model. Only PASS is an all-clear. On ERROR, read `error` and `hint`.
         Rule layer only: routing, NAT and topology are not evaluated.
 
-        path: config file or directory. policy_path: optional segmentation
-        policy JSON. vendor: auto (default) or ios-asa, nxos, eos, junos, panos,
-        iptables, aws-sg. fail_on: critical, high (default), medium, low, none.
+        path: absolute path of a config file (show running-config, iptables-save,
+        PAN-OS set commands, AWS SG JSON...) or a directory of them.
+        policy_path: optional segmentation policy JSON. vendor: leave as auto;
+        or force ios-asa, nxos, eos, junos, panos, iptables, aws-sg.
+        fail_on: critical, high (default), medium, low, none.
         """
         return audit(path, policy_path, vendor, fail_on)
 
@@ -672,8 +804,11 @@ def build_server():
         """List every RuleHawk finding for a config file or directory, worst
         first, each with a stable id, file, line, rule, cited rule, witness
         packet and suggested fix. Filter with min_severity (critical, high,
-        medium, low, info) and kinds (e.g. ["dangerous-exposure"]). Includes
-        the same coverage block as rulehawk_audit.
+        medium, low, info; default low) and kinds (e.g. ["dangerous-exposure"];
+        see rulehawk_supported_inputs for all kinds). At most `limit` findings
+        (default 100); `truncated` says if more exist. Includes the same
+        coverage block as rulehawk_audit. path: absolute path, as for
+        rulehawk_audit.
         """
         return list_findings(path, policy_path, vendor, min_severity, kinds, limit)
 
@@ -682,10 +817,11 @@ def build_server():
     def rulehawk_explain_finding(finding_id: str = "", path: str = "",
                                  kind: str = "", policy_path: str = "",
                                  vendor: str = "auto") -> dict:
-        """Explain one finding: pass finding_id (RH-...) with the same path
-        (and policy_path) it came from, and get the finding, the source line,
-        what the finding kind means and how to fix it. Or pass only kind (e.g.
-        "intent-inversion-deny-dead") for the meaning of a finding kind.
+        """Explain one finding: pass finding_id (RH-...) AND the same path
+        (and policy_path) it came from (path is required with finding_id), and
+        get the finding, the source line, what the finding kind means and how
+        to fix it. Or pass only kind (e.g. "intent-inversion-deny-dead") for
+        the meaning of a finding kind.
         """
         return explain_finding(finding_id, path, kind, policy_path, vendor)
 
@@ -694,10 +830,12 @@ def build_server():
     def rulehawk_compare(before: str, after: str, policy_path: str = "",
                          vendor: str = "auto", fail_on: str = "high") -> dict:
         """Compare a before (running) and after (candidate) config, both files
-        or both directories (paired by relative path). Returns the findings the
-        change introduces, the ones it resolves, the rules it adds, and verdict
-        INTRODUCES_RISK / NO_NEW_RISK / INCOMPLETE / ERROR. This is a
-        rule-layer finding delta, not a forwarding or reachability diff.
+        or both directories (paired by relative path), using absolute paths.
+        Use this before pushing a change. Returns the findings the change
+        introduces, the ones it resolves, the rules it adds, and verdict
+        INTRODUCES_RISK / NO_NEW_RISK / INCOMPLETE / ERROR (ADVISORY when
+        fail_on=none). Only NO_NEW_RISK is an all-clear. This is a rule-layer
+        finding delta, not a forwarding or reachability diff.
         """
         return compare(before, after, policy_path, vendor, fail_on)
 
@@ -712,13 +850,38 @@ def build_server():
     return server
 
 
+_NO_SDK = (
+    "rulehawk-mcp: the MCP SDK is not installed, so the server cannot start.\n"
+    "It needs Python 3.10 or newer; this is Python {py}. In a 3.10+ environment:\n"
+    '  pip install "rulehawk[mcp] @ git+https://github.com/optimesh-ai/RuleHawk"\n'
+    "(On Python 3.9 pip installs the CLI and silently skips the MCP extra.)")
+
+
+def _sdk_version() -> Optional[str]:
+    try:
+        import mcp  # noqa: F401
+    except ImportError:
+        return None
+    try:
+        from importlib.metadata import version
+        return version("mcp")
+    except Exception:
+        return "unknown"
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "-h" in argv or "--help" in argv:
         print(__doc__.split("DESIGN RULES")[0].rstrip())
         return 0
     if "--version" in argv:
-        print(f"rulehawk-mcp {__version__}")
+        py = ".".join(str(x) for x in sys.version_info[:3])
+        sdk = _sdk_version()
+        if sdk is None:
+            print(f"rulehawk-mcp {__version__} (Python {py}, MCP SDK not installed)")
+            print(_NO_SDK.format(py=py), file=sys.stderr)
+            return 2
+        print(f"rulehawk-mcp {__version__} (Python {py}, MCP SDK {sdk})")
         return 0
     if argv:
         print(f"rulehawk-mcp: unexpected argument {argv[0]!r} (it takes none; "
@@ -727,9 +890,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         server = build_server()
     except ImportError:
-        print("rulehawk-mcp: the MCP SDK is not installed. Install the extra:\n"
-              '  pip install "rulehawk[mcp] @ git+https://github.com/optimesh-ai/RuleHawk"\n'
-              "(needs Python 3.10+)", file=sys.stderr)
+        py = ".".join(str(x) for x in sys.version_info[:3])
+        print(_NO_SDK.format(py=py), file=sys.stderr)
         return 2
     server.run("stdio")
     return 0

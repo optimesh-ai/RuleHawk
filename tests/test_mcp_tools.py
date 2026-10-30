@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rulehawk import mcp_server as m  # noqa: E402
 
+_HAVE_SDK = m._sdk_version() is not None
+
 _CLEAN = """ip access-list extended EDGE
  permit tcp 10.20.0.0 0.0.255.255 host 10.20.5.5 eq 443
  deny ip any any
@@ -108,7 +110,8 @@ def test_audit_unsupported_vendor_is_incomplete_never_pass(tmp_path):
     assert r["coverage"]["state"] == "incomplete"
     na = r["coverage"]["not_analysed"]
     assert na and na[0]["path"] == "fgt.conf"
-    assert "no firewall rules recognised" in na[0]["reason"]
+    assert na[0]["reason"].startswith("no rules parsed")
+    assert "FortiGate" in na[0]["reason"]
 
 
 def test_audit_directory_reports_every_file_and_skips_hidden(tmp_path):
@@ -166,7 +169,8 @@ def test_audit_refuses_paths_outside_the_root(tmp_path, monkeypatch):
 
 def test_audit_fail_on_none_is_advisory(tmp_path):
     r = m.audit(_write(tmp_path, "edge.cfg", _DIRTY), fail_on="none")
-    assert r["verdict"] == "PASS" and r["blocking_findings"] == []
+    # Nothing blocks, but a run that cannot fail is not an all-clear.
+    assert r["verdict"] == "ADVISORY" and r["blocking_findings"] == []
     assert r["findings_by_severity"]["critical"] >= 1
 
 
@@ -326,12 +330,12 @@ def test_the_tool_layer_never_reaches_the_network_or_a_subprocess():
 def test_console_script_help_version_and_bad_args(capsys):
     assert m.main(["--help"]) == 0
     assert "rulehawk-mcp" in capsys.readouterr().out
-    assert m.main(["--version"]) == 0
+    assert m.main(["--version"]) == (0 if _HAVE_SDK else 2)
     assert m.main(["--bogus"]) == 2
 
 
 def test_rulehawk_mcp_subcommand_reaches_the_server_entry_point(capsys):
     """`rulehawk mcp` is what the MCP registry entry runs (uvx rulehawk mcp)."""
     from rulehawk import cli
-    assert cli.main(["mcp", "--version"]) == 0
+    assert cli.main(["mcp", "--version"]) == (0 if _HAVE_SDK else 2)
     assert "rulehawk-mcp" in capsys.readouterr().out
