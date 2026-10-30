@@ -234,6 +234,12 @@ _PROTO_NUM = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6",
 # status flags, not states, and are handled as unmodeled).
 _CT_STATES = frozenset({"NEW", "ESTABLISHED", "RELATED", "INVALID", "UNTRACKED"})
 
+# Chain operations; a line with none of them is not an iptables rule/command.
+_OPS = frozenset({"-A", "--append", "-I", "--insert", "-R", "--replace", "-P",
+                  "--policy", "-N", "--new-chain", "-D", "--delete", "-F",
+                  "--flush", "-X", "--delete-chain", "-Z", "--zero", "-E",
+                  "--rename-chain"})
+
 _NEUTRAL_MODULES = frozenset({"tcp", "udp", "icmp", "icmp6", "icmpv6", "sctp",
                               "dccp", "udplite", "comment", "multiport",
                               "state", "conntrack", "set", "ah", "esp"})
@@ -887,7 +893,10 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             continue
 
         # Honor an explicit `-t TABLE` (command form); default table is filter.
-        if "-t" in toks or "--table" in toks:
+        # Only on a line that is an iptables operation: in a shell script,
+        # `ssh -t "su -"` / `mount -t ntfs-3g` are not table switches.
+        is_op = bool(_OPS & set(toks))
+        if ("-t" in toks or "--table" in toks) and is_op:
             k = toks.index("-t") if "-t" in toks else toks.index("--table")
             tbl = toks[k + 1] if k + 1 < len(toks) else "filter"
             del toks[k:k + 2]
