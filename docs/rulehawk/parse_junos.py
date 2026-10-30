@@ -115,6 +115,20 @@ _THEN_MODIFIERS = {
 _THEN_REDIRECT = {"routing-instance", "next-hop-group", "next-ip", "next-ip6",
                   "next-interface", "topology"}
 
+# Junos ICMPv4 type names/numbers -> RuleHawk's canonical names (as parse.py).
+_JUNOS_ICMP = {
+    "echo-request": "echo", "echo-reply": "echo-reply", "unreachable": "unreachable",
+    "time-exceeded": "time-exceeded", "redirect": "redirect",
+    "source-quench": "source-quench", "parameter-problem": "parameter-problem",
+    "router-advertisement": "router-advertisement",
+    "router-solicit": "router-solicitation", "router-solicitation": "router-solicitation",
+    "timestamp": "timestamp-request", "timestamp-reply": "timestamp-reply",
+    "0": "echo-reply", "3": "unreachable", "4": "source-quench", "5": "redirect",
+    "8": "echo", "9": "router-advertisement", "10": "router-solicitation",
+    "11": "time-exceeded", "12": "parameter-problem", "13": "timestamp-request",
+    "14": "timestamp-reply",
+}
+
 # Common IP protocol numbers, so `protocol 6` reads the same as `protocol tcp`.
 _PROTO_NUM = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6",
               "47": "gre", "50": "esp", "51": "ah", "89": "ospf"}
@@ -320,6 +334,7 @@ class _Match:
     dports: List[PortRange] = field(default_factory=list)
     stateful: bool = False
     imprecise: bool = False
+    icmp_types: List[str] = field(default_factory=list)
     # Partial-precision tracking — used by _parse_term to apply the same
     # "resolved subset exact + opaque remainder" pattern as parse.py's
     # _resolve_nets_partial / _resolve_svcs_partial.
@@ -403,6 +418,8 @@ def _parse_from(from_toks: List[str], label: str, notes: List[str],
                 family: Optional[str] = None) -> _Match:
     m = _Match()
     seen_src = seen_dst = 0
+    icmp_t: List[str] = []
+    icmp_c: List[str] = []
     for key, vals in _read_conditions(from_toks):
         if key in ("source-prefix-list", "destination-prefix-list"):
             pfx = _resolve_prefix_lists(vals, family)
@@ -460,7 +477,11 @@ def _parse_from(from_toks: List[str], label: str, notes: List[str],
             m.other_imprecise = True
             notes.append(f"Junos '{key}' in {label} not modeled — flag restriction "
                          f"ignored (over-approximated, marked imprecise)")
-        elif key in ("address", "port", "icmp-type", "icmp-code"):
+        elif key == "icmp-type":
+            icmp_t += vals
+        elif key == "icmp-code":
+            icmp_c += vals
+        elif key in ("address", "port"):
             # direction-agnostic / typed matches we can't place in the rectangle:
             # over-approximate (mark imprecise) so it's never used to prove deadness.
             # Also block partial precision: these conditions narrow the rule's true
@@ -475,6 +496,18 @@ def _parse_from(from_toks: List[str], label: str, notes: List[str],
             m.other_imprecise = True
             notes.append(f"unmodeled Junos match '{key}' in {label} "
                          f"(rule kept but marked imprecise — verify manually)")
+    if icmp_t or icmp_c:
+        types = [_JUNOS_ICMP.get(t.lower()) for t in icmp_t]
+        ok = (family != "inet6" and m.protos == ["icmp"] and types
+              and all(types) and (not icmp_c or (len(types) == 1 and len(icmp_c) == 1
+                                                  and icmp_c[0].isdigit())))
+        if ok:
+            m.icmp_types = [f"{types[0]}/{icmp_c[0]}"] if icmp_c else list(dict.fromkeys(types))
+        else:
+            m.imprecise = True
+            m.other_imprecise = True
+            notes.append(f"unmodeled Junos match 'icmp-type/icmp-code' in {label} "
+                         f"(treated conservatively/imprecise — verify manually)")
     return m
 
 
@@ -505,12 +538,14 @@ def _parse_then(then_toks: List[str], label: str,
 
 
 def _raw(tname: str, action: str, proto: str, s: _IPNet, d: _IPNet,
-         sp: PortRange, dp: PortRange) -> str:
+         sp: PortRange, dp: PortRange, icmp: Optional[str] = None) -> str:
     parts = [f"term {tname}:", action, proto, str(s), "->", str(d)]
     if not sp.is_any():
         parts.append(f"sport {sp}")
     if not dp.is_any():
         parts.append(f"dport {dp}")
+    if icmp:
+        parts.append(icmp)
     return " ".join(parts)
 
 
@@ -602,7 +637,8 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
                      f"(marked imprecise — verify manually)")
 
     cap_exceeded = False
-    if len(srcs) * len(dsts) * len(protos) * len(sports) * len(dports) > _MAX_EXPAND:
+    if len(srcs) * len(dsts) * len(protos) * len(sports) * len(dports) \
+            * max(1, len(m.icmp_types)) > _MAX_EXPAND:
         # Truncating to the first value per dimension would model a SUBSET
         # (dropped members become invisible holes): widen everything instead.
         notes.append(f"Junos term {label} expands to >{_MAX_EXPAND} rules; widened "
@@ -669,13 +705,14 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
             for s, d in pairs:
                 for sp in (sports if ported else [ANY_PORTS]):
                     for dp in (dports if ported else [ANY_PORTS]):
+                      for it in (m.icmp_types if proto == "icmp" and m.icmp_types else [None]):
                         seq += 1
                         n_precise += 1
                         entries.append(ACE(
                             seq=seq, action=action, proto=proto, src=s, dst=d,
-                            src_port=sp, dst_port=dp, icmp_type=None,
+                            src_port=sp, dst_port=dp, icmp_type=it,
                             stateful=m.stateful, imprecise=False,
-                            raw=_raw(tname, action, proto, s, d, sp, dp),
+                            raw=_raw(tname, action, proto, s, d, sp, dp, it),
                             acl=fname, line=line))
         # Trailing opaque ACE covers the unresolved-name remainder (in the
         # filter's own family: a v4 any/any remainder in an inet6 filter could
@@ -698,12 +735,13 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
         for s, d in pairs:
             for sp in (sports if ported else [ANY_PORTS]):
                 for dp in (dports if ported else [ANY_PORTS]):
+                  for it in (m.icmp_types if proto == "icmp" and m.icmp_types else [None]):
                     seq += 1
                     entries.append(ACE(
                         seq=seq, action=action, proto=proto, src=s, dst=d,
-                        src_port=sp, dst_port=dp, icmp_type=None,
+                        src_port=sp, dst_port=dp, icmp_type=it,
                         stateful=m.stateful, imprecise=imprecise,
-                        raw=_raw(tname, action, proto, s, d, sp, dp),
+                        raw=_raw(tname, action, proto, s, d, sp, dp, it),
                         acl=fname, line=line))
     return seq
 
