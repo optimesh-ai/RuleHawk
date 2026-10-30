@@ -21,6 +21,7 @@ a finding — NAT/error/unknown-device fail closed and keep it. See pathground.p
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 from .analyze import analyze, score
@@ -182,7 +183,12 @@ def main(argv: list[str] | None = None) -> int:
             with open(argv[0], "rb") as _fh:
                 raw = _fh.read()
         except OSError as e:
-            print(f"rulehawk: cannot read {argv[0]!r}: {e}", file=sys.stderr)
+            if os.path.isdir(argv[0]):
+                print(f"rulehawk: {argv[0]!r} is a directory. To audit every "
+                      f"config in it, run:  rulehawk gate {argv[0]}",
+                      file=sys.stderr)
+            else:
+                print(f"rulehawk: cannot read {argv[0]!r}: {e}", file=sys.stderr)
             return 2
         text = raw.decode("utf-8", "replace")
         source = argv[0]

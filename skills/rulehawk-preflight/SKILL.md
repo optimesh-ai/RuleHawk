@@ -1,6 +1,7 @@
 ---
 name: rulehawk-preflight
 description: Run a local RuleHawk audit of a firewall or ACL change before it is pushed, committed or applied, and stop on high-severity findings or input RuleHawk could not read unless a human explicitly overrides. Use whenever you are about to change, push, deploy or approve an ACL, firewall filter, security policy, iptables ruleset or AWS security group (Cisco IOS/ASA/NX-OS, Arista EOS, Juniper Junos, Palo Alto PAN-OS, iptables, AWS SG).
+license: Apache-2.0
 ---
 
 # RuleHawk preflight: audit the rules before the change goes out
@@ -42,7 +43,8 @@ Before any of these, for any file that holds firewall or ACL rules:
    |---|---|
    | `INTRODUCES_RISK` (compare) or `FAIL` (audit) | **Stop.** Do not push or apply. |
    | `INCOMPLETE` | **Stop.** Something was not analysed. |
-   | `ERROR` | **Stop.** Fix the call (path, vendor, policy) and re-run. |
+   | `ERROR` | **Stop.** Read `error` and `hint`, fix the call (usually the path: make it absolute) and re-run. |
+| `ADVISORY` | You ran with `fail_on: none`, which never blocks. Not an all-clear: re-run with the default unless the human asked for advisory. |
    | `PASS` / `NO_NEW_RISK` with `coverage.state` = `partial` | Show the `unmodelled_lines` to the human and wait for them to confirm before going on. |
    | `PASS` / `NO_NEW_RISK` with `coverage.state` = `complete` | You may go on. Say what was checked (see step 5). |
 

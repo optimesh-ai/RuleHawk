@@ -35,6 +35,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -222,19 +223,69 @@ def _pick_parser(text: str, vendor: str):
         if v == "aws-sg":
             return "aws-sg", parse_awssg
         return "ios-asa", parse_acls
+    detected = _detect_signature(text)
+    if detected is None:
+        return "ios-asa", parse_acls     # the fallback, not a detection
+    return _pick_parser(text, detected)
+
+
+def _detect_signature(text: str) -> Optional[str]:
+    """The vendor whose detector fires on `text` (same precedence as the CLI),
+    or None. Cisco IOS/ASA has no detector: it is the fallback parser."""
     if detect_junos(text):
-        return "junos", parse_junos
+        return "junos"
     if detect_panos(text):
-        return "panos", parse_panos
+        return "panos"
     if detect_iptables(text):
-        return "iptables", parse_iptables
+        return "iptables"
     if detect_awssg(text):
-        return "aws-sg", parse_awssg
+        return "aws-sg"
     if detect_nxos(text):
-        return "nxos", parse_nxos
+        return "nxos"
     if detect_eos(text):
-        return "eos", parse_eos
-    return "ios-asa", parse_acls
+        return "eos"
+    return None
+
+
+def detect_vendor(text: str) -> Optional[str]:
+    """The vendor `text` is recognised as, or None: a detector fires, or the
+    IOS/ASA fallback parser finds at least one rule."""
+    v = _detect_signature(text)
+    if v is None and parse_acls(text)[0]:
+        v = "ios-asa"
+    return v
+
+
+# Formats people commonly try that RuleHawk does not parse, named so the
+# "not analysed" reason says so instead of a generic "unrecognised".
+_UNSUPPORTED = [
+    ("FortiGate (FortiOS)", re.compile(r"^\s*config firewall (policy|address)", re.M)),
+    ("nftables", re.compile(r"^\s*table (inet|ip6?|arp|bridge|netdev) \S+\s*\{", re.M)),
+    ("Check Point", re.compile(r"\bcheckpoint\b|\bmgmt_cli\b", re.I)),
+    ("Cisco IOS XR", re.compile(r"^\s*ipv[46] access-list \S+\s*$", re.M)),
+    ("AWS Network ACLs", re.compile(r'"NetworkAcls"\s*:')),
+]
+
+
+def no_rules_reason(fr: "FileResult", vendor: str = "auto") -> str:
+    """Why a file parsed to zero rules, in words a user can act on."""
+    text = fr.raw.decode("utf-8", errors="replace")
+    if not text.strip():
+        return "the file is empty"
+    auto = detect_vendor(text)
+    if vendor and vendor != "auto":
+        msg = f"vendor was forced to {fr.vendor} and that parser found no rules"
+        if auto and auto != fr.vendor:
+            msg += f"; this file looks like {auto}: retry with vendor auto"
+        return msg
+    if auto is None:
+        for name, sig in _UNSUPPORTED:
+            if sig.search(text):
+                return (f"this looks like {name}, which RuleHawk does not "
+                        "read yet (no supported firewall vendor recognised)")
+        return ("no supported firewall vendor recognised and no Cisco IOS/ASA "
+                "ACL lines found: not a supported format, or not a config")
+    return f"recognised as {auto}, but no rules were found in it"
 
 
 def audit_file(path: str, policy: Optional[dict], vendor: str = "auto",
@@ -271,6 +322,7 @@ class GateResult:
     files: List[FileResult]
     fail_on: str
     ledger: object = None      # riskaccept.Ledger for this run (set by run_gate)
+    vendor: str = "auto"       # the vendor the run forced, or auto
 
     @property
     def real_findings(self) -> List[Tuple[FileResult, Finding]]:
@@ -351,7 +403,7 @@ def run_gate(paths: List[str], policy: Optional[dict], fail_on: str = "high",
     ledger = evaluate(policy, as_of)
     files = [audit_file(p, policy, vendor, ledger) for p in paths]
     finalize(ledger)
-    gate = GateResult(files, fail_on)
+    gate = GateResult(files, fail_on, vendor=vendor or "auto")
     gate.ledger = ledger
     # Exceptions that did NOT apply are reported against the policy itself.
     # An INVALID one is high severity: it looks like protection and gives none.
@@ -798,7 +850,8 @@ def to_console(gate: GateResult) -> str:
             out.append(f"  [ERROR] {fr.path}: {fr.error}")
             continue
         if fr.status == "no_rules_parsed":
-            out.append(f"  [WARN ] {fr.path}: no rules parsed ({fr.vendor})")
+            out.append(f"  [WARN ] {fr.path}: no rules parsed, not audited "
+                       f"({no_rules_reason(fr, gate.vendor)})")
             continue
         real = [f for f in fr.findings if f.severity != "info"]
         tag = "FAIL" if any(f.severity in ("critical", "high") for f in real) else (
