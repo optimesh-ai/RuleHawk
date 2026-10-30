@@ -115,7 +115,8 @@ def test_text_report_next_step_after_findings_before_cleanup():
     aces, notes, fs = _findings(cfg, _POLICY)
     out = to_text(fs, notes, len(aces))
     assert "Scope: rule layer only" in out
-    assert "Next: RuleHawk proved" in out and _HH in out
+    assert "Next: RuleHawk proved" in out and "forwarding model" in out
+    assert "Hammerhead" not in out and _HH not in out
     assert (out.index("segmentation-violation") < out.index("Next:")
             < out.index("Cleanup plan"))
 
@@ -131,13 +132,15 @@ def test_gate_markdown_next_step_under_witness_table(tmp_path):
     assert "Rule-layer audit: routing, NAT and topology are not evaluated." in md
     nxt = md.index("> **Next:**")
     assert md.index("### Segmentation violations") < nxt < md.index("<details>")
-    assert f"[Hammerhead]({_HH})" in md
+    assert "forwarding model" in md[nxt:]
+    assert "Hammerhead" not in md and _HH not in md
     assert "[!CAUTION]" not in md
 
 
 def test_gate_console_next_only_when_triggered(tmp_path):
     out = gate.to_console(_gate(tmp_path, _LEAK, _POLICY))
     assert "SCOPE  : rule layer only" in out and "NEXT   :" in out
+    assert "Hammerhead" not in out and _HH not in out
     clean = gate.to_console(_gate(tmp_path, _HYGIENE_ONLY))
     assert "SCOPE  : rule layer only" in clean and "NEXT" not in clean
 
