@@ -10,6 +10,33 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
 dependencies = []
+authors = [{ name = "Optimesh" }]
+keywords = ["firewall", "acl", "network-security", "audit", "segmentation",
+            "cisco", "juniper", "palo-alto", "iptables", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Information Technology",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Networking :: Firewalls",
+    "Topic :: Security",
+]
+
+[project.urls]
+Homepage = "https://github.com/optimesh-ai/RuleHawk"
+Documentation = "https://github.com/optimesh-ai/RuleHawk/blob/main/docs/quickstart.md"
+Source = "https://github.com/optimesh-ai/RuleHawk"
+Issues = "https://github.com/optimesh-ai/RuleHawk/issues"
+"Try in browser" = "https://optimesh-ai.github.io/RuleHawk/"
 
 [project.optional-dependencies]
 # The MCP server (`rulehawk-mcp`). The engine itself stays dependency-free.

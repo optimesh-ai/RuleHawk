@@ -7,22 +7,43 @@
 > reachability and segmentation, not just rules), see
 > [Hammerhead](https://optimesh.ai/#pricing) (plans start free; access is by request).
 
-**Paste your firewall/ACL config → get a ranked list of dead, shadowed, and
-dangerously-permissive rules in seconds.** No agent, no integration, no account.
+**Point it at a firewall/ACL config → get a ranked list of dead, shadowed, and
+dangerously-permissive rules, each with the line to change.** Free, local, no
+account, no API key.
 
 RuleHawk tells you a rule is wrong and shows the packet that proves it. It
 audits the rule layer only, so it does not tell you what a change breaks on your
-network; see [*Where RuleHawk stops*](#where-rulehawk-stops-and-hammerhead-starts).
+network; see [*Scope & limits*](#scope--limits-what-it-does-not-model).
+
+## Try it
 
 ```
-python -m rulehawk samples/ios_acl.txt                         # human report
-python -m rulehawk samples/ios_acl.txt --json                  # machine/CI report
-cat acl.txt | python -m rulehawk -                             # stdin
-python -m rulehawk samples/ios_acl.txt --policy samples/policy.json   # + segmentation
-pip install -e .   # then:  rulehawk acl.txt
+pip install "git+https://github.com/optimesh-ai/RuleHawk"     # Python 3.9+, no dependencies
+rulehawk - <<'EOF'
+ip access-list extended EDGE_IN
+ permit tcp any any eq 3389
+ permit ip any any
+ deny tcp any any eq 22
+EOF
 ```
 
-Exit code is non-zero when a critical/high finding exists → drop it in CI.
+One of the three findings it prints:
+
+```
+[CRITICAL] intent-inversion-deny-dead  (EDGE_IN:3)
+   rule : deny tcp any any eq 22
+   line : 4
+   cause: permit ip any any
+   why  : This deny NEVER takes effect — an earlier permit (rule 2) already
+          allows the same traffic. The traffic you meant to block is ALLOWED.
+   fix  : move rule 3 (line 4) above rule 2 (line 3)
+```
+
+Then `rulehawk edge-fw.txt` for one config, `rulehawk gate configs/` for a
+directory, `--json` for machines. Exit code is non-zero on a critical/high
+finding (1) or when nothing could be audited (2), so it drops into CI.
+**[Quickstart](docs/quickstart.md)**: install, first audit, agents (Claude, Cursor,
+NetClaw) and what to do when something goes wrong.
 
 ## CI gate — audit a whole repo on every PR (GitHub Action)
 Keep your firewall configs in git and let RuleHawk check the rule layer of every
@@ -70,6 +91,7 @@ makes no network calls and writes nothing.
 ```
 pip install "rulehawk[mcp] @ git+https://github.com/optimesh-ai/RuleHawk"   # Python 3.10+
 rulehawk-mcp --version
+claude mcp add --transport stdio rulehawk --env RULEHAWK_MCP_ROOT="$PWD" -- rulehawk-mcp
 ```
 
 | Tool | What it does |
@@ -83,58 +105,19 @@ rulehawk-mcp --version
 Every result carries a `coverage` block (files analysed, files **not**
 analysed and why, config lines the parser could not model) and the scope
 statement: rule layer only, routing/NAT/topology not evaluated. A file no
-parser recognises makes the result `INCOMPLETE`, never `PASS`.
-`rulehawk_compare` is a rule-layer finding delta matched on rule text, not a
-forwarding diff. Set `RULEHAWK_MCP_ROOT` to refuse paths outside one directory.
-Pass absolute paths: relative ones resolve against the server's working
-directory.
+parser recognises makes the result `INCOMPLETE`, never `PASS`; errors carry an
+`error_code` and a `hint`. `rulehawk_compare` is a rule-layer finding delta
+matched on rule text, not a forwarding diff. `RULEHAWK_MCP_ROOT` confines the
+server to one directory, and relative paths resolve against it.
 
-**Claude Desktop** (`claude_desktop_config.json`). Use the absolute path to
-`rulehawk-mcp` (`which rulehawk-mcp`), since Desktop does not use your shell's
-`PATH`:
-
-```json
-{
-  "mcpServers": {
-    "rulehawk": {
-      "command": "/absolute/path/to/venv/bin/rulehawk-mcp",
-      "env": { "RULEHAWK_MCP_ROOT": "/absolute/path/to/firewall-configs" }
-    }
-  }
-}
-```
-
-**Claude Code**:
-
-```
-claude mcp add --transport stdio --env RULEHAWK_MCP_ROOT="$PWD" rulehawk -- rulehawk-mcp
-```
-
-**Cursor** (`~/.cursor/mcp.json`, or `.cursor/mcp.json` in a project):
-
-```json
-{
-  "mcpServers": {
-    "rulehawk": {
-      "command": "rulehawk-mcp",
-      "env": { "RULEHAWK_MCP_ROOT": "/absolute/path/to/firewall-configs" }
-    }
-  }
-}
-```
-
-No install step: with [uv](https://docs.astral.sh/uv/), any of the above can
-use `"command": "uvx"` and
-`"args": ["--from", "rulehawk[mcp] @ git+https://github.com/optimesh-ai/RuleHawk", "rulehawk-mcp"]`.
+Claude Desktop, Cursor, NetClaw and `uvx` setups:
+[docs/quickstart.md](docs/quickstart.md#3-let-an-agent-call-it-mcp).
 
 **The skill.** [`skills/rulehawk-preflight/SKILL.md`](skills/rulehawk-preflight/SKILL.md)
 teaches an agent to run the audit before it pushes an ACL or firewall change,
 and to stop on a high or critical finding, or on input RuleHawk could not
 read, unless a human overrides. Copy the folder into your agent's skills
 directory (for Claude Code, `~/.claude/skills/` or `.claude/skills/`).
-
-A RuleHawk pass is a rule-layer result. For full network verification (routing,
-NAT, what a change breaks), Optimesh offers Hammerhead, by request.
 
 ## Segmentation-intent (the audit/compliance layer)
 Declare zones + `must_not_reach` rules in a JSON policy, and RuleHawk proves the
@@ -308,46 +291,9 @@ network-wide reachability or change-impact verifier. It reasons about the
   as notes — RuleHawk errs toward over-reporting and **fails closed**, never toward a
   false "isolated."
 
-## Why it exists
-Firewall-rule sprawl and segmentation proof are an acute, recurring pain — and the
-heavyweight tools (AlgoSec/Tufin/FireMon) price out the mid-market. RuleHawk is the
-zero-setup, self-serve, multi-vendor auditor for everyone they miss: paste a config,
-get findings you can verify by eye in seconds.
-
-## Adoption analytics (opt-in, privacy-preserving)
-RuleHawk's core promise is that **your config never leaves your browser.** The
-hosted tool (`docs/index.html`) keeps that promise even with analytics on: it
-emits only anonymous *usage* metadata, never config text or findings. Everything
-is **off by default** — set two constants at the top of the `<script>` in
-`docs/index.html`:
-
-- `ANALYTICS_ENDPOINT` — a URL that accepts a JSON `POST`. Empty = nothing is
-  ever sent. When set, RuleHawk beacons (via `navigator.sendBeacon`, so it never
-  blocks the UI):
-  - `page_view` — a visit, with the `?ref=` campaign tag and referrer.
-  - `scan_run` — that an audit ran, a coarse size **bucket** (e.g. `50-199`,
-    never the exact count), and whether a segmentation policy was used.
-    **Never the config, never the findings.**
-  - `wall_view` — the "what RuleHawk can't tell you" panel was shown (no
-    finding details attached).
-  - `cta_click` / `lead_capture` — interaction with the results call-to-action
-    (`target` is `ci-gate`, `hammerhead` or `hammerhead-wall`).
-
-  Point it at any collector: a Cloudflare Worker, a Plausible/Umami proxy, or
-  your own endpoint.
-- `LEAD_ENDPOINT` — optional. When set, the results panel shows a "notify me"
-  email field. On submit it posts the email plus the **finding counts the user
-  already sees on screen** (criticals / highs / rules) — still never the config.
-  Empty = no email field is shown.
-
-**Campaign attribution:** append `?ref=<tag>` to the demo link in outreach
-(e.g. `…/RuleHawk/?ref=acme-netlead`) and the tag rides along on every event, so
-you can see which outreach actually got opened and used — without any config
-telemetry.
-
-The privacy banner on the page auto-discloses usage counting **only when
-`ANALYTICS_ENDPOINT` is set**, so what the page claims and what it does stay in
-sync.
+## Hosted page analytics
+The hosted page sends nothing unless its operator sets an endpoint, and never
+sends config text or findings. See [docs/hosted-analytics.md](docs/hosted-analytics.md).
 
 ## License
 RuleHawk is Apache-2.0 — see `LICENSE`. This licence covers RuleHawk only;

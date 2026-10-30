@@ -28,6 +28,22 @@ Ownership checks:
 
 Steps:
 
+0. Checked locally (2026-10-30): `python -m build` and
+   `python -m twine check --strict dist/*` pass; the wheel holds only the
+   `rulehawk` package. On PyPI, the README's relative links (docs/,
+   skills/) do not resolve; the quickstart is also linked from
+   `[project.urls]`. Exact commands, from a clean checkout of the release
+   commit (the upload needs the maintainer's PyPI token):
+
+   ```
+   python3 -m venv /tmp/rh-release && . /tmp/rh-release/bin/activate
+   pip install build twine
+   rm -rf dist && python -m build && twine check --strict dist/*
+   pip install "dist/rulehawk-0.4.0-py3-none-any.whl[mcp]" && rulehawk-mcp --version
+   twine upload --repository testpypi dist/*      # optional dry run
+   twine upload dist/*                            # asks for the PyPI token
+   ```
+
 1. Tag the release commit `v0.4.0` and build: `python -m build` (sdist + wheel).
 2. Upload to PyPI: `python -m twine upload dist/rulehawk-0.4.0*`.
 3. Check it runs from PyPI: `uvx --from "rulehawk[mcp]==0.4.0" rulehawk mcp --version`.
