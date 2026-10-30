@@ -95,7 +95,7 @@ _NAMED_PORTS = {
     # Arista EOS names (its default control-plane ACL uses them)
     "bfd": 3784, "bfd-echo": 3785, "multihop-bfd": 4784, "micro-bfd": 6784,
     "sbfd": 7784, "mlag": 4432, "ldp": 646, "msdp": 639, "lsp-ping": 3503,
-    "netconf-ssh": 830, "gnmi": 6030,
+    "netconf-ssh": 830,
     "bootps": 67, "bootpc": 68, "imap4": 143, "imap": 143, "sunrpc": 111,
     "nntp": 119, "lpd": 515, "non500-isakmp": 4500, "tacacs": 49, "time": 37,
     "whois": 43, "finger": 79, "gopher": 70, "echo": 7, "discard": 9,
