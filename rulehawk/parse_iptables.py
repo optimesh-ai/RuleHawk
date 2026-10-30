@@ -160,7 +160,8 @@ class _Rule:
 
     __slots__ = ("src", "dst", "proto", "sports", "dports", "stateful",
                  "imprecise", "icmp_type", "action", "skip_note", "modules",
-                 "jump_custom", "base_return", "goto", "state_seen")
+                 "jump_custom", "base_return", "goto", "state_seen",
+                 "state_limited")
 
     def __init__(self) -> None:
         self.src: Optional[_IPNet] = None
@@ -178,6 +179,7 @@ class _Rule:
         self.base_return = False               # `-j RETURN` (fail-closed in a base transit chain)
         self.goto = False                      # the jump was `-g`/`--goto`, not `-j`
         self.state_seen = False                # a --state/--ctstate match was present
+        self.state_limited = False             # NEW plus only SOME other states
 
     def unconditional(self) -> bool:
         """True iff the rule carries NO match criterion at all — it fires for
@@ -228,6 +230,10 @@ _PROTO_NUM = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6",
 # `-m` modules known NOT to restrict the match space by themselves (their
 # narrowing options, if any, are parsed or surfaced separately). Anything else
 # (`limit`, `recent`, `time`, `owner`, ...) restricts by default -> imprecise.
+# Every conntrack state a `--state` / `--ctstate` list can name (SNAT/DNAT are
+# status flags, not states, and are handled as unmodeled).
+_CT_STATES = frozenset({"NEW", "ESTABLISHED", "RELATED", "INVALID", "UNTRACKED"})
+
 _NEUTRAL_MODULES = frozenset({"tcp", "udp", "icmp", "icmp6", "icmpv6", "sctp",
                               "dccp", "udplite", "comment", "multiport",
                               "state", "conntrack", "set", "ah", "esp"})
@@ -370,15 +376,30 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                 notes.append(f"negated conntrack state (`! {t} {nxt}`) in {label} "
                              f"— complement not modeled, marked imprecise — "
                              f"verify manually")
-            elif states and states <= {"ESTABLISHED", "RELATED", "INVALID", "UNTRACKED"}:
+            elif not states or not states <= _CT_STATES:
+                # SNAT / DNAT (conntrack status flags: only NAT'ed connections)
+                # or a word we don't know restricts the rule to an unmodeled
+                # subset. Read as an unrestricted new-flow rule, a
+                # `--ctstate DNAT -j DROP` blocked EVERY new flow in the model
+                # (a false PASS for a later ACCEPT). Over-approximate + flag.
+                r.imprecise = True
+                notes.append(f"iptables conntrack/state {sorted(states)} in {label} "
+                             f"— state(s) not modeled (marked imprecise — verify "
+                             f"manually)")
+            elif states <= {"ESTABLISHED", "RELATED", "INVALID", "UNTRACKED"}:
                 # No NEW: return-traffic only -> stateful (never proves a flow open).
                 r.stateful = True
                 notes.append(f"iptables conntrack/state {sorted(states)} in {label} "
                              f"modeled as stateful (return-traffic only; never used "
                              f"to prove a rule dead)")
             else:
-                # Includes NEW: the connection-opening packet IS allowed, so the
-                # L3/L4 reachability is real — model it normally (a note for audit).
+                # Includes NEW: the connection-opening packet IS matched, so the
+                # L3/L4 reachability is real — model it normally (a note for
+                # audit). Unless EVERY state is listed, packets in the missing
+                # states pass this rule, so it must never prove a later rule
+                # dead (state_limited; the kernel oracle refuted exactly that).
+                if states != _CT_STATES:
+                    r.state_limited = True
                 notes.append(f"iptables conntrack/state {sorted(states)} in {label} "
                              f"(NEW present — modeled as a new-flow rule)")
             i += 2
@@ -519,6 +540,7 @@ def _expand(chain: str, r: _Rule, seq: int, entries: List[ACE],
                 seq=seq, action=r.action, proto=r.proto, src=src, dst=dst,
                 src_port=sp, dst_port=dp, icmp_type=r.icmp_type,
                 stateful=r.stateful, imprecise=r.imprecise,
+                state_limited=r.state_limited,
                 raw=_raw(chain, r.action, r.proto, src, dst, sp, dp), acl=chain,
                 line=line, transit=transit))
     return seq
@@ -646,6 +668,7 @@ def _resolve_transit_jump(
                     dst_port=dp,
                     icmp_type=child.icmp_type,
                     stateful=child.stateful,
+                    state_limited=child.state_limited,
                     imprecise=False,
                     raw=(f"{parent_chain}: resolved jump to {target_chain}: "
                          f"{child.raw}"),
@@ -1016,7 +1039,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                  j_sports, j_dports, j_unres) = item.jump
                 pending_jumps.append((ch, ph_start, ph_end, tgt, j_src, j_dst,
                                       j_proto, j_sports, j_dports, item.line,
-                                      j_unres))
+                                      j_unres, item.r.state_limited))
         by_chain[ch] = aces_ch
         seqs[ch] = seq
 
@@ -1044,7 +1067,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     #      placeholder ACE during parsing, which triggers this gate.
     for (pch, ph_start, ph_end, tgt,
          j_src, j_dst, j_proto, j_sports, j_dports, jline,
-         j_unresolvable) in pending_jumps:
+         j_unresolvable, j_state_limited) in pending_jumps:
         if j_unresolvable:
             continue                        # jump rule imprecise/stateful/ICMP-
                                             # typed — keep imprecise (gate 0)
@@ -1060,6 +1083,11 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             tgt, pch, by_chain, default6, jline)
         if resolved is None:
             continue                        # internal error in resolution — keep imprecise
+        if j_state_limited:
+            # the jump itself only fires for SOME conntrack states: every
+            # resolved ACE inherits the limit (exact for new flows, never a
+            # coverer).
+            resolved = [dataclasses.replace(a, state_limited=True) for a in resolved]
 
         # Replace the placeholder ACE(s) with the resolved ones and renumber
         # the parent chain 1..N in list order so seqs stay coherent.
@@ -1104,6 +1132,26 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                     f"(IPv6 modeled as indeterminate)",
                 acl=ch, line=0, transit=_is_transit(ch)))
         entries.extend(chain_aces)
+
+    # A user-defined chain sees a forwarded packet ONLY through a jump from
+    # FORWARD, and the FORWARD model already carries every such jump (resolved
+    # to precise ACEs, or an imprecise fail-closed placeholder). With FORWARD
+    # present, searching a user chain on its own as a transit path only invents
+    # violations whose witness never reaches that chain (the kernel oracle
+    # refused all 51 such witnesses in a 40-ruleset run). Keep user chains for
+    # hygiene analysis, out of the inter-zone search. Without a FORWARD chain
+    # nothing anchors them (e.g. `iptables -S DOCKER-USER`), so they stay in
+    # (over-report, never a hidden leak).
+    if "FORWARD" in items_by_chain:
+        user = sorted({a.acl for a in entries
+                       if a.acl not in _BASE_CHAINS and a.transit})
+        if user:
+            entries = [dataclasses.replace(a, transit=False)
+                       if a.acl not in _BASE_CHAINS else a for a in entries]
+            notes.append(f"user-defined chain(s) {', '.join(user)} are reached only "
+                         f"through jumps from FORWARD, which the FORWARD model "
+                         f"carries; they are analysed for hygiene, not searched "
+                         f"as a separate transit path.")
 
     # iptables base chains (INPUT/FORWARD/OUTPUT) are INDEPENDENT first-match
     # hooks. A transit (inter-zone) packet is forwarded through the box and

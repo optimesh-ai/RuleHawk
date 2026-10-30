@@ -1,0 +1,35 @@
+name: RuleHawk differential oracles
+
+# Opt-in ground-truth checks that need Docker, kept out of the normal suite:
+# the iptables model vs the real Linux kernel (tools/oracle/). Nightly and on
+# demand; a failure means RuleHawk disagreed with the kernel outside the
+# documented classes.
+on:
+  workflow_dispatch:
+    inputs:
+      rulesets:
+        description: random rulesets to test
+        default: "200"
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  kernel:
+    name: iptables vs the Linux kernel
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet pytest -e .
+      - name: Kernel differential test
+        env:
+          RULEHAWK_KERNEL_ORACLE: "1"
+          RULEHAWK_ORACLE_N: ${{ github.event.inputs.rulesets || '200' }}
+          RULEHAWK_ORACLE_SEED: ${{ github.run_number }}
+        run: python -m pytest -q -rs -s tests/test_oracle_kernel.py
