@@ -1,11 +1,10 @@
 # RuleHawk
 
-> **RuleHawk is now the Hammerhead firewall audit.** The same engine runs free in
-> your browser at [optimesh-ai.github.io/RuleHawk](https://optimesh-ai.github.io/RuleHawk/),
-> and this open-source package and its GitHub Action stay free and keep working under
-> the `rulehawk` name. To check what a change does across your whole network (routing,
-> reachability and segmentation, not just rules), see
-> [Hammerhead](https://optimesh.ai/#pricing) (plans start free; access is by request).
+> **Free and open source (Apache-2.0).** Runs on your machine or
+> [in your browser](https://optimesh-ai.github.io/RuleHawk/), with no account, no API key
+> and no subscription, and your config never leaves your machine. Built and maintained by
+> [Optimesh](https://optimesh.ai); for checks across routing and reachability too, see
+> [where RuleHawk stops](#where-rulehawk-stops-and-hammerhead-starts).
 
 **Point it at a firewall/ACL config → get a ranked list of dead, shadowed, and
 dangerously-permissive rules, each with the line to change.** Free, local, no
