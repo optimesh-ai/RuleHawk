@@ -54,6 +54,27 @@ from typing import Dict, List, Optional, Tuple
 from .model import ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet
 from .parse import _canon_icmp_type, _port_num  # reuse IANA maps + icmp canon
 
+# iptables (`iptables -p icmp -h`) names -> RuleHawk canonical TYPE[/CODE].
+# NB: in iptables `ttl-exceeded` is an alias of time-exceeded (all codes),
+# unlike Cisco's ttl-exceeded (code 0).
+_IPT_ICMP = {
+    "pong": "echo-reply", "ping": "echo", "echo-request": "echo",
+    "destination-unreachable": "unreachable",
+    "network-unreachable": "unreachable/0", "host-unreachable": "unreachable/1",
+    "protocol-unreachable": "unreachable/2", "port-unreachable": "unreachable/3",
+    "fragmentation-needed": "unreachable/4", "source-route-failed": "unreachable/5",
+    "network-unknown": "unreachable/6", "host-unknown": "unreachable/7",
+    "network-prohibited": "unreachable/9", "host-prohibited": "unreachable/10",
+    "tos-network-unreachable": "unreachable/11", "tos-host-unreachable": "unreachable/12",
+    "communication-prohibited": "unreachable/13",
+    "host-precedence-violation": "unreachable/14", "precedence-cutoff": "unreachable/15",
+    "network-redirect": "redirect/0", "host-redirect": "redirect/1",
+    "tos-network-redirect": "redirect/2", "tos-host-redirect": "redirect/3",
+    "ttl-exceeded": "time-exceeded", "ttl-zero-during-transit": "time-exceeded/0",
+    "ttl-zero-during-reassembly": "time-exceeded/1",
+    "ip-header-bad": "parameter-problem/0", "required-option-missing": "parameter-problem/1",
+}
+
 _ANY4: _IPNet = ipaddress.ip_network("0.0.0.0/0")
 _ANY6: _IPNet = ipaddress.ip_network("::/0")
 
@@ -432,7 +453,15 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                              f"over-approximated to all types (marked imprecise "
                              f"— verify)")
             elif (nxt or "").lower() != "any":
-                r.icmp_type = _canon_icmp_type(nxt)
+                tname = _IPT_ICMP.get((nxt or "").lower(), nxt)
+                r.icmp_type = _canon_icmp_type(tname)
+                if r.icmp_type is None:
+                    # unknown name: any type (superset), never an exact type
+                    # that matches nothing
+                    r.imprecise = True
+                    notes.append(f"unknown ICMP type `{nxt}` in {label} — "
+                                 f"over-approximated to all types (marked "
+                                 f"imprecise — verify)")
             i += 2
         elif t in ("-m", "--match"):
             mod = nxt or ""

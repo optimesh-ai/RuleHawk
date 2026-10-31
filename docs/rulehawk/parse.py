@@ -70,17 +70,33 @@ _ICMP_TYPE_CANON = {
     "4": "source-quench", "source-quench": "source-quench",
     "9": "router-advertisement", "router-advertisement": "router-advertisement",
     "10": "router-solicitation", "router-solicitation": "router-solicitation",
+    # IOS / NX-OS names that pin the CODE too
+    "ttl-exceeded": "time-exceeded/0", "reassembly-timeout": "time-exceeded/1",
+    "net-unreachable": "unreachable/0", "host-unreachable": "unreachable/1",
+    "protocol-unreachable": "unreachable/2", "port-unreachable": "unreachable/3",
+    "packet-too-big": "unreachable/4", "source-route-failed": "unreachable/5",
+    "administratively-prohibited": "unreachable/13",
 }
+_ICMP_CANON_NAMES = {v.partition("/")[0] for v in _ICMP_TYPE_CANON.values()}
 
 
-def _canon_icmp_type(tok: Optional[str]) -> Optional[str]:
+def _canon_icmp_type(tok: Optional[str], proto: str = "icmp") -> Optional[str]:
+    """Canonical ICMP type string, or None when an ICMPv4 name is unknown (the
+    caller then treats the token as an unrecognized qualifier: imprecise,
+    any type — never an exact type that matches nothing)."""
     if tok is None:
         return None
     t = tok.lower()
     if "/" in t:                       # TYPE/CODE — canonicalize the type half
         ty, _, code = t.partition("/")
-        return f"{_ICMP_TYPE_CANON.get(ty, ty)}/{code}"
-    return _ICMP_TYPE_CANON.get(t, t)
+        out = f"{_ICMP_TYPE_CANON.get(ty, ty)}/{code}"
+    else:
+        out = _ICMP_TYPE_CANON.get(t, t)
+    if proto == "icmp":
+        ty, _, code = out.partition("/")
+        if not (ty.isdigit() or ty in _ICMP_CANON_NAMES) or (code and not code.isdigit()):
+            return None
+    return out
 
 
 _NAMED_PORTS = {
@@ -888,7 +904,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     # it stays exact and threads into the emitted ACEs. When a service group
     # occupies the proto slot (`proto` is None) there is no icmp context, so the
     # token stays unknown (fail closed below).
-    icmp_type = _canon_icmp_type(type_tok) if proto in ("icmp", "icmpv6") else None
+    icmp_type = _canon_icmp_type(type_tok, proto) if proto in ("icmp", "icmpv6") else None
     rnotes: List[str] = []
     if port_imprecise:
         rnotes.append(_PORT_OP_NOTE + raw)
@@ -1214,7 +1230,7 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0,
         # ASA `inactive`: the rule is DISABLED on the device — its true match
         # space is empty, so emitting no ACE is exact (not a narrowing).
         return [], [f"inactive (disabled on device, not enforced) -> skipped: {raw}"]
-    icmp_type = _canon_icmp_type(type_tok) if proto in ("icmp", "icmpv6") else None
+    icmp_type = _canon_icmp_type(type_tok, proto) if proto in ("icmp", "icmpv6") else None
     # Unknown trailing tokens: for icmp the first free token is the (modeled)
     # ICMP type; every other free token — and for non-icmp protos the first one
     # too — is an unrecognized qualifier (a TCP flag like `syn`, an `eq`-list
