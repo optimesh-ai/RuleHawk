@@ -57,24 +57,43 @@ def _hc(p: Pkt):
     return HeaderConstraints(**kw)
 
 
+def _vendor_header(vendor: str, host: str, text: str) -> str:
+    """One line that makes Batfish detect the vendor of a snippet that lacks
+    its usual preamble (a bare `set firewall ...` file is UNKNOWN to Batfish;
+    a bare ASA ACL is read as IOS, wildcard masks and all)."""
+    if vendor == "asa" and not re.search(r"(?m)^\s*(?:ASA|PIX) Version", text):
+        return "ASA Version 9.8(4)\n"
+    if vendor.startswith("junos") and "host-name" not in text:
+        return (f"set system host-name {host}\n" if re.search(r"(?m)^\s*set\s", text)
+                else f"system {{ host-name {host}; }}\n")
+    if vendor in ("ios", "eos", "nxos") and not re.search(r"(?m)^\s*hostname\s", text):
+        return f"hostname {host}\n"
+    return ""
+
+
 def _snapshot(bf, items, tag):
+    """Write one snapshot; return {host: line offset} (1 when a vendor header
+    line was prepended, so Batfish line numbers are shifted by one)."""
     d = tempfile.mkdtemp(prefix=f"bf-{tag}-")
     os.makedirs(os.path.join(d, "configs"))
-    for host, _v, text in items:
+    offsets = {}
+    for host, vendor, text in items:
         # Force Batfish's node name to the item name (real configs share
         # hostnames like "router1"); edits stay on the same line.
         text = re.sub(r"(?m)^(\s*hostname\s+)\S+", lambda m: m.group(1) + host, text)
         text = re.sub(r"(host-name\s+)[^;\s]+", lambda m: m.group(1) + host, text)
+        hdr = _vendor_header(vendor, host, text)
+        offsets[host] = 1 if hdr else 0
         with open(os.path.join(d, "configs", host + ".cfg"), "w") as fh:
-            fh.write(text)
+            fh.write(hdr + text)
     bf.init_snapshot(d, name=tag, overwrite=True)
-    return d
+    return offsets
 
 
 def run_batch(bf, items, rng, n_pkts=300, threads=4, witnesses=True):
     """items: [(host, vendor, text)] in ONE snapshot. Returns per-host results."""
     tag = f"s{rng.randrange(1 << 30)}"
-    _snapshot(bf, items, tag)
+    offsets = _snapshot(bf, items, tag)
     issues = bf.q.initIssues().answer().frame()
     res: Dict[str, dict] = {}
     rh = {}
@@ -91,11 +110,28 @@ def run_batch(bf, items, rng, n_pkts=300, threads=4, witnesses=True):
                      "bf_unreachable": 0, "rh_missed": [], "witness": 0,
                      "witness_ok": 0, "witness_bad": [], "attr_mismatch": 0,
                      "bf_issues": [], "rh_notes": len(notes), "flr_failed": 0,
-                     "dead_unverifiable": 0}
+                     "dead_unverifiable": 0, "disagree_bf_partial": [],
+                     "dead_refuted_bf_partial": [], "witness_bad_bf_partial": [],
+                     "bf_partial_acls": []}
+    lc = {h.lower(): h for h in res}
+    unparsed = {h: set() for h in res}          # source lines Batfish dropped
     for _, row in issues.iterrows():
-        for n in (row.get("Nodes") or []):
-            if n in res:
-                res[n]["bf_issues"].append(f"{row['Type']}: {row.get('Line_Text') or row['Details']}"[:200])
+        # Parse warnings carry no Nodes, only Source_Lines (file + lines):
+        # map configs/<host>.cfg back to the host.
+        hosts = {lc[n.lower()] for n in (row.get("Nodes") or []) if n.lower() in lc}
+        flines = list(row.get("Source_Lines") or [])
+        for fl in flines:
+            stem = os.path.splitext(os.path.basename(str(getattr(fl, "filename", ""))))[0]
+            if stem.lower() in lc:
+                hosts.add(lc[stem.lower()])
+        for h in hosts:
+            res[h]["bf_issues"].append(f"{row['Type']}: {row.get('Line_Text') or row['Details']}"[:200])
+            if "parse" in str(row["Type"]).lower():
+                for fl in flines:
+                    stem = os.path.splitext(os.path.basename(str(getattr(fl, "filename", ""))))[0]
+                    if stem.lower() == h.lower():
+                        for ln in (getattr(fl, "lines", None) or []):
+                            unparsed[h].add(int(ln) - offsets.get(h, 0))
     # ---- dead lines vs filterLineReachability
     unreach = {}
     try:
@@ -182,6 +218,18 @@ def run_batch(bf, items, rng, n_pkts=300, threads=4, witnesses=True):
                     res[host]["disagree"].append({
                         "acl": acl, "pkt": str(p), "batfish": bv, "bf_line": r["Line_Content"],
                         "rulehawk": rv, "rh_line": _src_line(items, host, ace.line) if ace else "(implicit deny)"})
+    # Batfish dropped (parse warning) at least one line of this ACL: its view
+    # of the ACL is partial, so a discrepancy there is an oracle limit, not a
+    # RuleHawk bug. Kept apart, per kind.
+    for host, (aces, acls) in rh.items():
+        r = res[host]
+        partial = {acl for acl, aa in acls.items() if {a.line for a in aa} & unparsed[host]}
+        for kind in ("disagree", "dead_refuted"):
+            keep = []
+            for x in r[kind]:
+                (r[kind + "_bf_partial"].append(x) if x["acl"] in partial else keep.append(x))
+            r[kind] = keep
+        r["bf_partial_acls"] = sorted(partial)
     # A dead claim in an ACL Batfish never answered for (it doesn't model it,
     # e.g. a QoS class ACL or one it failed to parse) is unverifiable, not
     # refuted.
@@ -220,6 +268,9 @@ def run_batch(bf, items, rng, n_pkts=300, threads=4, witnesses=True):
                     or _line_in(_norm(row[0]["Line_Content"]), {_norm(_src_line(items, host, ace_line))})
             if ok:
                 res[host]["witness_ok"] += 1
+            elif acl in res[host]["bf_partial_acls"]:
+                res[host]["witness_bad_bf_partial"].append({"witness": f.witness, "rule": f.rule,
+                                                            "bf_line": row[0]["Line_Content"] if row else None})
             else:
                 res[host]["witness_bad"].append({"witness": f.witness, "rule": f.rule,
                                                  "bf": row[0]["Action"] if row else None,
@@ -260,7 +311,9 @@ def totals(all_res):
             if isinstance(v, int):
                 t[k] = t.get(k, 0) + v
             elif isinstance(v, list) and k in ("disagree", "dead_refuted", "rh_missed",
-                                               "witness_bad", "unmatched_acls"):
+                                               "witness_bad", "unmatched_acls",
+                                               "disagree_bf_partial", "dead_refuted_bf_partial",
+                                               "witness_bad_bf_partial", "bf_partial_acls"):
                 t[k] = t.get(k, 0) + len(v)
     t["configs"] = len(all_res)
     t["configs_with_bf_issues"] = sum(1 for r in all_res.values() if r["bf_issues"])
