@@ -90,7 +90,8 @@ def run_batch(bf, items, rng, n_pkts=300, threads=4, witnesses=True):
                      "dead_lines": 0, "dead_confirmed": 0, "dead_refuted": [],
                      "bf_unreachable": 0, "rh_missed": [], "witness": 0,
                      "witness_ok": 0, "witness_bad": [], "attr_mismatch": 0,
-                     "bf_issues": [], "rh_notes": len(notes), "flr_failed": 0}
+                     "bf_issues": [], "rh_notes": len(notes), "flr_failed": 0,
+                     "dead_unverifiable": 0}
     for _, row in issues.iterrows():
         for n in (row.get("Nodes") or []):
             if n in res:
@@ -181,6 +182,18 @@ def run_batch(bf, items, rng, n_pkts=300, threads=4, witnesses=True):
                     res[host]["disagree"].append({
                         "acl": acl, "pkt": str(p), "batfish": bv, "bf_line": r["Line_Content"],
                         "rulehawk": rv, "rh_line": _src_line(items, host, ace.line) if ace else "(implicit deny)"})
+    # A dead claim in an ACL Batfish never answered for (it doesn't model it,
+    # e.g. a QoS class ACL or one it failed to parse) is unverifiable, not
+    # refuted.
+    for host, r in res.items():
+        keep = []
+        for x in r["dead_refuted"]:
+            if x["acl"] in r["unmatched_acls"]:
+                r["dead_unverifiable"] += 1
+                r["dead_lines"] -= 1
+            else:
+                keep.append(x)
+        r["dead_refuted"] = keep
     # ---- witnesses
     if witnesses:
         wl = []
