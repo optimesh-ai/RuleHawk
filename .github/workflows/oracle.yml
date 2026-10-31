@@ -1,7 +1,8 @@
 name: RuleHawk differential oracles
 
 # Opt-in ground-truth checks that need Docker, kept out of the normal suite:
-# the iptables model vs the real Linux kernel (tools/oracle/). Nightly and on
+# the iptables model vs the real Linux kernel, and the IOS/ASA/EOS/NX-OS/Junos
+# frontends vs Batfish (tools/oracle/). Nightly and on
 # demand; a failure means RuleHawk disagreed with the kernel outside the
 # documented classes.
 on:
@@ -10,6 +11,9 @@ on:
       rulesets:
         description: random rulesets to test
         default: "200"
+      acls:
+        description: random ACLs (x7 vendor renderings) for Batfish
+        default: "12"
   schedule:
     - cron: "17 6 * * *"
 
@@ -33,3 +37,30 @@ jobs:
           RULEHAWK_ORACLE_N: ${{ github.event.inputs.rulesets || '200' }}
           RULEHAWK_ORACLE_SEED: ${{ github.run_number }}
         run: python -m pytest -q -rs -s tests/test_oracle_kernel.py
+
+  batfish:
+    name: vendor ACL parsers vs Batfish
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      batfish:
+        # pinned: a Batfish upgrade must not silently change the oracle
+        image: batfish/allinone@sha256:54cb0ed94fd9a3c1ca0985f73e5be479e955cee9b9f6a6799b66be3364fd8e5c
+        ports:
+          - 9996:9996
+          - 9997:9997
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet pytest pybatfish==2026.9.17.3748 -e .
+      - name: Wait for Batfish
+        run: |
+          for i in $(seq 1 60); do curl -sf localhost:9996/v2/version >/dev/null && exit 0; sleep 5; done; exit 1
+      - name: Batfish differential test
+        env:
+          RULEHAWK_BATFISH_ORACLE: "1"
+          RULEHAWK_ORACLE_N: ${{ github.event.inputs.acls || '12' }}
+          RULEHAWK_ORACLE_SEED: ${{ github.run_number }}
+        run: python -m pytest -q -rs -s tests/test_oracle_batfish.py
