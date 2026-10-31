@@ -997,7 +997,7 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
         stripped = raw.strip()
         if not stripped or stripped.startswith("!"):
             continue
-        m = re.match(r"(?i)^(ip|ipv6)\s+access-list\s+(?:(extended|standard)\s+)?(\S+)",
+        m = re.match(r"(?i)^(ip|ipv4|ipv6)\s+access-list\s+(?:(extended|standard)\s+)?(\S+)",
                      stripped)
         if m:
             in_other = False
