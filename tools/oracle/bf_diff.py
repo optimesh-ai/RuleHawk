@@ -90,19 +90,31 @@ def run_batch(bf, items, rng, n_pkts=300, threads=4, witnesses=True):
                      "dead_lines": 0, "dead_confirmed": 0, "dead_refuted": [],
                      "bf_unreachable": 0, "rh_missed": [], "witness": 0,
                      "witness_ok": 0, "witness_bad": [], "attr_mismatch": 0,
-                     "bf_issues": [], "rh_notes": len(notes)}
+                     "bf_issues": [], "rh_notes": len(notes), "flr_failed": 0}
     for _, row in issues.iterrows():
         for n in (row.get("Nodes") or []):
             if n in res:
                 res[n]["bf_issues"].append(f"{row['Type']}: {row.get('Line_Text') or row['Details']}"[:200])
     # ---- dead lines vs filterLineReachability
-    flr = bf.q.filterLineReachability().answer().frame()
     unreach = {}
-    for _, row in flr.iterrows():
+    try:
+        flr_frames = [bf.q.filterLineReachability().answer().frame()]
+    except Exception:   # noqa: BLE001  one config can crash Batfish's question
+        flr_frames = []
+        for host, _v, _t in items:
+            try:
+                flr_frames.append(bf.q.filterLineReachability(nodes=host).answer().frame())
+            except Exception as e:   # noqa: BLE001
+                res[host]["bf_issues"].append(f"filterLineReachability failed: {str(e)[-160:]}")
+                res[host]["flr_failed"] = 1
+    rows = [row for fr in flr_frames for _, row in fr.iterrows()]
+    for row in rows:
         for src in row["Sources"]:
             host, _, acl = src.partition(": ")
             unreach.setdefault((host.lower(), acl), set()).add(_norm(row["Unreachable_Line"]))
     for host, (aces, acls) in rh.items():
+        if res[host].get("flr_failed"):
+            continue
         findings = analyze(aces)
         dead_ids = {f.rule_id for f in findings if f.kind in _DEAD}
         by_line = {}
@@ -258,7 +270,7 @@ def build_items(n_random=0, seed=1, vendors="ios,asa,eos,nxos,junos", files=()):
 
 
 def main_run(n_random=0, seed=1, vendors="ios,asa,eos,nxos,junos", files=(),
-             batch=20, pkts=300, host=None, log=sys.stderr):
+             batch=20, pkts=300, host=None, log=sys.stderr, checkpoint=""):
     from pybatfish.client.session import Session
     bf = Session(host=host or os.environ.get("BATFISH_HOST", "localhost"))
     bf.set_network("rulehawk-oracle")
@@ -267,6 +279,8 @@ def main_run(n_random=0, seed=1, vendors="ios,asa,eos,nxos,junos", files=(),
     for k in range(0, len(items), batch):
         all_res.update(run_batch(bf, items[k:k + batch], rng, n_pkts=pkts))
         print(f"batch {k // batch + 1}: {json.dumps(totals(all_res))}", file=log)
+        if checkpoint:
+            _dump(checkpoint, totals(all_res), all_res, items)
     return totals(all_res), all_res, items
 
 
@@ -284,12 +298,15 @@ def main(argv=None):
     files = list(a.files)
     if a.file_list:
         files += [x.strip() for x in open(a.file_list) if x.strip()]
-    t, all_res, items = main_run(a.random, a.seed, a.vendors, files, a.batch, a.pkts)
+    t, all_res, items = main_run(a.random, a.seed, a.vendors, files, a.batch, a.pkts,
+                                 checkpoint=a.json)
     print(json.dumps(t, indent=1))
-    if a.json:
-        with open(a.json, "w") as fh:
-            json.dump({"totals": t, "results": all_res,
-                       "configs": {h: text for h, _, text in items}}, fh, indent=1)
+
+
+def _dump(path, t, all_res, items):
+    with open(path, "w") as fh:
+        json.dump({"totals": t, "results": all_res,
+                   "configs": {h: text for h, _, text in items}}, fh, indent=1)
 
 
 if __name__ == "__main__":
