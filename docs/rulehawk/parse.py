@@ -1192,6 +1192,38 @@ def _reorder_by_sequence(entries: List[ACE], notes: List[str]) -> List[ACE]:
         group = by_acl[acl]
         nums = [_SEQ_PREFIX.match(a.raw) for a in group]
         if all(nums) and len(group) > 1:
+            # One sequence number = ONE entry on the device. A config that
+            # carries the same ACL twice (concatenated `show run` sections) or
+            # re-enters `10 permit ...` repeats the number: an identical
+            # re-entry is the same entry (keep the first; reporting the copy as
+            # "redundant" was noise the device never has). Different text under
+            # the same number is not modeled — keep both, marked imprecise.
+            first_line: "dict[int, tuple]" = {}
+            drop, clash = set(), set()
+            for a, m in zip(group, nums):
+                k = int(m.group(1))
+                txt = re.sub(r"\s+", " ", a.raw.strip()).lower()
+                if k not in first_line:
+                    first_line[k] = (a.line, txt)
+                elif first_line[k][0] != a.line:
+                    (drop if first_line[k][1] == txt else clash).add((k, a.line))
+                    if first_line[k][1] != txt:
+                        clash.add((k, first_line[k][0]))
+            if drop or clash:
+                if drop:
+                    notes.append(f"ACL {acl}: {len(drop)} entr(ies) repeat an existing "
+                                 f"sequence number with identical text — one entry "
+                                 f"on the device, duplicates ignored")
+                if clash:
+                    notes.append(f"ACL {acl}: sequence number(s) "
+                                 f"{sorted({k for k, _ in clash})} appear with "
+                                 f"different entries — not modeled, marked imprecise")
+                keep_i = [i for i, (a, m) in enumerate(zip(group, nums))
+                          if (int(m.group(1)), a.line) not in drop]
+                group = [dataclasses.replace(group[i], imprecise=True)
+                         if (int(nums[i].group(1)), group[i].line) in clash else group[i]
+                         for i in keep_i]
+                nums = [nums[i] for i in keep_i]
             keyed = sorted(range(len(group)),
                            key=lambda i: (int(nums[i].group(1)), i))
             if keyed != list(range(len(group))):
