@@ -146,19 +146,11 @@ def run_one(container: str, name: str, text: str, rng: random.Random) -> dict:
         if not chain_aces:
             continue
         pkts = [p for p in sample(chain_aces, rng) if usable(p.src) and usable(p.dst)]
-        if mode == "input":
-            # Local delivery answers (RST / port-unreachable) and records
-            # conntrack state: a later probe whose 5-tuple equals an earlier
-            # one, or its reverse, is no longer NEW. Keep each flow once.
-            seen_t, kept = set(), []
-            for p in pkts:
-                t = (p.proto, p.src, p.sport, p.dst, p.dport)
-                r = (p.proto, p.dst, p.dport, p.src, p.sport)
-                if t in seen_t or r in seen_t:
-                    continue
-                seen_t.add(t)
-                kept.append(p)
-            pkts = kept
+        # Conntrack keeps state across the probe burst in BOTH modes: a later
+        # probe whose 5-tuple equals an earlier one, or its reverse, is no
+        # longer NEW (a forwarded GRE a->b makes b->a ESTABLISHED and a
+        # NEW-only ACCEPT then misses it). Keep each flow once.
+        pkts = one_per_flow(pkts)
         # RuleHawk models host-hook (INPUT/OUTPUT) jumps to user chains as
         # surfaced notes only (no decision), so per-packet INPUT verdicts are
         # not a RuleHawk claim there; class them separately.
@@ -248,6 +240,19 @@ def run_one(container: str, name: str, text: str, rng: random.Random) -> dict:
                                            "kernel": kv, "rule": f.rule,
                                            "hits": hits})
     return res
+
+
+def one_per_flow(pkts):
+    """Drop probes whose 5-tuple (or its reverse) was already sent."""
+    seen_t, kept = set(), []
+    for p in pkts:
+        t = (p.proto, p.src, p.sport, p.dst, p.dport)
+        r = (p.proto, p.dst, p.dport, p.src, p.sport)
+        if t in seen_t or r in seen_t:
+            continue
+        seen_t.add(t)
+        kept.append(p)
+    return kept
 
 
 def run_many(work, jobs: int = 4, seed: int = 1):
