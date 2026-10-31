@@ -131,7 +131,10 @@ _JUNOS_ICMP = {
 
 # Common IP protocol numbers, so `protocol 6` reads the same as `protocol tcp`.
 _PROTO_NUM = {"1": "icmp", "6": "tcp", "17": "udp", "58": "icmpv6",
-              "47": "gre", "50": "esp", "51": "ah", "89": "ospf"}
+              "47": "gre", "50": "esp", "51": "ah", "89": "ospf",
+              # Junos names that are NOT families: `protocol ipv6` is IPv6-in-
+              # IPv4 (41), never RuleHawk's "ipv6" wildcard.
+              "ipv6": "41", "ipip": "4", "icmp6": "icmpv6"}
 
 # Cap the cartesian expansion of one term so a pathological filter can't blow up;
 # beyond it we widen every dimension to ANY (a superset) and mark the entry
@@ -234,7 +237,7 @@ def _read_conditions(toks: List[str]) -> List[Tuple[str, List[str]]]:
 # --- value parsers ---------------------------------------------------------
 
 def _proto(v: str) -> str:
-    return _PROTO_NUM.get(v, v.lower())
+    return _PROTO_NUM.get(v.lower(), v.lower())
 
 
 def _addrs(vals: List[str], label: str,
@@ -555,10 +558,14 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
     label = f"{fname}/{tname}"
     from_toks: List[str] = []
     then_toks: List[str] = []
+    filter_ref: Optional[str] = None
     i, n = 0, len(tbody)
     while i < n:
         t = tbody[i]
-        if t == "from" and i + 1 < n and tbody[i + 1] == "{":
+        if t == "filter" and i + 1 < n and tbody[i + 1] not in ("{", ";"):
+            filter_ref = tbody[i + 1]
+            i += 2
+        elif t == "from" and i + 1 < n and tbody[i + 1] == "{":
             blk, i = _read_block(tbody, i + 1)
             from_toks += blk
         elif t == "then":
@@ -573,6 +580,20 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
                 i = j + 1
         else:
             i += 1
+
+    if filter_ref is not None:
+        # `term T { filter OTHER; }` evaluates OTHER and falls through when it
+        # doesn't decide. OTHER is not inlined: one opaque stand-in (never a
+        # confident verdict, never a coverer) keeps everything behind it honest.
+        fam_any = _fam_any_net(family)
+        seq += 1
+        entries.append(ACE(seq=seq, action="permit", proto="ip", src=fam_any,
+                           dst=fam_any, imprecise=True,
+                           raw=f"term {tname}: filter {filter_ref} (not inlined)",
+                           acl=fname, line=line))
+        notes.append(f"Junos term {label} chains to filter {filter_ref} — not "
+                     f"inlined; packets reaching it are INDETERMINATE")
+        return seq
 
     conds = _read_conditions(from_toks)
     keys = [k for k, _ in conds]

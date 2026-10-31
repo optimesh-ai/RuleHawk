@@ -28,6 +28,7 @@ and stay exact.
 
 from __future__ import annotations
 
+import contextvars
 import ipaddress
 import re
 from typing import List, Optional, Tuple
@@ -251,6 +252,13 @@ def _classify_mask(mask: str) -> Tuple[int, str]:
     return 32 - bits.bit_length(), "noncontiguous"
 
 
+# True while parsing an entry of an `ip/ipv4/ipv6 access-list` block (IOS,
+# IOS-XR, NX-OS, EOS): there a dotted mask is ALWAYS a wildcard, never an ASA
+# netmask, whatever it looks like.
+_WILDCARD_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_WILDCARD_ONLY", default=False)
+
+
 def _parse_addr(tokens: List[str], i: int, v6: bool = False) -> Tuple[_IPNet, int, bool]:
     """Parse an address operand; return (net, next_i, imprecise). `v6` is the
     enclosing ACL's family (`ipv6 access-list`) — it sizes `any`; `host` sizes
@@ -271,6 +279,11 @@ def _parse_addr(tokens: List[str], i: int, v6: bool = False) -> Tuple[_IPNet, in
         return ipaddress.ip_network(t, strict=False), i + 1, False
     addr, mask = tokens[i], tokens[i + 1]
     plen, kind = _classify_mask(mask)
+    if kind == "netmask" and _WILDCARD_ONLY.get():
+        # e.g. 255.192.0.0 in an IOS block: a non-contiguous WILDCARD. Covering
+        # prefix = the mask's leading-zero run (see _classify_mask).
+        plen = 32 - int(ipaddress.IPv4Address(mask)).bit_length()
+        kind = "noncontiguous"
     if kind == "host" and addr == "0.0.0.0":
         # `0.0.0.0 0.0.0.0` (ASA netmask) and `0.0.0.0 255.255.255.255` (IOS
         # wildcard) are both real-world spellings of "any"; the competing
@@ -982,6 +995,14 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     `notes` records lines recognized as ACEs but not fully modeled — surfaced,
     never silently dropped.
     """
+    tok = _WILDCARD_ONLY.set(False)
+    try:
+        return _parse_acls(text)
+    finally:
+        _WILDCARD_ONLY.reset(tok)
+
+
+def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     entries: List[ACE] = []
     notes: List[str] = []
     text, n_alias = _apply_asa_names(text)
@@ -997,10 +1018,11 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
         stripped = raw.strip()
         if not stripped or stripped.startswith("!"):
             continue
-        m = re.match(r"(?i)^(ip|ipv6)\s+access-list\s+(?:(extended|standard)\s+)?(\S+)",
+        m = re.match(r"(?i)^(ip|ipv4|ipv6)\s+access-list\s+(?:(extended|standard)\s+)?(\S+)",
                      stripped)
         if m:
             in_other = False
+            _WILDCARD_ONLY.set(True)
             current_acl, seq = m.group(3), 0
             cur_v6 = m.group(1).lower() == "ipv6"
             cur_std = (m.group(2) or "").lower() == "standard"
@@ -1024,6 +1046,7 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
         m = re.match(r"(?i)^access-list\s+(\S+)\s+(?:line\s+\d+\s+)?(standard\s+)?",
                      stripped)
         if m and re.search(r"(?i)\b(permit|deny)\b", stripped):
+            _WILDCARD_ONLY.set(False)        # flat access-list: auto-detect
             current_acl = m.group(1)
             # Flat `access-list` lines (ASA / IOS numbered) carry their own IPv4
             # context; standard = the explicit keyword, or an IOS standard number.
