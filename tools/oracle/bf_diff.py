@@ -91,11 +91,20 @@ def run_batch(bf, items, rng, n_pkts=300, threads=4, witnesses=True):
                      "bf_unreachable": 0, "rh_missed": [], "witness": 0,
                      "witness_ok": 0, "witness_bad": [], "attr_mismatch": 0,
                      "bf_issues": [], "rh_notes": len(notes), "flr_failed": 0,
-                     "dead_unverifiable": 0}
+                     "dead_unverifiable": 0, "disagree_bf_partial": [],
+                     "dead_refuted_bf_partial": [], "witness_bad_bf_partial": [],
+                     "bf_partial_acls": []}
+    lc = {h.lower(): h for h in res}
+    unparsed = {h: set() for h in res}          # source lines Batfish dropped
     for _, row in issues.iterrows():
         for n in (row.get("Nodes") or []):
-            if n in res:
-                res[n]["bf_issues"].append(f"{row['Type']}: {row.get('Line_Text') or row['Details']}"[:200])
+            if n.lower() in lc:
+                h = lc[n.lower()]
+                res[h]["bf_issues"].append(f"{row['Type']}: {row.get('Line_Text') or row['Details']}"[:200])
+                if "warning" in str(row["Type"]).lower() or "error" in str(row["Type"]).lower():
+                    for fl in (row.get("Source_Lines") or []):
+                        for ln in (getattr(fl, "lines", None) or []):
+                            unparsed[h].add(int(ln))
     # ---- dead lines vs filterLineReachability
     unreach = {}
     try:
@@ -182,6 +191,18 @@ def run_batch(bf, items, rng, n_pkts=300, threads=4, witnesses=True):
                     res[host]["disagree"].append({
                         "acl": acl, "pkt": str(p), "batfish": bv, "bf_line": r["Line_Content"],
                         "rulehawk": rv, "rh_line": _src_line(items, host, ace.line) if ace else "(implicit deny)"})
+    # Batfish dropped (parse warning) at least one line of this ACL: its view
+    # of the ACL is partial, so a discrepancy there is an oracle limit, not a
+    # RuleHawk bug. Kept apart, per kind.
+    for host, (aces, acls) in rh.items():
+        r = res[host]
+        partial = {acl for acl, aa in acls.items() if {a.line for a in aa} & unparsed[host]}
+        for kind in ("disagree", "dead_refuted"):
+            keep = []
+            for x in r[kind]:
+                (r[kind + "_bf_partial"].append(x) if x["acl"] in partial else keep.append(x))
+            r[kind] = keep
+        r["bf_partial_acls"] = sorted(partial)
     # A dead claim in an ACL Batfish never answered for (it doesn't model it,
     # e.g. a QoS class ACL or one it failed to parse) is unverifiable, not
     # refuted.
@@ -220,6 +241,9 @@ def run_batch(bf, items, rng, n_pkts=300, threads=4, witnesses=True):
                     or _line_in(_norm(row[0]["Line_Content"]), {_norm(_src_line(items, host, ace_line))})
             if ok:
                 res[host]["witness_ok"] += 1
+            elif acl in res[host]["bf_partial_acls"]:
+                res[host]["witness_bad_bf_partial"].append({"witness": f.witness, "rule": f.rule,
+                                                            "bf_line": row[0]["Line_Content"] if row else None})
             else:
                 res[host]["witness_bad"].append({"witness": f.witness, "rule": f.rule,
                                                  "bf": row[0]["Action"] if row else None,
@@ -260,7 +284,9 @@ def totals(all_res):
             if isinstance(v, int):
                 t[k] = t.get(k, 0) + v
             elif isinstance(v, list) and k in ("disagree", "dead_refuted", "rh_missed",
-                                               "witness_bad", "unmatched_acls"):
+                                               "witness_bad", "unmatched_acls",
+                                               "disagree_bf_partial", "dead_refuted_bf_partial",
+                                               "witness_bad_bf_partial", "bf_partial_acls"):
                 t[k] = t.get(k, 0) + len(v)
     t["configs"] = len(all_res)
     t["configs_with_bf_issues"] = sum(1 for r in all_res.values() if r["bf_issues"])
