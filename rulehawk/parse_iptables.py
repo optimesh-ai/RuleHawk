@@ -1103,6 +1103,15 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     #      produce a false PASS). Gate 3 also catches transitive chain cycles:
     #      a subchain that itself jumps to another custom chain gets an imprecise
     #      placeholder ACE during parsing, which triggers this gate.
+    # ph_start/ph_end were recorded against the UNRESOLVED chain. Each splice
+    # changes the parent chain's length by len(resolved) - placeholder width
+    # (a jump can resolve to several ACEs, or to none), so every later
+    # placeholder in the same chain moves by that much. pending_jumps is in
+    # chain order and ascending item order within a chain, so a running
+    # per-chain offset keeps each slice on its own placeholder. Without it a
+    # later splice overwrites a neighbouring rule (e.g. deletes an ACCEPT
+    # between two jumps) and leaves the real placeholder behind.
+    shift: Dict[str, int] = {}
     for (pch, ph_start, ph_end, tgt,
          j_src, j_dst, j_proto, j_sports, j_dports, jline,
          j_unresolvable, j_state_limited) in pending_jumps:
@@ -1130,7 +1139,9 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
         # Replace the placeholder ACE(s) with the resolved ones and renumber
         # the parent chain 1..N in list order so seqs stay coherent.
         chain_list = by_chain[pch]
-        chain_list[ph_start:ph_end] = resolved
+        off = shift.get(pch, 0)
+        chain_list[ph_start + off:ph_end + off] = resolved
+        shift[pch] = off + len(resolved) - (ph_end - ph_start)
         for idx in range(len(chain_list)):
             chain_list[idx] = dataclasses.replace(chain_list[idx], seq=idx + 1)
         seqs[pch] = len(chain_list)
