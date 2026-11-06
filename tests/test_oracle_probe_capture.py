@@ -185,3 +185,44 @@ def test_unregistered_tag_reads_drop():
     kp.EXPECT.clear()
     b, _ = kp.build(PROBES["icmp"], 7)
     assert kp.find_tag(b, False) is None
+
+
+# --- L1: only the filter table may be loaded ---------------------------------
+# NAT and mangle rewrite the bytes find_tag compares, so a real accept would
+# read as drop. load() refuses them before touching iptables.
+
+_NAT_SAVE = ("*nat\n:PREROUTING ACCEPT [0:0]\n:POSTROUTING ACCEPT [0:0]\n"
+             "-A POSTROUTING -j MASQUERADE\nCOMMIT\n"
+             "*filter\n:FORWARD ACCEPT [0:0]\nCOMMIT\n")
+
+
+@pytest.mark.parametrize("ruleset", [
+    _NAT_SAVE,
+    "*mangle\n:PREROUTING ACCEPT [0:0]\n-A PREROUTING -j TTL --ttl-set 9\nCOMMIT\n",
+    "*raw\n:PREROUTING ACCEPT [0:0]\nCOMMIT\n",
+    "iptables -t mangle -A FORWARD -j TTL --ttl-set 9\n",
+    "iptables -A FORWARD -j ACCEPT\niptables -t nat -A POSTROUTING -j MASQUERADE\n",
+    "iptables --table nat -A POSTROUTING -j MASQUERADE\n",
+    "iptables --table=nat -A POSTROUTING -j MASQUERADE\n",
+    "iptables -tnat -A POSTROUTING -j MASQUERADE\n",
+    "iptables -t filter -A FORWARD -j ACCEPT\n",
+])
+def test_non_filter_table_is_a_load_error(ruleset, monkeypatch):
+    def no_iptables(*a, **k):
+        raise AssertionError("load() ran iptables on a refused ruleset")
+    monkeypatch.setattr(kp.subprocess, "run", no_iptables)
+    err = kp.load(ruleset)
+    assert err and "table" in err
+
+
+def test_filter_only_ruleset_still_loads(monkeypatch):
+    calls = []
+
+    class R:
+        returncode, stderr = 0, ""
+
+    monkeypatch.setattr(kp.subprocess, "run", lambda *a, **k: calls.append(a) or R())
+    assert kp.load("*filter\n:FORWARD DROP [0:0]\n-A FORWARD -s 192.0.2.0/24 -j ACCEPT\n"
+                   "COMMIT\n") is None
+    assert kp.load("iptables -A FORWARD -s 192.0.2.0/24 -j ACCEPT\n") is None
+    assert len(calls) == 2
