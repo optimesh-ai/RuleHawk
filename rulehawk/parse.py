@@ -33,7 +33,7 @@ import ipaddress
 import re
 from typing import List, Optional, Tuple
 
-from .failclosed import cisco_dialect_ambiguous, cisco_lex, split_lines
+from .failclosed import _EXIT_END, cisco_dialect_ambiguous, cisco_lex, split_lines
 from .model import (ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet,
                     _PORTED)
 
@@ -1106,20 +1106,58 @@ _NO_ACL_RE = re.compile(r"(?i)^no\s+(?:(?:ip|ipv4|ipv6)\s+)?access-list\b")
 _NO_ENTRY_RE = re.compile(r"(?i)^no\s+(?:\d+|permit|deny)\b")
 
 
-def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
+def parse_acls(text: str, vendor: str = "ios") -> Tuple[List[ACE], List[str]]:
     """Parse all ACLs in `text`; return (entries, notes).
 
     `notes` records lines recognized as ACEs but not fully modeled — surfaced,
-    never silently dropped.
-    """
+    never silently dropped. `vendor` (`ios`, `nxos`, `eos`) selects the
+    sequence-number grammar of ACL mode (round 8, R7-3)."""
     tok = _WILDCARD_ONLY.set(False)
     try:
-        return _parse_acls(text)
+        return _parse_acls(text, vendor)
     finally:
         _WILDCARD_ONLY.reset(tok)
 
 
-def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
+# The sequence-number forms of ACL mode, per vendor and family (review of
+# #42, round 8, R7-3). Any other form is read as a number and noted.
+# - IOS / IOS XE IPv4: a bare number. IOS XE 17 "IP Access List Entry
+#   Sequence Numbering" (https://www.cisco.com/c/en/us/td/docs/routers/ios/config/17-x/sec-vpn/b-security-vpn/m_sec-acl-seq-num.html):
+#   "Device(config-std-nacl)# 105 permit ...".
+# - IOS / IOS XE IPv6: the `sequence` keyword. Cisco IOS XE Catalyst SD-WAN
+#   Qualified Command Reference, ACL Commands, `sequence`
+#   (https://www.cisco.com/c/en/us/td/docs/routers/sdwan/command/iosxe/qualified-cli-command-reference-guide/m-acl-commands.html):
+#   "Command Modes: IPv6 access-list configuration",
+#   "Device(config-ipv6-acl)# sequence 100 permit ipv6 any 2001:DB8::/32".
+# - NX-OS IPv4 and IPv6: a bare number. Nexus 3600 NX-OS Security
+#   Configuration Guide 10.5(x), "Configuring IP ACLs"
+#   (https://www.cisco.com/c/en/us/td/docs/dcn/nx-os/nexus3600/105x/configuration/security/cisco-nexus-3600-switch-nx-os-security-configuration-guide-105x/m-configuring-ip-acls.html):
+#   "[sequence-number] { permit | deny} protocol ...".
+# - EOS: a bare number (what RuleHawk read before; not cited, the Arista
+#   manual is behind a bot challenge).
+def _seq_form_ok(vendor: str, v6: bool, form: str) -> bool:
+    if form == "sequence":
+        return vendor == "ios" and v6
+    return not (vendor == "ios" and v6)
+
+
+_SEQ_FORM = re.compile(r"(?i)^(sequence\s+)?(\d+)\s+(\S.*)$")
+# `no N` / `no sequence N` delete entry N. IOS XE 17 "IP Access List Entry
+# Sequence Numbering" (URL above): "Use the no sequence-number command to
+# delete an entry."; IOS XE IPv6 `sequence` (URL above): "To remove a
+# sequence number from an IP access list, use the no form of this command.";
+# NX-OS (URL above): "switch(config-acl)# no 101". The deletion is applied
+# and also noted (the answer is UNKNOWN or, if the leak is proven, FAIL).
+_DEL_SEQ = re.compile(r"(?ai)^no\s+(sequence\s+)?([0-9]+)$")
+_ACL_HEADER_FULL = re.compile(
+    r"(?ai)^(?:ip|ipv4|ipv6) access-list (?:(?:extended|standard) )?\S+$")
+_STATS = re.compile(r"(?ai)^(?:no )?statistics per-entry$")
+_FLAT_REMARK = re.compile(r"(?i)^access-list\s+\S+\s+(?:line\s+\d+\s+)?remark(?:\s|$)")
+_REMARK = re.compile(r"(?i)^remark(?:\s|$)")
+
+
+def _parse_acls(text: str, vendor: str = "ios") -> Tuple[List[ACE], List[str]]:
+    from .failclosed import Ledger
     entries: List[ACE] = []
     notes: List[str] = []
     text, notes_b = strip_banners(text)
@@ -1140,6 +1178,23 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     acl_opener = -1                          # header line of the current named ACL
     cur_v6 = cur_std = False                 # family/kind of the current named ACL
     seq = 0
+    # Line accounting (round 8): the scope is every line the lexer puts in ACL
+    # mode, every ACL header and every flat `access-list` line, whatever the
+    # handlers below make of it.
+    led = Ledger("cisco-acl")
+    for lx in lex.lines:
+        if lx.post_end:
+            continue
+        if (lx.mode == "acl" or re.match(r"(?i)^access-list(?: |$)", lx.norm)):
+            led.add(lx.no, lx.norm)
+    # Per ACL, in text order: (kind, line, explicit number or None, v6) with
+    # kind entry | remark | delete, for the device numbering (R7-1, R7-2).
+    events: "dict[str, list]" = {}
+
+    def event(kind: str, lineno: int, n: Optional[int]) -> None:
+        if current_acl != "(unnamed)":
+            events.setdefault(current_acl, []).append((kind, lineno, n))
+
     if lex.post_end:
         no = lex.post_end[0]
         notes.append(f"line {no} (`{srcs[no - 1].strip()[:60]}`) and "
@@ -1154,13 +1209,54 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
         opener_txt = srcs[lx.opener - 1].strip() if lx.opener else ""
         in_block = (lx.mode != "acl" and not lx.header
                     and lx.opener != lineno and bool(_NON_FILTER_HDR.match(opener_txt)))
-        if _NO_ACL_RE.match(stripped) or (in_acl and _NO_ENTRY_RE.match(stripped)):
+        if lx.mode == "acl" and lx.norm.lower() in _EXIT_END:
+            # `exit` ends ACL mode; the lexer reads it (and flags `ex`, `en`).
+            led.consume(lineno)
+            continue
+        mdel = _DEL_SEQ.match(lx.norm) if in_acl else None
+        if mdel:
+            kw = bool(mdel.group(1))
+            ok = _seq_form_ok(vendor, cur_v6, "sequence" if kw else "bare")
+            if ok:
+                event("delete", lineno, int(mdel.group(2)))
+            led.note(lineno, notes,
+                     f"`{lx.norm}` (line {lineno}) in {current_acl}: "
+                     + ("the deletion is applied (Cisco: `no` of a sequence "
+                        "number deletes the entry)" if ok else
+                        "this deletion form is not cited for this ACL mode, so it "
+                        "is not applied")
+                     + "; the answer rests on it, so it is not a PASS")
+            continue
+        if _NO_ACL_RE.match(stripped) or (in_acl and _NO_ENTRY_RE.match(stripped)) \
+                or (in_acl and re.match(r"(?i)^no\s+(?:sequence|remark|evaluate|"
+                                        r"dynamic)\b", stripped)):
             # IOS deletes the ACL (or the entry) at this point in the file;
             # RuleHawk does not replay deletions, so it keeps rules the device
             # no longer has. Fail closed: the note blocks every PASS.
-            notes.append(f"unmodeled `{stripped}` (line {lineno}): the deletion "
-                         f"is not applied, so the parsed ACL may hold rules the "
-                         f"device removed")
+            led.note(lineno, notes,
+                     f"unmodeled `{stripped}` (line {lineno}): the deletion "
+                     f"is not applied, so the parsed ACL may hold rules the "
+                     f"device removed")
+            continue
+        if in_acl and re.match(r"(?i)^default(?:\s|$)", stripped):
+            # `default N`, `default sequence N`, `default remark`: what the
+            # device does is not cited (R7-2). Noted, not applied.
+            led.note(lineno, notes,
+                     f"`{lx.norm}` (line {lineno}) in {current_acl}: a `default` "
+                     f"line in ACL mode is not modelled (what it restores or "
+                     f"removes is not known)")
+            continue
+        if in_acl and _STATS.match(lx.norm):
+            # NX-OS `statistics per-entry` only counts matches (Nexus 7000
+            # NX-OS Security Command Reference, "statistics per-entry",
+            # Command Modes: IP access-list configuration). Only NX-OS
+            # (R7-7): elsewhere it is not cited.
+            if vendor == "nxos":
+                led.consume(lineno)
+            else:
+                led.note(lineno, notes,
+                         f"`{lx.norm}` (line {lineno}) in {current_acl}: an NX-OS "
+                         f"ACL command in a config read as {vendor}; not modelled")
             continue
         m = re.match(r"(?i)^(ip|ipv4|ipv6)\s+access-list\s+(?:(extended|standard)\s+)?(\S+)",
                      stripped)
@@ -1170,6 +1266,12 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             acl_opener = lineno if lx.mode == "acl" and lx.opener == lineno else -2
             cur_v6 = m.group(1).lower() == "ipv6"
             cur_std = (m.group(2) or "").lower() == "standard"
+            if _ACL_HEADER_FULL.match(lx.norm):
+                led.consume(lineno)
+            else:
+                led.note(lineno, notes,
+                         f"ACL header line {lineno} (`{lx.norm[:60]}`) holds words "
+                         f"RuleHawk does not read")
             continue
         if _NON_FILTER_HDR.match(stripped):
             # Routing policy (route-map / prefix-list / community-list /
@@ -1183,6 +1285,26 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             continue
         if in_block:
             continue                         # body line of a non-filter block
+        # The sequence-number prefix and its form (R7-1, R7-3).
+        explicit: Optional[int] = None
+        sm = _SEQ_FORM.match(lx.norm) if in_acl else None
+        if sm:
+            explicit = int(sm.group(2))
+            form = "sequence" if sm.group(1) else "bare"
+            if not _seq_form_ok(vendor, cur_v6, form):
+                led.note(lineno, notes,
+                         f"`{sm.group(1) or ''}{sm.group(2)}` (line {lineno}) in "
+                         f"{current_acl}: this sequence-number form is not cited "
+                         f"for {vendor} {'IPv6' if cur_v6 else 'IPv4'} ACL mode; "
+                         f"read as a sequence number, not a PASS")
+        body_txt = sm.group(3) if sm else lx.norm
+        if in_acl and _REMARK.match(body_txt):
+            event("remark", lineno, explicit)
+            led.consume(lineno)
+            continue
+        if _FLAT_REMARK.match(stripped):
+            led.consume(lineno)
+            continue
         line_v6, line_std = cur_v6, cur_std
         m = re.match(r"(?i)^access-list\s+(\S+)\s+(?:line\s+\d+\s+)?(standard\s+)?",
                      stripped)
@@ -1203,18 +1325,19 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             nm = m.group(1)
             line_std = bool(m.group(2)) or (nm.isdigit() and (
                 1 <= int(nm) <= 99 or 1300 <= int(nm) <= 1999))
-        if re.match(r"(?i)^evaluate\s+\S+", stripped):
+        if re.match(r"(?i)^evaluate\s+\S+", body_txt):
             # IOS reflexive ACL: `evaluate NAME` splices in the dynamic
             # return-traffic entries that `reflect NAME` permits created. They
             # match mirrored sessions only (return traffic, like `established`),
             # so they never decide a NEW flow and cannot prove a rule dead —
             # but the line must be surfaced, never dropped without a trace.
-            notes.append(f"IOS reflexive ACL `{stripped}` in {current_acl}: "
-                         f"dynamic return-traffic entries not modeled (stateful, "
-                         f"never a new-flow decision) — verify manually")
+            led.note(lineno, notes,
+                     f"IOS reflexive ACL `{stripped}` in {current_acl}: "
+                     f"dynamic return-traffic entries not modeled (stateful, "
+                     f"never a new-flow decision) — verify manually")
             continue
         if not re.search(r"(?i)\b(permit|deny)\b", stripped):
-            continue
+            continue                         # unaccounted: the ledger notes it
         if not m and not in_acl:
             # Not a flat `access-list` line and not in the mode of a named ACL
             # header: on the device this line is rejected (or belongs to a
@@ -1222,30 +1345,35 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             # is kept under "(unnamed)", which nothing binds, with a note.
             where = (f"after line {lx.opener} (`{opener_txt[:40]}`)" if lx.opener
                      else "before any ACL header")
-            notes.append(f"line {lineno}: `{stripped[:60]}` is not in ACL mode "
-                         f"on the device ({where}); not added to any named ACL")
+            led.note(lineno, notes,
+                     f"line {lineno}: `{stripped[:60]}` is not in ACL mode "
+                     f"on the device ({where}); not added to any named ACL")
             if current_acl != "(unnamed)":
                 current_acl, seq, acl_opener = "(unnamed)", 0, -3
             cur_v6 = cur_std = line_v6 = line_std = False
         toks = _entry_tokens(raw.strip())
         if not toks or toks[0].lower() not in _ACTIONS:
             if "remark" not in stripped.lower():
-                notes.append(f"unparsed: {stripped}")
+                led.note(lineno, notes, f"unparsed: {stripped}")
             continue
         action = toks[0].lower()
+        n0 = len(notes)
         if line_std:
             try:
                 aces, enotes = _parse_std_entry(toks, seq, current_acl, stripped,
                                                 lineno)
             except (IndexError, ValueError, ipaddress.AddressValueError):
-                notes.append(f"unparsed (kept fail-closed): {stripped}")
+                led.note(lineno, notes, f"unparsed (kept fail-closed): {stripped}")
                 seq += 1
                 entries.append(_opaque_ace(action, seq, current_acl, stripped,
                                            lineno))
+                event("entry", lineno, explicit)
                 continue
             seq += len(aces)
             entries.extend(aces)
             notes.extend(enotes)
+            event("entry", lineno, explicit)
+            (led.note if len(notes) > n0 else led.consume)(lineno)
             continue
         # Object-group / object references expand a permit in ways we don't model.
         # DROPPING such a line let segcheck FALSE-PASS a real leak hidden behind
@@ -1281,10 +1409,13 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
                 seq += len(races)
                 entries.extend(races)
                 notes.extend(rnotes)
+                event("entry", lineno, explicit)
+                (led.note if len(notes) > n0 else led.consume)(lineno)
                 continue
-            notes.append(f"unmodeled (object-group): {stripped}")
+            led.note(lineno, notes, f"unmodeled (object-group): {stripped}")
             seq += 1
             entries.append(_opaque_ace(action, seq, current_acl, stripped, lineno))
+            event("entry", lineno, explicit)
             continue
         try:
             aces, enotes = _parse_entry(toks, seq, current_acl, stripped, lineno,
@@ -1292,18 +1423,23 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
         except (IndexError, ValueError, ipaddress.AddressValueError):
             # Recognized as an ACE but unparseable — fail closed rather than drop,
             # so an unreadable permit can't be silently treated as isolated.
-            notes.append(f"unparsed (kept fail-closed): {stripped}")
+            led.note(lineno, notes, f"unparsed (kept fail-closed): {stripped}")
             seq += 1
             entries.append(_opaque_ace(action, seq, current_acl, stripped, lineno))
+            event("entry", lineno, explicit)
             continue
         seq += len(aces)
         entries.extend(aces)
         notes.extend(enotes)
-    entries = _reorder_by_sequence(entries, notes)
+        event("entry", lineno, explicit)
+        (led.note if len(notes) > n0 else led.consume)(lineno)
+    entries = _apply_numbering(entries, notes, events)
+    led.close(notes, lambda k, t: (
+        f"line {k} (`{t[:60]}`) in ACL mode is not read by RuleHawk: what it "
+        f"changes is not modelled"))
     return entries, notes
 
 
-_SEQ_PREFIX = re.compile(r"(?i)^\s*(?:sequence\s+)?(\d+)\s")
 # An IOS numbered ACL line: a numeric name followed directly by the action (no
 # ASA `extended` / `standard` / `webtype` / `ethertype` keyword).
 # Its mask is always a wildcard. Cisco, "Configure IP Access Lists" (Document
@@ -1317,22 +1453,43 @@ _IOS_NUMBERED = re.compile(
     r"(?i)^access-list\s+\d+\s+(?:permit|deny|dynamic)\b")
 
 
-def _reorder_by_sequence(entries: List[ACE], notes: List[str]) -> List[ACE]:
-    """Honor explicit ACL sequence numbers as the device's match order.
+def _device_numbers(evs: list, remark_counts: bool):
+    """Each line's sequence number as the device assigns it, and the lines a
+    deletion removed. IOS XE 17 "IP Access List Entry Sequence Numbering"
+    (https://www.cisco.com/c/en/us/td/docs/routers/ios/config/17-x/sec-vpn/b-security-vpn/m_sec-acl-seq-num.html):
+    "If you enter an entry without a sequence number, it is assigned a
+    sequence number that is 10 greater than the last sequence number in that
+    access list and is placed at the end of the list." and "if entries with no
+    sequence numbers are applied, the first entry is assigned a sequence
+    number of 10". NX-OS says the same ("assigns a sequence number that is 10
+    greater than the sequence number of the preceding rule", Nexus 3600 10.5
+    "Configuring IP ACLs"). Whether an unnumbered `remark` takes a number is
+    not cited: the caller computes both readings."""
+    live: "dict[int, int]" = {}                # line -> number, entries on the list
+    nums: "dict[int, int]" = {}
+    deleted: set = set()
+    for kind, ln, n in evs:
+        if kind == "delete":
+            for victim in [k for k, v in live.items() if v == n]:
+                del live[victim]
+                deleted.add(victim)
+            continue
+        if n is None:
+            if kind == "remark" and not remark_counts:
+                continue
+            n = (max(live.values()) if live else 0) + 10
+        live[ln] = n
+        nums[ln] = n
+    return nums, deleted
 
-    IOS/NX-OS/EOS number ACL entries (`10 permit ...`, `20 deny ...`) and the
-    device evaluates them in NUMERIC order regardless of the order they appear
-    in the text. `show running-config` normally emits them already sorted, but a
-    hand-edited or automation-pushed config can be out of order — and evaluating
-    the text order would silently mis-rank first-match (a `10 permit` written
-    below a `20 deny` would be wrongly shadowed -> false PASS).
 
-    Conservative: an ACL is reordered ONLY when EVERY one of its entries carries
-    an explicit leading number (mixing numbered and unnumbered is ambiguous, so
-    we leave text order). Entries expanded from one source line share that
-    line's number and keep their relative order (stable sort). The match-order
-    `seq` is reassigned to the sorted position so findings/witnesses rank
-    correctly; `raw`/`line` are preserved."""
+def _apply_numbering(entries: List[ACE], notes: List[str], events: "dict") -> List[ACE]:
+    """Put each ACL in device order and apply its deletions (round 8, R7-1,
+    R7-2). An ACL with no explicit number and no deletion keeps text order.
+    Otherwise every entry gets its device number (`_device_numbers`), the
+    entries are sorted by it, and a change from text order is noted. When
+    the two readings of an unnumbered remark give different orders or
+    deletions, that is noted too."""
     import dataclasses
 
     order: List[str] = []
@@ -1346,48 +1503,58 @@ def _reorder_by_sequence(entries: List[ACE], notes: List[str]) -> List[ACE]:
     out: List[ACE] = []
     for acl in order:
         group = by_acl[acl]
-        nums = [_SEQ_PREFIX.match(a.raw) for a in group]
-        if all(nums) and len(group) > 1:
-            # One sequence number = ONE entry on the device. A config that
-            # carries the same ACL twice (concatenated `show run` sections) or
-            # re-enters `10 permit ...` repeats the number: an identical
-            # re-entry is the same entry (keep the first; reporting the copy as
-            # "redundant" was noise the device never has). Different text under
-            # the same number is not modeled — keep both, marked imprecise.
-            first_line: "dict[int, tuple]" = {}
-            drop, clash = set(), set()
-            for a, m in zip(group, nums):
-                k = int(m.group(1))
-                txt = re.sub(r"\s+", " ", a.raw.strip()).lower()
-                if k not in first_line:
-                    first_line[k] = (a.line, txt)
-                elif first_line[k][0] != a.line:
-                    (drop if first_line[k][1] == txt else clash).add((k, a.line))
-                    if first_line[k][1] != txt:
-                        clash.add((k, first_line[k][0]))
-            if drop or clash:
-                if drop:
-                    notes.append(f"ACL {acl}: {len(drop)} entr(ies) repeat an existing "
-                                 f"sequence number with identical text — one entry "
-                                 f"on the device, duplicates ignored")
-                if clash:
-                    notes.append(f"ACL {acl}: sequence number(s) "
-                                 f"{sorted({k for k, _ in clash})} appear with "
-                                 f"different entries — not modeled, marked imprecise")
-                keep_i = [i for i, (a, m) in enumerate(zip(group, nums))
-                          if (int(m.group(1)), a.line) not in drop]
-                group = [dataclasses.replace(group[i], imprecise=True)
-                         if (int(nums[i].group(1)), group[i].line) in clash else group[i]
-                         for i in keep_i]
-                nums = [nums[i] for i in keep_i]
-            keyed = sorted(range(len(group)),
-                           key=lambda i: (int(nums[i].group(1)), i))
-            if keyed != list(range(len(group))):
-                group = [group[i] for i in keyed]
-                notes.append(f"ACL {acl}: entries reordered by explicit sequence "
-                             f"number to match device first-match evaluation")
-            group = [dataclasses.replace(a, seq=n)
-                     for n, a in enumerate(group, 1)]
+        evs = events.get(acl, [])
+        if acl == "(unnamed)" or not any(n is not None or k == "delete"
+                                         for k, _, n in evs):
+            out.extend(group)
+            continue
+        nums, deleted = _device_numbers(evs, True)
+        nums_b, deleted_b = _device_numbers(evs, False)
+        lines = [ln for k, ln, _ in evs if k == "entry"]
+        rank_a = sorted(lines, key=lambda ln: (nums.get(ln, 0), lines.index(ln)))
+        rank_b = sorted(lines, key=lambda ln: (nums_b.get(ln, 0), lines.index(ln)))
+        if [ln for ln in rank_a if ln not in deleted] != \
+                [ln for ln in rank_b if ln not in deleted_b]:
+            notes.append(f"ACL {acl}: the device order depends on whether an "
+                         f"unnumbered remark takes a sequence number, which is "
+                         f"not known")
+        deleted &= deleted_b
+        group = [a for a in group if a.line not in deleted]
+        # One sequence number = ONE entry on the device. A config that
+        # carries the same ACL twice (concatenated `show run` sections) or
+        # re-enters `10 permit ...` repeats the number: an identical re-entry
+        # is the same entry (keep the first; reporting the copy as
+        # "redundant" was noise the device never has). Different text under
+        # the same number is not modeled — keep both, marked imprecise.
+        first_line: "dict[int, tuple]" = {}
+        drop, clash = set(), set()
+        for a in group:
+            k = nums.get(a.line, 0)
+            txt = re.sub(r"\s+", " ", a.raw.strip()).lower()
+            if k not in first_line:
+                first_line[k] = (a.line, txt)
+            elif first_line[k][0] != a.line:
+                (drop if first_line[k][1] == txt else clash).add(a.line)
+                if first_line[k][1] != txt:
+                    clash.add(first_line[k][0])
+        if drop:
+            notes.append(f"ACL {acl}: {len(drop)} entr(ies) repeat an existing "
+                         f"sequence number with identical text — one entry "
+                         f"on the device, duplicates ignored")
+        if clash:
+            notes.append(f"ACL {acl}: sequence number(s) "
+                         f"{sorted({nums.get(ln, 0) for ln in clash})} appear with "
+                         f"different entries — not modeled, marked imprecise")
+        group = [dataclasses.replace(a, imprecise=True) if a.line in clash else a
+                 for a in group if a.line not in drop]
+        keyed = sorted(range(len(group)),
+                       key=lambda i: (nums.get(group[i].line, 0), i))
+        if keyed != list(range(len(group))):
+            group = [group[i] for i in keyed]
+            notes.append(f"ACL {acl}: entries reordered by explicit sequence "
+                         f"number (an unnumbered entry is the last number + 10) "
+                         f"to match device first-match evaluation")
+        group = [dataclasses.replace(a, seq=n) for n, a in enumerate(group, 1)]
         out.extend(group)
     return out
 
@@ -1483,11 +1650,19 @@ def _parse_std_entry(toks: List[str], seq: int, acl: str, raw: str,
     action = toks[0].lower()
     t = toks[1].lower()
     if t in ("any", "host") or "/" in toks[1]:
-        src, _, imp = _parse_addr(toks, 1)
+        src, nxt, imp = _parse_addr(toks, 1)
     elif len(toks) > 2 and _is_v4(toks[2]):
-        src, _, imp = _parse_addr(toks, 1)   # A MASK
+        src, nxt, imp = _parse_addr(toks, 1)   # A MASK
     else:
-        src, imp = _host_net(toks[1]), False  # bare address == host
+        src, nxt, imp = _host_net(toks[1]), 2, False  # bare address == host
     notes = [f"imprecise mask (treated conservatively): {raw}"] if imp else []
+    # Every token is read (round 8): after the source only `log` / `log-input`
+    # (which do not change the match) may follow. Anything else means the
+    # device rejects or reads the line differently: imprecise and noted.
+    rest = [w.lower() for w in toks[nxt:]]
+    if rest and rest not in (["log"], ["log-input"]):
+        imp = True
+        notes.append(f"unrecognized trailing word(s) {'/'.join(toks[nxt:])} in a "
+                     f"standard ACL entry — marked imprecise, verify manually: {raw}")
     return [ACE(seq=seq + 1, action=action, proto="ip", src=src, dst=_ANY_NET,
                 imprecise=imp, raw=raw, acl=acl, line=line)], notes

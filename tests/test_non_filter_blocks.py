@@ -43,8 +43,17 @@ def test_only_ip_acl_entries_are_rules():
 
 
 def test_only_the_mac_acl_is_noted():
+    """The MAC ACL is noted; so are (review of #42, round 8) the three
+    unindented global lines after `ip access-list E2`, which the lexer keeps
+    in that ACL's mode (it cannot tell whether the device left it) and the
+    parser does not read: the line-accounting ledger notes each one."""
     _, notes = parse_acls(CFG)
-    assert len(notes) == 1 and "mac access-list M1" in notes[0], notes
+    assert "mac access-list M1" in notes[0], notes
+    rest = notes[1:]
+    assert len(rest) == 3, notes
+    for no, word in ((14, "same-security-traffic"), (15, "xlate"), (16, "no arp")):
+        assert any(n.startswith(f"line {no} (`{word}") and "in ACL mode" in n
+                   for n in rest), (no, rest)
 
 
 def test_acl_after_a_block_is_still_parsed_unindented():

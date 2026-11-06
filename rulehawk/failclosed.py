@@ -39,8 +39,11 @@ from __future__ import annotations
 import ipaddress
 import re
 import unicodedata
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import (Callable, Dict, Hashable, Iterable, Iterator, List, Optional,
+                    Sequence, Set, Tuple)
 
 # --------------------------------------------------------------------------- #
 # reason codes
@@ -249,6 +252,81 @@ class Reason:
         return {"code": self.code, "message": msg}
 
 
+# --------------------------------------------------------------------------- #
+# Line accounting (review of #42, round 8)
+# --------------------------------------------------------------------------- #
+# Every line inside an object on the evaluated path ends in exactly one of two
+# states: consumed (the parser turned it into model state and read every
+# token) or noted (a parse-note, which caps the verdict below PASS). Each
+# frontend fills a Ledger: `add` puts a line in scope (from the mode or block
+# it is in, never from whether a handler read it), `consume` only where model
+# state was made, `note` where a note was written. The one central check is
+# `close`: every line in scope that is neither consumed nor noted gets a
+# note. A line both consumed and noted counts as noted.
+_LEDGERS: "ContextVar[Optional[List[Ledger]]]" = ContextVar("rulehawk_ledgers",
+                                                           default=None)
+
+
+class Ledger:
+    def __init__(self, frontend: str):
+        self.frontend = frontend
+        self.scope: Dict[Hashable, str] = {}
+        self.consumed: Set[Hashable] = set()
+        self.noted: Set[Hashable] = set()
+        self.caught: List[Hashable] = []
+        self.closed = False
+        sink = _LEDGERS.get()
+        if sink is not None:
+            sink.append(self)
+
+    def add(self, key: Hashable, text: str) -> None:
+        self.scope.setdefault(key, text)
+
+    def consume(self, key: Hashable) -> None:
+        self.consumed.add(key)
+
+    def note(self, key: Hashable, notes: Optional[List[str]] = None,
+             text: str = "") -> None:
+        self.noted.add(key)
+        if notes is not None and text:
+            notes.append(text)
+
+    def close(self, notes: List[str],
+              fmt: Optional[Callable[[Hashable, str], str]] = None,
+              cap: int = 20) -> None:
+        """Note every line in scope that no handler consumed or noted."""
+        miss = [k for k in self.scope
+                if k not in self.consumed and k not in self.noted]
+        self.caught = miss
+        for k in miss[:cap]:
+            notes.append(fmt(k, self.scope[k]) if fmt else
+                         f"{self.frontend} line {k} (`{self.scope[k][:60]}`) is not "
+                         f"read by RuleHawk: what it changes is not modelled")
+        if len(miss) > cap:
+            notes.append(f"... and {len(miss) - cap} more {self.frontend} line(s) "
+                         f"not read")
+        self.closed = True
+
+    def counts(self) -> Dict[str, int]:
+        noted = {k for k in self.scope if k in self.noted}
+        consumed = {k for k in self.scope if k in self.consumed} - noted
+        caught = set(self.caught) - noted - consumed
+        return {"scope": len(self.scope), "consumed": len(consumed),
+                "noted": len(noted), "caught": len(caught),
+                "unaccounted": len(self.scope) - len(consumed | noted | caught)}
+
+
+@contextmanager
+def collect_ledgers() -> Iterator[List[Ledger]]:
+    """Every Ledger made inside the block, for the tests."""
+    sink: List[Ledger] = []
+    tok = _LEDGERS.set(sink)
+    try:
+        yield sink
+    finally:
+        _LEDGERS.reset(tok)
+
+
 def reason_dicts(reasons: Iterable[Reason]) -> List[dict]:
     """Deduplicated, order-preserving list of reason dicts."""
     out: List[dict] = []
@@ -422,10 +500,25 @@ _ACL_ENTRY = re.compile(
 _EXIT_END = {"ex": "exit", "exi": "exit", "exit": "exit", "en": "end", "end": "end"}
 # Openers of the sub-modes `exit` can close without leaving configuration
 # mode. After any other line, or after a body RuleHawk does not check, an
-# `exit` may leave configuration mode (round 7, R6-2).
+# `exit` may leave configuration mode (round 7, R6-2). The whole opener must
+# match, with its required arguments (round 8, R7-4): `router` alone, `line`
+# alone or `control-plane xyzzy` is rejected by the device, which then runs
+# the `exit` in global mode. `_SUBMODE_WORD` is the first word only: an
+# opener that starts like one but is not fully recognised makes its `exit`
+# `ambiguous`. `management` is EOS / NX-OS only, so it is not here.
 _SUBMODE = re.compile(
-    r"(?i)^(?:router|line|route-map|class-map|policy-map|control-plane"
-    r"|vrf (?:definition|context|instance)|management|mac access-list)(?: |$)")
+    r"(?ai)^(?:router (?:ospf|ospfv3|eigrp) [0-9]+(?: vrf \S+)?"
+    r"|router bgp [0-9]+(?:\.[0-9]+)?"
+    r"|router (?:rip|isis(?: \S+)?)"
+    r"|line (?:vty|con|console|aux) [0-9]+(?: [0-9]+)?|line [0-9]+(?: [0-9]+)?"
+    r"|route-map \S+(?: (?:permit|deny))?(?: [0-9]+)?"
+    r"|class-map (?:match-any |match-all )?\S+|policy-map \S+"
+    r"|control-plane(?: host| transit| cef-exception)?"
+    r"|vrf (?:definition|context|instance) \S+"
+    r"|mac access-list (?:extended )?\S+)$")
+_SUBMODE_WORD = re.compile(
+    r"(?i)^(?:router|line|route-map|class-map|policy-map|control-plane|vrf"
+    r"|mac)(?: |$)")
 _IF_HEADER = re.compile(r"(?i)^(in(?:t(?:e(?:r(?:f(?:a(?:ce?)?)?)?)?)?)?)$")
 _ACL_HEADER = re.compile(r"(?i)^(?:ip|ipv4|ipv6) access-list(?: |$)")
 _OBJGROUP_HEADER = re.compile(r"(?i)^object-group(?: |$)")
@@ -587,7 +680,9 @@ def cisco_lex(text: str) -> CiscoLex:
                 ended = True
             elif mode in ("other", "objgroup"):
                 sub = mode == "objgroup" or bool(_SUBMODE.match(opener_norm))
-                if body:
+                if body or (not sub and _SUBMODE_WORD.match(opener_norm)):
+                    # A body RuleHawk does not check, or an opener that starts
+                    # like a sub-mode but is not fully recognised (R7-4).
                     amb.append((no, f"the mode of line {opener}", "exit"))
                 elif not sub:
                     ended = True                  # `hostname R1` / `exit`
@@ -1163,9 +1258,21 @@ def _cisco_unallowed(lex: CiscoLex) -> List[str]:
             add(f"{name}: {word} (abbreviated interface)")
     for name in lex.ranges:
         add(f"{name}: interface range")
+    # Line accounting (round 8): every line of a forwarding interface is in
+    # scope; an allowlisted line (whole line, every word) is consumed, any
+    # other is noted by this blocker.
+    led = Ledger("cisco-interface")
     for ln in lex.iface_lines(forwarding=True):
+        led.add(ln.no, ln.norm)
         if not _IF_ALLOW_RX.fullmatch(ln.norm):
             add(f"{ln.iface}: {_keyword(ln.norm)}")
+            led.note(ln.no)
+        else:
+            led.consume(ln.no)
+    rest: List[str] = []
+    led.close(rest)
+    for item in rest:
+        add(item)
     return out
 
 

@@ -389,6 +389,15 @@ class GateResult:
                 if fr.status in ("error", "no_rules_parsed")]
 
     @property
+    def failed_assertions(self) -> List[Tuple[FileResult, Finding]]:
+        """Policy assertions the audit disproved (verdict FAIL), whatever their
+        severity (review of #42, round 8). An unproven assertion already
+        blocks at every threshold; a disproven one must too, or `--fail-on
+        critical` reported PASS for a broken `must_reach`."""
+        return [(fr, f) for fr in self.files for f in fr.findings
+                if getattr(f, "verdict", None) == "FAIL" and f.accepted is None]
+
+    @property
     def undecided(self) -> List[Tuple[FileResult, Finding]]:
         """Policy assertions that could not be proven (verdict UNKNOWN). Any
         one makes the run UNKNOWN, never PASS — whatever the threshold."""
@@ -403,7 +412,7 @@ class GateResult:
             return 0
         if self.parse_failures:
             return 2
-        if self.violations:
+        if self.violations or self.failed_assertions:
             return 1
         return 3 if self.undecided else 0
 
@@ -757,8 +766,12 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
                    f"rather than assume isolation it could not verify.")
     else:
         extra = (f" plus {len(pf)} unparseable file(s)" if pf else "")
+        fa = [f for _, f in gate.failed_assertions
+              if all(f is not g for _, g in gate.violations)]
+        more = (f" and {len(fa)} failed policy assertion(s) below it (a failed "
+                f"assertion blocks at every threshold)" if fa else "")
         verdict = (f"**FAIL** — {len(gate.violations)} finding(s) at or above "
-                   f"`{gate.fail_on}`{extra} block this change.")
+                   f"`{gate.fail_on}`{more}{extra} block this change.")
     icon = "✅" if gate.passed else "❌"
     sc = gate.score
     lines: List[str] = []
@@ -1008,8 +1021,12 @@ def to_console(gate: GateResult) -> str:
         out.append(f"  VERDICT: FAIL (exit 2, fail-closed) — {n} file(s) parsed "
                    f"to zero rules; cannot certify isolation")
     else:
+        fa = [f for _, f in gate.failed_assertions
+              if all(f is not g for _, g in gate.violations)]
+        more = (f"; {len(fa)} failed policy assertion(s) below it (a failed "
+                f"assertion blocks at every threshold)" if fa else "")
         out.append(f"  VERDICT: FAIL — {len(gate.violations)} finding(s) "
-                   f">= {gate.fail_on} (threshold --fail-on {gate.fail_on})")
+                   f">= {gate.fail_on} (threshold --fail-on {gate.fail_on}){more}")
     if gate.passed and _pass_scope(gate):
         out.append(f"  SCOPE  : {_pass_scope(gate)}")
     else:

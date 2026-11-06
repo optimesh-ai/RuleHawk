@@ -52,7 +52,7 @@ import shlex
 from typing import Dict, List, Optional, Tuple
 
 from .model import ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet
-from .failclosed import split_lines
+from .failclosed import Ledger, split_lines
 from .parse import _canon_icmp_type, _port_num  # reuse IANA maps + icmp canon
 
 # iptables (`iptables -p icmp -h`) names -> RuleHawk canonical TYPE[/CODE].
@@ -919,10 +919,40 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     foreign: set = set()
     nft_depth = 0
     is_save = bool(re.search(r"(?m)^\s*\*", text))
+    # Line accounting (round 8): every line that is not blank or a comment is
+    # in scope; `close` notes each one no handler consumed.
+    led = Ledger("iptables")
+    # iptables-restore table blocks (round 8, R7-5): a block runs from a
+    # `*table` header to its `COMMIT`. iptables-restore(8) (iptables 1.8.13,
+    # https://man7.org/linux/man-pages/man8/iptables-restore.8.html) does not
+    # say what it does with a block that has no `COMMIT` or with a line
+    # outside a block, so both are noted.
+    table_open = 0                               # header line of the open block
     for lineno, raw in enumerate(split_lines(text), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        led.add(lineno, line)
+        if is_save and nft_depth == 0 and not _NFT_LINE.match(line):
+            if line.startswith("*"):
+                if table_open:
+                    led.note(lineno, notes,
+                             f"iptables-restore table block at line {table_open} "
+                             f"has no `COMMIT` before the next table header (line "
+                             f"{lineno}); what iptables-restore loads is not "
+                             f"modelled")
+                table_open = lineno
+            elif line.upper() == "COMMIT":
+                if not table_open:
+                    led.note(lineno, notes,
+                             f"`COMMIT` at line {lineno} is outside a table block")
+                table_open = 0
+            elif not table_open:
+                led.note(lineno, notes,
+                         f"iptables-restore line {lineno} (`{line.split()[0][:20]}"
+                         f" ...`) is outside a table block (before the first "
+                         f"`*table` header or after a `COMMIT`); what "
+                         f"iptables-restore does with it is not modelled")
         # Line forms neither bash nor iptables-restore reads as RuleHawk
         # would (review of #42, round 6, N5): a trailing backslash joins the
         # next line into this command (bash), and iptables-restore has no
@@ -1148,18 +1178,18 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                 or any(c in t for t in toks for c in (";", "|", "&", "`", "$("))):
             consumed.discard(lineno)
 
-    missed = [(n, ln.strip()) for n, ln in enumerate(split_lines(text), 1)
-              if ln.strip() and not ln.strip().startswith("#")
-              and (n not in consumed or n in foreign)]
-    for n, ln in missed[:_MAX_LINE_NOTES]:
-        # Only the first word is quoted: the rest of a shell line can look
-        # like an iptables option (`ssh -t "su -"`) and must not read as one.
-        notes.append(f"unmodeled line {n} (`{ln.split()[0][:40]} ...`) — not an "
-                     f"iptables filter rule, policy or chain RuleHawk models, so "
-                     f"it cannot tell what the line changes")
-    if len(missed) > _MAX_LINE_NOTES:
-        notes.append(f"... and {len(missed) - _MAX_LINE_NOTES} more unmodeled "
-                     f"line(s)")
+    if is_save and table_open:
+        led.note(table_open, notes,
+                 f"iptables-restore table block at line {table_open} has no "
+                 f"`COMMIT`; what iptables-restore loads is not modelled")
+    for n in consumed - foreign:
+        led.consume(n)
+    # Only the first word is quoted: the rest of a shell line can look like an
+    # iptables option (`ssh -t "su -"`) and must not read as one.
+    led.close(notes, lambda n, ln: (
+        f"unmodeled line {n} (`{ln.split()[0][:40]} ...`) — not an iptables "
+        f"filter rule, policy or chain RuleHawk models, so it cannot tell what "
+        f"the line changes"), cap=_MAX_LINE_NOTES)
 
     # ── Expansion: materialize each chain's ACEs in device (first-match) order.
     # Deferred until now so the -A/-I/-R splices above have already fixed each

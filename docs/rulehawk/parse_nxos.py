@@ -44,11 +44,12 @@ from .model import ACE
 from .parse import parse_acls
 
 # NX-OS-specific pattern: version with parens (7.0(3)I7(9)), feature lines,
-# per-entry statistics, or vlan configuration block.
+# or vlan configuration block. `statistics per-entry` is not a marker on its
+# own (review of #42, round 8, R7-7): it is one line inside an ACL, and an
+# IOS file that carries it is still IOS (where the line is noted).
 _NXOS_MARKERS = re.compile(
     r"(?:^version\s+\d+\.\d+\(\d+\))"           # version 9.3(10)
     r"|(?:^feature\s+\S)"                         # feature interface-vlan
-    r"|(?:\bstatistics\s+per-entry\b)"            # statistics per-entry
     r"|(?:^vlan\s+configuration\b)",              # vlan configuration 10
     re.MULTILINE | re.IGNORECASE,
 )
@@ -123,4 +124,4 @@ def parse_nxos(text: str) -> Tuple[List[ACE], List[str]]:
     tuple as every other frontend.
     """
     normalised = _NXOS_ACL_HDR_RE.sub(r"ip access-list \1", text)
-    return parse_acls(normalised)
+    return parse_acls(normalised, vendor="nxos")

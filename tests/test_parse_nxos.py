@@ -96,9 +96,13 @@ class TestDetect:
         text = "version 9.3(10)\nfeature interface-vlan\ninterface Ethernet1/1\n"
         assert detect(text) is False
 
-    def test_statistics_per_entry_marker(self):
+    def test_statistics_per_entry_is_not_a_marker_on_its_own(self):
+        """Review of #42, round 8 (R7-7): `statistics per-entry` alone does not
+        make a file NX-OS; an IOS file carrying it stays IOS, where the line
+        is noted (UNKNOWN)."""
         text = "ip access-list TEST\n  statistics per-entry\n  10 permit ip any any\n"
-        assert detect(text) is True
+        assert detect(text) is False
+        assert detect("feature interface-vlan\n" + text) is True
 
     def test_vlan_configuration_marker(self):
         text = "vlan configuration 10\nip access-list VLAN-ACL\n  permit ip any any\n"

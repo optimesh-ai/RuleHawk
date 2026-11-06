@@ -75,7 +75,7 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from .failclosed import split_lines
+from .failclosed import Ledger, split_lines
 
 from .model import ACE, ANY_PORTS, _PORTED, PortRange, _IPNet
 from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
@@ -951,9 +951,21 @@ def _parse_filter(fname: str, body: List[str], entries: List[ACE],
             raw=(f"filter {fname}: apply-groups — inherited terms not visible "
                  f"(indeterminate)"),
             acl=fname, line=0))
+    # Line accounting at term level (review of #42, round 8): a term is
+    # consumed when it made rules and wrote no note, noted when it wrote one;
+    # `Ledger.close` notes a term that did neither.
+    led = _JLEDGER.get()
     for tname, tbody in terms:
+        n0, e0 = len(notes), len(entries)
         seq = _parse_term(fname, tname, tbody, seq, entries, notes,
                           term_lines.get((fname, tname), 0), family=family)
+        if led is not None:
+            key = f"{fname}/{tname}#{len(led.scope)}"
+            led.add(key, f"filter {fname} term {tname}")
+            if len(notes) > n0:
+                led.note(key)
+            elif len(entries) > e0:
+                led.consume(key)
 
 
 def _term_line_map(text: str) -> "dict":
@@ -1156,7 +1168,24 @@ def parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
         _PREFIX_LISTS.reset(tok)
 
 
+_JLEDGER: "contextvars.ContextVar[Optional[Ledger]]" = contextvars.ContextVar(
+    "rulehawk_junos_ledger",
+                                                     default=None)
+
+
 def _parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
+    led = Ledger("junos")
+    tok = _JLEDGER.set(led)
+    try:
+        entries, notes = _parse_junos_body(text)
+    finally:
+        _JLEDGER.reset(tok)
+    led.close(notes, lambda k, t: (f"Junos {t} makes no rule and no note: what it "
+                                   f"does is not modelled"))
+    return entries, notes
+
+
+def _parse_junos_body(text: str) -> Tuple[List[ACE], List[str]]:
     entries: List[ACE] = []
     notes: List[str] = []
     rebuilt = None

@@ -63,7 +63,7 @@ import shlex
 from typing import Dict, List, Optional, Tuple
 
 from .model import ACE, ANY_PORTS, _PORTED, PortRange, _IPNet
-from .failclosed import split_lines
+from .failclosed import Ledger, split_lines
 from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
 
 _ANY_NET: _IPNet = ipaddress.ip_network("0.0.0.0/0")
@@ -866,32 +866,37 @@ _MAX_LINE_NOTES = 20
 
 
 def _note_unconsumed(numbered: "List[Tuple[int, List[str]]]", consumed: set,
-                     notes: List[str]) -> None:
-    """A note for every line no handler consumed. NAT rules get their own
-    wording (failclosed also blocks them as nat-present)."""
-    missed: List[Tuple[int, List[str]]] = []
+                     notes: List[str], noted: Optional[set] = None) -> None:
+    """Line accounting (review of #42, round 8): every line is in scope; a
+    line a handler consumed, or one in a subtree that does not change which
+    packets a rule matches, is consumed; a rule line with an unmodelled field
+    is noted; `Ledger.close` notes the rest. NAT rules get their own wording
+    (failclosed also blocks them as nat-present)."""
+    led = Ledger("panos")
+    by_no = dict(numbered)
     for lineno, toks in numbered:
-        if lineno in consumed or not toks:
+        if not toks:
             continue
-        if toks[0] == "set" and _subtree(toks) in _HARMLESS_SUBTREES:
-            continue
-        missed.append((lineno, toks))
-    for lineno, toks in missed[:_MAX_LINE_NOTES]:
-        text = " ".join(toks)
+        led.add(lineno, " ".join(toks))
+        if lineno in (noted or ()):
+            led.note(lineno)
+        elif lineno in consumed or (toks[0] == "set"
+                                    and _subtree(toks) in _HARMLESS_SUBTREES):
+            led.consume(lineno)
+
+    def fmt(lineno: int, text: str) -> str:
+        toks = by_no[lineno]
         if len(text) > 100:
             text = text[:97] + "..."
         if toks[0] == "set" and _subtree(toks).endswith("rulebase") and \
                 len(toks) > 2 and "nat" in toks:
-            notes.append(f"PAN-OS NAT rule (line {lineno}) not modeled — security "
-                         f"rules match the pre-NAT address, so a translated "
-                         f"flow is not checked: `{text}`")
-        else:
-            notes.append(f"unmodeled PAN-OS line {lineno}: `{text}` — RuleHawk "
-                         f"reads only `set` object and security-rule lines, so "
-                         f"it cannot tell what this line changes")
-    if len(missed) > _MAX_LINE_NOTES:
-        notes.append(f"... and {len(missed) - _MAX_LINE_NOTES} more unmodeled "
-                     f"PAN-OS line(s)")
+            return (f"PAN-OS NAT rule (line {lineno}) not modeled — security "
+                    f"rules match the pre-NAT address, so a translated "
+                    f"flow is not checked: `{text}`")
+        return (f"unmodeled PAN-OS line {lineno}: `{text}` — RuleHawk "
+                f"reads only `set` object and security-rule lines, so "
+                f"it cannot tell what this line changes")
+    led.close(notes, fmt, cap=_MAX_LINE_NOTES)
 
 
 def _rule_anchor(toks: List[str]) -> int:
@@ -987,6 +992,7 @@ def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
     # #42, round 3): a line skipped silently (a `delete`, an `edit` followed
     # by relative `set`s, a NAT rule) could change what the rulebase does.
     consumed: set = set()
+    noted: set = set()
 
     scope_map: dict = {}
     addresses, addr_groups, services = _collect_objects(numbered, notes, consumed,
@@ -1015,6 +1021,8 @@ def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
             order.append(key)
         unknown: List[str] = []
         fields_here = _read_fields(toks[k + 2:], unknown)
+        if unknown:
+            noted.add(lineno)
         for u in unknown:
             notes.append(f"unmodeled PAN-OS rule field '{u}' in rule {name} "
                          f"(line {lineno}) — not modeled; RuleHawk cannot tell "
@@ -1051,7 +1059,7 @@ def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
             seq = _build_rule(key[2], rules[key], seq, addresses, addr_groups,
                               services, entries, notes, rule_lines.get(key, 0), acl)
 
-    _note_unconsumed(numbered, consumed, notes)
+    _note_unconsumed(numbered, consumed, notes, noted)
 
     if not entries and re.search(r"<\s*(?:rulebase|security|entry)\b", text):
         notes.append("PAN-OS XML config detected but not yet supported — export "

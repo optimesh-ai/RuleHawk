@@ -95,4 +95,4 @@ def parse_eos(text: str) -> Tuple[List[ACE], List[str]]:
     ACL syntax and requires no additional parsing logic.
     """
     normalised = _EOS_ACL_HDR_RE.sub(r"ip access-list \1", text)
-    return parse_acls(normalised)
+    return parse_acls(normalised, vendor="eos")
