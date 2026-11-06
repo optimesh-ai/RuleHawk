@@ -123,16 +123,17 @@ run is one.
 - A removed, reset or deactivated binding -> UNKNOWN (`acl-binding-negated`):
   `no` or `default` before `ip access-group`, `ipv6 traffic-filter`,
   `ip port access-group`, `access-class` or ASA `access-group`, a top-level
-  `no interface` or `default interface`, Junos `inactive:` on an interface,
+  `no interface` or `default interface` (or `no int`, `default inte`, ...),
+  Junos `inactive:` on an interface,
   unit, family, filter binding or filter, and set-form `deactivate` /
   `delete` of an interface or a filter. The removal is not applied.
 - Cisco IOS / ASA / NX-OS / EOS interfaces are an allowlist: every line in
   an `interface` stanza other than Loopback / Null must be one that cannot
   change a transit packet's fate (the list is in the README and in
   `rulehawk/failclosed.py`, each entry with its reason). Any other line, any
-  `default` form and any abbreviated keyword (`no ip access-gr F in`) ->
-  UNKNOWN (`interface-feature-unmodeled`; the detail names the keyword, not
-  the line).
+  `default` form, any abbreviated keyword (`no ip access-gr F in`) and an
+  abbreviated `int X` header -> UNKNOWN (`interface-feature-unmodeled`; the
+  detail names the keyword, not the line).
 - Cisco features that drop, inspect, rewrite or bypass traffic outside the
   ACLs, on any line -> UNKNOWN: zone-based firewall (`zone security`,
   `zone-member security`, `zone-pair security`; `zone-firewall`), `ip

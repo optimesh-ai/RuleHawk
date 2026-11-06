@@ -95,8 +95,8 @@ The Cisco interface allowlist is: `description`, `ip address` (with
 `no ip unreachables`, `no ip proxy-arp`, `no ipv6 redirects`,
 `no ipv6 unreachables`, `cdp enable` and `no cdp enable`, each spelled in full.
 Loopback and Null interfaces carry no transit traffic and are not checked. Any
-other line on an interface is UNKNOWN with `interface-feature-unmodeled`,
-which names the line's keyword, not the line.
+other line on an interface, and an abbreviated `int X` header, is UNKNOWN with
+`interface-feature-unmodeled`, which names the line's keyword, not the line.
 **[Quickstart](docs/quickstart.md)**: install, first audit, agents (Claude, Cursor,
 NetClaw) and what to do when something goes wrong.
 
