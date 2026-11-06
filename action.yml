@@ -125,7 +125,7 @@ runs:
         set +e -f
         # ${arr[@]+...} guards the empty-array expansion: bash 3.2 (macOS
         # runners) treats "${POLICY_ARGS[@]}" as unbound under `set -u` and
-        # would abort the step before the verdict file is even written.
+        # would abort the step before the exit code is even recorded.
         python3 -m rulehawk gate ${RH_CONFIGS} \
           ${POLICY_ARGS[@]+"${POLICY_ARGS[@]}"} \
           --fail-on "${RH_FAIL_ON}" \
@@ -137,8 +137,11 @@ runs:
         set +f
 
         # Persist the verdict FIRST so nothing below can mask it (the final
-        # 'Enforce' step re-raises it after SARIF + comment have posted).
-        echo "${RC}" > "${RUNNER_TEMP:-/tmp}/rulehawk.rc"
+        # 'Enforce' step re-raises it after SARIF + comment have posted). It is
+        # this step's own output, never a file in the shared RUNNER_TEMP: a
+        # later use of the action in the same job whose gate step is skipped or
+        # aborts must find no verdict, not this one.
+        echo "exit_code=${RC}" >> "${GITHUB_OUTPUT}"
 
         # Surface paths + parsed outputs for later steps (best-effort; never abort).
         # Only advertise an artifact path when the file truly exists, so the SARIF
@@ -147,7 +150,6 @@ runs:
           [ -f "${SARIF}" ]   && echo "sarif=${SARIF}"     || echo "sarif="
           [ -f "${JSON}" ]    && echo "json=${JSON}"       || echo "json="
           [ -f "${COMMENT}" ] && echo "comment=${COMMENT}" || echo "comment="
-          echo "exit_code=${RC}"
         } >> "${GITHUB_OUTPUT}"
         python3 - "${JSON}" >> "${GITHUB_OUTPUT}" <<'PY' || true
         import json, sys
@@ -210,10 +212,13 @@ runs:
         RH_FAIL_ON: ${{ inputs.fail-on }}
         RH_WORST: ${{ steps.gate.outputs.worst }}
         RH_VERDICT: ${{ steps.gate.outputs.verdict }}
+        # This use's own gate step output: empty when that step was skipped
+        # or aborted before RuleHawk returned, whatever an earlier use left.
+        RH_RC: ${{ steps.gate.outputs.exit_code }}
       run: |
-        RC="$(cat "${RUNNER_TEMP:-/tmp}/rulehawk.rc" 2>/dev/null || echo missing)"
+        RC="${RH_RC:-missing}"
         if [ "${RC}" = "missing" ]; then
-          echo "::error title=RuleHawk gate did not complete::No verdict was recorded — the gate step aborted before RuleHawk ran. See the step log above."
+          echo "::error title=RuleHawk gate did not complete::No verdict was recorded — the gate step was skipped or aborted before RuleHawk returned. See the step log above."
           exit 1
         elif [ "${RC}" = "2" ]; then
           echo "::error title=RuleHawk gate failed (fail-closed)::One or more configs parsed to zero rules — RuleHawk will not certify isolation it could not verify. Check the vendor/format, or set the 'vendor' input."

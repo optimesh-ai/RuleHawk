@@ -49,8 +49,11 @@ same codes with its fixed critical/high threshold, so a clean config now exits
 - GitHub Action: exit 3 fails the check with an error annotation naming the
   stopgap. New outputs `verdict` and `exit-code`; `passed` is never true.
   Under `fail-on: none` the step succeeds with a warning that names the
-  verdict. If the gate step aborts before RuleHawk records an exit code, the
-  check fails with "No verdict was recorded" (0.3.1 treated that as exit 0).
+  verdict. If the gate step is skipped or aborts before RuleHawk records an
+  exit code, the check fails with "No verdict was recorded" (0.3.1 read a
+  missing exit code as 0, and could read an earlier RuleHawk step's). The exit
+  code is now the gate step's own output, not a file shared by every
+  RuleHawk step in the job.
 - The hosted page is served from the main line, not from 0.3.x; its stopgap
   ships in 0.4.1.
 
@@ -65,8 +68,9 @@ it.
 
 `fail-on: none` turns off **all** blocking, not just UNKNOWN: a FAIL (exit 1)
 and a config that parses to zero rules (exit 2) no longer fail the step
-either. To keep blocking on FAIL while UNKNOWN stays non-blocking, keep
-`fail-on` at your threshold and gate on the verdict yourself:
+either. To keep blocking on everything except UNKNOWN, keep `fail-on` at
+your threshold, let the RuleHawk step continue on error, and fail the job
+unless the step failed with exit code 3:
 
 ```yaml
 - id: rh
@@ -75,9 +79,13 @@ either. To keep blocking on FAIL while UNKNOWN stays non-blocking, keep
   with:
     configs: 'firewall/**/*.txt'
     fail-on: high
-- if: steps.rh.outputs.verdict == 'FAIL' || steps.rh.outputs.exit-code == '2'
+- if: steps.rh.outcome == 'failure' && steps.rh.outputs.exit-code != '3'
   run: exit 1
 ```
+
+This blocks on FAIL (exit 1), on exit 2, on a crash, and when the step failed
+before RuleHawk recorded an exit code (a setup failure, or "gate did not
+complete"). Only an explicit UNKNOWN (exit 3) passes.
 
 ### Other changes you may notice
 
