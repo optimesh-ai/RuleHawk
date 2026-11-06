@@ -317,24 +317,33 @@ def test_numbered_ios_acl_never_auto_detects_a_netmask():
     assert str(aces[0].src) == "192.0.2.0/24" and not aces[0].imprecise
 
 
-def test_ios_wildcard_all_ones_is_never_a_host():
-    """In an IOS wildcard context 255.255.255.255 ignores every bit: it is
-    not host A. Reading it as /32 narrowed a permit (false PASS)."""
-    from rulehawk.parse import parse_acls
-    aces, _ = parse_acls("ip access-list extended A\n"
-                         " permit ip 192.0.2.5 255.255.255.255 any\n")
-    assert aces[0].src.prefixlen == 0, aces[0]
-    aces, _ = parse_acls("access-list 110 permit ip 192.0.2.5 255.255.255.255 any\n")
-    assert aces[0].src.prefixlen == 0, aces[0]
+def test_ios_wildcard_all_ones_is_never_a_host(tmp_path):
+    """In an IOS wildcard context `A 255.255.255.255` ignores every bit: it is
+    not host A. The parser keeps the host reading (test_parse_cisco pins it),
+    so no PASS may rest on it: UNKNOWN, ios-wildcard-all-ones."""
+    pol = _pol("v4_tcp445.json")
+    # Host reading: the permit is from 203.0.113.5 only (not CORP), a
+    # would-be PASS. Wildcard reading: any source, so CORP reaches PCI.
+    for body in ("ip access-list extended A\n"
+                 " permit ip 203.0.113.5 255.255.255.255 198.51.100.0 0.0.0.255\n"
+                 "interface GigabitEthernet0/1\n ip access-group A in\n",
+                 "access-list 110 permit ip 203.0.113.5 255.255.255.255 198.51.100.0 0.0.0.255\n"
+                 "interface GigabitEthernet0/1\n ip access-group 110 in\n"):
+        cfg = tmp_path / "ones.cfg"
+        cfg.write_text(body)
+        _assert_unknown_everywhere(str(cfg), pol, "ios-wildcard-all-ones")
 
 
 def test_numbered_acl_mask_with_pix_dialect_is_ambiguous_unknown(tmp_path):
     """No `extended` keyword plus a PIX/ASA dialect marker: the mask could be
     a PIX netmask or an IOS wildcard. Truly ambiguous -> UNKNOWN."""
     cfg = tmp_path / "pix.cfg"
+    # Read as a PIX netmask the deny covers CORP -> PCI and the search finds
+    # no witness (a would-be PASS); read as an IOS wildcard it denies only
+    # the .0 addresses and the permit leaks.
     cfg.write_text("PIX Version 6.3(5)\n"
-                   "access-list 101 permit ip 192.0.2.0 255.255.255.0 198.51.100.0 255.255.255.0\n"
-                   "access-list 101 deny ip any any\n"
+                   "access-list 101 deny ip 192.0.2.0 255.255.255.0 198.51.100.0 255.255.255.0\n"
+                   "access-list 101 permit ip any any\n"
                    "access-group 101 in interface inside\n")
     rc, out = _run_cli([str(cfg), "--json", "--policy", _pol("v4_tcp445.json")])
     report = json.loads(out)
@@ -528,3 +537,20 @@ def test_no_production_surface_calls_the_raw_search():
                     and "def check_segmentation" not in line
                     and "`check_segmentation(" not in line):
                 assert "context=" in line, (rel, line)
+
+
+def test_an_unrecognised_vendor_label_never_passes():
+    """build_context with a label it has no checks for must block a PASS,
+    not silently skip every vendor-specific check."""
+    from rulehawk.failclosed import build_context
+    from rulehawk.parse import parse_acls
+    from rulehawk.segcheck import check_segmentation
+    text = ("ip access-list extended A\n permit ip host 203.0.113.9 any\n"
+            "interface GigabitEthernet0/1\n ip access-group A in\n")
+    aces, notes = parse_acls(text)
+    pol = json.load(open(_pol("v4_tcp445.json")))
+    ctx = build_context(text, aces, notes, "cisco")
+    fs = check_segmentation(aces, pol, context=ctx)
+    assert not any(f.kind in _PASS_KINDS for f in fs)
+    assert any("vendor-unknown" in [r["code"] for r in (f.reasons or [])]
+               for f in fs)
