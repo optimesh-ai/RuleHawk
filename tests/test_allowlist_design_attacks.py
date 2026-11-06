@@ -7,9 +7,20 @@ Fixtures are in tests/fixtures/fail_closed/variants/design:
 - cfg3/: 52 configs from round 3 aimed at the non-Cisco path, rows in
   EXPECTED-r3.tsv. Two of them (i09, p10) may PASS by design and are only
   checked for their assertion verdict (_MAY_PASS);
-- controls/: positive controls. They PASS today and must stay all-clear on
-  every surface. Without them, a build that answered UNKNOWN to everything
-  would pass this file.
+- cfg4/: 2 configs from the v4 delta check (p17, p18), rows in
+  EXPECTED-r4.tsv. Both PASS on the #42 engine at a6d9d61;
+- controls/: positive controls. They must be all-clear on every surface
+  once PASS is restored (design v4, slice 9). Without them, a build that
+  answered UNKNOWN to everything would pass this file.
+
+The base is #44, the 0.4.1 fail-closed stopgap, under which no surface ever
+emits PASS. So until slice 9:
+- the controls' all-clear tests, and i09's PASS verdict, are
+  `xfail(strict=True, raises=AssertionError)` with reason "stopgap: no
+  PASS", and their stopgap observations are pinned (_STOPGAP_CONTROL for
+  the observations, _STOPGAP_MAY_PASS for i09);
+- the per-assertion verdict is read from the findings, because the stopgap
+  removed the JSON key `assertion_verdict`.
 
 All addresses are RFC 5737.
 
@@ -34,11 +45,12 @@ How the red cells are kept honest (review round 2, M10):
 - when phase 2 fixes a cell, its strict xfail and its pinned test both fail
   until the cell is taken out of _RED;
 - the phase-3 gate runs this file with RULEHAWK_PHASE3_GATE=1, which fails
-  while _RED is not empty.
+  while _RED, _RED_B, _STOPGAP_CONTROL or _STOPGAP_MAY_PASS is not empty.
 """
 
 from __future__ import annotations
 
+import collections
 import io
 import json
 import os
@@ -140,6 +152,9 @@ _ATTACKS = {
     "cfg3/p14_panos_pci_nexthop_on_corp_segment.set": ("v4_ip.json", {"UNKNOWN"}),
     "cfg3/p15_panos_disabled_deny.set": ("v4_ip.json", {"FAIL"}),
     "cfg3/p16_panos_negate_source_deny.set": ("v4_ip.json", {"FAIL", "UNKNOWN"}),
+    # v4 delta check (EXPECTED-r4.tsv): static-route next hops, R4-M1, R4-H1
+    "cfg4/p17_panos_default_route_via_corp_segment.set": ("v4_ip.json", {"UNKNOWN"}),
+    "cfg4/p18_panos_recursive_nexthop_via_corp_segment.set": ("v4_ip.json", {"UNKNOWN"}),
 }
 
 # Round-3 files whose expected answer includes PASS: i09 (PASS with the
@@ -213,6 +228,7 @@ def _quiet(fn, *a):
 _SEG = {"segmentation-ok": "PASS", "segmentation-violation": "FAIL",
         "connectivity-ok": "PASS", "connectivity-broken": "FAIL"}
 _ASSERTION_KINDS = ("segmentation-", "connectivity-")
+_ASSERTION_OK = frozenset(k for k, v in _SEG.items() if v == "PASS")
 
 
 def _assertion_of(gate_json: dict) -> str:
@@ -232,8 +248,9 @@ def _assert_bad(a: str, allowed) -> bool:
 
 
 def _obs_cli_json(path, pol, _tmp):
+    # The stopgap removed `assertion_verdict`; read the assertion findings.
     _, out = _quiet(cli.main, [path, "--json", "--policy", _pol(pol)])
-    return json.loads(out)["assertion_verdict"]
+    return _assertion_of({"files": [json.loads(out)]})
 
 
 def _obs_cli_text(path, pol, _tmp):
@@ -288,8 +305,10 @@ def _obs_sarif(path, pol, _tmp):
     gate = g.run_gate([path], _policy(pol), fail_on="high")
     ids = sorted({r["ruleId"] for r in json.loads(g.to_sarif(gate))["runs"][0]["results"]})
     # Only a result about the assertion (or an uncertified file) shows that
-    # the assertion is not clean; a hygiene result does not.
-    seg = [i for i in ids if i.startswith(_ASSERTION_KINDS) or i == "rulehawk/uncertified"]
+    # the assertion is not clean. A hygiene result does not, and neither does
+    # a segmentation-ok or connectivity-ok result (review v4 delta, R4-L3).
+    seg = [i for i in ids if (i.startswith(_ASSERTION_KINDS) and i not in _ASSERTION_OK)
+           or i == "rulehawk/uncertified"]
     return f"results={len(ids)} assertion_results={','.join(seg) or 'none'}"
 
 
@@ -344,7 +363,8 @@ def _obs_hosted(path, pol, _tmp):
         cfg = fh.read()
     with open(_pol(pol), encoding="utf-8") as fh:
         ptxt = fh.read()
-    return _run_hosted(_analyze_py(_read(_WORKER)), cfg, ptxt)["report_json"]["assertion_verdict"]
+    r = _run_hosted(_analyze_py(_read(_WORKER)), cfg, ptxt)["report_json"]
+    return _assertion_of({"files": [r]})
 
 
 # name -> (observer, bad(obs, allowed, rel), good(obs) or None)
@@ -377,704 +397,268 @@ def _observe(surface, rel, pol, tmp_path):
     return _SURFACES[surface][0](_p(rel), pol, tmp_path)
 
 
-# Red at 49c4e89 (engine code as at b18261d): (file, surface) -> today's
-# exact observation. Each cell is a strict xfail in test_attack_surface and
-# is pinned by test_red_cell_is_pinned.
+# Red at e04630e, the head of #44 (the 0.4.1 fail-closed stopgap): (file,
+# surface) -> the exact observation there. The stopgap clears every
+# PASS-shaped cell. These 97 are left, all on two surfaces (93 on the
+# round 1-3 files, as at 85c83fe, plus 4 on cfg4):
+# - 49 mcp_audit `coverage=complete` on files that are UNKNOWN, or that are
+#   not certifiable (design v2 section 3.1: complete means file-certified);
+# - 48 sarif with no assertion result: an UNKNOWN run whose SARIF is empty
+#   or holds only hygiene results.
+# Slice 2 (design v4 section 12) turns all of them green. Each cell is a
+# strict xfail in test_attack_surface and is pinned by test_red_cell_is_pinned.
 _RED = {
-    # cfg/a02_ios_seq_reorder_permit_first.cfg
-    ('cfg/a02_ios_seq_reorder_permit_first.cfg',
-     'mcp_compare'): 'NO_NEW_RISK/audit=FAIL',
+    # cfg/a01_ios_no_ip_access_list_after_bind.cfg
+    ('cfg/a01_ios_no_ip_access_list_after_bind.cfg',
+     'sarif'): 'results=0 assertion_results=none',
+    ('cfg/a01_ios_no_ip_access_list_after_bind.cfg',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a03_ios_remark_only_acl.cfg
+    ('cfg/a03_ios_remark_only_acl.cfg',
+     'sarif'): 'results=0 assertion_results=none',
     ('cfg/a03_ios_remark_only_acl.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a04_ios_description_holds_binding_text.cfg
     ('cfg/a04_ios_description_holds_binding_text.cfg',
+     'sarif'): 'results=0 assertion_results=none',
+    ('cfg/a04_ios_description_holds_binding_text.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a05_ios_banner_delim_midline.cfg
+    ('cfg/a05_ios_banner_delim_midline.cfg',
+     'sarif'): 'results=0 assertion_results=none',
     ('cfg/a05_ios_banner_delim_midline.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a06_ios_portchannel_member_binding.cfg
     ('cfg/a06_ios_portchannel_member_binding.cfg',
+     'sarif'): 'results=0 assertion_results=none',
+    ('cfg/a06_ios_portchannel_member_binding.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a07_ios_subinterface_parent_binding.cfg
+    ('cfg/a07_ios_subinterface_parent_binding.cfg',
+     'sarif'): 'results=0 assertion_results=none',
     ('cfg/a07_ios_subinterface_parent_binding.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a08_ios_alias_shutdown_reenable.cfg
     ('cfg/a08_ios_alias_shutdown_reenable.cfg',
+     'sarif'): 'results=0 assertion_results=none',
+    ('cfg/a08_ios_alias_shutdown_reenable.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a09_ios_out_only_bindings_platform.cfg
     ('cfg/a09_ios_out_only_bindings_platform.cfg',
-     'cli_json'): 'PASS',
-    ('cfg/a09_ios_out_only_bindings_platform.cfg',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg/a09_ios_out_only_bindings_platform.cfg',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg/a09_ios_out_only_bindings_platform.cfg',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a09_ios_out_only_bindings_platform.cfg',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a09_ios_out_only_bindings_platform.cfg',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a09_ios_out_only_bindings_platform.cfg',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a09_ios_out_only_bindings_platform.cfg',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a09_ios_out_only_bindings_platform.cfg',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg/a09_ios_out_only_bindings_platform.cfg',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg/a09_ios_out_only_bindings_platform.cfg',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg/a09_ios_out_only_bindings_platform.cfg',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg/a09_ios_out_only_bindings_platform.cfg',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg/a09_ios_out_only_bindings_platform.cfg',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a10_ios_crlf_tab_in_deny.cfg
     ('cfg/a10_ios_crlf_tab_in_deny.cfg',
-     'cli_json'): 'PASS',
-    ('cfg/a10_ios_crlf_tab_in_deny.cfg',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg/a10_ios_crlf_tab_in_deny.cfg',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg/a10_ios_crlf_tab_in_deny.cfg',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a10_ios_crlf_tab_in_deny.cfg',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a10_ios_crlf_tab_in_deny.cfg',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a10_ios_crlf_tab_in_deny.cfg',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a10_ios_crlf_tab_in_deny.cfg',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a10_ios_crlf_tab_in_deny.cfg',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg/a10_ios_crlf_tab_in_deny.cfg',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg/a10_ios_crlf_tab_in_deny.cfg',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg/a10_ios_crlf_tab_in_deny.cfg',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg/a10_ios_crlf_tab_in_deny.cfg',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg/a10_ios_crlf_tab_in_deny.cfg',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a11_ios_excerpt_bytecount_mismatch.cfg
     ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
-     'cli_json'): 'PASS',
-    ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a12_ios_reach_urpf_inert_ruling.cfg
+    ('cfg/a12_ios_reach_urpf_inert_ruling.cfg',
+     'sarif'): 'results=0 assertion_results=none',
     ('cfg/a12_ios_reach_urpf_inert_ruling.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/g01_ios_accepted_violation_gate.cfg
     ('cfg/g01_ios_accepted_violation_gate.cfg',
-     'cli_text'): 'rc=0 pass_line=False',
-    ('cfg/g01_ios_accepted_violation_gate.cfg',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=FAIL',
-    ('cfg/g01_ios_accepted_violation_gate.cfg',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=FAIL',
-    ('cfg/g01_ios_accepted_violation_gate.cfg',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=FAIL',
-    ('cfg/g01_ios_accepted_violation_gate.cfg',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=FAIL',
-    ('cfg/g01_ios_accepted_violation_gate.cfg',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=FAIL',
-    ('cfg/g01_ios_accepted_violation_gate.cfg',
-     'gate_cli'): 'rc=0 assert=FAIL',
-    ('cfg/g01_ios_accepted_violation_gate.cfg',
-     'mcp_audit'): 'PASS/seg_passed=0/coverage=complete',
-    ('cfg/g01_ios_accepted_violation_gate.cfg',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg/g01_ios_accepted_violation_gate.cfg',
-     'combine'): 'rc=0 verdict=PASS proven_line=False',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
+    # cfg/i01_iptables_exit_before_drop.sh
+    ('cfg/i01_iptables_exit_before_drop.sh',
+     'sarif'): 'results=0 assertion_results=none',
+    ('cfg/i01_iptables_exit_before_drop.sh',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/n01_nxos_unlisted_admin_state.cfg
+    ('cfg/n01_nxos_unlisted_admin_state.cfg',
+     'sarif'): 'results=0 assertion_results=none',
     ('cfg/n01_nxos_unlisted_admin_state.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/p01_panos_object_named_like_literal.set
     ('cfg/p01_panos_object_named_like_literal.set',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
-    ('cfg/p01_panos_object_named_like_literal.set',
-     'mcp_compare'): 'NO_NEW_RISK/audit=FAIL',
+    # cfg/s01_asa_control_plane_binding.cfg
+    ('cfg/s01_asa_control_plane_binding.cfg',
+     'sarif'): 'results=0 assertion_results=none',
+    ('cfg/s01_asa_control_plane_binding.cfg',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_01_ios_version_contradicts_declared_release.cfg
     ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
-     'cli_json'): 'PASS',
-    ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_02_ios_svi_only_dialect_declared.cfg
     ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
-     'cli_json'): 'PASS',
-    ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_03_ios_svi_secondary_same_vlan.cfg
     ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
-     'cli_json'): 'PASS',
-    ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_04_ios_pacl_then_no_switchport.cfg
+    ('cfg2/r2_04_ios_pacl_then_no_switchport.cfg',
+     'sarif'): 'results=0 assertion_results=none',
     ('cfg2/r2_04_ios_pacl_then_no_switchport.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg
     ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
-     'cli_json'): 'PASS',
-    ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_06_ios_banner_single_line_close.cfg
+    ('cfg2/r2_06_ios_banner_single_line_close.cfg',
+     'sarif'): 'results=0 assertion_results=none',
     ('cfg2/r2_06_ios_banner_single_line_close.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_07_ios_banner_caret_literal.cfg
     ('cfg2/r2_07_ios_banner_caret_literal.cfg',
-     'cli_json'): 'PASS',
-    ('cfg2/r2_07_ios_banner_caret_literal.cfg',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg2/r2_07_ios_banner_caret_literal.cfg',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg2/r2_07_ios_banner_caret_literal.cfg',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_07_ios_banner_caret_literal.cfg',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_07_ios_banner_caret_literal.cfg',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_07_ios_banner_caret_literal.cfg',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_07_ios_banner_caret_literal.cfg',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_07_ios_banner_caret_literal.cfg',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg2/r2_07_ios_banner_caret_literal.cfg',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg2/r2_07_ios_banner_caret_literal.cfg',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg2/r2_07_ios_banner_caret_literal.cfg',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg2/r2_07_ios_banner_caret_literal.cfg',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg2/r2_07_ios_banner_caret_literal.cfg',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_08_ios_binding_name_case_folded.cfg
+    ('cfg2/r2_08_ios_binding_name_case_folded.cfg',
+     'sarif'): 'results=0 assertion_results=none',
     ('cfg2/r2_08_ios_binding_name_case_folded.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg
     ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
-     'cli_json'): 'PASS',
-    ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg
     ('cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg',
-     'cli_text'): 'rc=0 pass_line=False',
-    ('cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=FAIL',
-    ('cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=FAIL',
-    ('cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=FAIL',
-    ('cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=FAIL',
-    ('cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=FAIL',
-    ('cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg',
-     'gate_cli'): 'rc=0 assert=FAIL',
-    ('cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg',
-     'mcp_audit'): 'PASS/seg_passed=0/coverage=complete',
-    ('cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg',
-     'combine'): 'rc=0 verdict=PASS proven_line=False',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
+    # cfg3/i07_iptables_heredoc_not_executed.sh
+    ('cfg3/i07_iptables_heredoc_not_executed.sh',
+     'sarif'): 'results=1 assertion_results=none',
+    ('cfg3/i07_iptables_heredoc_not_executed.sh',
+     'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
+    # cfg3/i11_iptables_function_never_called.sh
+    ('cfg3/i11_iptables_function_never_called.sh',
+     'sarif'): 'results=1 assertion_results=none',
+    ('cfg3/i11_iptables_function_never_called.sh',
+     'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
+    # cfg3/i16_iptables_conditional_drop.sh
+    ('cfg3/i16_iptables_conditional_drop.sh',
+     'sarif'): 'results=1 assertion_results=none',
+    ('cfg3/i16_iptables_conditional_drop.sh',
+     'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
+    # cfg3/i17_iptables_save_two_filter_blocks.rules
+    ('cfg3/i17_iptables_save_two_filter_blocks.rules',
+     'sarif'): 'results=1 assertion_results=none',
+    ('cfg3/i17_iptables_save_two_filter_blocks.rules',
+     'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
+    # cfg3/i18_iptables_save_invalid_line_aborts.rules
+    ('cfg3/i18_iptables_save_invalid_line_aborts.rules',
+     'sarif'): 'results=1 assertion_results=none',
     # cfg3/k04_junos_interface_range_unfiltered.conf
+    ('cfg3/k04_junos_interface_range_unfiltered.conf',
+     'sarif'): 'results=1 assertion_results=none',
     ('cfg3/k04_junos_interface_range_unfiltered.conf',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/k05_junos_delete_annotation_binding.conf
     ('cfg3/k05_junos_delete_annotation_binding.conf',
-     'cli_json'): 'PASS',
-    ('cfg3/k05_junos_delete_annotation_binding.conf',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg3/k05_junos_delete_annotation_binding.conf',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg3/k05_junos_delete_annotation_binding.conf',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k05_junos_delete_annotation_binding.conf',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k05_junos_delete_annotation_binding.conf',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k05_junos_delete_annotation_binding.conf',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k05_junos_delete_annotation_binding.conf',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k05_junos_delete_annotation_binding.conf',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg3/k05_junos_delete_annotation_binding.conf',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg3/k05_junos_delete_annotation_binding.conf',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg3/k05_junos_delete_annotation_binding.conf',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg3/k05_junos_delete_annotation_binding.conf',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg3/k05_junos_delete_annotation_binding.conf',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/k10_junos_comment_holds_cisco_lines.conf
     ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
-     'cli_json'): 'PASS',
-    ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/k11_polyglot_ios_in_junos_comment.conf
     ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
-     'cli_json'): 'PASS',
-    ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/k12_polyglot_veto_dodging_forms.conf
     ('cfg3/k12_polyglot_veto_dodging_forms.conf',
-     'cli_json'): 'PASS',
-    ('cfg3/k12_polyglot_veto_dodging_forms.conf',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg3/k12_polyglot_veto_dodging_forms.conf',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg3/k12_polyglot_veto_dodging_forms.conf',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k12_polyglot_veto_dodging_forms.conf',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k12_polyglot_veto_dodging_forms.conf',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k12_polyglot_veto_dodging_forms.conf',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k12_polyglot_veto_dodging_forms.conf',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k12_polyglot_veto_dodging_forms.conf',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg3/k12_polyglot_veto_dodging_forms.conf',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg3/k12_polyglot_veto_dodging_forms.conf',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg3/k12_polyglot_veto_dodging_forms.conf',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg3/k12_polyglot_veto_dodging_forms.conf',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg3/k12_polyglot_veto_dodging_forms.conf',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/k13_junos_irb_both_zones_one_unit.conf
     ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
-     'cli_json'): 'PASS',
-    ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
+    # cfg3/k14_ios_banner_holds_junos.cfg
+    ('cfg3/k14_ios_banner_holds_junos.cfg',
+     'sarif'): 'results=0 assertion_results=none',
+    ('cfg3/k14_ios_banner_holds_junos.cfg',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/k15_junos_pci_nexthop_on_corp_segment.conf
     ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
-     'cli_json'): 'PASS',
-    ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
-     'gate_cli'): 'rc=0 assert=PASS',
-    ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/k16_junos_coloc_masked_by_other_finding.conf
-    ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
-     'cli_json'): 'PASS',
-    ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
-     'cli_text'): 'rc=1 pass_line=True',
-    ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
-     'gate_critical'): 'FAIL/passed=False/json_passed=False/exit=1/check_mark=False/assert=PASS',
-    ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
-     'gate_high'): 'FAIL/passed=False/json_passed=False/exit=1/check_mark=False/assert=PASS',
-    ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
-     'gate_medium'): 'FAIL/passed=False/json_passed=False/exit=1/check_mark=False/assert=PASS',
-    ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
-     'gate_low'): 'FAIL/passed=False/json_passed=False/exit=1/check_mark=False/assert=PASS',
-    ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
-     'gate_none'): 'ADVISORY/passed=False/json_passed=False/exit=0/check_mark=False/assert=PASS',
-    ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
-     'gate_cli'): 'rc=1 assert=PASS',
     ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
      'sarif'): 'results=1 assertion_results=none',
     ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
-     'mcp_audit'): 'FAIL/seg_passed=1/coverage=complete',
-    ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
-     'mcp_compare'): 'NO_NEW_RISK/audit=FAIL',
-    ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
-     'combine'): 'rc=1 verdict=FAIL proven_line=True',
-    ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
+    # cfg3/k17_junos_apply_groups_wildcard_unit.conf
+    ('cfg3/k17_junos_apply_groups_wildcard_unit.conf',
+     'sarif'): 'results=0 assertion_results=none',
     # cfg3/k18_junos_replace_tag_subtree_save.conf
-    ('cfg3/k18_junos_replace_tag_subtree_save.conf',
-     'cli_json'): 'PASS',
-    ('cfg3/k18_junos_replace_tag_subtree_save.conf',
-     'cli_text'): 'rc=1 pass_line=True',
-    ('cfg3/k18_junos_replace_tag_subtree_save.conf',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg3/k18_junos_replace_tag_subtree_save.conf',
-     'gate_critical'): 'FAIL/passed=False/json_passed=False/exit=1/check_mark=False/assert=PASS',
-    ('cfg3/k18_junos_replace_tag_subtree_save.conf',
-     'gate_high'): 'FAIL/passed=False/json_passed=False/exit=1/check_mark=False/assert=PASS',
-    ('cfg3/k18_junos_replace_tag_subtree_save.conf',
-     'gate_medium'): 'FAIL/passed=False/json_passed=False/exit=1/check_mark=False/assert=PASS',
-    ('cfg3/k18_junos_replace_tag_subtree_save.conf',
-     'gate_low'): 'FAIL/passed=False/json_passed=False/exit=1/check_mark=False/assert=PASS',
-    ('cfg3/k18_junos_replace_tag_subtree_save.conf',
-     'gate_none'): 'ADVISORY/passed=False/json_passed=False/exit=0/check_mark=False/assert=PASS',
-    ('cfg3/k18_junos_replace_tag_subtree_save.conf',
-     'gate_cli'): 'rc=1 assert=PASS',
     ('cfg3/k18_junos_replace_tag_subtree_save.conf',
      'sarif'): 'results=2 assertion_results=none',
     ('cfg3/k18_junos_replace_tag_subtree_save.conf',
-     'mcp_audit'): 'FAIL/seg_passed=1/coverage=complete',
-    ('cfg3/k18_junos_replace_tag_subtree_save.conf',
-     'mcp_compare'): 'NO_NEW_RISK/audit=FAIL',
-    ('cfg3/k18_junos_replace_tag_subtree_save.conf',
-     'combine'): 'rc=1 verdict=FAIL proven_line=True',
-    ('cfg3/k18_junos_replace_tag_subtree_save.conf',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/k19_junos_inactive_binding.conf
+    ('cfg3/k19_junos_inactive_binding.conf',
+     'sarif'): 'results=0 assertion_results=none',
     ('cfg3/k19_junos_inactive_binding.conf',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/p02_panos_rule_type_interzone_deny.set
     ('cfg3/p02_panos_rule_type_interzone_deny.set',
+     'sarif'): 'results=1 assertion_results=none',
+    ('cfg3/p02_panos_rule_type_interzone_deny.set',
+     'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
+    # cfg3/p04_panos_move_rule_top.set
+    ('cfg3/p04_panos_move_rule_top.set',
+     'sarif'): 'results=1 assertion_results=none',
+    ('cfg3/p04_panos_move_rule_top.set',
+     'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
+    # cfg3/p06_panos_shared_object_shadowed.set
+    ('cfg3/p06_panos_shared_object_shadowed.set',
+     'sarif'): 'results=1 assertion_results=none',
+    ('cfg3/p06_panos_shared_object_shadowed.set',
+     'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
+    # cfg3/p08_panos_dnat_prenat_destination.set
+    ('cfg3/p08_panos_dnat_prenat_destination.set',
+     'sarif'): 'results=1 assertion_results=none',
+    ('cfg3/p08_panos_dnat_prenat_destination.set',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/p11_panos_list_attr_set_twice.set
     ('cfg3/p11_panos_list_attr_set_twice.set',
-     'cli_json'): 'PASS',
-    ('cfg3/p11_panos_list_attr_set_twice.set',
-     'cli_text'): 'rc=1 pass_line=True',
-    ('cfg3/p11_panos_list_attr_set_twice.set',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg3/p11_panos_list_attr_set_twice.set',
-     'gate_critical'): 'FAIL/passed=False/json_passed=False/exit=1/check_mark=False/assert=PASS',
-    ('cfg3/p11_panos_list_attr_set_twice.set',
-     'gate_high'): 'FAIL/passed=False/json_passed=False/exit=1/check_mark=False/assert=PASS',
-    ('cfg3/p11_panos_list_attr_set_twice.set',
-     'gate_medium'): 'FAIL/passed=False/json_passed=False/exit=1/check_mark=False/assert=PASS',
-    ('cfg3/p11_panos_list_attr_set_twice.set',
-     'gate_low'): 'FAIL/passed=False/json_passed=False/exit=1/check_mark=False/assert=PASS',
-    ('cfg3/p11_panos_list_attr_set_twice.set',
-     'gate_none'): 'ADVISORY/passed=False/json_passed=False/exit=0/check_mark=False/assert=PASS',
-    ('cfg3/p11_panos_list_attr_set_twice.set',
-     'gate_cli'): 'rc=1 assert=PASS',
-    ('cfg3/p11_panos_list_attr_set_twice.set',
      'sarif'): 'results=1 assertion_results=none',
     ('cfg3/p11_panos_list_attr_set_twice.set',
-     'mcp_audit'): 'FAIL/seg_passed=1/coverage=complete',
-    ('cfg3/p11_panos_list_attr_set_twice.set',
-     'mcp_compare'): 'NO_NEW_RISK/audit=FAIL',
-    ('cfg3/p11_panos_list_attr_set_twice.set',
-     'combine'): 'rc=1 verdict=FAIL proven_line=True',
-    ('cfg3/p11_panos_list_attr_set_twice.set',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/p14_panos_pci_nexthop_on_corp_segment.set
-    ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
-     'cli_json'): 'PASS',
-    ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
-     'cli_text'): 'rc=0 pass_line=True',
-    ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
-     'cli_evidence'): 'VERIFIED',
-    ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
-     'gate_critical'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
-     'gate_high'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
-     'gate_medium'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
-     'gate_low'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
-     'gate_none'): 'PASS/passed=True/json_passed=True/exit=0/check_mark=True/assert=PASS',
-    ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
-     'gate_cli'): 'rc=0 assert=PASS',
     ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
      'sarif'): 'results=0 assertion_results=none',
     ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
-     'mcp_audit'): 'PASS/seg_passed=1/coverage=complete',
-    ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
-     'mcp_compare'): 'NO_NEW_RISK/audit=PASS',
-    ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
-     'combine'): 'rc=0 verdict=PASS proven_line=True',
-    ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
-     'hosted'): 'PASS',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
+    # cfg4/p17_panos_default_route_via_corp_segment.set
+    ('cfg4/p17_panos_default_route_via_corp_segment.set',
+     'sarif'): 'results=0 assertion_results=none',
+    ('cfg4/p17_panos_default_route_via_corp_segment.set',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
+    # cfg4/p18_panos_recursive_nexthop_via_corp_segment.set
+    ('cfg4/p18_panos_recursive_nexthop_via_corp_segment.set',
+     'sarif'): 'results=0 assertion_results=none',
+    ('cfg4/p18_panos_recursive_nexthop_via_corp_segment.set',
+     'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
 }
 
-# Red boundary cells at 49c4e89: (file, --vendor) -> today's observation.
-_RED_B = {
-    # cfg/a09_ios_out_only_bindings_platform.cfg
-    ('cfg/a09_ios_out_only_bindings_platform.cfg', 'auto'): 'PASS/assert=PASS',
-    ('cfg/a09_ios_out_only_bindings_platform.cfg', 'ios-asa'): 'PASS/assert=PASS',
-    # cfg/a10_ios_crlf_tab_in_deny.cfg
-    ('cfg/a10_ios_crlf_tab_in_deny.cfg', 'auto'): 'PASS/assert=PASS',
-    ('cfg/a10_ios_crlf_tab_in_deny.cfg', 'ios-asa'): 'PASS/assert=PASS',
-    # cfg/a11_ios_excerpt_bytecount_mismatch.cfg
-    ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg', 'auto'): 'PASS/assert=PASS',
-    ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg', 'ios-asa'): 'PASS/assert=PASS',
-    # cfg/g01_ios_accepted_violation_gate.cfg
-    ('cfg/g01_ios_accepted_violation_gate.cfg', 'auto'): 'PASS/assert=FAIL',
-    ('cfg/g01_ios_accepted_violation_gate.cfg', 'ios-asa'): 'PASS/assert=FAIL',
-    ('cfg/g01_ios_accepted_violation_gate.cfg', 'nxos'): 'PASS/assert=FAIL',
-    ('cfg/g01_ios_accepted_violation_gate.cfg', 'eos'): 'PASS/assert=FAIL',
-    # cfg2/r2_01_ios_version_contradicts_declared_release.cfg
-    ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg', 'auto'): 'PASS/assert=PASS',
-    ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg', 'ios-asa'): 'PASS/assert=PASS',
-    # cfg2/r2_02_ios_svi_only_dialect_declared.cfg
-    ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg', 'auto'): 'PASS/assert=PASS',
-    ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg', 'ios-asa'): 'PASS/assert=PASS',
-    # cfg2/r2_03_ios_svi_secondary_same_vlan.cfg
-    ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg', 'auto'): 'PASS/assert=PASS',
-    ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg', 'ios-asa'): 'PASS/assert=PASS',
-    # cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg
-    ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg', 'auto'): 'PASS/assert=PASS',
-    ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg', 'ios-asa'): 'PASS/assert=PASS',
-    # cfg2/r2_07_ios_banner_caret_literal.cfg
-    ('cfg2/r2_07_ios_banner_caret_literal.cfg', 'auto'): 'PASS/assert=PASS',
-    ('cfg2/r2_07_ios_banner_caret_literal.cfg', 'ios-asa'): 'PASS/assert=PASS',
-    # cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg
-    ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg', 'auto'): 'PASS/assert=PASS',
-    ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg', 'ios-asa'): 'PASS/assert=PASS',
-    # cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg
-    ('cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg', 'auto'): 'PASS/assert=FAIL',
-    ('cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg', 'ios-asa'): 'PASS/assert=FAIL',
-    ('cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg', 'nxos'): 'PASS/assert=FAIL',
-    ('cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg', 'eos'): 'PASS/assert=FAIL',
-    # cfg3/k10_junos_comment_holds_cisco_lines.conf
-    ('cfg3/k10_junos_comment_holds_cisco_lines.conf', 'auto'): 'PASS/assert=PASS',
-    ('cfg3/k10_junos_comment_holds_cisco_lines.conf', 'junos'): 'PASS/assert=PASS',
-    # cfg3/k11_polyglot_ios_in_junos_comment.conf
-    ('cfg3/k11_polyglot_ios_in_junos_comment.conf', 'auto'): 'PASS/assert=PASS',
-    ('cfg3/k11_polyglot_ios_in_junos_comment.conf', 'junos'): 'PASS/assert=PASS',
-    # cfg3/k12_polyglot_veto_dodging_forms.conf
-    ('cfg3/k12_polyglot_veto_dodging_forms.conf', 'auto'): 'PASS/assert=PASS',
-    ('cfg3/k12_polyglot_veto_dodging_forms.conf', 'junos'): 'PASS/assert=PASS',
-}
+# Red boundary cells: (file, --vendor) -> the exact observation. None at
+# e04630e: the stopgap never gives a gate PASS, under any --vendor value. The
+# 32 cells that were red on the #42 engine (49c4e89) are green here.
+_RED_B: dict = {}
 
 
 # The B boundary (design v3 section 1.2, review r3 H1): every Cisco-family
@@ -1102,8 +686,10 @@ def _boundary_bad(obs):
     return v in ("PASS", "ACCEPTED") or "PASS" in a[len("assert="):].split(",")
 
 
-# Non-assertion findings each attack file carries at 49c4e89 (review r3, M5
-# lint). Each one belongs to the file's review row:
+# Non-assertion findings each attack file carries, counted per kind (review
+# r3 M5 lint; counts per review v4 delta R4-L3). Counts are as at e04630e;
+# the kinds are the same as on the #42 engine at 49c4e89. Each one belongs
+# to the file's review row:
 # - permit-any-any: the row's trailing allow-all, which turns a lost deny
 #   into reach (k16 adds it to k13 on purpose, as the masking probe);
 # - intent-inversion-deny-dead: the attacked deny, shown dead;
@@ -1112,45 +698,45 @@ def _boundary_bad(obs):
 # Because the exit-code predicates read the assertion, these findings no
 # longer hide a false PASS (k16, k18, p11).
 _ROW_FINDINGS = {
-    'cfg/a02_ios_seq_reorder_permit_first.cfg': ('intent-inversion-deny-dead',),
-    'cfg/p01_panos_object_named_like_literal.set': ('intent-inversion-deny-dead',),
-    'cfg3/i02_iptables_goto_falls_to_policy.sh': ('permit-any-any',),
-    'cfg3/i03_iptables_limit_on_drop.sh': ('permit-any-any',),
-    'cfg3/i04_iptables_return_in_user_chain.sh': ('permit-any-any',),
-    'cfg3/i05_iptables_policy_twice.sh': ('permit-any-any',),
-    'cfg3/i07_iptables_heredoc_not_executed.sh': ('permit-any-any',),
-    'cfg3/i08_iptables_fragment_only_drop.sh': ('permit-any-any',),
-    'cfg3/i10_iptables_lowercase_chain.sh': ('permit-any-any',),
-    'cfg3/i11_iptables_function_never_called.sh': ('permit-any-any',),
-    'cfg3/i12_iptables_time_window_drop.sh': ('permit-any-any',),
-    'cfg3/i14_iptables_insert_accept_top.sh': ('intent-inversion-deny-dead',),
-    'cfg3/i15_iptables_shell_var_reassigned.sh': ('permit-any-any',),
-    'cfg3/i16_iptables_conditional_drop.sh': ('permit-any-any',),
-    'cfg3/i17_iptables_save_two_filter_blocks.rules': ('permit-any-any',),
-    'cfg3/i18_iptables_save_invalid_line_aborts.rules': ('permit-any-any',),
-    'cfg3/i19_iptables_iprange_partial.sh': ('permit-any-any',),
-    'cfg3/k01_junos_count_only_term.conf': ('intent-inversion-deny-dead',),
-    'cfg3/k02_junos_noncontiguous_mask.conf': ('permit-any-any',),
-    'cfg3/k03_junos_dscp_narrowed_deny.conf': ('permit-any-any',),
-    'cfg3/k04_junos_interface_range_unfiltered.conf': ('permit-any-any',),
-    'cfg3/k06_junos_apply_path_prefix_list.conf': ('permit-any-any',),
-    'cfg3/k07_junos_prefix_list_except.conf': ('permit-any-any',),
-    'cfg3/k08_junos_set_deactivate_term.set': ('permit-any-any',),
-    'cfg3/k09_junos_policer_term.conf': ('permit-any-any',),
-    'cfg3/k16_junos_coloc_masked_by_other_finding.conf': ('permit-any-any',),
-    'cfg3/k18_junos_replace_tag_subtree_save.conf': ('permit-any-any', 'redundant',),
-    'cfg3/p02_panos_rule_type_interzone_deny.set': ('permit-any-any',),
-    'cfg3/p04_panos_move_rule_top.set': ('permit-any-any',),
-    'cfg3/p05_panos_vsys_split_rulebase.set': ('permit-any-any',),
-    'cfg3/p06_panos_shared_object_shadowed.set': ('permit-any-any',),
-    'cfg3/p07_panos_ip_range_partial.set': ('permit-any-any',),
-    'cfg3/p08_panos_dnat_prenat_destination.set': ('permit-any-any',),
-    'cfg3/p09_panos_zone_defined_twice.set': ('permit-any-any',),
-    'cfg3/p11_panos_list_attr_set_twice.set': ('permit-any-any',),
-    'cfg3/p12_panos_post_rulebase_before_local.set': ('permit-any-any',),
-    'cfg3/p13_panos_edl_source.set': ('permit-any-any',),
-    'cfg3/p15_panos_disabled_deny.set': ('permit-any-any',),
-    'cfg3/p16_panos_negate_source_deny.set': ('permit-any-any',),
+    'cfg/a02_ios_seq_reorder_permit_first.cfg': {'intent-inversion-deny-dead': 1},
+    'cfg/p01_panos_object_named_like_literal.set': {'intent-inversion-deny-dead': 1},
+    'cfg3/i02_iptables_goto_falls_to_policy.sh': {'permit-any-any': 1},
+    'cfg3/i03_iptables_limit_on_drop.sh': {'permit-any-any': 1},
+    'cfg3/i04_iptables_return_in_user_chain.sh': {'permit-any-any': 1},
+    'cfg3/i05_iptables_policy_twice.sh': {'permit-any-any': 1},
+    'cfg3/i07_iptables_heredoc_not_executed.sh': {'permit-any-any': 1},
+    'cfg3/i08_iptables_fragment_only_drop.sh': {'permit-any-any': 1},
+    'cfg3/i10_iptables_lowercase_chain.sh': {'permit-any-any': 1},
+    'cfg3/i11_iptables_function_never_called.sh': {'permit-any-any': 1},
+    'cfg3/i12_iptables_time_window_drop.sh': {'permit-any-any': 1},
+    'cfg3/i14_iptables_insert_accept_top.sh': {'intent-inversion-deny-dead': 1},
+    'cfg3/i15_iptables_shell_var_reassigned.sh': {'permit-any-any': 1},
+    'cfg3/i16_iptables_conditional_drop.sh': {'permit-any-any': 1},
+    'cfg3/i17_iptables_save_two_filter_blocks.rules': {'permit-any-any': 3},
+    'cfg3/i18_iptables_save_invalid_line_aborts.rules': {'permit-any-any': 2},
+    'cfg3/i19_iptables_iprange_partial.sh': {'permit-any-any': 1},
+    'cfg3/k01_junos_count_only_term.conf': {'intent-inversion-deny-dead': 1},
+    'cfg3/k02_junos_noncontiguous_mask.conf': {'permit-any-any': 1},
+    'cfg3/k03_junos_dscp_narrowed_deny.conf': {'permit-any-any': 1},
+    'cfg3/k04_junos_interface_range_unfiltered.conf': {'permit-any-any': 1},
+    'cfg3/k06_junos_apply_path_prefix_list.conf': {'permit-any-any': 1},
+    'cfg3/k07_junos_prefix_list_except.conf': {'permit-any-any': 1},
+    'cfg3/k08_junos_set_deactivate_term.set': {'permit-any-any': 1},
+    'cfg3/k09_junos_policer_term.conf': {'permit-any-any': 1},
+    'cfg3/k16_junos_coloc_masked_by_other_finding.conf': {'permit-any-any': 1},
+    'cfg3/k18_junos_replace_tag_subtree_save.conf': {'permit-any-any': 1, 'redundant': 1},
+    'cfg3/p02_panos_rule_type_interzone_deny.set': {'permit-any-any': 1},
+    'cfg3/p04_panos_move_rule_top.set': {'permit-any-any': 1},
+    'cfg3/p05_panos_vsys_split_rulebase.set': {'permit-any-any': 2},
+    'cfg3/p06_panos_shared_object_shadowed.set': {'permit-any-any': 1},
+    'cfg3/p07_panos_ip_range_partial.set': {'permit-any-any': 1},
+    'cfg3/p08_panos_dnat_prenat_destination.set': {'permit-any-any': 1},
+    'cfg3/p09_panos_zone_defined_twice.set': {'permit-any-any': 1},
+    'cfg3/p11_panos_list_attr_set_twice.set': {'permit-any-any': 1},
+    'cfg3/p12_panos_post_rulebase_before_local.set': {'permit-any-any': 1},
+    'cfg3/p13_panos_edl_source.set': {'permit-any-any': 1},
+    'cfg3/p15_panos_disabled_deny.set': {'permit-any-any': 1},
+    'cfg3/p16_panos_negate_source_deny.set': {'permit-any-any': 1},
 }
 
 
@@ -1180,7 +766,7 @@ def _boundary_params():
 
 def test_fixture_dirs_hold_exactly_the_listed_files():
     listed = set(_ATTACKS) | set(_CONTROLS) | set(_MAY_PASS)
-    for sub in ("cfg", "cfg2", "cfg3", "controls"):
+    for sub in ("cfg", "cfg2", "cfg3", "cfg4", "controls"):
         on_disk = {f"{sub}/{n}" for n in os.listdir(os.path.join(_D, sub))}
         want = {k for k in listed if k.startswith(sub + "/")}
         assert on_disk == want, sorted(on_disk ^ want)
@@ -1192,6 +778,8 @@ def test_red_cells_are_real_cells():
     for rel, v in _RED_B:
         assert rel in _B_FILES and v in _VENDORS, (rel, v)
     assert _CERTIFIABLE_FAIL <= set(_ATTACKS)
+    for rel in _STOPGAP_MAY_PASS:
+        assert _MAY_PASS[rel][1] == {"PASS"}, rel
 
 
 @pytest.mark.parametrize("rel,surface", list(_attack_params()))
@@ -1223,14 +811,57 @@ def test_b_boundary_red_cell_is_pinned(rel, vendor):
 
 @pytest.mark.parametrize("rel", sorted(_ATTACKS), ids=lambda r: _id(r, "findings"))
 def test_attack_file_carries_no_second_finding(rel):
+    # Counts per kind, not a set of kinds (review v4 delta, R4-L3): a second
+    # finding of a kind the row already has must fail too.
     pol, _ = _ATTACKS[rel]
     d = json.loads(g.to_json(g.run_gate([_p(rel)], _policy(pol), fail_on="high")))
-    kinds = sorted({x["kind"] for f in d["files"] for x in f["findings"]
-                    if not x["kind"].startswith(_ASSERTION_KINDS)})
-    assert kinds == sorted(_ROW_FINDINGS.get(rel, ())), (rel, kinds)
+    kinds = collections.Counter(x["kind"] for f in d["files"] for x in f["findings"]
+                                if not x["kind"].startswith(_ASSERTION_KINDS))
+    assert dict(kinds) == _ROW_FINDINGS.get(rel, {}), (rel, dict(kinds))
 
 
-@pytest.mark.parametrize("rel", sorted(_MAY_PASS), ids=lambda r: _id(r, "verdict"))
+# Under #44's stopgap no surface emits PASS (0.4.1), so the tests that need
+# one are strict xfails until slice 9 (design v4, section 12) restores PASS
+# where a certificate holds. A crash still fails (raises=AssertionError).
+_STOPGAP_XFAIL = pytest.mark.xfail(strict=True, raises=AssertionError,
+                                   reason="stopgap: no PASS")
+
+# What those tests see under the stopgap, pinned so the xfail cannot absorb
+# a different wrong answer (review round 2, M10). Every control gives the same
+# observation per surface. i09's verdict is pinned as "verdict", and the
+# controls' gate verdict under --vendor auto as "boundary".
+_STOPGAP_CONTROL = {
+    "cli_json": "UNKNOWN",
+    "cli_text": "rc=3 pass_line=False",
+    "cli_evidence": "INDETERMINATE",
+    "gate_critical": "UNKNOWN/passed=False/json_passed=False/exit=3/check_mark=False/assert=UNKNOWN",
+    "gate_high": "UNKNOWN/passed=False/json_passed=False/exit=3/check_mark=False/assert=UNKNOWN",
+    "gate_medium": "UNKNOWN/passed=False/json_passed=False/exit=3/check_mark=False/assert=UNKNOWN",
+    "gate_low": "UNKNOWN/passed=False/json_passed=False/exit=3/check_mark=False/assert=UNKNOWN",
+    "gate_none": "UNKNOWN/passed=False/json_passed=False/exit=0/check_mark=False/assert=UNKNOWN",
+    "gate_cli": "rc=3 assert=UNKNOWN",
+    "mcp_audit": "UNKNOWN/seg_passed=0/coverage=complete",
+    "mcp_compare": "UNKNOWN/audit=UNKNOWN",
+    "combine": "rc=2 verdict=UNKNOWN proven_line=False",
+    "hosted": "UNKNOWN",
+    "boundary": "UNKNOWN/assert=UNKNOWN",
+    "verdict": "UNKNOWN",
+}
+# _MAY_PASS files whose PASS verdict is an xfail under the stopgap (i09).
+# Slice 9 empties this set; i09's allowed verdicts stay {"PASS"}.
+_STOPGAP_MAY_PASS = frozenset({"cfg3/i09_iptables_restore_noflush.rules"})
+
+
+def _control_params():
+    for r in sorted(_CONTROLS):
+        for s in _SURFACES:
+            if _SURFACES[s][2] is not None:
+                yield pytest.param(r, s, id=f"{os.path.basename(r).split('_')[0]}-{s}")
+
+
+@pytest.mark.parametrize("rel", [
+    pytest.param(r, marks=[_STOPGAP_XFAIL] if r in _STOPGAP_MAY_PASS else [],
+                 id=_id(r, "verdict")) for r in sorted(_MAY_PASS)])
 def test_may_pass_file_verdict(rel, tmp_path):
     pol, allowed = _MAY_PASS[rel]
     for s in ("cli_json", "hosted"):
@@ -1238,21 +869,35 @@ def test_may_pass_file_verdict(rel, tmp_path):
         assert obs in allowed, (rel, s, obs)
 
 
-@pytest.mark.parametrize("rel,surface",
-                         [(r, s) for r in sorted(_CONTROLS) for s in _SURFACES
-                          if _SURFACES[s][2] is not None],
-                         ids=[f"{os.path.basename(r).split('_')[0]}-{s}"
-                              for r in sorted(_CONTROLS) for s in _SURFACES
-                              if _SURFACES[s][2] is not None])
+@pytest.mark.parametrize("rel", sorted(_STOPGAP_MAY_PASS), ids=lambda r: _id(r, "verdict"))
+def test_may_pass_stopgap_verdict_is_pinned(rel, tmp_path):
+    pol, _ = _MAY_PASS[rel]
+    for s in ("cli_json", "hosted"):
+        assert _observe(s, rel, pol, tmp_path) == _STOPGAP_CONTROL["verdict"], (rel, s)
+
+
+@_STOPGAP_XFAIL
+@pytest.mark.parametrize("rel,surface", list(_control_params()))
 def test_positive_control_is_all_clear(rel, surface, tmp_path):
     obs = _observe(surface, rel, _CONTROLS[rel], tmp_path)
     assert _SURFACES[surface][2](obs), (rel, surface, obs)
 
 
+@pytest.mark.parametrize("rel,surface", list(_control_params()))
+def test_positive_control_stopgap_observation_is_pinned(rel, surface, tmp_path):
+    assert _observe(surface, rel, _CONTROLS[rel], tmp_path) == _STOPGAP_CONTROL[surface]
+
+
+@_STOPGAP_XFAIL
 @pytest.mark.parametrize("rel,vendor", [(r, "auto") for r in sorted(_CONTROLS)],
                          ids=lambda x: str(x))
 def test_positive_control_boundary(rel, vendor):
     assert _obs_boundary_control(rel, vendor) == "PASS/assert=PASS"
+
+
+@pytest.mark.parametrize("rel", sorted(_CONTROLS), ids=lambda x: str(x))
+def test_positive_control_boundary_stopgap_is_pinned(rel):
+    assert _obs_boundary_control(rel, "auto") == _STOPGAP_CONTROL["boundary"]
 
 
 def _obs_boundary_control(rel, vendor):
@@ -1264,3 +909,6 @@ def _obs_boundary_control(rel, vendor):
                     reason="phase-3 gate only (design v3, section 9)")
 def test_phase3_gate_no_red_cell_left():
     assert not _RED and not _RED_B, (sorted(_RED), sorted(_RED_B))
+    # Slice 9 removes the stopgap xfails (_STOPGAP_CONTROL, _STOPGAP_MAY_PASS)
+    # along with the stopgap.
+    assert not _STOPGAP_CONTROL and not _STOPGAP_MAY_PASS
