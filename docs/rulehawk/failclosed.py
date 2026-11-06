@@ -170,8 +170,9 @@ REASONS: Dict[str, str] = {
         "`ipv6 policy route-map`, `ip local policy`, `service-policy type pbr`); "
         "it can send traffic to another interface or Null0 and is not modeled",
     "mpls-forwarding":
-        "MPLS or a pseudowire is configured (`mpls ip`, `tag-switching ip`, "
-        "`mpls bgp forwarding`, `xconnect`, `l2vpn`, `pseudowire`); labelled or "
+        "MPLS or a pseudowire is configured (any `mpls ...` line such as "
+        "`mpls ip` or `mpls label protocol`, `tag-switching`, `xconnect`, "
+        "`l2vpn`, `pseudowire`); labelled or "
         "cross-connected traffic is not filtered by the IP ACLs modeled here",
     "reach-not-every-context":
         "one audited rule context permits the whole flow but another denies "
@@ -833,8 +834,8 @@ _CISCO_FEATURES = [
         r"(?im)^\s*((?:ip|ipv6)\s+(?:local\s+)?policy\s+route-map|"
         r"service-policy\s+type\s+pbr)\b")),
     ("mpls-forwarding", re.compile(
-        r"(?im)^\s*(mpls\s+ip|mpls\s+bgp\s+forwarding|tag-switching\s+ip|"
-        r"xconnect|l2vpn|pseudowire)\b")),
+        r"(?im)^\s*(mpls\s+[a-z-]+|tag-switching\s+[a-z-]+|xconnect|l2vpn|"
+        r"pseudowire)\b")),
 ]
 
 
