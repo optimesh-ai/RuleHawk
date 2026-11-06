@@ -46,8 +46,15 @@ def test_only_the_mac_acl_is_noted():
     """The MAC ACL is noted; so are (review of #42, round 8) the three
     unindented global lines after `ip access-list E2`, which the lexer keeps
     in that ACL's mode (it cannot tell whether the device left it) and the
-    parser does not read: the line-accounting ledger notes each one."""
+    parser does not read: the line-accounting ledger notes each one.
+
+    Round 10 (R9-1): read as IOS (`parse_acls`' default), the two untyped
+    headers `ip access-list E1` / `E2` are not in the IOS grammar and are
+    noted as well; nothing else is."""
     _, notes = parse_acls(CFG)
+    hdr = [n for n in notes if "not in the IOS grammar" in n]
+    assert [n.split("`")[1] for n in hdr] == ["ip access-list E1", "ip access-list E2"], notes
+    notes = [n for n in notes if n not in hdr]
     assert "mac access-list M1" in notes[0], notes
     rest = notes[1:]
     assert len(rest) == 3, notes

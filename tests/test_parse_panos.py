@@ -554,10 +554,14 @@ def test_pre_post_ordering_is_per_vsys():
     assert [a.action for a in v2] == ["permit"]
 
 
-# ── Multi-line service definition: ports UNION, never last-wins ───────────────
-# `set service s protocol tcp port 443` then `... port 445` — on the device `s`
-# now matches BOTH ports (a set on a list node appends). Last-wins kept only 445,
-# so a must_not_reach on 443 FALSE-PASSED. Ports must accumulate to the union.
+# ── Multi-line service definition: never last-wins, never a silent union ─────
+# `set service s protocol tcp port 443` then `... port 445`. Last-wins kept only
+# 445, so a must_not_reach on 443 FALSE-PASSED. The union (rounds 1-9) was the
+# other guess: `port` holds ONE value (several ports are one comma-separated
+# value, PAN-OS Objects > Services), and whether a second `set` replaces or
+# merges it is not cited (review of #42, round 10, R9-2: the union false-PASSED
+# a must_reach and a deny). So the service is unresolved: noted, the rule
+# imprecise, and no assertion on either port can PASS.
 
 def test_multiline_service_ports_accumulate_no_false_pass():
     cfg = """
@@ -565,31 +569,29 @@ def test_multiline_service_ports_accumulate_no_false_pass():
     set service s protocol tcp port 445
     set rulebase security rules leak from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service s action allow
     """
-    aces, _ = parse_panos(cfg)
-    # Both declared ports are modeled, each an exact ACE.
-    assert {(a.dst_port.lo, a.dst_port.hi) for a in aces} == {(443, 443), (445, 445)}
-    assert all(a.proto == "tcp" and a.imprecise is False for a in aces)
-    # must_not_reach on the port the last-wins bug DROPPED (443): must NOT PASS.
-    pol443 = {"zones": _SEG_POLICY["zones"],
-              "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp",
-                                  "ports": [443]}]}
-    kinds443 = {f.kind for f in check_segmentation(aces, pol443)}
-    assert "segmentation-ok" not in kinds443, (
-        "dropped port 443 must not certify isolation")
-    assert "segmentation-violation" in kinds443
-    # The retained port (445) still leaks too.
-    kinds445 = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
-    assert "segmentation-violation" in kinds445
+    aces, notes = parse_panos(cfg)
+    assert any("service 's' port is set more than once" in n for n in notes), notes
+    assert aces and all(a.imprecise for a in aces)
+    # Neither port is certified isolated (443 was the last-wins false PASS).
+    for port in (443, 445):
+        pol = {"zones": _SEG_POLICY["zones"],
+               "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp",
+                                   "ports": [port]}]}
+        assert "segmentation-ok" not in {f.kind for f in check_segmentation(aces, pol)}
 
 
 def test_multiline_service_single_line_list_still_unions():
-    # Regression guard: the single-LINE `port 443,445` case is unchanged, and a
-    # following multi-LINE `port 8443` extends it (union of all three).
-    cfg = """
+    # The single-LINE `port 443,445` is one value and stays exact; a following
+    # multi-LINE `port 8443` is a second value (round 10, R9-2): noted, the
+    # service unresolved and the rule imprecise.
+    one = """
     set service s protocol tcp port 443,445
-    set service s protocol tcp port 8443
     set rulebase security rules r from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service s action allow
     """
-    aces, _ = parse_panos(cfg)
-    assert {a.dst_port.lo for a in aces} == {443, 445, 8443}
+    aces, notes = parse_panos(one)
+    assert {a.dst_port.lo for a in aces} == {443, 445} and not notes
     assert all(a.proto == "tcp" and a.imprecise is False for a in aces)
+    aces, notes = parse_panos(one.replace(
+        "port 443,445\n", "port 443,445\n    set service s protocol tcp port 8443\n"))
+    assert any("service 's' port is set more than once" in n for n in notes), notes
+    assert aces and all(a.imprecise for a in aces)

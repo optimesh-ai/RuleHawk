@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rulehawk import cli  # noqa: E402
 from rulehawk import gate as g  # noqa: E402
+from test_fail_closed_review10 import _T_MARK  # noqa: E402
 
 try:
     from rulehawk.failclosed import collect_ledgers  # noqa: E402
@@ -78,6 +79,12 @@ def _corpus() -> List[Tuple[str, str]]:
                     # the reviewer's round-8 and round-9 drivers
                     pol = ("v6_ip.json" if base.startswith("v6") else
                            "v4_tcp445.json" if "tcp445" in base else pol)
+                if os.sep + "r9" + os.sep in path:
+                    # the reviewer's round-10 driver (rev42-r9/pol.sh)
+                    m = re.search(r"_(reach)?(tcp|udp)(\d+)", base)
+                    pol = (("must_reach" if m.group(1) else "must_not_reach")
+                           + f"_{m.group(2)}{m.group(3)}.json" if m else
+                           "v6_ip.json" if base.startswith("v6") else pol)
                 out.append((path, os.path.join(_POL, pol)))
     for path in sorted(glob.glob(os.path.join(_ROOT, "samples", "*"))):
         if not path.endswith("policy.json"):
@@ -558,15 +565,190 @@ def _separators(lines: List[str]) -> Iterator[Mutant]:
                    _j(lines[:i] + [ln[:k] + ch + ln[k:]] + lines[i + 1:]), "never", None)
 
 
+# --------------------------------------------------------------------------- #
+# Round 10 families (review-rh42-r9.md). None comes from rulehawk's grammars:
+# the labels come from the other dialect's cited grammar, or from "the file
+# no longer says which device reads it".
+# --------------------------------------------------------------------------- #
+# Lines that say which Cisco dialect wrote the file (the test's own list, the
+# citations are in test_fail_closed_review10.py).
+_MARKER_LINE = re.compile(
+    r"(?i)^\s*(?:!\s*command:|!\s*device:|!\s*time:|!\s*running configuration|"
+    r"building configuration|current configuration\s*:|version\s|"
+    r"boot-start-marker|boot-end-marker|boot system|asa version|pix version|"
+    r":\s*saved|:\s*hardware|feature\s|vlan configuration\b|"
+    r"management api http-commands)")
+_TYPED_HDR = re.compile(r"(?im)^(\s*ip access-list) (?:extended|standard) ")
+_UNTYPED_HDR = re.compile(r"(?m)^ip access-list (?!extended\b|standard\b|resequence\b|"
+                          r"logging\b|persistent\b|role-based\b|helper\b)\S+\s*$")
+_FLAT_OR_SHOW = re.compile(r"(?im)^(?:access-list\s|(?:ip|ipv6) access list\s)")
+_BANNER_IOS = "Building configuration...\n\nCurrent configuration : 900 bytes\n!\nversion 15.2\n!"
+_BANNER_EOS = "! Command: show running-config\n! device: r1 (vEOS, EOS-4.30.0F)\n!"
+_BANNER_NX = ("!Command: show running-config\n\nversion 9.3(10) Bios:version 05.45\n"
+              "feature interface-vlan")
+
+
+def _strip_markers(lines: List[str]) -> List[str]:
+    return [_TYPED_HDR.sub(r"\1 ", ln) for ln in lines if not _MARKER_LINE.match(ln)]
+
+
+def _cisco_dialect(lines: List[str], vendor: str) -> Iterator[Mutant]:
+    """R9-1, R9-3. A PASS needs the dialect to be positively identified."""
+    text = _j(lines)
+    if not _FLAT_OR_SHOW.search(text):
+        # Banners, version, feature and boot lines removed and headers
+        # untyped: no line says which device reads the file. Never.
+        stripped = _strip_markers(lines)
+        if stripped != lines:
+            yield ("cisco-marker-strip", vendor, _j(stripped), "never", None)
+    if vendor == "ios-asa":
+        # IOS: `ip access-list {standard | extended} NAME` (Catalyst 9400
+        # IOS XE 16.10 command reference); a bound named ACL that does not
+        # exist passes every packet (IOS XE 16.11 ACL guide). An untyped
+        # header in an IOS file: never.
+        for i, ln in enumerate(lines):
+            if _TYPED_HDR.match(ln):
+                yield ("cisco-untyped-header", f"{i + 1}",
+                       _j(lines[:i] + [_TYPED_HDR.sub(r"\1 ", ln)] + lines[i + 1:]), "never", None)
+        if _TYPED_HDR.search(text) or re.search(r"(?m)^access-list\s", text):
+            # An IOS body under an EOS banner (EOS grammar: not cited) or an
+            # NX-OS banner (NX-OS: `ip access-list access-list-name`, no
+            # type, no numbered lists). Never.
+            yield ("cisco-dialect-transplant", "ios-body+eos-banner",
+                   _BANNER_EOS + "\n" + text, "never", None)
+            yield ("cisco-dialect-transplant", "ios-body+nxos-banner",
+                   _BANNER_NX + "\n" + text, "never", None)
+    elif _UNTYPED_HDR.search(text) and not _FLAT_OR_SHOW.search(text):
+        # An NX-OS / EOS body, its markers gone, under an IOS banner: the
+        # untyped header is not in the IOS grammar. Never.
+        yield ("cisco-dialect-transplant", f"{vendor}-body+ios-banner",
+               _BANNER_IOS + "\n" + _j(_strip_markers(lines)), "never", None)
+
+
+_PA_RULE = re.compile(r'^(set (?:.*? )?rules (?:"[^"]*"|\S+))(?: (.*))?$')
+_PA_OPP = {"allow": "deny", "deny": "allow", "drop": "allow", "reset-client": "allow",
+           "reset-server": "allow", "reset-both": "allow", "yes": "no", "no": "yes"}
+
+
+def _panos_leaf(lines: List[str]) -> Iterator[Mutant]:
+    """R9-2, R9-5. A field that holds one value, set a second time with a
+    different value, and `any` with a member added. The replace / merge
+    semantics are not cited: never."""
+    text = _j(lines)
+    svcs = re.findall(r"(?m)^set (?:.*? )?service (\S+) protocol ", text)
+
+    def after(i: int, extra: str) -> str:
+        return _j(lines[:i + 1] + [extra] + lines[i + 1:])
+
+    for i, ln in enumerate(lines):
+        m = re.match(r"^(set (?:.*? )?service \S+ protocol )(tcp|udp)( .*)$", ln)
+        if m:
+            other = "udp" if m.group(2) == "tcp" else "tcp"
+            yield ("panos-leaf-dup", f"{i + 1}:protocol",
+                   after(i, m.group(1) + other + m.group(3)), "never", None)
+            for leaf in ("port", "source-port"):
+                pm = re.search(rf"\b{leaf} (\S+)", m.group(3))
+                if pm:
+                    new = "1" if pm.group(1) != "1" else "2"
+                    yield ("panos-leaf-dup", f"{i + 1}:{leaf}",
+                           after(i, f"{m.group(1)}{m.group(2)} {leaf} {new}"), "never", None)
+        m = re.match(r"^(set (?:.*? )?address \S+) (ip-netmask|ip-range|fqdn) (\S+)$", ln)
+        if m:
+            new = "203.0.113.0/24" if m.group(3) != "203.0.113.0/24" else "203.0.113.128/25"
+            yield ("panos-leaf-dup", f"{i + 1}:address",
+                   after(i, f"{m.group(1)} ip-netmask {new}"), "never", None)
+        m = _PA_RULE.match(ln)
+        if m and m.group(2):
+            rest = " " + m.group(2)
+            for leaf in ("action", "disabled", "negate-source", "negate-destination"):
+                lm = re.search(rf" {leaf} (\S+)", rest)
+                if lm and lm.group(1) in _PA_OPP:
+                    yield ("panos-leaf-dup", f"{i + 1}:{leaf}",
+                           after(i, f"{m.group(1)} {leaf} {_PA_OPP[lm.group(1)]}"), "never", None)
+            for leaf in ("source", "destination"):
+                if re.search(rf" {leaf} any\b", rest):
+                    yield ("panos-any-plus-member", f"{i + 1}:{leaf}",
+                           after(i, f"{m.group(1)} {leaf} 203.0.113.0/24"), "never", None)
+                    yield ("panos-any-plus-member", f"{i + 1}:{leaf}-bracket",
+                           _j(lines[:i] + [m.group(1) + re.sub(
+                               rf" {leaf} any\b", f" {leaf} [ any 203.0.113.0/24 ]", rest, count=1)]
+                              + lines[i + 1:]), "never", None)
+            if re.search(r" service any\b", rest) and svcs:
+                yield ("panos-any-plus-member", f"{i + 1}:service",
+                       after(i, f"{m.group(1)} service {svcs[0]}"), "never", None)
+
+
+def _junos_leaf(lines: List[str]) -> Iterator[Mutant]:
+    """R9-2 for Junos. Juniper, "filter (Applying to a Logical Interface)":
+    `input filter-name`, "Name of one filter to evaluate when packets are
+    received on the interface". A second `input` / `output` on the same
+    unit and family, naming another filter: never."""
+    text = _j(lines)
+    cmt = _junos_comments(text)
+    extra = "ZZOPEN"
+    d = next((m for m in re.finditer(r"(?m)^([ \t]*)filter\s+[A-Za-z0-9_.-]+\s*\{", text)
+              if not cmt[m.start(0) + len(m.group(1))]), None)
+    if d is not None:
+        ins = d.start(0)
+        # The added filter permits nothing, so on its own it never turns the
+        # answer: the second `input` / `output` naming it is the change.
+        t2 = text[:ins] + f"{d.group(1)}filter {extra} {{ term t {{ then discard; }} }}\n" + text[ins:]
+        cmt2 = _junos_comments(t2)
+        for k, m in enumerate(re.finditer(r"\b(input|output)\s+[^;\s{}]+\s*;", t2)):
+            if cmt2[m.start()] or not re.search(r"filter\s*\{[^{}]*$", t2[:m.start()]):
+                continue
+            t = t2[:m.end()] + f" {m.group(1)} {extra};" + t2[m.end():]
+            yield ("junos-leaf-dup", f"brace{k}", t, "never", None)
+    for i, ln in enumerate(lines):
+        m = re.match(r"^(set (?:.* )?interfaces \S+ unit \S+ family (\S+) filter (input|output)) "
+                     r"(\S+)\s*$", ln)
+        if m:
+            t = _j(lines[:i + 1] + [f"{m.group(1)} {extra}"] + lines[i + 1:]
+                   + [f"set firewall family {m.group(2)} filter {extra} term t then discard"])
+            yield ("junos-leaf-dup", f"set{i + 1}", t, "never", None)
+
+
+_IPT_OPT = [("-s", "203.0.113.0/24"), ("-d", "203.0.113.0/24"), ("-i", "zz9"),
+            ("-o", "zz9"), ("-p", None), ("--dport", "1"), ("--sport", "1"), ("-j", None)]
+
+
+def _iptables_leaf(lines: List[str]) -> Iterator[Mutant]:
+    """One rule option given twice. xshared.c set_option: "multiple -%c
+    flags not allowed"; a match option marked XTF_ONLY_ONCE: "Only one of
+    --dport allowed" (libxtables). The command is rejected: never."""
+    for i, ln in enumerate(lines):
+        if not re.match(r"^\s*(?:ip6?tables\s+)?-[AI]\s+\S+", ln):
+            continue
+        for opt, val in _IPT_OPT:
+            m = re.search(rf"(?<!\S){re.escape(opt)} (\S+)", ln)
+            if not m:
+                continue
+            v = val
+            if opt == "-p":
+                v = "udp" if m.group(1) != "udp" else "tcp"
+            elif opt == "-j":
+                v = "DROP" if m.group(1) == "ACCEPT" else "ACCEPT"
+            elif v == m.group(1):
+                v = "2"
+            new = ln[:m.end()] + f" {opt} {v}" + ln[m.end():]
+            yield ("ipt-option-dup", f"{i + 1}:{opt}", _j(lines[:i] + [new] + lines[i + 1:]),
+                   "never", None)
+
+
 def mutants(text: str, vendor: str) -> Iterator[Mutant]:
     lines = text.split("\n")
     if vendor in _CISCO:
         yield from _cisco(lines, vendor)
+        yield from _cisco_dialect(lines, vendor)
     fam = (_iptables if vendor == "iptables" else
            _panos if vendor == "panos" else _junos if vendor == "junos" else
            _aws if vendor == "aws-sg" else None)
     if fam:
         yield from fam(lines)
+    leaf = (_iptables_leaf if vendor == "iptables" else _panos_leaf if vendor == "panos"
+            else _junos_leaf if vendor == "junos" else None)
+    if leaf:
+        yield from leaf(lines)
     yield from _separators(lines)
 
 
@@ -581,6 +763,7 @@ class _Runner:
         self.policies: Dict[str, dict] = {}
         self.ledger: Counter = Counter()
         self.ledger_bad: List[str] = []
+        self.marker_bad: List[str] = []
 
     def path_for(self, text: str, ext: str) -> str:
         self.n += 1
@@ -601,7 +784,13 @@ class _Runner:
             else:
                 with collect_ledgers() as leds, redirect_stdout(buf):
                     cli.main([p, "--json", "--policy", pol])
-            v_cli = json.loads(buf.getvalue())["assertion_verdict"] or "NONE"
+            rep = json.loads(buf.getvalue())
+            v_cli = rep["assertion_verdict"] or "NONE"
+            # Round 10 (R9-1, R9-3): a Cisco PASS rests on a marker the
+            # dialect writes, by the test's own cited list.
+            if v_cli == "PASS" and rep.get("vendor") in _T_MARK and \
+                    not _T_MARK[rep["vendor"]].search(text):
+                self.marker_bad.append(f"m{self.n} {rep['vendor']}: PASS with no dialect marker")
             # The line-accounting invariant on every mutant (round 8): every
             # ledger closed, nothing unaccounted, a noted line means no PASS.
             self.ledger["configs"] += 1
@@ -699,6 +888,7 @@ def test_no_mutant_passes_where_the_device_would_not(tmp_path_factory):
     assert collect_ledgers is not None, "no line-accounting ledger (round 8)"
     assert not run.ledger_bad, "\n".join(run.ledger_bad[:40])
     assert led.get("unaccounted", 0) == 0 and led.get("scope", 0) > 0, led
+    assert not run.marker_bad, "\n".join(run.marker_bad[:40])
     for fam in ("cisco-acl-entry-delete", "cisco-acl-seq-mix", "cisco-acl-default",
                 "cisco-acl-trailing-token", "cisco-acl-mode-break-abbrev",
                 "cisco-acl-mode-break", "cisco-acl-mode-break-unlisted",
@@ -711,7 +901,11 @@ def test_no_mutant_passes_where_the_device_would_not(tmp_path_factory):
                 "junos-two-terminating", "junos-duplicate-term",
                 "junos-term-unknown-stmt", "cisco-acl-seq-range", "cisco-acl-resequence",
                 "cisco-acl-cidr-operand", "cisco-acl-log-args", "cisco-acl-keyword-case",
-                "ipt-policy-extra-arg", "ipt-commit-spelling", "panos-object-extra-token"):
+                "ipt-policy-extra-arg", "ipt-commit-spelling", "panos-object-extra-token",
+                # round 10 (R9-1, R9-2, R9-3, R9-5)
+                "cisco-marker-strip", "cisco-untyped-header", "cisco-dialect-transplant",
+                "panos-leaf-dup", "panos-any-plus-member", "junos-leaf-dup",
+                "ipt-option-dup"):
         assert stats[fam]["mutants"] > 0, fam
     assert not bad, f"{len(bad)} mutant(s) PASS where the device would not:\n" + \
         "\n".join(bad[:80]) + "\n" + table
