@@ -44,7 +44,7 @@ from typing import Dict, List, Optional, Tuple
 from .analyze import Finding, analyze, score
 from .boundary import markdown_lines as boundary_markdown, triggers
 from .evidence import Subject, build_evidence, to_evidence_markdown
-from .failclosed import build_context, undecided
+from .failclosed import PASS_SCOPE, REACH_SCOPE, build_context, undecided
 from .model import strip_pager
 from .parse import parse_acls
 from .parse_iptables import detect as detect_iptables, parse_iptables
@@ -706,6 +706,15 @@ def _sorted(findings: List[Finding]) -> List[Finding]:
     return sorted(findings, key=key)
 
 
+def _pass_scope(gate: GateResult) -> Optional[str]:
+    """What a passing run's policy proofs rest on, or None without one."""
+    kinds = {f.kind for fr in gate.files for f in fr.findings
+             if getattr(f, "verdict", None) == "PASS"}
+    parts = ([PASS_SCOPE] if "segmentation-ok" in kinds else []) + \
+        ([REACH_SCOPE] if "connectivity-ok" in kinds else [])
+    return " / ".join(parts) or None
+
+
 def _why_not_pass(gate: GateResult) -> str:
     """One sentence on why an unenforced run is not a PASS."""
     pf = gate.parse_failures
@@ -757,8 +766,11 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
     lines.append("")
     lines.append(verdict)
     lines.append("")
-    lines.append("<sub>Rule-layer audit: routing, NAT and topology are not "
-                 "evaluated.</sub>")
+    if gate.passed and _pass_scope(gate):
+        lines.append(f"<sub>Scope: {_pass_scope(gate)}.</sub>")
+    else:
+        lines.append("<sub>Rule-layer audit: routing, NAT and topology are not "
+                     "evaluated.</sub>")
     lines.append("")
     # Headline metrics row.
     score_txt = f"{sc}/100" if sc is not None else "—"
@@ -998,8 +1010,11 @@ def to_console(gate: GateResult) -> str:
     else:
         out.append(f"  VERDICT: FAIL — {len(gate.violations)} finding(s) "
                    f">= {gate.fail_on} (threshold --fail-on {gate.fail_on})")
-    out.append("  SCOPE  : rule layer only; routing, NAT and topology not "
-               "evaluated")
+    if gate.passed and _pass_scope(gate):
+        out.append(f"  SCOPE  : {_pass_scope(gate)}")
+    else:
+        out.append("  SCOPE  : rule layer only; routing, NAT and topology not "
+                   "evaluated")
     if triggers(f for fr in gate.files for f in fr.findings):
         out.append("  NEXT   : delivery and change impact need a forwarding "
                    "model (e.g. Batfish)")

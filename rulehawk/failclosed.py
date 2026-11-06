@@ -745,6 +745,14 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
     return ctx
 
 
+# What every positive verdict rests on, stated with it (review of #42, F8).
+PASS_SCOPE = ("no audited ruleset permits this flow; assumes every interface is "
+              "in the file; routing, NAT and topology not evaluated")
+REACH_SCOPE = ("an audited ruleset permits the whole flow; assumes every "
+               "interface is in the file; routing, NAT and topology not "
+               "evaluated")
+
+
 def families_of(nets: Iterable) -> Set[int]:
     out: Set[int] = set()
     for n in nets:

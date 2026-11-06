@@ -382,26 +382,50 @@ _SCOPE = ("no audited ruleset permits this flow; assumes every interface is in "
 
 
 def test_f8_pass_states_its_scope_on_every_surface(tmp_path):
+    """c19 is a one-interface snippet: its PASS must say it assumes every
+    interface is in the file. c19 also has `permit ip any any` (a critical
+    hygiene finding, so its gate is FAIL); the gate surfaces are checked on
+    the same snippet with that line narrowed, which the gate passes."""
     from rulehawk import mcp_server as m
-    for path in (_rev("c19_partial.cfg"),):
-        r = _report(path)
-        assert r["assertion_verdict"] == "PASS"
-        ok = [f for f in _assertion_findings(r) if f["verdict"] == "PASS"]
-        assert ok and all(_SCOPE in f["message"] for f in ok), ok
-        _, text = _run_cli([path, "--policy", _pol("v4_ip.json")])
-        assert _SCOPE in text, text
-        gate = g.run_gate([path], _load_policy("v4_ip.json"))
-        assert gate.verdict == "PASS"
-        assert _SCOPE in g.to_console(gate)
-        assert _SCOPE in g.to_markdown(gate)
-        assert _SCOPE in g.to_json(gate)
-        res = m.audit(path, _pol("v4_ip.json"))
-        assert res["segmentation_passed"], res
-        assert all(_SCOPE in s["message"] for s in res["segmentation_passed"])
-        rec = tmp_path / "r.json"
-        rec.write_text(g.to_result(gate, "c19"))
-        body, worst = render([str(rec)])
-        assert worst == "PASS" and _SCOPE in body, body
+    c19 = _rev("c19_partial.cfg")
+    r = _report(c19)
+    assert r["assertion_verdict"] == "PASS"
+    ok = [f for f in _assertion_findings(r) if f["verdict"] == "PASS"]
+    assert ok and all(_SCOPE in f["message"] for f in ok), ok
+    _, text = _run_cli([c19, "--policy", _pol("v4_ip.json")])
+    assert _SCOPE in text, text
+    res = m.audit(c19, _pol("v4_ip.json"))
+    assert res["segmentation_passed"], res
+    assert all(_SCOPE in x["message"] for x in res["segmentation_passed"])
+
+    clean = tmp_path / "c19_clean.cfg"
+    clean.write_text(open(c19).read().replace(" permit ip any any\n",
+                                              " permit ip 203.0.113.0 0.0.0.255 any\n"))
+    gate = g.run_gate([str(clean)], _load_policy("v4_ip.json"))
+    assert gate.verdict == "PASS", g.to_console(gate)
+    assert _SCOPE in g.to_console(gate)
+    assert _SCOPE in g.to_markdown(gate)
+    assert _SCOPE in g.to_json(gate)
+    res = m.audit(str(clean), _pol("v4_ip.json"))
+    assert res["verdict"] == "PASS", res["verdict"]
+    assert all(_SCOPE in x["message"] for x in res["segmentation_passed"])
+    rec = tmp_path / "r.json"
+    rec.write_text(g.to_result(gate, "c19"))
+    body, worst = render([str(rec)])
+    assert worst == "PASS" and _SCOPE in body, body
+
+
+def test_f8_connectivity_ok_states_its_scope(tmp_path):
+    p = tmp_path / "reach.cfg"
+    p.write_text(_BOUND_IOS.replace(
+        " deny ip 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255\n",
+        " permit ip 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255\n"))
+    r = _report(str(p), "v4_reach_tcp445.json")
+    ok = [f for f in _assertion_findings(r) if f["verdict"] == "PASS"]
+    assert ok and all("assumes every interface is in the file" in f["message"]
+                      and "routing, NAT and topology not evaluated" in f["message"]
+                      for f in ok), _assertion_findings(r)
+    assert all("no audited ruleset permits" not in f["message"] for f in ok)
 
 
 # --------------------------------------------------------------------------- #

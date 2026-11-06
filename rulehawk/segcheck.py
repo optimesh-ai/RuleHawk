@@ -34,7 +34,8 @@ import ipaddress
 from typing import Dict, List, Optional
 
 from .analyze import Finding
-from .failclosed import FailClosedContext, Reason, families_of, reason_dicts
+from .failclosed import (PASS_SCOPE, REACH_SCOPE, FailClosedContext, Reason,
+                         families_of, reason_dicts)
 from .model import (ACE, ANY_PORTS, _ICMP_PROTOS, _IPNet, _PORTED,
                     _WILDCARD_PROTO, PortRange)
 from .parse import _PROTO_NUM
@@ -530,7 +531,8 @@ def check_segmentation(aces: List[ACE], policy: dict, *,
                         f"{rule.acl}:{rule.seq}", "connectivity-ok", "info",
                         f"CONNECTIVITY OK ({sname} must reach {dname}{scope}): "
                         f"the ENTIRE flow space is provably permitted — e.g. "
-                        f"rule {rule.seq}{_line_part} permits {wit}.",
+                        f"rule {rule.seq}{_line_part} permits {wit}. "
+                        f"Scope: {REACH_SCOPE}.",
                         rule.raw,
                         witness=wit,
                         line=rule.line,
@@ -658,7 +660,7 @@ def check_segmentation(aces: List[ACE], policy: dict, *,
             findings.append(Finding(
                 label, "segmentation-ok", "info",
                 f"PASS: {sname} cannot reach {dname}{scope}"
-                + " (no permitted witness flow found).", "",
+                + f" (no permitted witness flow found). Scope: {PASS_SCOPE}.", "",
                 fix="", verdict="PASS", reasons=[]))
     return findings
 
