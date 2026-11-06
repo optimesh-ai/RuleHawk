@@ -101,9 +101,43 @@ def flush():
     sh("conntrack", "-F", check=False)
 
 
+def _table_option(tok: str) -> bool:
+    """`-t`, `-tNAME`, `--table`, `--table=NAME` or an abbreviation of it."""
+    if tok.startswith("--"):
+        return len(tok) >= 4 and "--table".startswith(tok.split("=", 1)[0])
+    return tok.startswith("-t")
+
+
+def non_filter_table(ruleset: str):
+    """Why the ruleset touches a table other than filter, or None.
+
+    Only the filter table may be loaded: NAT and mangle rewrite bytes that
+    find_tag compares (addresses, ports, TOS, checksums), so a probe the
+    kernel accepted would read as dropped. Any `-t` option is refused, even
+    `-t filter`, so no spelling slips through."""
+    for m in re.finditer(r"(?m)^\s*\*(\S+)", ruleset):
+        if m.group(1) != "filter":
+            return f"table *{m.group(1)} refused: only *filter is supported"
+    for ln in ruleset.splitlines():
+        s = ln.strip()
+        if not (s.startswith("iptables ") or s.startswith("iptables\t")):
+            continue
+        try:
+            toks = shlex.split(s, comments=True)
+        except ValueError:
+            toks = s.split()
+        if any(_table_option(t) for t in toks[1:]):
+            return f"table option refused (only the filter table is supported): {s}"
+    return None
+
+
 def load(ruleset: str):
     """iptables-save text -> iptables-restore; command form -> one argv per
-    `iptables ...` line (no shell, so a corpus file can't run anything else)."""
+    `iptables ...` line (no shell, so a corpus file can't run anything else).
+    A ruleset that touches any table but filter is refused as a load error."""
+    bad = non_filter_table(ruleset)
+    if bad:
+        return bad
     if re.search(r"(?m)^\s*\*(filter|nat|mangle|raw|security)\b", ruleset):
         r = subprocess.run(["iptables-restore"], input=ruleset, capture_output=True,
                            text=True)
