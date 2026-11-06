@@ -586,3 +586,147 @@ def test_a_binding_to_an_undefined_or_empty_acl_never_passes(tmp_path):
                    "interface GigabitEthernet0/2\n ip access-group MISSING in\n")
     _assert_unknown_everywhere(str(cfg), _pol("v4_tcp445.json"),
                                "acl-binding-undefined")
+
+
+# --------------------------------------------------------------------------- #
+# own blocker per known gap (coordinator 11-06 item 5)
+# --------------------------------------------------------------------------- #
+# A bound, fully modelled IOS config where PASS is genuinely supported: every
+# interface carries an inbound filter, no parse note, no L4 rule.
+_BOUND_IOS = ("hostname edge1\n!\n"
+              "interface GigabitEthernet0/0\n ip address 192.0.2.1 255.255.255.0\n"
+              " ip access-group EDGE in\n!\n"
+              "interface GigabitEthernet0/1\n ip address 198.51.100.1 255.255.255.0\n"
+              " ip access-group EDGE in\n!\n"
+              "ip access-list extended EDGE\n"
+              " deny ip 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255\n"
+              " permit ip 203.0.113.0 0.0.0.255 any\n!\nend\n")
+
+
+def _junos_unit(name: str, addr: str, filtered: bool) -> str:
+    filt = ("                filter {\n                    input EDGE;\n"
+            "                }\n") if filtered else ""
+    return (f"    {name} {{\n        unit 0 {{\n            family inet {{\n"
+            f"{filt}                address {addr};\n            }}\n        }}\n    }}\n")
+
+
+def _bound_junos(*units) -> str:
+    return ("interfaces {\n" + "".join(_junos_unit(*u) for u in units) + "}\n"
+            "firewall {\n    family inet {\n        filter EDGE {\n"
+            "            term t1 {\n                from {\n"
+            "                    source-address {\n                        192.0.2.0/24;\n"
+            "                    }\n                    destination-address {\n"
+            "                        198.51.100.0/24;\n                    }\n"
+            "                }\n                then discard;\n            }\n"
+            "            term t2 {\n                from {\n"
+            "                    source-address {\n                        203.0.113.0/24;\n"
+            "                    }\n                }\n                then accept;\n"
+            "            }\n        }\n    }\n}\n")
+
+
+def test_bound_fully_filtered_ios_config_still_passes(tmp_path):
+    """The control for the blockers below: nothing a PASS rests on is in
+    doubt, so it stays PASS, exit 0."""
+    cfg = tmp_path / "bound.cfg"
+    cfg.write_text(_BOUND_IOS)
+    rc, out = _run_cli([str(cfg), "--json", "--policy", _pol("v4_tcp445.json")])
+    report = json.loads(out)
+    seg = _assertion_findings(report)
+    assert [f["kind"] for f in seg] == ["segmentation-ok"], seg
+    assert report["assertion_verdict"] == "PASS"
+    assert rc == 0
+
+
+def test_an_unfiltered_interface_pair_is_a_bypass_unknown(tmp_path):
+    """Gi0/2 has no inbound filter and Gi0/1 no outbound one: CORP traffic
+    arriving on Gi0/2 reaches PCI without crossing EDGE. UNKNOWN,
+    unfiltered-path."""
+    cfg = tmp_path / "bypass.cfg"
+    cfg.write_text(_BOUND_IOS.replace(
+        "\nip access-list extended EDGE\n",
+        "\ninterface GigabitEthernet0/1\n!\n"
+        "interface GigabitEthernet0/2\n ip address 203.0.113.1 255.255.255.0\n!\n"
+        "ip access-list extended EDGE\n"))
+    _assert_unknown_everywhere(str(cfg), _pol("v4_tcp445.json"), "unfiltered-path")
+
+
+def test_an_unfiltered_junos_unit_is_a_bypass_unknown(tmp_path):
+    """ge-0/0/2 (no input filter) to ge-0/0/1 (no output filter) bypasses
+    EDGE. The fully filtered control stays PASS."""
+    ok = tmp_path / "ok.conf"
+    ok.write_text(_bound_junos(("ge-0/0/0", "192.0.2.1/24", True),
+                               ("ge-0/0/1", "198.51.100.1/24", True)))
+    rc, out = _run_cli([str(ok), "--json", "--policy", _pol("v4_tcp445.json")])
+    assert json.loads(out)["assertion_verdict"] == "PASS" and rc == 0
+    cfg = tmp_path / "bypass.conf"
+    cfg.write_text(_bound_junos(("ge-0/0/0", "192.0.2.1/24", True),
+                                ("ge-0/0/1", "198.51.100.1/24", False),
+                                ("ge-0/0/2", "203.0.113.1/24", False)))
+    _assert_unknown_everywhere(str(cfg), _pol("v4_tcp445.json"), "unfiltered-path")
+
+
+def test_iptables_l4_deny_and_non_initial_fragments_is_unknown(tmp_path):
+    """A non-initial fragment carries no L4 header, so a `--dport 445` DROP
+    never matches it and the later ACCEPT does. UNKNOWN, iptables-fragments."""
+    cfg = tmp_path / "frag.rules"
+    cfg.write_text("*filter\n:INPUT ACCEPT [0:0]\n:FORWARD DROP [0:0]\n"
+                   ":OUTPUT ACCEPT [0:0]\n"
+                   "-A FORWARD -s 192.0.2.0/24 -d 198.51.100.0/24 -p tcp --dport 445 -j DROP\n"
+                   "-A FORWARD -s 192.0.2.0/24 -d 198.51.100.0/24 -j ACCEPT\n"
+                   "COMMIT\n")
+    _assert_unknown_everywhere(str(cfg), _pol("v4_tcp445.json"), "iptables-fragments")
+
+
+def test_a_path_grounded_suppression_is_unknown_not_fail_or_pass():
+    """Hammerhead proving ONE witness unreachable does not prove the other
+    packets of the violated space unreachable: the assertion is UNKNOWN
+    (pathground-witness-only), never PASS, and still blocks the run."""
+    from rulehawk.failclosed import build_context, undecided
+    from rulehawk.parse import parse_acls
+    from rulehawk.pathground import Reach, path_ground
+    from rulehawk.segcheck import check_segmentation
+    text = _BOUND_IOS.replace(" deny ip 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255\n",
+                              " permit ip 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255\n")
+    aces, notes = parse_acls(text)
+    fs = check_segmentation(aces, _load_policy("v4_tcp445.json"),
+                            context=build_context(text, aces, notes, "ios-asa"))
+    assert any(f.kind == "segmentation-violation" for f in fs)
+    out = path_ground(fs, lambda w: Reach.UNREACHABLE)
+    sup = [f for f in out if f.kind == "segmentation-infeasible-path"]
+    assert sup, [f.kind for f in out]
+    assert sup[0].verdict == "UNKNOWN"
+    assert "pathground-witness-only" in [r["code"] for r in sup[0].reasons]
+    assert sup[0] in undecided(out)
+
+
+def test_scalar_ports_never_crash_evidence(tmp_path):
+    """`"ports": 445` (a scalar) is accepted by segcheck; --evidence used to
+    crash with a TypeError. It must produce the same attestation as [445]."""
+    cfg = tmp_path / "bound.cfg"
+    cfg.write_text(_BOUND_IOS)
+    pol = tmp_path / "scalar.json"
+    pol.write_text(json.dumps({
+        "zones": {"CORP": ["192.0.2.0/24"], "PCI": ["198.51.100.0/24"]},
+        "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp", "ports": 445}]}))
+    rc, out = _run_cli([str(cfg), "--evidence", "--policy", str(pol)])
+    art = json.loads(out)
+    att = art["attestations"][0]
+    assert att["claim"].endswith("on tcp/445"), att["claim"]
+    assert att["status"] == "VERIFIED"
+    assert rc == 0
+
+
+def test_hosted_page_applies_fail_closed_to_counterexample_10():
+    """The Pages/Pyodide entrypoint must take the same fail-closed path as
+    the CLI: counterexample 10 (a vty access-class ACL) is UNKNOWN there."""
+    from tests.test_hosted_parity import _WORKER, _analyze_py, _read, _run_hosted
+    with open(_cfg("10_ios_vty_acl.cfg"), encoding="utf-8") as fh:
+        cfg = fh.read()
+    with open(_pol("v4_tcp445.json"), encoding="utf-8") as fh:
+        pol = fh.read()
+    env = _run_hosted(_analyze_py(_read(_WORKER)), cfg, pol)
+    findings = env["report_json"]["findings"]
+    assert not any(f["kind"] in _PASS_KINDS for f in findings), findings
+    unk = [f for f in findings if f["kind"] == "segmentation-unknown"]
+    assert unk and unk[0]["verdict"] == "UNKNOWN"
+    assert "acl-not-packet-filter" in _reason_codes(unk[0])
