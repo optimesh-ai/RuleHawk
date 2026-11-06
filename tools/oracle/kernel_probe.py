@@ -220,14 +220,18 @@ def find_tag(frame: bytes, l2: bool):
         return None
     if len(ip) < 20 or ip[0] >> 4 != 4:
         return None
+    # Try every MAGIC in the packet, not just the first: an address or port
+    # can spell b"RHOR". A candidate counts only when MAGIC + idx sits at
+    # that probe's own tag offset, len(sent) - 8.
     k = ip.find(MAGIC)
-    if k < 0 or k + 8 > len(ip):
-        return None
-    idx = struct.unpack("!I", ip[k + 4:k + 8])[0]
-    sent = EXPECT.get(idx)
-    if sent is None or k + 8 != len(sent) or _hdr_masked(ip[:k + 8]) != sent:
-        return None
-    return idx
+    while 0 <= k and k + 8 <= len(ip):
+        idx = struct.unpack("!I", ip[k + 4:k + 8])[0]
+        sent = EXPECT.get(idx)
+        if sent is not None and k == len(sent) - 8 \
+                and _hdr_masked(ip[:k + 8]) == sent:
+            return idx
+        k = ip.find(MAGIC, k + 1)
+    return None
 
 
 EXPECT = {}
