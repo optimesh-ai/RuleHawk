@@ -299,8 +299,17 @@ def _object_scope(prefix: List[str]) -> Optional[str]:
 _OBJECT_HARMLESS = frozenset({"description", "tag", "disable-override"})
 
 
+# Address and address-group names share one namespace, as do service and
+# service-group names: a rule's `source CORP` can mean either kind, so a name
+# is ambiguous when it is defined as more than one (kind, scope) pair (review
+# of #42, round 4, R3).
+_NAMESPACE = {"address": "addr", "address-group": "addr",
+              "service": "svc", "service-group": "svc"}
+
+
 def _collect_objects(numbered: "List[Tuple[int, List[str]]]", notes: List[str],
-                     consumed: Optional[set] = None) -> Tuple[
+                     consumed: Optional[set] = None,
+                     scope_map: Optional[dict] = None) -> Tuple[
         Dict[str, Optional[Tuple[List[_IPNet], bool]]],
         Dict[str, Optional[List[str]]],
         Dict[str, Optional[Tuple[str, List[PortRange], List[PortRange]]]]]:
@@ -322,11 +331,14 @@ def _collect_objects(numbered: "List[Tuple[int, List[str]]]", notes: List[str],
     service_defs: "Dict[str, List[str]]" = {}
     if consumed is None:
         consumed = set()
-    scopes: "Dict[Tuple[str, str], set]" = {}
+    # (namespace, name) -> {(kind, scope)}; handed back through `scope_map`
+    # so the caller can check each rule sees the objects it names.
+    scopes: "Dict[Tuple[str, str], set]" = {} if scope_map is None else scope_map
 
     def _take(lineno: int, kind: str, name: str, prefix: List[str]) -> None:
         consumed.add(lineno)
-        scopes.setdefault((kind, name), set()).add(_object_scope(prefix))
+        scopes.setdefault((_NAMESPACE[kind], name), set()).add(
+            (kind, _object_scope(prefix)))
 
     for lineno, toks in numbered:
         if not toks or toks[0] != "set":
@@ -428,19 +440,20 @@ def _collect_objects(numbered: "List[Tuple[int, List[str]]]", notes: List[str],
                              f"referencing rule marked imprecise")
             continue
 
-    # A name defined in more than one scope: resolve it to nothing exact.
-    for (kind, name), where in sorted(scopes.items()):
+    # A name defined as more than one (kind, scope): resolve it to nothing
+    # exact, whichever kind a rule would have picked.
+    for (ns, name), where in sorted(scopes.items()):
         if len(where) < 2:
             continue
-        notes.append(f"PAN-OS {kind} '{name}' is defined in more than one scope "
-                     f"({', '.join(sorted(w or 'firewall' for w in where))}) — "
-                     f"objects are not resolved per vsys / device-group, so "
-                     f"'{name}' is treated as unresolved (object-scope-ambiguous)")
-        if kind == "address":
+        defs = ", ".join(sorted(f"{k} in {w or 'firewall'}" for k, w in where))
+        notes.append(f"PAN-OS object '{name}' is defined more than once "
+                     f"({defs}) — objects are not resolved per kind and vsys / "
+                     f"device-group, so '{name}' is treated as unresolved "
+                     f"(object-scope-ambiguous)")
+        if ns == "addr":
             addresses[name] = None
-        elif kind == "address-group":
             addr_groups[name] = None
-        elif kind == "service":
+        else:
             service_defs.pop(name, None)
             services[name] = None
 
@@ -902,6 +915,40 @@ def _rule_path(toks: List[str]) -> "Tuple[int, str, str]":
     return k, phase, scope
 
 
+def _visible_scopes(rule_scope: str) -> set:
+    if not rule_scope:
+        return {"", "shared"}
+    return {f"vsys {rule_scope}", f"device-group {rule_scope}", "shared"}
+
+
+def _check_visible(rule_scope: str, rule: str, fields: "Dict[str, List[str]]",
+                   scope_map: dict, addr_groups: dict, notes: List[str]) -> None:
+    """Note (object-scope-ambiguous) each object the rule names, directly or
+    through a static group, that is defined only outside the rule's view.
+    Names RuleHawk does not define (literals, `any`, builtins) are left to
+    the resolver."""
+    vis = _visible_scopes(rule_scope)
+    todo = [("addr", v) for f in ("source", "destination") for v in fields.get(f, [])]
+    todo += [("svc", v) for v in fields.get("service", [])]
+    seen: set = set()
+    while todo:
+        ns, name = todo.pop()
+        if (ns, name) in seen:
+            continue
+        seen.add((ns, name))
+        where = scope_map.get((ns, name))
+        if not where:
+            continue
+        if not any(w in vis for _, w in where):
+            defs = ", ".join(sorted(f"{k} in {w or 'firewall'}" for k, w in where))
+            notes.append(f"PAN-OS rule {rule} ({rule_scope or 'firewall'}) names "
+                         f"'{name}', defined only outside its scope ({defs}) — "
+                         f"not resolved (object-scope-ambiguous)")
+            continue
+        if ns == "addr" and isinstance(addr_groups.get(name), list):
+            todo += [("addr", m) for m in addr_groups[name]]
+
+
 def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
     """Parse a PAN-OS set-format security policy; return (entries, notes).
 
@@ -920,7 +967,9 @@ def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
     # by relative `set`s, a NAT rule) could change what the rulebase does.
     consumed: set = set()
 
-    addresses, addr_groups, services = _collect_objects(numbered, notes, consumed)
+    scope_map: dict = {}
+    addresses, addr_groups, services = _collect_objects(numbered, notes, consumed,
+                                                        scope_map)
 
     # Second pass: accumulate each rule's fields (split across lines) keyed by
     # (scope, phase, name) so same-named rules in different vsys / device-groups
@@ -953,6 +1002,13 @@ def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
             rules[key].setdefault(fk, []).extend(vals)
         if "action" in fields_here or key not in rule_lines:
             rule_lines[key] = lineno
+
+    # Each name a rule uses must be defined where the rule can see it: its own
+    # vsys / device-group, then shared (a firewall rulebase sees the firewall
+    # objects and shared). A name defined only elsewhere would resolve on the
+    # device to something else, or not at all (round 4, R3).
+    for key in order:
+        _check_visible(key[0], key[2], rules[key], scope_map, addr_groups, notes)
 
     # Emit ordered per scope. Each scope is an independent first-match context
     # (its own `acl`, so segcheck searches it in isolation); WITHIN a scope rules

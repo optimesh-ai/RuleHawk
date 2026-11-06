@@ -58,8 +58,11 @@ rules, or no ACL bound to an interface or `access-group`), when any parse note
 exists in the evaluated config (on PAN-OS and iptables every line the parser
 does not model gets one), when an ACL's role is unknown or is not a transit
 packet filter (`line vty` `access-class`, SNMP, route-map, NAT, crypto, QoS),
-when a binding is removed or deactivated (`no ip access-group`, Junos
-`inactive:`), when a vendor default it does not model applies (PAN-OS
+when a binding is removed, reset or deactivated (`no` / `default ip
+access-group`, `default interface`, Junos `inactive:`), when a Cisco interface
+carries a line outside the allowlist below, when a feature that drops, inspects,
+rewrites or bypasses traffic is configured (zone firewall, `ip inspect`,
+`service-policy`, policy routing, `mpls ip` / `xconnect`), when a vendor default it does not model applies (PAN-OS
 `default-security-rules`, the iptables chain policy when no `-P` is given, IPv6
 implicit ND permits, ...), when NAT or nftables text is present, or when an IOS
 ACL mask is ambiguous. The full list is in the CHANGELOG. A PASS still assumes
@@ -72,6 +75,28 @@ such a claim `INDETERMINATE` with the same reasons, never `VERIFIED`.
 Before 0.5.0 these cases printed PASS and exited 0. A CI job that relied on that
 exit 0 now goes red with exit 3: bind the ACL, fix the parse note, or model the
 default, and the verdict becomes a real PASS or FAIL.
+
+### Known limits
+
+Every PASS prints these next to the verdict (text, the `--json` `scope` field,
+`--evidence`, the gate, MCP and the hosted page):
+
+- Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, NAT); any other interface line is UNKNOWN and other global commands are not read.
+- PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed.
+- iptables reads the filter table; a chain's policy comes only from its parsed -P or :CHAIN line.
+- Junos reads firewall filters and their interface bindings; SRX security zones or policies make the answer UNKNOWN.
+
+The Cisco interface allowlist is: `description`, `ip address` (with
+`secondary`), `ipv6 address`, `ipv6 enable`, the filter bindings
+(`ip access-group`, `ipv6 traffic-filter`, `ipv6 access-group`,
+`ip port access-group`, `ipv6 port traffic-filter`, `ipv4 access-group` with
+`in`/`out`/`ingress`/`egress`), `shutdown`, `no shutdown`, `no switchport`,
+`speed`, `duplex`, `negotiation auto`, `load-interval`, `no ip redirects`,
+`no ip unreachables`, `no ip proxy-arp`, `no ipv6 redirects`,
+`no ipv6 unreachables`, `cdp enable` and `no cdp enable`, each spelled in full.
+Loopback and Null interfaces carry no transit traffic and are not checked. Any
+other line on an interface is UNKNOWN with `interface-feature-unmodeled`,
+which names the line's keyword, not the line.
 **[Quickstart](docs/quickstart.md)**: install, first audit, agents (Claude, Cursor,
 NetClaw) and what to do when something goes wrong.
 

@@ -57,6 +57,7 @@ from typing import Dict, List, Optional, Sequence
 
 from .analyze import Finding, score
 from .riskaccept import Ledger, accepted_for, evaluate, finalize
+from .failclosed import KNOWN_LIMITS
 from .segcheck import check_segmentation
 
 SCHEMA = "rulehawk.evidence/v1"
@@ -209,7 +210,7 @@ SCOPE_LIMITS = [
     "RuleHawk fails closed: a config that parses to zero rules is reported as "
     "no_rules_parsed, never as a clean result, and blocks any VERIFIED "
     "attestation for the run.",
-]
+] + [f"Known limit: {lim}." for lim in KNOWN_LIMITS]
 
 # Appended to the scope limits for browser-generated artifacts. In the hosted
 # tool the audited input is the text submitted to the page, which the browser

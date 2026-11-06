@@ -7,7 +7,8 @@ from typing import Dict, List, Optional
 
 from .analyze import Finding, score
 from .boundary import text_lines as boundary_text, to_dict as boundary_dict
-from .failclosed import assertion_verdict
+from .failclosed import (KNOWN_LIMITS, LIMITS_STATEMENT, PASS_SCOPE,
+                         REACH_SCOPE, assertion_verdict)
 
 _ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
@@ -61,6 +62,9 @@ def to_json(findings: List[Finding], notes: List[str], n_rules: int,
         ],
         "parse_notes": notes,
         "verification_boundary": boundary_dict(findings),
+        # What a PASS rests on and what each frontend reads (round 4, R7).
+        "scope": {"statement": LIMITS_STATEMENT, "must_not_reach": PASS_SCOPE,
+                  "must_reach": REACH_SCOPE, "known_limits": list(KNOWN_LIMITS)},
     }, indent=2)
 
 

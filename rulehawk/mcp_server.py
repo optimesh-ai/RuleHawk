@@ -47,6 +47,7 @@ from typing import Dict, List, Optional, Tuple
 from . import __version__
 from .analyze import Finding
 from .boundary import to_dict as boundary_dict
+from .failclosed import LIMITS_STATEMENT
 from .gate import (_KIND_HELP, _SEV_ORDER, _SEV_RANK, _VENDORS, FileResult,
                    _pick_parser, no_rules_reason, run_gate)
 
@@ -87,7 +88,8 @@ NOT_MODELLED = [
 ]
 
 SCOPE_STATEMENT = ("Rule layer only (ACL/filter semantics). Routing, NAT, "
-                   "topology and change impact were not evaluated.")
+                   "topology and change impact were not evaluated. "
+                   + LIMITS_STATEMENT[0].upper() + LIMITS_STATEMENT[1:] + ".")
 
 _VENDOR_CHOICES = ("auto", "ios-asa", "nxos", "eos", "junos", "panos",
                    "iptables", "aws-sg")

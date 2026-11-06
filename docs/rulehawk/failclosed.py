@@ -134,17 +134,45 @@ REASONS: Dict[str, str] = {
         "read nftables, whose chains can accept, drop or forward a packet "
         "before or after the parsed ones",
     "acl-binding-negated":
-        "a filter binding is removed or deactivated (`no ip access-group`, "
-        "`no ipv6 traffic-filter`, `no access-class`, Junos `inactive:` / "
+        "a filter binding is removed, reset or deactivated (`no` or "
+        "`default` before `ip access-group`, `ipv6 traffic-filter` or "
+        "`access-class`, a top-level `default interface`, Junos `inactive:` / "
         "`deactivate` / `delete` on an interface filter or a filter); the "
         "removal is not applied, so which interfaces are filtered is unknown",
     "nat-present":
-        "NAT is configured (Cisco `ip nat`, ASA `nat`/`static`, PAN-OS NAT "
-        "rulebase, Junos NAT, iptables nat table); addresses are checked "
-        "before translation only, so a translated flow may reach the zone",
+        "NAT is configured (Cisco `ip nat` / `ipv6 nat` / `nat64`, ASA "
+        "`nat`/`static`, PAN-OS NAT rulebase, Junos NAT, iptables nat table); "
+        "addresses are checked before translation only, so a translated flow "
+        "may reach the zone",
     "object-scope-ambiguous":
-        "a PAN-OS object name is defined in more than one vsys / "
-        "device-group / shared scope; objects are not resolved per scope",
+        "a PAN-OS object name is defined as more than one kind (address and "
+        "address-group, service and service-group) or in more than one vsys / "
+        "device-group / shared scope, or a rule names an object defined only "
+        "outside its own vsys / device-group and shared; such a name is not "
+        "resolved",
+    "interface-feature-unmodeled":
+        "a Cisco / Arista interface carries a line that is not on RuleHawk's "
+        "allowlist of lines that cannot change a transit packet's fate (any "
+        "other feature, any `default` form, any abbreviated keyword); what the "
+        "line does to the packet is not modeled",
+    "zone-firewall":
+        "a zone-based firewall is configured (`zone security`, "
+        "`zone-member security`, `zone-pair security`); zone policy drops or "
+        "passes traffic independently of the interface ACLs and is not modeled",
+    "stateful-inspection":
+        "stateful inspection is configured (`ip inspect` / CBAC); it opens "
+        "return-traffic holes in the interface ACLs and is not modeled",
+    "qos-policy":
+        "a `service-policy` applies a policy-map; its actions (drop, police, "
+        "redirect) can discard or divert traffic and are not modeled",
+    "policy-routing":
+        "policy-based routing is configured (`ip policy route-map`, "
+        "`ipv6 policy route-map`, `ip local policy`, `service-policy type pbr`); "
+        "it can send traffic to another interface or Null0 and is not modeled",
+    "mpls-forwarding":
+        "MPLS or a pseudowire is configured (`mpls ip`, `tag-switching ip`, "
+        "`mpls bgp forwarding`, `xconnect`, `l2vpn`, `pseudowire`); labelled or "
+        "cross-connected traffic is not filtered by the IP ACLs modeled here",
     "reach-not-every-context":
         "one audited rule context permits the whole flow but another denies "
         "part of it; which contexts are on the path is not modelled, so "
@@ -633,9 +661,9 @@ def _panos_unmodeled_fields(text: str) -> List[str]:
 # removal is not applied; any such line makes which interfaces are filtered
 # unknown.
 _CISCO_NEGATED_BIND = re.compile(
-    r"(?im)^\s*no\s+(?:(?:ip|ipv4|ipv6)\s+(?:port\s+)?"
+    r"(?im)^\s*(?:no|default)\s+(?:(?:ip|ipv4|ipv6)\s+(?:port\s+)?"
     r"(?:access-group|traffic-filter|access-class)|access-group|access-class|"
-    r"ipv6\s+port\s+traffic-filter)\b.*$")
+    r"ipv6\s+port\s+traffic-filter)\b.*$|^default\s+interface\b.*$")
 _JUNOS_SET_NEGATED = re.compile(
     r"(?m)^\s*(?:deactivate|delete)\s+(?:logical-systems\s+\S+\s+)?"
     r"(?:interfaces\b|firewall\s+(?:family\s+\S+\s+)?filter\s+\S+\s*$).*$")
@@ -643,8 +671,8 @@ _JUNOS_SET_NEGATED = re.compile(
 # NAT (M1, H8): addresses are checked before translation only.
 _NAT = {
     "cisco": re.compile(
-        r"(?im)^\s*(?:ip|ipv6)\s+nat\s+(?:inside|outside|source|destination|"
-        r"pool|enable|static)\b|^\s*nat\s*\(|^\s*static\s*\(|^\s*nat64\b"),
+        r"(?im)^\s*(?:ip|ipv6)\s+nat\b|^\s*nat\s*\(|^\s*static\s*\(|"
+        r"^\s*nat(?:64|66)\b"),
     "panos": re.compile(r"(?m)^\s*set\s.*\b(?:pre-|post-)?rulebase\s+nat\b"),
     "junos": re.compile(
         r"(?m)^\s*(?:set\s+(?:\S+\s+)*?(?:security|services)\s+nat\b|"
@@ -660,11 +688,18 @@ _PANOS_OBJECT = re.compile(
     r"(address|address-group|service|service-group)\s+(\S+)")
 
 
+_PANOS_NS = {"address": "address", "address-group": "address",
+             "service": "service", "service-group": "service"}
+
+
 def _panos_scope_collisions(text: str) -> List[str]:
-    where: Dict[Tuple[str, str], Set[str]] = {}
+    """Names defined as more than one (kind, scope): address and
+    address-group share a namespace, as do service and service-group."""
+    where: Dict[Tuple[str, str], Set[Tuple[str, str]]] = {}
     for m in _PANOS_OBJECT.finditer(text):
         scope = m.group(1) or (f"{m.group(2)} {m.group(3)}" if m.group(2) else "")
-        where.setdefault((m.group(4), m.group(5).strip('"')), set()).add(scope)
+        where.setdefault((_PANOS_NS[m.group(4)], m.group(5).strip('"')),
+                         set()).add((m.group(4), scope))
     return [f"{k} {n}" for (k, n), sc in sorted(where.items()) if len(sc) > 1]
 
 
@@ -699,6 +734,108 @@ def _junos_inactive(text: str) -> List[str]:
     for m in _JUNOS_SET_NEGATED.finditer(text):
         out.append(m.group(0).strip())
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Cisco IOS / ASA / NX-OS / EOS interfaces: an allowlist (review of #42,
+# round 4). A PASS rests on the interface ACLs being the only thing on the
+# path that decides a packet's fate, so every line in an `interface` stanza
+# (other than Loopback / Null, which carry no transit traffic) must be one
+# that cannot change it. Each entry is whitespace-normalised and matched in
+# full, case-insensitively: a `default` form, an abbreviation (`access-gr`) or
+# any other feature does not match and makes the answer UNKNOWN
+# (interface-feature-unmodeled). The list is kept small on purpose; adding to
+# it needs a reason the line cannot drop, permit, rewrite or divert a packet.
+# --------------------------------------------------------------------------- #
+_IF_ALLOW = [
+    # Free text.
+    r"description(?: .*)?",
+    # Addresses: they say which subnets the interface is on, not what crosses
+    # it. Every interface is already treated as carrying both families.
+    r"ip address [0-9.]+(?: [0-9.]+|/\d{1,2})(?: secondary)?",
+    r"ipv6 address [0-9a-f:]+/\d{1,3}(?: eui-64)?",
+    r"ipv6 address [0-9a-f:]+ link-local",
+    r"ipv6 enable",
+    # The filter bindings themselves, full keyword only (modeled by
+    # _cisco_bindings / _cisco_paths).
+    r"(?:ip access-group|ipv6 traffic-filter|ipv6 access-group|"
+    r"ip port access-group|ipv6 port traffic-filter|ipv4 access-group)"
+    r" \S+ (?:in|out|ingress|egress)",
+    # Admin state (modeled: a shutdown interface is not on a path).
+    r"shutdown", r"no shutdown",
+    # A routed port (NX-OS / EOS): the interface then routes, as modeled.
+    r"no switchport",
+    # Physical layer: link speed and duplex do not select packets.
+    r"speed (?:auto|\d+)", r"duplex (?:auto|full|half)", r"negotiation auto",
+    # Counter sampling interval only.
+    r"load-interval \d+",
+    # Turning off messages the router itself originates: ICMP unreachables
+    # and redirects (RFC 1812 sections 5.2.7.1 and 5.2.7.2) and proxy-ARP
+    # replies (RFC 1027). None of them lets a transit packet through or
+    # stops one.
+    r"no ip redirects", r"no ip unreachables", r"no ip proxy-arp",
+    r"no ipv6 redirects", r"no ipv6 unreachables",
+    # CDP is a link-local discovery protocol the device terminates.
+    r"cdp enable", r"no cdp enable",
+]
+_IF_ALLOW_RX = re.compile("(?i)(?:" + "|".join(_IF_ALLOW) + ")")
+# Words after which the next word is still part of the keyword, so the detail
+# names `ip verify` or `no ip access-gr`, never an argument (an ACL name, an
+# address).
+_KW_PREFIX = frozenset({"no", "default", "ip", "ipv4", "ipv6", "mpls",
+                        "switchport", "crypto", "tunnel", "service-policy",
+                        "zone-member"})
+_KW_TOKEN = re.compile(r"^[A-Za-z][A-Za-z-]*$")
+
+
+def _keyword(line: str) -> str:
+    out: List[str] = []
+    for t in line.split():
+        if len(out) == 3 or not _KW_TOKEN.match(t):
+            break
+        out.append(t.lower())
+        if t.lower() not in _KW_PREFIX:
+            break
+    return " ".join(out) or "(not a keyword)"
+
+
+def _cisco_unallowed(text: str) -> List[str]:
+    """`interface: keyword` for each interface line not on the allowlist."""
+    out: List[str] = []
+    cur: Optional[str] = None
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("!"):
+            continue
+        if raw[:1] not in (" ", "\t"):
+            m = re.match(r"(?i)^interface\s+(\S+)", raw)
+            cur = m.group(1) if m and not _NO_FORWARD_IF.match(m.group(1)) else None
+            continue
+        if cur is None:
+            continue
+        line = " ".join(raw.split())
+        if not _IF_ALLOW_RX.fullmatch(line):
+            item = f"{cur}: {_keyword(line)}"
+            if item not in out:
+                out.append(item)
+    return out
+
+
+# Global features that drop, permit statefully, rewrite or bypass traffic
+# independently of the interface ACLs. Matched on any line, any indentation,
+# so a stanza RuleHawk skips (a Loopback, a sub-block) still counts. `no X`
+# forms do not match (they turn the feature off).
+_CISCO_FEATURES = [
+    ("zone-firewall", re.compile(
+        r"(?im)^\s*(zone(?:-member)?\s+security|zone-pair\s+security)\b")),
+    ("stateful-inspection", re.compile(r"(?im)^\s*((?:ip|ipv6)\s+inspect)\b")),
+    ("qos-policy", re.compile(r"(?im)^\s*(service-policy)\b")),
+    ("policy-routing", re.compile(
+        r"(?im)^\s*((?:ip|ipv6)\s+(?:local\s+)?policy\s+route-map|"
+        r"service-policy\s+type\s+pbr)\b")),
+    ("mpls-forwarding", re.compile(
+        r"(?im)^\s*(mpls\s+ip|mpls\s+bgp\s+forwarding|tag-switching\s+ip|"
+        r"xconnect|l2vpn|pseudowire)\b")),
+]
 
 
 _ALL_ONES_NONZERO = re.compile(
@@ -747,6 +884,15 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
         if _NAT["cisco"].search(text):
             b.append(Reason("nat-present",
                             _NAT["cisco"].search(text).group(0).strip()))
+        for code, rx in _CISCO_FEATURES:
+            m = rx.search(text)
+            if m:
+                b.append(Reason(code, " ".join(m.group(1).lower().split())))
+        unallowed = _cisco_unallowed(text)
+        if unallowed:
+            more = (f" (+{len(unallowed) - 3} more)" if len(unallowed) > 3 else "")
+            b.append(Reason("interface-feature-unmodeled",
+                            "; ".join(unallowed[:3]) + more))
         transit, other = _cisco_bindings(text)
         role = _role_reasons(acls, transit, other)
         b += role
@@ -797,7 +943,8 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
                             "no filter is applied on a transit interface"))
         if re.search(r"\blogical-systems\b", text):
             b.append(Reason("junos-logical-systems"))
-        if re.search(r"(?m)^\s*(?:set\s+)?security\s+(?:\{|policies\b)", text) or \
+        if re.search(r"(?m)^\s*(?:set\s+)?security\s+(?:\{|policies\b|zones\b)",
+                     text) or \
                 re.search(r"\bfrom-zone\s+\S+\s+to-zone\s+\S+", text) or \
                 re.search(r"(?m)^\s*policies\s*\{", text):
             b.append(Reason("junos-srx-policies"))
@@ -809,6 +956,9 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
         coll = _panos_scope_collisions(text)
         if coll:
             b.append(Reason("object-scope-ambiguous", ", ".join(coll)))
+        elif any("(object-scope-ambiguous)" in str(x) for x in notes):
+            b.append(Reason("object-scope-ambiguous",
+                            "a rule names an object defined outside its scope"))
         if "default-security-rules" in text:
             b.append(Reason("panos-default-security-rules"))
         fields = _panos_unmodeled_fields(text)
@@ -834,11 +984,13 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
         # Every forwarded packet crosses FORWARD, whatever chain the rules are
         # in: with no FORWARD policy anywhere, its kernel default ACCEPT
         # decides whatever the parsed rules do not (H3: a user chain nothing
-        # jumps to, and no FORWARD rule at all).
-        if aces and not re.search(
-                r"(?m)(?:^|\s)(?:-P|--policy)\s+FORWARD\s+(?:ACCEPT|DROP)\b|"
-                r"^\s*:FORWARD\s+(?:ACCEPT|DROP)\b",
-                text):
+        # jumps to, and no FORWARD rule at all). The policy is the one the
+        # parser applied (its trailing chain-policy entry), never a regex over
+        # the text: a `-P FORWARD DROP` in a comment, a `--comment` or a
+        # `--log-prefix` sets nothing (round 4, R1).
+        if aces and not any(a.acl == "FORWARD" and
+                            a.raw.startswith("FORWARD: default policy ")
+                            for a in aces):
             b.append(Reason("iptables-chain-policy-unset",
                             "FORWARD has no policy: the kernel default is ACCEPT"))
         ctx.fallthrough.append(Reason("iptables-chain-policy-unset",
@@ -864,12 +1016,29 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
     return ctx
 
 
+# What each frontend reads (review of #42, round 4, R7). Printed with every
+# PASS, on every surface, and in the README; it must match the checks above.
+KNOWN_LIMITS = (
+    "Cisco reads ACLs, allowlisted interface lines and the listed global "
+    "features (zone firewall, ip inspect, service-policy, policy routing, "
+    "MPLS / xconnect, NAT); any other interface line is UNKNOWN and other "
+    "global commands are not read",
+    "PAN-OS resolves an object name only in the rule's own vsys or "
+    "device-group and in shared; device-group inheritance is not followed",
+    "iptables reads the filter table; a chain's policy comes only from its "
+    "parsed -P or :CHAIN line",
+    "Junos reads firewall filters and their interface bindings; SRX security "
+    "zones or policies make the answer UNKNOWN",
+)
+LIMITS_STATEMENT = "known limits: " + "; ".join(KNOWN_LIMITS)
+
 # What every positive verdict rests on, stated with it (review of #42, F8).
 PASS_SCOPE = ("no audited ruleset permits this flow; assumes every interface is "
-              "in the file; routing, NAT and topology not evaluated")
+              "in the file; routing, NAT and topology not evaluated; "
+              + LIMITS_STATEMENT)
 REACH_SCOPE = ("every audited ruleset permits the whole flow; assumes every "
                "interface is in the file; routing, NAT and topology not "
-               "evaluated")
+               "evaluated; " + LIMITS_STATEMENT)
 
 
 def families_of(nets: Iterable) -> Set[int]:

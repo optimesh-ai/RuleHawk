@@ -1006,23 +1006,25 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             consumed.add(lineno)
             continue
 
-        # Dispatch the action verb.
-        if "-A" in toks or "--append" in toks:
-            k = toks.index("-A") if "-A" in toks else toks.index("--append")
+        # Dispatch on the FIRST verb token (review of #42, round 4, R1): a
+        # verb later on the line (`-N X # -A FORWARD ...`) is an argument or a
+        # comment, never the operation.
+        op = next((t for t in toks if t in _OPS or t in _READ_ONLY), None)
+        k = toks.index(op) if op is not None else -1
+        if op in ("-A", "--append"):
             if k + 1 < len(toks):
                 consumed.add(lineno)
                 ch = toks[k + 1]
                 ensure_chain(ch)
                 items_by_chain[ch].append(parse_one(ch, toks[k + 2:], lineno,
                                                     unreliable))
-        elif "-I" in toks or "--insert" in toks:
+        elif op in ("-I", "--insert"):
             # Insert at 1-based position N (no index => the very front). iptables
             # evaluates the inserted rule BEFORE whatever rule currently sits at
             # position N, so we SPLICE it into the chain's ordered item list at
             # that slot — first-match order is thereby modeled (ACE `seq` is
             # assigned in list order at expansion). N past the end appends; N < 1
             # is treated as 1 (front).
-            k = toks.index("-I") if "-I" in toks else toks.index("--insert")
             if k + 1 < len(toks):
                 consumed.add(lineno)
                 ch = toks[k + 1]
@@ -1043,17 +1045,15 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                              f"insert modeled at position {idx + 1} of {ch} "
                              f"(first-match order honored; it evaluates before "
                              f"whatever held that slot)")
-        elif "-P" in toks or "--policy" in toks:
-            k = toks.index("-P") if "-P" in toks else toks.index("--policy")
+        elif op in ("-P", "--policy"):
             if k + 2 < len(toks):
                 if pol_ok(toks[k + 2]):
                     consumed.add(lineno)
                 set_policy(toks[k + 1], toks[k + 2], lineno)
-        elif "-R" in toks or "--replace" in toks:
+        elif op in ("-R", "--replace"):
             # Replace the rule currently at 1-based position N in place, so the
             # replacement inherits N's first-match slot. An out-of-range (or
             # missing) index fails safe: append at the end + surface the note.
-            k = toks.index("-R") if "-R" in toks else toks.index("--replace")
             if k + 1 < len(toks):
                 consumed.add(lineno)
                 ch = toks[k + 1]
@@ -1076,20 +1076,18 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                                  f"{'' if pos is None else ' ' + str(pos)}` replace "
                                  f"position {'missing' if pos is None else 'out of range'}"
                                  f" — rule appended at end of {ch} (verify)")
-        elif "-D" in toks or "--delete" in toks:
+        elif op in ("-D", "--delete"):
             # Delete: removal not modeled — the deleted rule (if parsed earlier)
             # stays in the analysis. Surfaced, never silent.
-            k = toks.index("-D") if "-D" in toks else toks.index("--delete")
             consumed.add(lineno)
             ch = toks[k + 1] if k + 1 < len(toks) else "?"
             notes.append(f"iptables `-D {ch}` delete not modeled — the deleted "
                          f"rule may still appear in the analysis (verify manually)")
-        elif "-F" in toks or "--flush" in toks:
+        elif op in ("-F", "--flush"):
             # Flush: an ignored mid-script flush could let a flushed earlier rule
             # falsely prove a later rule dead — clear the accumulated items. Any
             # jump placeholders they carried go with them: deferred expansion
             # never sees flushed rules, so no stale pending resolution survives.
-            k = toks.index("-F") if "-F" in toks else toks.index("--flush")
             consumed.add(lineno)
             ch = toks[k + 1] if k + 1 < len(toks) else None
             if ch is not None:
@@ -1102,12 +1100,11 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                     items_by_chain[c] = []
                 notes.append("iptables `-F` flush — all rules accumulated before "
                              "this point cleared from the analysis")
-        elif "-N" in toks or "--new-chain" in toks:
-            k = toks.index("-N") if "-N" in toks else toks.index("--new-chain")
+        elif op in ("-N", "--new-chain"):
             if k + 1 < len(toks):
                 consumed.add(lineno)
                 ensure_chain(toks[k + 1])
-        elif _READ_ONLY & set(toks) and not (_OPS - _READ_ONLY) & set(toks):
+        elif op in _READ_ONLY and not (_OPS - _READ_ONLY) & set(toks):
             # -Z zeroes counters, -L / -S list: none changes filtering.
             consumed.add(lineno)
         # Anything else (-X, -E, a shell line, an unknown verb) is noted below.
