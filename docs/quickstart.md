@@ -54,8 +54,12 @@ Then your own configs:
 | a directory of configs, mixed vendors | `rulehawk gate configs/` |
 | a segmentation policy | add `--policy policy.json` ([schema](policy.md)) |
 
-Exit code: 0 clean, 1 a critical/high finding, 2 nothing could be audited
-(a file with no rules RuleHawk recognises is never reported as clean).
+Exit code (0.4.1, fail-closed stopgap: PASS is never reported): 1 a
+critical/high finding (`rulehawk gate`: a finding at or above `--fail-on`), 2
+nothing could be audited, or bad usage (a file with no rules RuleHawk
+recognises is never reported as clean), 3 UNKNOWN: no such finding, but not
+certified, so a run with no finding exits 3, not 0. Exit 0 only for `--help`
+and for `rulehawk gate --fail-on none` (advisory).
 Pasted `show run` headers, `--More--` pager prompts and Windows line endings
 are fine. Vendors: Cisco IOS/ASA/NX-OS, Arista EOS, Juniper Junos (brace form),
 Palo Alto PAN-OS (set format), iptables, AWS Security Groups.
