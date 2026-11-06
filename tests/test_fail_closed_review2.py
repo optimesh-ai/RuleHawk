@@ -186,7 +186,8 @@ def test_f3_fail_on_none_failure_and_advisory_are_named(tmp_path):
     # a broken isolation: FAIL, not enforced
     p = tmp_path / "leak.cfg"
     p.write_text(_BOUND_IOS.replace(
-        " deny ip 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255\n", ""))
+        " deny ip 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255\n",
+        " permit ip 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255\n"))
     gate = _none_gate(str(p), "v4_ip.json")
     assert (gate.verdict, gate.passed, gate.exit_code()) == ("FAIL", False, 0)
     assert "VERDICT: FAIL (not enforced" in g.to_console(gate)
@@ -226,8 +227,9 @@ def test_f3_fail_on_none_combine_shows_the_real_verdict(tmp_path):
     # ...and the exit code still follows the threshold: not enforced, exit 0
     out = tmp_path / "c.md"
     assert combine_main([str(rec), "--comment", str(out), "-q"]) == 0
-    head = out.read_text().splitlines()[1]
-    assert "PASS" not in head and "not enforced" in head, head
+    head = "\n".join(l for l in out.read_text().splitlines()[1:6] if l.strip())
+    assert "**PASS**" not in head and "✅" not in head, head
+    assert "not enforced" in head, head
 
 
 def test_f3_combine_with_an_enforced_and_an_advisory_check(tmp_path):
@@ -415,3 +417,26 @@ def test_f9_changelog_compatibility_covers_the_behaviour_changes():
     assert "iptables-fragments" in compat, compat
     assert "rulehawk_compare" in compat and "NO_NEW_RISK" in compat, compat
     assert "keep the job advisory with `fail-on: none`" not in compat, compat
+
+
+def test_f3_comment_action_reports_an_advisory_unknown_without_blocking(tmp_path):
+    """optimesh-ai/RuleHawk/comment: a fail-on none check that is UNKNOWN is
+    shown as UNKNOWN (not enforced) in its verdict output and comment, and
+    its enforce step does not fail."""
+    from test_comment_action import _run
+    from test_sticky_comment_verdict import needs_node_and_bash  # noqa: F401
+    import shutil
+    if not (shutil.which("node") and os.path.exists("/bin/bash")):
+        pytest.skip("needs node and bash")
+    d = tmp_path / "results"
+    d.mkdir()
+    s = os.path.join(_ROOT, "samples")
+    g.main([os.path.join(s, "adv_realistic.txt"), "--policy",
+            os.path.join(s, "policy.json"), "--fail-on", "none", "--label", "adv",
+            "--result", str(d / "r0.json"), "-q"])
+    run = _run(tmp_path, str(d), "1")
+    assert run["outputs"]["combine"]["verdict"] == "UNKNOWN (not enforced)", run["outputs"]
+    body = open(run["outputs"]["combine"]["comment"], encoding="utf-8").read()
+    assert "✅" not in body and "not enforced" in body, body
+    enforce = [v for k, v in run["outputs"].items() if k.startswith("_step")]
+    assert enforce[-1]["__rc__"] == 0, enforce
