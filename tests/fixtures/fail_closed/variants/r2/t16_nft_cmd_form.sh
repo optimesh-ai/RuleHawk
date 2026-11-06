@@ -1,0 +1,3 @@
+nft add table inet filter
+nft add chain inet filter forward '{ type filter hook forward priority 0; policy accept; }'
+nft add rule inet filter forward ip saddr 192.0.2.0/24 ip daddr 198.51.100.0/24 drop

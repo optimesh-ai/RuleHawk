@@ -1,0 +1,21 @@
+! A bound, fully modelled edge ACL: every interface carries the inbound
+! filter, no L4 rule and nothing RuleHawk cannot model, so a PASS against
+! samples/policy.json is genuinely supported (RFC 5737 addresses only).
+hostname edge1
+!
+interface GigabitEthernet0/0
+ description outside
+ ip address 198.51.100.1 255.255.255.0
+ ip access-group EDGE_IN in
+!
+interface GigabitEthernet0/1
+ description inside
+ ip address 192.0.2.1 255.255.255.0
+ ip access-group EDGE_IN in
+!
+ip access-list extended EDGE_IN
+ permit ip 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255
+ permit ip 198.51.100.0 0.0.0.255 192.0.2.0 0.0.0.255
+ deny ip any any
+!
+end

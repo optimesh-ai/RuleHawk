@@ -9,7 +9,7 @@
 // parity.py fails the build if this list, the dispatch, or the engine drift apart.
 const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
                         "parse_iptables", "parse_nxos", "parse_eos", "parse_awssg", "analyze", "report",
-                        "segcheck", "riskaccept", "evidence", "pathground", "boundary"];
+                        "segcheck", "riskaccept", "evidence", "pathground", "boundary", "failclosed"];
 
 // Build the report envelope: structured JSON + human-readable text + a
 // rule_id -> source-line map so the UI can jump from a finding to its rule.
@@ -31,6 +31,7 @@ from rulehawk.parse_awssg import detect as detect_awssg, parse_awssg
 from rulehawk.analyze import analyze
 from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
+from rulehawk.failclosed import build_context, normalise_vendor
 from rulehawk.evidence import Subject, build_evidence, to_evidence_markdown
 from rulehawk.model import strip_pager
 _pasted = cfg
@@ -55,7 +56,8 @@ _policy_obj = None
 if _pol:
     try:
         _policy_obj = json.loads(_pol)
-        findings = findings + check_segmentation(aces, _policy_obj)
+        _ctx = build_context(cfg, aces, notes, vendor)
+        findings = findings + check_segmentation(aces, _policy_obj, context=_ctx)
     except Exception as e:
         _policy_obj = None
         notes = notes + ["segmentation policy error: " + str(e)]
@@ -68,7 +70,7 @@ _art = build_evidence([_subject], policy=_policy_obj,
                       policy_source=("pasted-policy" if _policy_obj else ""),
                       policy_raw=(_pol.encode("utf-8") if _policy_obj else None),
                       generator="hosted")
-json.dumps({"report_json": json.loads(to_json(findings, notes, len(aces))),
+json.dumps({"report_json": json.loads(to_json(findings, notes, len(aces), normalise_vendor(vendor))),
             "report_text": to_text(findings, notes, len(aces)),
             "rule_lines": _rl, "vendor": vendor,
             "evidence": _art, "evidence_md": to_evidence_markdown(_art)})

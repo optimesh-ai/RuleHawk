@@ -34,6 +34,8 @@ import ipaddress
 from typing import Dict, List, Optional
 
 from .analyze import Finding
+from .failclosed import (PASS_SCOPE, REACH_SCOPE, FailClosedContext, Reason,
+                         families_of, reason_dicts)
 from .model import (ACE, ANY_PORTS, _ICMP_PROTOS, _IPNet, _PORTED,
                     _WILDCARD_PROTO, PortRange)
 from .parse import _PROTO_NUM
@@ -209,7 +211,7 @@ def _rect_minus(rect, r: ACE, typed: bool):
 
 
 def _search(aces: List[ACE], i0: int, probe: str, rect0, budget: _Budget,
-            want: str = "permit"):
+            want: str = "permit", fell: Optional[set] = None):
     """First-match search over aces[i0:] for a packet in `rect0` whose verdict
     is `want` ("permit" or "deny").
 
@@ -224,7 +226,10 @@ def _search(aces: List[ACE], i0: int, probe: str, rect0, budget: _Budget,
     only PART of the source/destination zone leaves the rest as a reported hole.
 
     Either way an imprecise rule intersecting the rectangle fails closed
-    (indeterminate). Iterative DFS over (rule-index, rectangle) with a worklist
+    (indeterminate). For want="permit", `fell` (when given) collects the IP
+    version of every rectangle that reached the end of the context: that part
+    of the flow space was decided by the IMPLICIT default, not by a parsed
+    rule, and the fail-closed layer decides whether that default is modeled. Iterative DFS over (rule-index, rectangle) with a worklist
     (not recursion) so a long wall of partial rules cannot hit the recursion
     limit."""
     typed = probe in _ICMP_PROTOS
@@ -277,11 +282,33 @@ def _search(aces: List[ACE], i0: int, probe: str, rect0, budget: _Budget,
             # This rectangle reached the implicit default-deny uncovered by any
             # permit — a genuine hole in the required flow.
             return ("deny", rect, None)
+        if fell_through and fell is not None:
+            fell.add(rect[0].version)
     return None
 
 
 def _policy_error(rule_id: str, msg: str, fix: str) -> Finding:
-    return Finding(rule_id, "segmentation-error", "high", msg, "", fix=fix)
+    return Finding(rule_id, "segmentation-error", "high", msg, "", fix=fix,
+                   verdict="UNKNOWN",
+                   reasons=reason_dicts([Reason("policy-error")]))
+
+
+def _indet_reasons(rule: Optional[ACE],
+                   context: Optional[FailClosedContext]) -> List[dict]:
+    rs = [Reason("imprecise-rule", f"{rule.acl} rule {rule.seq}"
+                 + (f" (line {rule.line})" if rule.line else ""))
+          if rule is not None else Reason("search-budget")]
+    if context is not None:
+        rs += context.blockers
+    return reason_dicts(rs)
+
+
+def _reason_summary(reasons: List[dict]) -> str:
+    codes = []
+    for r in reasons:
+        if r["code"] not in codes:
+            codes.append(r["code"])
+    return ", ".join(codes)
 
 
 def _coerce_ports(raw) -> Optional[List[Optional[int]]]:
@@ -307,7 +334,19 @@ def _coerce_ports(raw) -> Optional[List[Optional[int]]]:
     return out
 
 
-def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
+def check_segmentation(aces: List[ACE], policy: dict, *,
+                       context: Optional[FailClosedContext] = None
+                       ) -> List[Finding]:
+    """Check every policy assertion against `aces`.
+
+    `context` (rulehawk.failclosed.build_context) carries what the config says
+    about the assumptions a PASS rests on: the rules' bindings and roles, the
+    parse notes, and the vendor defaults RuleHawk does not model. Every output
+    surface passes it, and with it a search that finds no witness becomes a
+    PASS only when no fail-closed reason applies — otherwise UNKNOWN, with the
+    reasons. Without it (context=None) the result is the raw SEARCH result,
+    which unit tests of the search use; it is not a verdict and must never be
+    shown to a user as one (tests/test_fail_closed.py pins every surface)."""
     findings: List[Finding] = []
     if not isinstance(policy, dict):
         return [_policy_error(
@@ -327,6 +366,21 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
     by_acl: Dict[str, List[ACE]] = {}
     for a in aces:
         by_acl.setdefault(a.acl, []).append(a)
+    ctx_families: Dict[str, set] = {
+        acl: {a.src.version for a in acl_aces} for acl, acl_aces in by_acl.items()}
+
+    def _blockers(sname, dname, proto, fell, reach=False) -> List[Reason]:
+        if context is None:
+            return []
+        rs: List[Reason] = []
+        if not by_acl:
+            rs.append(Reason("search-not-run",
+                             "no transit rule context was searched"))
+        rs += context.pass_blockers(
+            families=families_of(zones[sname]) | families_of(zones[dname]),
+            proto=proto, fell_through=fell, context_families=ctx_families,
+            reach=reach)
+        return rs
 
     zones: Dict[str, List[_IPNet]] = {}
     bad_zones = set()
@@ -453,14 +507,61 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                 if kind == "ok":
                     rule, wit = info
                     _line_part = f" (line {rule.line})" if rule.line else ""
+                    blk = reason_dicts(_blockers(sname, dname, proto, set(),
+                                                 reach=True))
+                    if blk:
+                        findings.append(Finding(
+                            label, "connectivity-unknown", "medium",
+                            f"UNKNOWN ({sname} must reach {dname}{scope}): a "
+                            f"parsed rule permits the flow (e.g. rule "
+                            f"{rule.seq}{_line_part} permits {wit}), but that "
+                            f"does not prove connectivity here — "
+                            f"{len(blk)} reason(s): {_reason_summary(blk)}. "
+                            f"This is NOT a connectivity OK.",
+                            rule.raw,
+                            fix="resolve each listed reason, or verify the "
+                                "flow on the device",
+                            line=rule.line,
+                            claim={"direction": direction, "src": sname,
+                                   "dst": dname, "proto": proto,
+                                   "ports": assertion.get("ports")},
+                            verdict="UNKNOWN", reasons=blk))
+                        continue
                     findings.append(Finding(
                         f"{rule.acl}:{rule.seq}", "connectivity-ok", "info",
                         f"CONNECTIVITY OK ({sname} must reach {dname}{scope}): "
                         f"the ENTIRE flow space is provably permitted — e.g. "
-                        f"rule {rule.seq}{_line_part} permits {wit}.",
+                        f"rule {rule.seq}{_line_part} permits {wit}. "
+                        f"Scope: {REACH_SCOPE}.",
                         rule.raw,
                         witness=wit,
-                        line=rule.line))
+                        line=rule.line,
+                        verdict="PASS", reasons=[]))
+                elif kind == "partial":
+                    rule, wit, hole_acl, hole = info
+                    hsrc, hdst, hport, hprobe = hole
+                    psfx = f":{hport}" if hport is not None else ""
+                    blk = reason_dicts(
+                        [Reason("reach-not-every-context",
+                                f"{rule.acl} permits it, {hole_acl} denies "
+                                f"{hsrc} -> {hdst}{psfx}")]
+                        + _blockers(sname, dname, proto, set(), reach=True))
+                    findings.append(Finding(
+                        label, "connectivity-unknown", "medium",
+                        f"UNKNOWN ({sname} must reach {dname}{scope}): "
+                        f"{rule.acl} permits the whole flow (e.g. {wit}), but "
+                        f"{hole_acl} denies {hsrc} -> {hdst}{psfx} ({hprobe}), "
+                        f"and which rule contexts are on the path is not "
+                        f"modelled — {len(blk)} reason(s): "
+                        f"{_reason_summary(blk)}. This is NOT a connectivity OK.",
+                        rule.raw,
+                        fix=f"permit the flow in {hole_acl} too, or verify it "
+                            f"on the device",
+                        line=rule.line,
+                        claim={"direction": direction, "src": sname,
+                               "dst": dname, "proto": proto,
+                               "ports": assertion.get("ports")},
+                        verdict="UNKNOWN", reasons=blk))
                 elif kind == "indeterminate":
                     rule, acl_name = info
                     if rule is not None:
@@ -472,14 +573,17 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                             f"(neq/complex mask); review manually.",
                             rule.raw,
                             fix="rewrite the rule with explicit ports/masks",
-                            line=rule.line))
+                            line=rule.line, verdict="UNKNOWN",
+                            reasons=_indet_reasons(rule, context)))
                     else:
                         findings.append(Finding(
                             acl_name, "connectivity-indeterminate", "medium",
                             f"Cannot prove {sname} is able to reach {dname} — "
                             f"the {acl_name} ruleset is too complex to search "
                             f"exhaustively; review manually.",
-                            "", fix="simplify the ruleset or split the assertion"))
+                            "", fix="simplify the ruleset or split the assertion",
+                            verdict="UNKNOWN",
+                            reasons=_indet_reasons(None, context)))
                 else:   # broken
                     hsrc, hdst, hport, hprobe = info
                     psfx = f":{hport}" if hport is not None else ""
@@ -494,11 +598,13 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                             f"governing this path",
                         claim={"direction": direction, "src": sname,
                                "dst": dname, "proto": proto,
-                               "ports": assertion.get("ports")}))
+                               "ports": assertion.get("ports")},
+                        verdict="FAIL", reasons=[]))
                 continue
 
+            fell: set = set()
             permit_hit, indet = _probe_space(aces, by_acl, zones[sname],
-                                             zones[dname], proto, ports)
+                                             zones[dname], proto, ports, fell)
 
             if permit_hit:
                 sub, rule, probe, port = permit_hit
@@ -523,7 +629,8 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                     witness=wit,
                     line=rule.line,
                     claim={"direction": direction, "src": sname, "dst": dname,
-                           "proto": proto, "ports": assertion.get("ports")}))
+                           "proto": proto, "ports": assertion.get("ports")},
+                    verdict="FAIL", reasons=[]))
                 continue
             if indet:
                 sub, rule, acl_name = indet
@@ -536,14 +643,17 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                         f"(neq/complex mask); review manually.",
                         rule.raw,
                         fix="rewrite the rule with explicit ports/masks",
-                        line=rule.line))
+                        line=rule.line, verdict="UNKNOWN",
+                        reasons=_indet_reasons(rule, context)))
                 else:
                     findings.append(Finding(
                         acl_name, "segmentation-indeterminate", "medium",
                         f"Cannot prove {sname} is isolated from {dname} — the "
                         f"{acl_name} ruleset is too complex to search "
                         f"exhaustively; review manually.",
-                        "", fix="simplify the ruleset or split the assertion"))
+                        "", fix="simplify the ruleset or split the assertion",
+                        verdict="UNKNOWN",
+                        reasons=_indet_reasons(None, context)))
                 continue
             if sname in bad_zones or dname in bad_zones:
                 # Part of the zone definition was dropped as invalid — a
@@ -555,17 +665,35 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                     f"cannot be certified.",
                     "fix the segmentation policy file"))
                 continue
+            blk = reason_dicts(_blockers(sname, dname, proto, fell))
+            if blk:
+                # The search found no permitted witness, but the search result
+                # rests on an assumption this config breaks. Not a PASS.
+                findings.append(Finding(
+                    label, "segmentation-unknown", "medium",
+                    f"UNKNOWN ({sname} must not reach {dname}{scope}): no "
+                    f"parsed rule permits the flow, but that does not prove "
+                    f"isolation here — {len(blk)} reason(s): "
+                    f"{_reason_summary(blk)}. This is NOT a PASS.",
+                    "",
+                    fix="resolve each listed reason, or verify the isolation "
+                        "on the device",
+                    claim={"direction": direction, "src": sname, "dst": dname,
+                           "proto": proto, "ports": assertion.get("ports")},
+                    verdict="UNKNOWN", reasons=blk))
+                continue
             findings.append(Finding(
                 label, "segmentation-ok", "info",
                 f"PASS: {sname} cannot reach {dname}{scope}"
-                + " (no permitted witness flow found).", "",
-                fix=""))
+                + f" (no permitted witness flow found). Scope: {PASS_SCOPE}.", "",
+                fix="", verdict="PASS", reasons=[]))
     return findings
 
 
 def _probe_space(aces: List[ACE], by_acl: Dict[str, List[ACE]],
                  sa_nets: List[_IPNet], db_nets: List[_IPNet],
-                 proto: str, ports: List[Optional[int]]):
+                 proto: str, ports: List[Optional[int]],
+                 fell: Optional[set] = None):
     """Search every (zone-net pair x port x probe proto x ACL context) for a
     permitted packet in the asserted flow space. Returns (permit_hit, indet):
     permit_hit = (sub_rect, rule, probe, port) for the first provably
@@ -577,7 +705,10 @@ def _probe_space(aces: List[ACE], by_acl: Dict[str, List[ACE]],
     does not block the udp/icmp space — plus the "ip" probe for protocols only
     wildcard rules match. The "ip" probe goes FIRST: when a `permit ip` rule
     decides the boundary, the strongest witness is the any-protocol one. A
-    port-constrained wildcard assertion is about ported protocols."""
+    port-constrained wildcard assertion is about ported protocols.
+
+    `fell` (when given) collects (ACL, IP version) for every context whose
+    search let part of the space fall through to its implicit default."""
     if proto not in _WILDCARD_PROTO:
         probes = [proto]
     else:
@@ -596,8 +727,11 @@ def _probe_space(aces: List[ACE], by_acl: Dict[str, List[ACE]],
                            else ANY_PORTS)
                     rect = (sa, db, ANY_PORTS, dpr, _IT_ANY)
                     for acl_name, acl_aces in by_acl.items():
+                        f_acl: Optional[set] = set() if fell is not None else None
                         res = _search(acl_aces, 0, probe, rect,
-                                      _Budget(_MAX_VISITS))
+                                      _Budget(_MAX_VISITS), fell=f_acl)
+                        if f_acl:
+                            fell.update((acl_name, v) for v in f_acl)
                         if res is None:
                             continue
                         kind, sub, rule = res
@@ -629,17 +763,21 @@ def _prove_reach(aces: List[ACE], by_acl: Dict[str, List[ACE]],
       ("ok",            (rule, witness-string))
       ("indeterminate", (rule_or_None, acl_name))
       ("broken",        (hole_src, hole_dst, hole_port, probe))
-    Preference order: ok > indeterminate > broken. A single scoped context (the
-    documented usage — one policy per config that owns the path) has no
-    ambiguity; with several transit contexts, ANY fully-permitting one proves an
-    open path (mirrors how must_not_reach treats any permitting context as a
-    leak)."""
+      ("partial",       (rule, witness-string, acl_name, hole))
+    Connectivity is proven only when EVERY audited context permits the whole
+    flow: which contexts sit on the path is not modelled, so one context that
+    denies part of it (an egress ACL on the destination interface, say) may
+    drop the flow (review of #42, round 3, H4). Some contexts permitting and
+    another denying is "partial" (UNKNOWN). Any undecidable context is
+    "indeterminate"; every context with a hole is "broken"."""
     probes = _reach_probes(aces, proto, ports)
     combos = [(sa, db, port, probe) for sa in sa_nets for db in db_nets
               for port in ports for probe in probes]
     best_indet = None       # (rule_or_None, acl_name)
     first_hole = None       # (src, dst, port, probe)
     witness = None          # from any clean combo, for the ok message
+    n_clean = 0             # contexts that permit the whole flow
+    hole_acl = None
     for acl_name, acl_aces in by_acl.items():
         ctx_hole = None
         ctx_indet = None
@@ -667,15 +805,18 @@ def _prove_reach(aces: List[ACE], by_acl: Dict[str, List[ACE]],
                         port, probe)
             break
         if ctx_hole is None and ctx_indet is None:
-            # this context permits the WHOLE flow -> proven reachable
-            if witness is not None:
-                return ("ok", witness)
+            n_clean += 1                 # this context permits the WHOLE flow
         if ctx_indet is not None and best_indet is None:
             best_indet = ctx_indet
         if ctx_hole is not None and first_hole is None:
             first_hole = ctx_hole
+            hole_acl = acl_name
     if best_indet is not None:
         return ("indeterminate", best_indet)
+    if n_clean and first_hole is None and witness is not None:
+        return ("ok", witness)
+    if n_clean and first_hole is not None and witness is not None:
+        return ("partial", (witness[0], witness[1], hole_acl, first_hole))
     if first_hole is not None:
         return ("broken", first_hole)
     # No context had a hole or indeterminate, yet none was recorded clean with a

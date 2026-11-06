@@ -52,6 +52,18 @@ _CLEAN = ("ip access-list extended T\n"
 
 _UNPARSEABLE = "this file is not a firewall config at all\n"
 
+# Bound, fully modelled fixtures (coordinator 11-06): every interface carries
+# the inbound filter, no parse note, no L4 rule, so a VERIFIED is genuinely
+# supported under fail-closed. RFC 5737 addresses only.
+_BOUND_IFS = ("interface GigabitEthernet0/0\n ip address 198.51.100.1 255.255.255.0\n ip access-group T in\n!\ninterface GigabitEthernet0/1\n ip address 192.0.2.1 255.255.255.0\n ip access-group T in\n!\n")
+# DMZ->PCI denied first (verified); CORP->PCI:445 permitted (violation).
+_BOUND_LEAKY = (_BOUND_IFS + "ip access-list extended T\n"
+                " deny ip 203.0.113.0 0.0.0.255 any\n"
+                " permit ip any any\n")
+_BOUND_CLEAN = (_BOUND_IFS + "ip access-list extended T\n"
+                " permit ip 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255\n"
+                " deny ip any any\n")
+
 
 def _subject(text, name="t.txt", policy=_POLICY):
     aces, notes = parse_acls(text)
@@ -116,7 +128,7 @@ def test_artifact_is_deterministic_apart_from_timestamp():
 # attestations
 # --------------------------------------------------------------------------- #
 def test_pass_and_fail_are_attributed_to_the_right_assertion():
-    art = _build(_LEAKY)
+    art = _build(_BOUND_LEAKY)
     by_claim = {a["claim"]: a for a in art["attestations"]}
     corp = by_claim["CORP cannot reach PCI on tcp/445"]
     assert corp["status"] == FAILED
@@ -125,7 +137,7 @@ def test_pass_and_fail_are_attributed_to_the_right_assertion():
 
 
 def test_clean_config_yields_verified_attestations():
-    art = _build(_CLEAN)
+    art = _build(_BOUND_CLEAN)
     assert [a["status"] for a in art["attestations"]] == [VERIFIED, VERIFIED]
     assert art["result"]["attestations_verified"] == 2
 
@@ -179,7 +191,7 @@ def test_per_assertion_split_matches_one_combined_run():
 # fleet semantics
 # --------------------------------------------------------------------------- #
 def test_one_leaky_config_fails_the_whole_fleet_claim():
-    art = _build(_CLEAN, _CLEAN, _LEAKY)
+    art = _build(_BOUND_CLEAN, _BOUND_CLEAN, _LEAKY)
     corp = next(a for a in art["attestations"] if a["claim"].startswith("CORP"))
     assert corp["status"] == FAILED
     assert [f["subject"] for f in corp["failed_on"]] == ["cfg2.txt"]
@@ -187,7 +199,7 @@ def test_one_leaky_config_fails_the_whole_fleet_claim():
 
 
 def test_all_clean_configs_verify_and_name_their_basis():
-    corp = next(a for a in _build(_CLEAN, _CLEAN)["attestations"]
+    corp = next(a for a in _build(_BOUND_CLEAN, _BOUND_CLEAN)["attestations"]
                 if a["claim"].startswith("CORP"))
     assert corp["status"] == VERIFIED
     assert corp["basis"] == "no audited ruleset permits this flow"
@@ -378,3 +390,45 @@ def test_gate_evidence_digests_match_the_files_on_disk(tmp_path):
     _run(["gate", str(tmp_path / "*.txt"), "--evidence", str(out), "-q"])
     for s in json.loads(out.read_text())["subjects"]:
         assert s["sha256"] == sha256(open(s["source"], "rb").read())
+
+
+# --------------------------------------------------------------------------- #
+# the original, unbound fixtures are now INDETERMINATE (fail-closed)
+# --------------------------------------------------------------------------- #
+_UNBOUND_CODES = {"acl-role-unknown", "no-transit-filter", "l4-fragments"}
+
+
+def _codes(att):
+    return {r["code"] for r in (att.get("reasons") or [])}
+
+
+def test_pass_and_fail_are_attributed_to_the_right_assertion__unbound_original():
+    by_claim = {a["claim"]: a for a in _build(_LEAKY)["attestations"]}
+    assert by_claim["CORP cannot reach PCI on tcp/445"]["status"] == FAILED
+    dmz = by_claim["DMZ cannot reach PCI"]
+    assert dmz["status"] == INDETERMINATE
+    assert _codes(dmz) == _UNBOUND_CODES
+
+
+def test_clean_config_yields_verified_attestations__unbound_original():
+    art = _build(_CLEAN)
+    assert [a["status"] for a in art["attestations"]] == [INDETERMINATE, INDETERMINATE]
+    assert art["result"]["attestations_verified"] == 0
+    assert all(_codes(a) == _UNBOUND_CODES for a in art["attestations"])
+
+
+def test_one_leaky_config_fails_the_whole_fleet_claim__unbound_original():
+    corp = next(a for a in _build(_CLEAN, _CLEAN, _LEAKY)["attestations"]
+                if a["claim"].startswith("CORP"))
+    assert corp["status"] == FAILED
+    assert [f["subject"] for f in corp["failed_on"]] == ["cfg2.txt"]
+    assert corp["verified_on"] == []
+    assert _codes(corp) == _UNBOUND_CODES
+
+
+def test_all_clean_configs_verify_and_name_their_basis__unbound_original():
+    corp = next(a for a in _build(_CLEAN, _CLEAN)["attestations"]
+                if a["claim"].startswith("CORP"))
+    assert corp["status"] == INDETERMINATE
+    assert corp["verified_on"] == []
+    assert _codes(corp) == _UNBOUND_CODES

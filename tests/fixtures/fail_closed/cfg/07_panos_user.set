@@ -1,0 +1,4 @@
+set rulebase security rules block-alice from any to any source 192.0.2.0/24 destination 198.51.100.0/24 source-user "example\alice" application any service any action deny
+set rulebase security rules block-night from any to any source 192.0.2.0/24 destination 198.51.100.0/24 schedule night application any service any action deny
+set rulebase security rules smb from any to any source 192.0.2.0/24 destination 198.51.100.0/24 application any service svc-smb action allow
+set service svc-smb protocol tcp port 445

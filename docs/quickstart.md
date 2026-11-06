@@ -13,7 +13,7 @@ python3 -m venv ~/.venvs/rulehawk
 ~/.venvs/rulehawk/bin/rulehawk-mcp --version
 ```
 
-`--version` should print `rulehawk-mcp 0.4.0 (Python 3.x, MCP SDK 2.x)`.
+`--version` should print `rulehawk-mcp 0.5.0 (Python 3.x, MCP SDK 2.x)`.
 The CLI runs on Python 3.9+; the MCP server needs 3.10+ (on 3.9 pip quietly
 skips the `[mcp]` extra, and `--version` tells you so). To pin a version, add
 `@<commit-sha>` after `RuleHawk` in the URL.

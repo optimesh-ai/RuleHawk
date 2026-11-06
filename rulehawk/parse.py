@@ -31,8 +31,9 @@ from __future__ import annotations
 import contextvars
 import ipaddress
 import re
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+from .failclosed import _EXIT_END, cisco_dialect_ambiguous, cisco_lex, split_lines
 from .model import (ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet,
                     _PORTED)
 
@@ -99,27 +100,92 @@ def _canon_icmp_type(tok: Optional[str], proto: str = "icmp") -> Optional[str]:
     return out
 
 
-_NAMED_PORTS = {
-    "ftp-data": 20, "ftp": 21, "ssh": 22, "telnet": 23, "smtp": 25,
-    "domain": 53, "dns": 53, "tftp": 69, "http": 80, "www": 80, "pop3": 110,
-    "ntp": 123, "netbios-ns": 137, "netbios-dgm": 138, "netbios-ssn": 139,
-    "snmp": 161, "snmptrap": 162, "bgp": 179, "ldap": 389, "https": 443,
-    "microsoft-ds": 445, "isakmp": 500, "syslog": 514, "rip": 520,
-    "ldaps": 636, "mssql": 1433, "sqlnet": 1521, "mysql": 3306, "rdp": 3389,
-    "postgres": 5432, "postgresql": 5432, "redis": 6379, "rtsp": 554,
-    "vnc": 5900, "sip": 5060, "elasticsearch": 9200, "mongodb": 27017,
-    "memcached": 11211, "nfs": 2049, "winrm": 5985,
-    # Arista EOS names (its default control-plane ACL uses them)
-    "bfd": 3784, "bfd-echo": 3785, "multihop-bfd": 4784, "micro-bfd": 6784,
-    "sbfd": 7784, "mlag": 4432, "ldp": 646, "msdp": 639, "lsp-ping": 3503,
-    "netconf-ssh": 830,
-    "bootps": 67, "bootpc": 68, "imap4": 143, "imap": 143, "sunrpc": 111,
-    "nntp": 119, "lpd": 515, "non500-isakmp": 4500, "tacacs": 49, "time": 37,
-    "whois": 43, "finger": 79, "gopher": 70, "echo": 7, "discard": 9,
-    "chargen": 19, "ident": 113, "irc": 194, "klogin": 543, "kshell": 544,
-    "login": 513, "cmd": 514, "talk": 517, "uucp": 540,
-    "pim-auto-rp": 496, "xdmcp": 177, "radius": 1812, "radius-acct": 1813,
+# Port names, per vendor and protocol (review of #42, round 10, R9-4). A name
+# is read only where the vendor defines it for that protocol; any other name
+# leaves the operand unresolved (imprecise, noted). Junos, iptables, PAN-OS,
+# NX-OS and EOS have no cited table here, so a name there is always noted
+# (iptables-save writes numbers; a name in a script resolves through the
+# host's /etc/services, which is not in the config).
+#
+# IOS: the names come from the Cisco IOS command reference, `dynamic`
+# (https://www.cisco.com/E-Learning/bulk/public/tac/cim/cib/using_cisco_ios_software/cmdrefs/dynamic.htm):
+# "TCP port names can only be used when filtering TCP. UDP port names can
+# only be used when filtering UDP", with one list for each; the values come
+# from Cisco-IOS-XE-acl.yang 16.7.1, typedef acl-port-type
+# (https://github.com/YangModels/yang/blob/main/vendor/cisco/xe/1671/Cisco-IOS-XE-acl.yang).
+# A name on one list with no value in the YANG model (tacacs-ds, dns) is left
+# out, and so is a YANG name the list for that protocol does not have.
+_IOS_PORTS = {
+    "tcp": {"bgp": 179, "chargen": 19, "daytime": 13, "discard": 9, "domain": 53,
+            "echo": 7, "finger": 79, "ftp": 21, "ftp-data": 20, "gopher": 70,
+            "hostname": 101, "irc": 194, "klogin": 543, "kshell": 544, "lpd": 515,
+            "nntp": 119, "pop2": 109, "pop3": 110, "smtp": 25, "sunrpc": 111,
+            "syslog": 514, "talk": 517, "telnet": 23, "time": 37, "uucp": 540,
+            "whois": 43, "www": 80},
+    "udp": {"biff": 512, "bootpc": 68, "bootps": 67, "discard": 9, "dnsix": 195,
+            "echo": 7, "mobile-ip": 434, "nameserver": 42, "netbios-dgm": 138,
+            "netbios-ns": 137, "ntp": 123, "rip": 520, "snmp": 161, "snmptrap": 162,
+            "sunrpc": 111, "syslog": 514, "talk": 517, "tftp": 69, "time": 37,
+            "who": 513, "xdmcp": 177},
 }
+# ASA: Table 7, "Port Literal Values", with the protocol of each (ASA 9.19
+# General Operations CLI Configuration Guide, "Addresses, Protocols, and
+# Ports", https://www.cisco.com/c/en/us/td/docs/security/asa/asa919/configuration/general/asa-919-general-config/ref-ports.html).
+# "The ASA listens for RADIUS on ports 1645 and 1646"; "If you use dns, the
+# ASA assumes you meant to use the dnsix literal value" (so `dns` is not
+# read as 53: it is not in the table and is noted).
+_ASA_BOTH = {"cifs": 3020, "discard": 9, "domain": 53, "echo": 7, "http": 80,
+             "kerberos": 750, "nfs": 2049, "pim-auto-rp": 496, "sip": 5060,
+             "sunrpc": 111, "tacacs": 49, "talk": 517, "www": 80}
+_ASA_PORTS = {
+    "tcp": dict(_ASA_BOTH, **{
+        "aol": 5190, "bgp": 179, "chargen": 19, "citrix-ica": 1494, "cmd": 514,
+        "ctiqbe": 2748, "daytime": 13, "exec": 512, "finger": 79, "ftp": 21,
+        "ftp-data": 20, "gopher": 70, "h323": 1720, "hostname": 101, "https": 443,
+        "ident": 113, "imap4": 143, "irc": 194, "klogin": 543, "kshell": 544,
+        "ldap": 389, "ldaps": 636, "login": 513, "lotusnotes": 1352, "lpd": 515,
+        "netbios-ssn": 139, "nntp": 119, "pcanywhere-data": 5631, "pop2": 109,
+        "pop3": 110, "pptp": 1723, "rsh": 514, "rtsp": 554, "smtp": 25,
+        "sqlnet": 1521, "ssh": 22, "telnet": 23, "uucp": 540, "whois": 43}),
+    "udp": dict(_ASA_BOTH, **{
+        "biff": 512, "bootpc": 68, "bootps": 67, "dnsix": 195, "isakmp": 500,
+        "mobile-ip": 434, "nameserver": 42, "netbios-dgm": 138, "netbios-ns": 137,
+        "ntp": 123, "pcanywhere-status": 5632, "radius": 1645, "radius-acct": 1646,
+        "rip": 520, "secureid-udp": 5510, "snmp": 161, "snmptrap": 162,
+        "syslog": 514, "tftp": 69, "time": 37, "vxlan": 4789, "who": 513,
+        "xdmcp": 177}),
+}
+_NO_NAMES: "Dict[str, int]" = {}
+
+
+def _agree(tables: "List[Dict[str, int]]") -> "Dict[str, int]":
+    """The names every table defines, with the same value in each."""
+    if not tables:
+        return _NO_NAMES
+    first = tables[0]
+    return {k: v for k, v in first.items() if all(t.get(k) == v for t in tables[1:])}
+
+
+def _port_names(dialect: str, protos: "Sequence[Optional[str]]") -> "Dict[str, int]":
+    """The port names a `dialect` defines for every one of `protos` (a name
+    that means one port on each of them)."""
+    if dialect in ("ios", "ios6"):
+        srcs = [_IOS_PORTS]
+    elif dialect == "asa":
+        srcs = [_ASA_PORTS]
+    else:
+        return _NO_NAMES
+    tables = []
+    for p in protos:
+        if p not in ("tcp", "udp"):
+            return _NO_NAMES
+        tables += [s[p] for s in srcs]
+    return _agree(tables)
+
+
+# The port names of the operand being read; set by the Cisco entry parser.
+_PORT_NAMES: "contextvars.ContextVar[Dict[str, int]]" = contextvars.ContextVar(
+    "_PORT_NAMES", default=_NO_NAMES)
 _ACTIONS = ("permit", "deny")
 # Match-NARROWING trailing qualifiers: on a real device each of these RESTRICTS
 # the packets the ACE matches (`fragments` -> non-initial fragments only,
@@ -188,20 +254,36 @@ def _scan_trailer(rest: List[str]
             j += 1 + _QUAL_ARGC.get(t, 0)
             continue
         if t in ("log", "log-input"):
-            # ASA log arguments: `log [level] [interval N]` or `log disable` /
-            # `log default`. Consume them so a logged-but-exact ACE stays exact
-            # (log never narrows the match).
+            # `log` never narrows the match; what may follow it depends on
+            # the dialect (review of #42, round 9, R8-6). A word that is not
+            # in the dialect's cited grammar is left for the unknown-token
+            # check (imprecise + note).
+            d = _DIALECT.get()
             j += 1
-            if j < len(rest) and rest[j].isdigit() and 0 <= int(rest[j]) <= 7:
-                j += 1                       # syslog level 0-7
-            while j < len(rest):
-                a = rest[j].lower()
-                if a == "interval" and j + 1 < len(rest) and rest[j + 1].isdigit():
-                    j += 2
-                elif a in ("disable", "default"):
+            if d == "asa":
+                if t == "log-input":
+                    # Not in the ASA grammar (below): an unknown word.
+                    extra_unknown.append(rest[j - 1])
+                    continue
+                # ASA: `log [[level] [interval secs] | disable | default]`,
+                # level 0-7, interval 1-600. Cisco Secure Firewall ASA
+                # Firewall CLI Configuration Guide 9.20, "Access Control
+                # Lists" (https://www.cisco.com/c/en/us/td/docs/security/asa/asa920/configuration/firewall/asa-920-firewall-config.pdf):
+                # "level—A severity level between 0 and 7" and "interval
+                # secs—The time interval in seconds between syslog messages,
+                # from 1 to 600".
+                if j < len(rest) and rest[j].lower() in ("disable", "default"):
                     j += 1
-                else:
-                    break
+                    continue
+                if j < len(rest) and rest[j].isdigit() and 0 <= int(rest[j]) <= 7:
+                    j += 1
+                if (j + 1 < len(rest) and rest[j].lower() == "interval"
+                        and rest[j + 1].isdigit() and 1 <= int(rest[j + 1]) <= 600):
+                    j += 2
+                continue
+            # IOS, NX-OS, EOS: nothing after `log` / `log-input` is read. (An
+            # IOS command reference has `log [word]`, a cookie; a word there
+            # stays noted, as in round 7: no lift.)
             continue
         if t == "established":
             stateful = True
@@ -223,16 +305,19 @@ def _scan_trailer(rest: List[str]
     return narrowing, first_type, extra_unknown, stateful, inactive
 
 
-def _port_num(tok: str) -> int:
+def _port_num(tok: str, names: "Optional[Dict[str, int]]" = None) -> int:
+    """A port number, or -1. A name is read only from `names` (default: the
+    names of the operand being read, `_PORT_NAMES`); the other frontends pass
+    none, so a name there is unresolved (R9-4)."""
     if tok.isdigit():
         return max(PORT_MIN, min(PORT_MAX, int(tok)))
-    return _NAMED_PORTS.get(tok.lower(), -1)
+    return (_PORT_NAMES.get() if names is None else names).get(tok.lower(), -1)
 
 
 def _is_port_token(tok: str) -> bool:
     """True if `tok` looks like a port literal (a number or a known service
     name) — used to detect the trailing ports of a multi-port `eq a b c`."""
-    return tok.isdigit() or tok.lower() in _NAMED_PORTS
+    return tok.isdigit() or tok.lower() in _PORT_NAMES.get()
 
 
 def _classify_mask(mask: str) -> Tuple[int, str]:
@@ -273,6 +358,13 @@ def _classify_mask(mask: str) -> Tuple[int, str]:
 # netmask, whatever it looks like.
 _WILDCARD_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_WILDCARD_ONLY", default=False)
+# The entry grammar of the line being parsed (review of #42, round 9, R8-6):
+# "ios" (IOS / IOS XE IPv4, named ACL mode or a numbered `access-list N`
+# line), "ios6" (IOS IPv6 ACL mode), "asa" (an ASA `access-list NAME
+# extended|standard` line), "nxos", "eos". It decides which operand and
+# trailer forms are read; any other form is noted.
+_DIALECT: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_DIALECT", default="ios")
 
 
 def _parse_addr(tokens: List[str], i: int, v6: bool = False) -> Tuple[_IPNet, int, bool]:
@@ -308,6 +400,16 @@ def _parse_addr(tokens: List[str], i: int, v6: bool = False) -> Tuple[_IPNet, in
         return _ANY_NET, i + 2, False
     imprecise = kind in ("ambiguous", "noncontiguous")
     return ipaddress.ip_network(f"{addr}/{plen}", strict=False), i + 2, imprecise
+
+
+def _port_op(tokens: List[str], i: int, proto: Optional[str]
+             ) -> Tuple[List[PortRange], int, bool, int]:
+    """`_parse_port_op` with the port names of the line's dialect and `proto`."""
+    tok = _PORT_NAMES.set(_port_names(_DIALECT.get(), [proto]))
+    try:
+        return _parse_port_op(tokens, i)
+    finally:
+        _PORT_NAMES.reset(tok)
 
 
 def _parse_port_op(tokens: List[str], i: int) -> Tuple[List[PortRange], int, bool, int]:
@@ -517,7 +619,8 @@ def _expand_proto(p: Optional[str]) -> Optional[List[str]]:
     return None                              # unknown -> fail closed
 
 
-def _svc_port(rest: List[str], idx: int) -> Optional[PortRange]:
+def _svc_port(rest: List[str], idx: int,
+              protos: "Sequence[str]" = ()) -> Optional[PortRange]:
     """Parse an exact, contiguous service-port operator at rest[idx:] -> one
     PortRange. Handles `eq P` / `range LO HI` / `lt P` -> [MIN, P-1] / `gt P` ->
     [P+1, MAX]. `neq` is non-contiguous (two ranges) and cannot be expressed as a
@@ -525,20 +628,27 @@ def _svc_port(rest: List[str], idx: int) -> Optional[PortRange]:
     INDETERMINATE) — never widened into a (possibly false) PASS."""
     if idx >= len(rest):
         return None
+    # `service-object`, `port-object` and `object service ... service` are
+    # the ASA object grammar (ASA firewall configuration guide, "Objects for
+    # Access Control"; IOS XE's `object-group service` body is bare
+    # `protocol [operator port]` lines, which this reader does not take), so
+    # the ASA names are read, for every protocol of the member (R9-4).
+    names = _port_names("asa" if _DIALECT.get() in ("ios", "ios6", "asa")
+                        else "", list(protos) or [None])
     op = rest[idx].lower()
     if op == "eq":
-        p = _port_num(rest[idx + 1])
+        p = _port_num(rest[idx + 1], names)
         return PortRange(p, p) if p >= 0 else None
     if op == "range":
-        lo, hi = _port_num(rest[idx + 1]), _port_num(rest[idx + 2])
+        lo, hi = _port_num(rest[idx + 1], names), _port_num(rest[idx + 2], names)
         if lo < 0 or hi < 0:
             return None
         return PortRange(min(lo, hi), max(lo, hi))
     if op == "lt":
-        p = _port_num(rest[idx + 1])
+        p = _port_num(rest[idx + 1], names)
         return PortRange(PORT_MIN, p - 1) if p > PORT_MIN else None
     if op == "gt":
-        p = _port_num(rest[idx + 1])
+        p = _port_num(rest[idx + 1], names)
         return PortRange(p + 1, PORT_MAX) if 0 <= p < PORT_MAX else None
     return None
 
@@ -555,7 +665,7 @@ def _svc_members(rest: List[str], header_proto: Optional[str]) -> List[Tuple]:
             return [("so", rest[1])]
         if t0 in _PORT_OPS:                  # port-object: proto from the header
             protos = _expand_proto(header_proto)
-            pr = _svc_port(rest, 0)
+            pr = _svc_port(rest, 0, protos or ())
             if protos is None or pr is None or any(p not in _PORTED for p in protos):
                 return [("bad",)]            # ports on a port-less proto -> fail closed
             return [("svc", p, pr) for p in protos]
@@ -569,7 +679,7 @@ def _svc_members(rest: List[str], header_proto: Optional[str]) -> List[Tuple]:
             idx += 1
         if idx >= len(rest):                 # protocol only -> any port
             return [("svc", p, ANY_PORTS) for p in protos]
-        pr = _svc_port(rest, idx)
+        pr = _svc_port(rest, idx, protos)
         if pr is None or any(p not in _PORTED for p in protos):
             # Unparseable port operator, or a port on a port-less protocol
             # (covers()/segcheck ignore ports there, so the member would claim
@@ -580,34 +690,54 @@ def _svc_members(rest: List[str], header_proto: Optional[str]) -> List[Tuple]:
         return [("bad",)]
 
 
-def _collect_defs(text: str) -> _Defs:
-    """Pass 1: read every object-group / object definition in the config."""
+def _collect_defs(text: str, lex=None) -> _Defs:
+    """Pass 1: read every object-group / object definition in the config.
+
+    A member line counts only when the lexer puts it in the mode its group's
+    header opened (indentation does not matter to the device). A member-like
+    line anywhere else makes that group fail closed (a malformed member)."""
+    lex = lex if lex is not None else cisco_lex(text)
+    by_no = {ln.no: ln for ln in lex.lines}
     defs = _Defs()
     cur = None          # ("ng"|"no"|"sg"|"so"|"other", name)
+    cur_no = -1         # header line of `cur`
     header_proto = None
-    for raw in text.splitlines():
+    for lineno, raw in enumerate(split_lines(text), 1):
         s = raw.strip()
-        if not s or s.startswith("!"):
+        lx = by_no.get(lineno)
+        if lx is None or lx.post_end or not s.split() or s.startswith("!"):
             continue
+        if cur is not None and lx.opener != cur_no and not (
+                lx.opener == lineno or lx.header):
+            # The mode changed since the header (a top-level command, `exit`,
+            # an interface): later member lines are not in this group.
+            if cur[0] in ("ng", "no", "sg", "so") and re.match(
+                    r"(?i)^(?:network-object|group-object|service-object|"
+                    r"port-object|host|subnet|range|service)\b", s):
+                (defs.net_groups if cur[0] == "ng" else defs.net_objs if cur[0] == "no"
+                 else defs.svc_groups if cur[0] == "sg" else defs.svc_objs
+                 )[cur[1]].append(("malformed",))
+            cur = None
         low = s.lower()
         m = re.match(r"(?i)^object-group\s+network\s+(\S+)", s)
         if m:
-            cur, header_proto = ("ng", m.group(1)), None
+            cur, header_proto, cur_no = ("ng", m.group(1)), None, lx.opener
             defs.net_groups.setdefault(m.group(1), [])
             continue
         m = re.match(r"(?i)^object-group\s+service\s+(\S+)(?:\s+(\S+))?", s)
         if m:
             cur, header_proto = ("sg", m.group(1)), (m.group(2) or "").lower() or None
+            cur_no = lx.opener
             defs.svc_groups.setdefault(m.group(1), [])
             continue
         m = re.match(r"(?i)^object\s+network\s+(\S+)", s)
         if m:
-            cur, header_proto = ("no", m.group(1)), None
+            cur, header_proto, cur_no = ("no", m.group(1)), None, lx.opener
             defs.net_objs.setdefault(m.group(1), [])
             continue
         m = re.match(r"(?i)^object\s+service\s+(\S+)", s)
         if m:
-            cur, header_proto = ("so", m.group(1)), None
+            cur, header_proto, cur_no = ("so", m.group(1)), None, lx.opener
             defs.svc_objs.setdefault(m.group(1), [])
             continue
         if low.startswith("object-group "):          # protocol / icmp-type / ... groups
@@ -845,7 +975,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     # rare — leave it unresolved/fail-closed rather than grow the model).
     src_ports: List[PortRange] = [ANY_PORTS]
     if i < n and ported and toks[i].lower() in _PORT_OPS:
-        src_ports, i, imp_sp, _ = _parse_port_op(toks, i)
+        src_ports, i, imp_sp, _ = _port_op(toks, i, proto)
         imprecise = imprecise or imp_sp
         port_imprecise = port_imprecise or imp_sp
     elif i < n and _is_svc_ref(toks, i, defs):
@@ -884,7 +1014,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
         if not combos:                       # tcp ACE over a udp-only group, etc.
             return None
     elif i < n and ported and toks[i].lower() in _PORT_OPS:
-        dst_ports, i, imp_dp, _ = _parse_port_op(toks, i)
+        dst_ports, i, imp_dp, _ = _port_op(toks, i, proto)
         imprecise = imprecise or imp_dp
         port_imprecise = port_imprecise or imp_dp
         combos = [(proto, dp) for dp in dst_ports]
@@ -895,6 +1025,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
         return None                          # over-cap -> fail closed (one opaque ACE)
 
     rest = toks[i:]
+    cidr = _v4_prefix_operands(toks[2:i]) if not v6 else []
     narrowing, type_tok, extra_unknown, stateful, inactive = _scan_trailer(rest)
     if inactive:
         # ASA `inactive`: the rule is DISABLED on the device — its true match
@@ -986,7 +1117,7 @@ def _apply_asa_names(text: str) -> Tuple[str, int]:
     if not names:
         return text, 0
     out = []
-    for ln in text.splitlines():
+    for ln in split_lines(text):
         st = ln.lstrip().lower()
         if st.startswith(("access-list ", "permit ", "deny ", "host ", "subnet ",
                           "range ", "network-object ")):
@@ -1005,43 +1136,403 @@ _ALIAS_RESERVED = frozenset({"any", "any4", "any6", "host", "object", "object-gr
                              "permit", "deny", "ip", "tcp", "udp", "icmp"})
 
 
-def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
+_BANNER_RE = re.compile(
+    r"(?i)^\s*banner(?:\s+(exec|login|motd|incoming|slip-ppp|prompt-timeout|"
+    r"config-save|asdm))?(?:\s+(.*))?$")
+
+
+def strip_banners(text: str) -> Tuple[str, List[str]]:
+    """Blank every banner line, so banner text is never read as config.
+
+    IOS / NX-OS: `banner TYPE D text D`, where D is the first character after
+    the type (running-config shows Ctrl-C as `^C`); the text may span lines
+    and ends at the next D. Arista EOS: `banner TYPE` alone, then text lines
+    up to a line `EOF`. ASA: `banner TYPE text`, one line each. A delimiter
+    RuleHawk cannot determine (a letter or digit, which ASA uses as text and
+    IOS as a delimiter) or a banner that never ends gets a note, so no PASS
+    rests on it. Line numbers are kept (blanked lines stay as empty lines).
+
+    `banner` is a global command wherever it is indented, so the first line
+    keeps a bare `banner TYPE ^C^C` header: the lexer reads it as the top-level
+    command that ends an interface / ACL / object-group mode."""
+    lines = text.split("\n")
+    notes: List[str] = []
+    asa = bool(re.search(r"(?im)^\s*(?:ASA|PIX|FWSM)\s+Version\b", text))
+    i, n = 0, len(lines)
+    while i < n:
+        m = _BANNER_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        start, rest = i, (m.group(2) or "").lstrip()
+        lead = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+        # `^C^C` makes the header a closed one-line banner, so a second pass
+        # leaves it as it is.
+        header = f"{lead}banner {(m.group(1) or 'motd').lower()} ^C^C"
+        if asa:
+            lines[i] = header
+            i += 1
+            continue
+        if not rest:
+            # EOS form: text lines up to `EOF`.
+            j = next((k for k in range(i + 1, n) if lines[k].strip() == "EOF"), None)
+            if j is None:
+                notes.append(f"banner without a delimiter (line {start + 1}): "
+                             f"`{lines[i].strip()}` — its extent is unknown")
+                lines[i] = header
+                i += 1
+                continue
+            for k in range(i + 1, j + 1):
+                lines[k] = ""
+            lines[i] = header
+            i = j + 1
+            continue
+        delim = "^C" if rest.startswith("^C") else rest[0]
+        if delim.isalnum():
+            notes.append(f"banner delimiter could not be determined (line "
+                         f"{start + 1}): `{lines[i].strip()}`")
+            lines[i] = header
+            i += 1
+            continue
+        body = rest[len(delim):]
+        if delim in body:
+            lines[i] = header
+            i += 1
+            continue
+        j = next((k for k in range(i + 1, n) if delim in lines[k]), None)
+        if j is None:
+            notes.append(f"banner with no closing delimiter {delim!r} (line "
+                         f"{start + 1}): the rest of the file was read as banner "
+                         f"text")
+            j = n - 1
+        for k in range(i + 1, j + 1):
+            lines[k] = ""
+        lines[i] = header
+        i = j + 1
+    return "\n".join(lines), notes
+
+
+_NO_ACL_RE = re.compile(r"(?i)^no\s+(?:(?:ip|ipv4|ipv6)\s+)?access-list\b")
+_NO_ENTRY_RE = re.compile(r"(?i)^no\s+(?:\d+|permit|deny)\b")
+
+
+# IOS global commands that share the `ip access-list` prefix and take no
+# argument: `ip access-list persistent` ("Enables persistency and stores the
+# IP access list entry sequence number across reloads", IOS 15SY ACL guide,
+# "IP Access List Entry Sequence Numbering",
+# https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/sec_data_acl/configuration/15-sy/sec-data-acl-15-sy-book/sec-acl-seq-num-persistent.html)
+# and `ip access-list match-local-traffic` (Cisco-IOS-XE-acl.yang 16.7.1,
+# "Enable ACL matching for locally generated traffic",
+# https://github.com/YangModels/yang/blob/main/vendor/cisco/xe/1671/Cisco-IOS-XE-acl.yang). Neither opens an ACL nor filters transit
+# traffic.
+_IOS_ACL_GLOBALS = frozenset({"persistent", "match-local-traffic"})
+
+
+def _header_dialect_note(vendor: str, family: str, typ: Optional[str], name: str,
+                         lineno: int) -> str:
+    """The ACL header form of each dialect (review of #42, round 10, R9-1).
+
+    - IOS / IOS XE: `ip access-list { { extended | resequence | standard }
+      { access-list-number | access-list-name } ...` (Catalyst 9400 IOS XE
+      16.10 security command reference); "Named access lists are specified as
+      standard or extended based on the keyword standard or extended in the ip
+      access-list command syntax" (IOS XE 17, IP Access List Overview). An
+      untyped IPv4 header is not in the grammar, and "if an access list is
+      referenced by a name, but the access list does not exist, all packets
+      pass" (IOS XE 16.11 ACL guide). `ipv6 access-list NAME` has no type.
+    - NX-OS: `ip access-list access-list-name` (Nexus 9000 NX-OS 10.5
+      security configuration guide): no type.
+    - EOS: its header grammar is not cited (Arista's manual is behind a bot
+      challenge), so a typed header there is not read either."""
+    if family != "ip":
+        return ""
+    if vendor == "ios" and not typ and name.lower() in _IOS_ACL_GLOBALS:
+        return ""
+    if vendor == "ios" and not typ:
+        return (f"`ip access-list {name}` (line {lineno}) has no `standard` / "
+                f"`extended`: not in the IOS grammar (an interface bound to a named "
+                f"ACL the device does not have passes every packet); not modelled")
+    if vendor in ("nxos", "eos") and typ:
+        what = ("not in the NX-OS grammar (`ip access-list NAME`)" if vendor == "nxos"
+                else "the EOS header grammar is not cited")
+        return (f"`ip access-list {typ.lower()} {name}` (line {lineno}): {what}; "
+                f"not modelled")
+    return ""
+
+
+def parse_acls(text: str, vendor: str = "ios") -> Tuple[List[ACE], List[str]]:
     """Parse all ACLs in `text`; return (entries, notes).
 
     `notes` records lines recognized as ACEs but not fully modeled — surfaced,
-    never silently dropped.
-    """
+    never silently dropped. `vendor` (`ios`, `nxos`, `eos`) selects the
+    sequence-number grammar of ACL mode (round 8, R7-3)."""
     tok = _WILDCARD_ONLY.set(False)
+    dtok = _DIALECT.set(vendor)
     try:
-        return _parse_acls(text)
+        return _parse_acls(text, vendor)
     finally:
+        _DIALECT.reset(dtok)
         _WILDCARD_ONLY.reset(tok)
 
 
-def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
+# The sequence-number forms of ACL mode, per vendor and family (review of
+# #42, round 8, R7-3). Any other form is read as a number and noted.
+# - IOS / IOS XE IPv4: a bare number. IOS XE 17 "IP Access List Entry
+#   Sequence Numbering" (https://www.cisco.com/c/en/us/td/docs/routers/ios/config/17-x/sec-vpn/b-security-vpn/m_sec-acl-seq-num.html):
+#   "Device(config-std-nacl)# 105 permit ...".
+# - IOS / IOS XE IPv6: the `sequence` keyword. Cisco IOS XE Catalyst SD-WAN
+#   Qualified Command Reference, ACL Commands, `sequence`
+#   (https://www.cisco.com/c/en/us/td/docs/routers/sdwan/command/iosxe/qualified-cli-command-reference-guide/m-acl-commands.html):
+#   "Command Modes: IPv6 access-list configuration",
+#   "Device(config-ipv6-acl)# sequence 100 permit ipv6 any 2001:DB8::/32".
+# - NX-OS IPv4 and IPv6: a bare number. Nexus 3600 NX-OS Security
+#   Configuration Guide 10.5(x), "Configuring IP ACLs"
+#   (https://www.cisco.com/c/en/us/td/docs/dcn/nx-os/nexus3600/105x/configuration/security/cisco-nexus-3600-switch-nx-os-security-configuration-guide-105x/m-configuring-ip-acls.html):
+#   "[sequence-number] { permit | deny} protocol ...".
+# - EOS: a bare number (what RuleHawk read before; not cited, the Arista
+#   manual is behind a bot challenge).
+def _seq_form_ok(vendor: str, v6: bool, form: str) -> bool:
+    if form == "sequence":
+        return vendor == "ios" and v6
+    return not (vendor == "ios" and v6)
+
+
+# The sequence-number range per vendor and family (review of #42, round 9,
+# R8-2). A number outside it, 0, or a number written with a leading zero
+# (how the device reads `010` is not cited) is noted.
+# - IOS / IOS XE IPv4: 1-2147483647. IOS XE 17 "IP Access List Entry Sequence
+#   Numbering" (URL above): "the range is from 1 to 2147483647" and "The
+#   maximum sequence number is 2147483647. If the generated sequence number
+#   exceeds this maximum number, the following message is displayed:
+#   Exceeded maximum sequence number."
+# - IOS / IOS XE IPv6: 1-4294967295. Catalyst 9600 IOS XE 17.15 Security
+#   Configuration Guide, "Configuring IPv6 ACLs" (a switch guide, round 10,
+#   R9-6; https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9600/software/release/17-15/configuration_guide/sec/b_1715_sec_9600_cg/configuring_ipv6_acls.html):
+#   "Enter sequence value to specify the sequence number for the access list
+#   statement. The acceptable range is from 1 to 4,294,967,295."
+# - NX-OS: 1-4294967295. Nexus 3600 10.5(x) "Configuring IP ACLs" (URL
+#   above): "The sequence-number argument can be a whole number between 1 and
+#   4294967295."
+# - EOS: not cited (the Arista manual is behind a bot challenge); the
+#   smallest cited bound is used, so a larger number is noted.
+_SEQ_MAX = {("ios", False): 2147483647, ("ios", True): 4294967295,
+            ("nxos", False): 4294967295, ("nxos", True): 4294967295,
+            ("eos", False): 2147483647, ("eos", True): 2147483647}
+
+
+def _seq_max(vendor: str, v6: bool) -> int:
+    return _SEQ_MAX.get((vendor, v6), 2147483647)
+
+
+# +10 for an unnumbered entry is cited for IOS IPv4 and NX-OS only (see
+# `_device_numbers`). Elsewhere an ACL that mixes numbered and unnumbered
+# entries is noted (R8-7).
+def _plus_ten_cited(vendor: str, v6: bool) -> bool:
+    return (vendor == "ios" and not v6) or vendor == "nxos"
+
+
+# Keywords whose case the device rule decides (round 9). IOS: "You can enter
+# commands in uppercase, lowercase, or mixed case. Only passwords are case
+# sensitive." (Cisco IOS Configuration Fundamentals Configuration Guide
+# 12.2SR, "Using the Cisco IOS Command-Line Interface",
+# https://www.cisco.com/c/en/us/td/docs/ios/fundamentals/configuration/guide/12_2sr/cf_12_2sr_book/cf_cli-basics.html).
+# NX-OS and EOS: no case rule is cited, so a keyword that is not lower case
+# is noted there.
+_CASE_KEYWORDS = frozenset({
+    "permit", "deny", "remark", "sequence", "any", "host", "eq", "gt", "lt",
+    "neq", "range", "log", "log-input", "established", "fragments",
+    "time-range", "dscp", "tos", "precedence", "ttl", "ip", "ipv4", "ipv6",
+    "tcp", "udp", "icmp", "icmpv6", "access-list", "extended", "standard",
+    "object-group", "addrgroup", "portgroup", "statistics", "per-entry",
+    "gre", "esp", "ahp", "ah", "ospf", "eigrp", "pim", "sctp", "igmp"})
+
+
+_SEQ_FORM = re.compile(r"(?i)^(sequence\s+)?(\d+)\s+(\S.*)$")
+# `no N` / `no sequence N` delete entry N. IOS XE 17 "IP Access List Entry
+# Sequence Numbering" (URL above): "Use the no sequence-number command to
+# delete an entry."; IOS XE IPv6 `sequence` (URL above): "To remove a
+# sequence number from an IP access list, use the no form of this command.";
+# NX-OS (URL above): "switch(config-acl)# no 101". The deletion is applied
+# and also noted (the answer is UNKNOWN or, if the leak is proven, FAIL).
+_DEL_SEQ = re.compile(r"(?ai)^no\s+(sequence\s+)?([0-9]+)$")
+_ACL_HEADER_FULL = re.compile(
+    r"(?ai)^(?:ip|ipv4|ipv6) access-list (?:(?:extended|standard) )?\S+$")
+_STATS = re.compile(r"(?ai)^(?:no )?statistics per-entry$")
+_FLAT_REMARK = re.compile(r"(?i)^access-list\s+\S+\s+(?:line\s+\d+\s+)?remark(?:\s|$)")
+_REMARK = re.compile(r"(?i)^remark(?:\s|$)")
+
+
+_RESEQ = re.compile(r"(?i)^(?:(?:ip|ipv4|ipv6)\s+access-list\s+resequence|resequence)(?:\s|$)")
+_FLAT = re.compile(r"(?i)^access-list(?:\s|$)")
+# Reference-only forms of a line that names an ACL outside ACL mode
+# (round 9): the ACL is used as a match list (vty access, SNMP, a route-map
+# or class-map `match`), or bound by the ASA `access-group` command, which
+# the path model reads. Group `n` is the ACL name.
+_ACL_REF_OK = [
+    re.compile(r"(?ai)(?:ipv6 )?access-class (?P<n>\S+) (?:in|out)(?: vrf-also)?"),
+    re.compile(r"(?ai)match (?:ip|ipv6) address (?P<n>\S+)"),
+    re.compile(r"(?ai)snmp-server community \S+ (?:RO|RW) (?P<n>\S+)"),
+    re.compile(r"(?ai)access-group (?P<n>\S+) (?:(?:in|out) interface \S+|global)"),
+]
+
+
+def _bad_case(line: str) -> Optional[str]:
+    """The first keyword of an NX-OS / EOS ACL line that is not lower case
+    (the words of a remark are free text)."""
+    for w in line.split():
+        lw = w.lower()
+        if w != lw and lw in _CASE_KEYWORDS:
+            return w
+        if lw == "remark":
+            break
+    return None
+
+
+def _parse_acls(text: str, vendor: str = "ios") -> Tuple[List[ACE], List[str]]:
+    from .failclosed import Ledger
     entries: List[ACE] = []
     notes: List[str] = []
+    text, notes_b = strip_banners(text)
+    notes += notes_b
     text, n_alias = _apply_asa_names(text)
     if n_alias:
         notes.append(f"ASA `name` aliases resolved: {n_alias} name(s) substituted "
                      f"with their address")
-    defs = _collect_defs(text)               # pass 1: object-group / object defs
+    # Stanza membership comes from the lexer, as the device reads modes: an
+    # entry belongs to the named ACL whose header opened the mode it is in,
+    # whatever its indentation (review of #42, round 6, N1).
+    lex = cisco_lex(text)
+    by_no = {ln.no: ln for ln in lex.lines}
+    srcs = split_lines(text)
+    defs = _collect_defs(text, lex)          # pass 1: object-group / object defs
+    pix_dialect = cisco_dialect_ambiguous(text)
     current_acl = "(unnamed)"
+    acl_opener = -1                          # header line of the current named ACL
     cur_v6 = cur_std = False                 # family/kind of the current named ACL
     seq = 0
-    in_other = False                         # inside a non-filter block (see below)
-    for lineno, raw in enumerate(text.splitlines(), 1):
+    # Line accounting (round 8): the scope is every line the lexer puts in ACL
+    # mode, every ACL header and every flat `access-list` line, whatever the
+    # handlers below make of it.
+    led = Ledger("cisco-acl")
+    for lx in lex.lines:
+        if lx.post_end:
+            continue
+        if (lx.mode == "acl" or re.match(r"(?i)^access-list(?: |$)", lx.norm)):
+            led.add(lx.no, lx.norm)
+    # Per ACL, in text order: (kind, line, explicit number or None, v6) with
+    # kind entry | remark | delete, for the device numbering (R7-1, R7-2).
+    events: "dict[str, list]" = {}
+    acl_meta: "dict[str, tuple]" = {}         # ACL -> (vendor, v6)
+    names: set = set()                        # every ACL name defined
+
+    def event(kind: str, lineno: int, n: Optional[int]) -> None:
+        if current_acl != "(unnamed)":
+            events.setdefault(current_acl, []).append((kind, lineno, n))
+
+    if lex.post_end:
+        no = lex.post_end[0]
+        notes.append(f"line {no} (`{srcs[no - 1].strip()[:60]}`) and "
+                     f"{len(lex.post_end) - 1} more come after `end` (or a global "
+                     f"`exit`): not configuration, not read")
+    for lineno, raw in enumerate(srcs, 1):
         stripped = raw.strip()
-        if not stripped or stripped.startswith("!"):
+        lx = by_no.get(lineno)
+        if lx is None or lx.post_end or not stripped.split() or stripped.startswith("!"):
+            continue                         # blank, `!`, or after `end`
+        in_acl = lx.mode == "acl" and lx.opener == acl_opener
+        opener_txt = srcs[lx.opener - 1].strip() if lx.opener else ""
+        in_block = (lx.mode != "acl" and not lx.header
+                    and lx.opener != lineno and bool(_NON_FILTER_HDR.match(opener_txt)))
+        if lx.mode == "acl" and lx.norm.lower() in _EXIT_END:
+            # `exit` ends ACL mode; the lexer reads it (and flags `ex`, `en`).
+            led.consume(lineno)
+            continue
+        if _RESEQ.match(lx.norm):
+            # `resequence` renumbers an ACL's entries (round 9, R8-5): NX-OS
+            # global `resequence ip access-list NAME START INC` (Nexus 3600
+            # 10.5(x) "Configuring IP ACLs": "Assigns sequence numbers to the
+            # rules contained in the ACL, where the first rule receives the
+            # starting sequence number that you specify."), IOS `ip
+            # access-list resequence NAME START INC`, and `resequence` inside
+            # ACL mode. Wherever it is, it names an ACL: in scope, noted.
+            led.add(lineno, lx.norm)
+            led.note(lineno, notes,
+                     f"`{lx.norm[:60]}` (line {lineno}) renumbers an ACL's "
+                     f"entries; the order after it is not modelled")
+            continue
+        if vendor in ("nxos", "eos") and (lx.mode == "acl" or _FLAT.match(lx.norm)):
+            bad = _bad_case(lx.norm)
+            if bad:
+                led.add(lineno, lx.norm)
+                led.note(lineno, notes,
+                         f"`{bad}` (line {lineno}) is not lower case: the case "
+                         f"rule of {vendor} keywords is not cited, so the line "
+                         f"is not read as the lower-case keyword")
+        mdel = _DEL_SEQ.match(lx.norm) if in_acl else None
+        if mdel:
+            kw = bool(mdel.group(1))
+            ok = _seq_form_ok(vendor, cur_v6, "sequence" if kw else "bare")
+            if ok:
+                event("delete", lineno, int(mdel.group(2)))
+            led.note(lineno, notes,
+                     f"`{lx.norm}` (line {lineno}) in {current_acl}: "
+                     + ("the deletion is applied (Cisco: `no` of a sequence "
+                        "number deletes the entry)" if ok else
+                        "this deletion form is not cited for this ACL mode, so it "
+                        "is not applied")
+                     + "; the answer rests on it, so it is not a PASS")
+            continue
+        if _NO_ACL_RE.match(stripped) or (in_acl and _NO_ENTRY_RE.match(stripped)) \
+                or (in_acl and re.match(r"(?i)^no\s+(?:sequence|remark|evaluate|"
+                                        r"dynamic)\b", stripped)):
+            # IOS deletes the ACL (or the entry) at this point in the file;
+            # RuleHawk does not replay deletions, so it keeps rules the device
+            # no longer has. Fail closed: the note blocks every PASS.
+            led.note(lineno, notes,
+                     f"unmodeled `{stripped}` (line {lineno}): the deletion "
+                     f"is not applied, so the parsed ACL may hold rules the "
+                     f"device removed")
+            continue
+        if in_acl and re.match(r"(?i)^default(?:\s|$)", stripped):
+            # `default N`, `default sequence N`, `default remark`: what the
+            # device does is not cited (R7-2). Noted, not applied.
+            led.note(lineno, notes,
+                     f"`{lx.norm}` (line {lineno}) in {current_acl}: a `default` "
+                     f"line in ACL mode is not modelled (what it restores or "
+                     f"removes is not known)")
+            continue
+        if in_acl and _STATS.match(lx.norm):
+            # NX-OS `statistics per-entry` only counts matches (Nexus 7000
+            # NX-OS Security Command Reference, "statistics per-entry",
+            # Command Modes: IP access-list configuration). Only NX-OS
+            # (R7-7): elsewhere it is not cited.
+            if vendor == "nxos":
+                led.consume(lineno)
+            else:
+                led.note(lineno, notes,
+                         f"`{lx.norm}` (line {lineno}) in {current_acl}: an NX-OS "
+                         f"ACL command in a config read as {vendor}; not modelled")
             continue
         m = re.match(r"(?i)^(ip|ipv4|ipv6)\s+access-list\s+(?:(extended|standard)\s+)?(\S+)",
                      stripped)
         if m:
-            in_other = False
             _WILDCARD_ONLY.set(True)
             current_acl, seq = m.group(3), 0
+            acl_opener = lineno if lx.mode == "acl" and lx.opener == lineno else -2
             cur_v6 = m.group(1).lower() == "ipv6"
             cur_std = (m.group(2) or "").lower() == "standard"
+            acl_meta.setdefault(current_acl, (vendor, cur_v6))
+            names.add(current_acl)
+            hdr_note = _header_dialect_note(vendor, m.group(1).lower(), m.group(2),
+                                            current_acl, lineno)
+            if hdr_note:
+                led.note(lineno, notes, hdr_note)
+            elif _ACL_HEADER_FULL.match(lx.norm):
+                led.consume(lineno)
+            else:
+                led.note(lineno, notes,
+                         f"ACL header line {lineno} (`{lx.norm[:60]}`) holds words "
+                         f"RuleHawk does not read")
             continue
         if _NON_FILTER_HDR.match(stripped):
             # Routing policy (route-map / prefix-list / community-list /
@@ -1049,58 +1540,117 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             # permit/deny are not packet filters. A block header starts a
             # non-filter context: its indented `seq N permit ...` lines belong
             # to it, never to the last IP ACL.
-            in_other = raw[:1] not in (" ", "\t")
             if stripped.lower().startswith("mac access-list"):
                 notes.append(f"L2 {stripped} not modeled (MAC filtering is out "
                              f"of scope; its entries are not IP rules)")
             continue
-        if in_other:
-            if raw[:1] in (" ", "\t"):
-                continue                     # body line of a non-filter block
-            in_other = False
+        if in_block:
+            continue                         # body line of a non-filter block
+        # The sequence-number prefix and its form (R7-1, R7-3).
+        explicit: Optional[int] = None
+        sm = _SEQ_FORM.match(lx.norm) if in_acl else None
+        if sm:
+            explicit = int(sm.group(2))
+            digits = sm.group(2)
+            top = _seq_max(vendor, cur_v6)
+            if explicit < 1 or explicit > top or (len(digits) > 1 and digits[0] == "0"):
+                led.note(lineno, notes,
+                         f"sequence number {digits} (line {lineno}) in {current_acl} "
+                         + ("is written with a leading zero, whose reading is not "
+                            "cited" if 1 <= explicit <= top else
+                            f"is outside the {vendor} {'IPv6' if cur_v6 else 'IPv4'} "
+                            f"range 1-{top}: the device does not take the entry")
+                         + "; not a PASS")
+            form = "sequence" if sm.group(1) else "bare"
+            if not _seq_form_ok(vendor, cur_v6, form):
+                led.note(lineno, notes,
+                         f"`{sm.group(1) or ''}{sm.group(2)}` (line {lineno}) in "
+                         f"{current_acl}: this sequence-number form is not cited "
+                         f"for {vendor} {'IPv6' if cur_v6 else 'IPv4'} ACL mode; "
+                         f"read as a sequence number, not a PASS")
+        body_txt = sm.group(3) if sm else lx.norm
+        if in_acl and _REMARK.match(body_txt):
+            event("remark", lineno, explicit)
+            led.consume(lineno)
+            continue
+        if _FLAT_REMARK.match(stripped):
+            led.consume(lineno)
+            continue
         line_v6, line_std = cur_v6, cur_std
         m = re.match(r"(?i)^access-list\s+(\S+)\s+(?:line\s+\d+\s+)?(standard\s+)?",
                      stripped)
         if m and re.search(r"(?i)\b(permit|deny)\b", stripped):
-            _WILDCARD_ONLY.set(False)        # flat access-list: auto-detect
+            # Flat access-list. An IOS NUMBERED ACL (`access-list 101 permit
+            # ...`, no `extended`/`standard` keyword) always carries WILDCARD
+            # masks; only an ASA line (`access-list NAME extended|standard ...`)
+            # carries netmasks. A numbered line in a config with a PIX/ASA
+            # dialect marker is ambiguous (PIX 6 wrote numbered lines with
+            # netmasks): keep the auto-detect there, and the fail-closed layer
+            # reports `numbered-acl-mask-ambiguous` so no PASS rests on it.
+            _WILDCARD_ONLY.set(bool(
+                _IOS_NUMBERED.match(stripped) and not pix_dialect))
             current_acl = m.group(1)
+            names.add(current_acl)
             # Flat `access-list` lines (ASA / IOS numbered) carry their own IPv4
             # context; standard = the explicit keyword, or an IOS standard number.
             line_v6 = False
             nm = m.group(1)
             line_std = bool(m.group(2)) or (nm.isdigit() and (
                 1 <= int(nm) <= 99 or 1300 <= int(nm) <= 1999))
-        if re.match(r"(?i)^evaluate\s+\S+", stripped):
+        if re.match(r"(?i)^evaluate\s+\S+", body_txt):
             # IOS reflexive ACL: `evaluate NAME` splices in the dynamic
             # return-traffic entries that `reflect NAME` permits created. They
             # match mirrored sessions only (return traffic, like `established`),
             # so they never decide a NEW flow and cannot prove a rule dead —
             # but the line must be surfaced, never dropped without a trace.
-            notes.append(f"IOS reflexive ACL `{stripped}` in {current_acl}: "
-                         f"dynamic return-traffic entries not modeled (stateful, "
-                         f"never a new-flow decision) — verify manually")
+            led.note(lineno, notes,
+                     f"IOS reflexive ACL `{stripped}` in {current_acl}: "
+                     f"dynamic return-traffic entries not modeled (stateful, "
+                     f"never a new-flow decision) — verify manually")
             continue
         if not re.search(r"(?i)\b(permit|deny)\b", stripped):
-            continue
+            continue                         # unaccounted: the ledger notes it
+        if not m and not in_acl:
+            # Not a flat `access-list` line and not in the mode of a named ACL
+            # header: on the device this line is rejected (or belongs to a
+            # mode that is not a packet filter), so it is in no named ACL. It
+            # is kept under "(unnamed)", which nothing binds, with a note.
+            where = (f"after line {lx.opener} (`{opener_txt[:40]}`)" if lx.opener
+                     else "before any ACL header")
+            led.note(lineno, notes,
+                     f"line {lineno}: `{stripped[:60]}` is not in ACL mode "
+                     f"on the device ({where}); not added to any named ACL")
+            if current_acl != "(unnamed)":
+                current_acl, seq, acl_opener = "(unnamed)", 0, -3
+            cur_v6 = cur_std = line_v6 = line_std = False
+        if m:
+            _DIALECT.set("ios" if vendor == "ios" and _IOS_NUMBERED.match(stripped)
+                         and not pix_dialect else "asa" if vendor == "ios" else vendor)
+        else:
+            _DIALECT.set(("ios6" if line_v6 else "ios") if vendor == "ios" else vendor)
         toks = _entry_tokens(raw.strip())
         if not toks or toks[0].lower() not in _ACTIONS:
             if "remark" not in stripped.lower():
-                notes.append(f"unparsed: {stripped}")
+                led.note(lineno, notes, f"unparsed: {stripped}")
             continue
         action = toks[0].lower()
+        n0 = len(notes)
         if line_std:
             try:
                 aces, enotes = _parse_std_entry(toks, seq, current_acl, stripped,
                                                 lineno)
             except (IndexError, ValueError, ipaddress.AddressValueError):
-                notes.append(f"unparsed (kept fail-closed): {stripped}")
+                led.note(lineno, notes, f"unparsed (kept fail-closed): {stripped}")
                 seq += 1
                 entries.append(_opaque_ace(action, seq, current_acl, stripped,
                                            lineno))
+                event("entry", lineno, explicit)
                 continue
             seq += len(aces)
             entries.extend(aces)
             notes.extend(enotes)
+            event("entry", lineno, explicit)
+            (led.note if len(notes) > n0 else led.consume)(lineno)
             continue
         # Object-group / object references expand a permit in ways we don't model.
         # DROPPING such a line let segcheck FALSE-PASS a real leak hidden behind
@@ -1136,10 +1686,13 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
                 seq += len(races)
                 entries.extend(races)
                 notes.extend(rnotes)
+                event("entry", lineno, explicit)
+                (led.note if len(notes) > n0 else led.consume)(lineno)
                 continue
-            notes.append(f"unmodeled (object-group): {stripped}")
+            led.note(lineno, notes, f"unmodeled (object-group): {stripped}")
             seq += 1
             entries.append(_opaque_ace(action, seq, current_acl, stripped, lineno))
+            event("entry", lineno, explicit)
             continue
         try:
             aces, enotes = _parse_entry(toks, seq, current_acl, stripped, lineno,
@@ -1147,36 +1700,95 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
         except (IndexError, ValueError, ipaddress.AddressValueError):
             # Recognized as an ACE but unparseable — fail closed rather than drop,
             # so an unreadable permit can't be silently treated as isolated.
-            notes.append(f"unparsed (kept fail-closed): {stripped}")
+            led.note(lineno, notes, f"unparsed (kept fail-closed): {stripped}")
             seq += 1
             entries.append(_opaque_ace(action, seq, current_acl, stripped, lineno))
+            event("entry", lineno, explicit)
             continue
         seq += len(aces)
         entries.extend(aces)
         notes.extend(enotes)
-    entries = _reorder_by_sequence(entries, notes)
+        event("entry", lineno, explicit)
+        (led.note if len(notes) > n0 else led.consume)(lineno)
+    entries = _apply_numbering(entries, notes, events, acl_meta)
+    # Every other line that names an ACL is in scope too (round 9): it is
+    # consumed only in a reference-only form (`_ACL_REF_OK`), which uses the
+    # list and does not change it or bind it to a forwarding interface.
+    # Interface lines are the interface ledger's.
+    for lx in lex.lines:
+        if lx.post_end or lx.mode in ("acl", "interface") or lx.no in led.scope:
+            continue
+        if lx.no in led.noted:               # a deletion line, noted above
+            led.add(lx.no, lx.norm)
+            continue
+        words = lx.norm.split()
+        if not any(w in names for w in words):
+            continue
+        led.add(lx.no, lx.norm)
+        if any(r.fullmatch(lx.norm) and r.fullmatch(lx.norm).group("n") in names
+               for r in _ACL_REF_OK):
+            led.consume(lx.no)
+        else:
+            led.note(lx.no, notes,
+                     f"line {lx.no} (`{lx.norm[:60]}`) names an ACL outside ACL "
+                     f"mode; what it does to the ACL is not modelled")
+    led.close(notes, lambda k, t: (
+        f"line {k} (`{t[:60]}`) in ACL mode is not read by RuleHawk: what it "
+        f"changes is not modelled"))
     return entries, notes
 
 
-_SEQ_PREFIX = re.compile(r"(?i)^\s*(?:sequence\s+)?(\d+)\s")
+# An IOS numbered ACL line: a numeric name followed directly by the action (no
+# ASA `extended` / `standard` / `webtype` / `ethertype` keyword).
+# Its mask is always a wildcard. Cisco, "Configure IP Access Lists" (Document
+# ID 23602, updated 2025-10-15, fetched 2026-11-05):
+#   "In contrast, ACLs use a wildcard mask (also called an inverse mask)"
+#   https://www.cisco.com/c/en/us/support/docs/security/ios-firewall/23602-confaccesslists.html
+# and the IOS `access-list` command reference names the field so:
+#   "source-wildcard (Optional) Wildcard bits to be applied to the source."
+#   https://www.cisco.com/E-Learning/bulk/public/tac/cim/cib/using_cisco_ios_software/cmdrefs/access-list.htm
+_IOS_NUMBERED = re.compile(
+    r"(?i)^access-list\s+\d+\s+(?:permit|deny|dynamic)\b")
 
 
-def _reorder_by_sequence(entries: List[ACE], notes: List[str]) -> List[ACE]:
-    """Honor explicit ACL sequence numbers as the device's match order.
+def _device_numbers(evs: list, remark_counts: bool):
+    """Each line's sequence number as the device assigns it, and the lines a
+    deletion removed. IOS XE 17 "IP Access List Entry Sequence Numbering"
+    (https://www.cisco.com/c/en/us/td/docs/routers/ios/config/17-x/sec-vpn/b-security-vpn/m_sec-acl-seq-num.html):
+    "If you enter an entry without a sequence number, it is assigned a
+    sequence number that is 10 greater than the last sequence number in that
+    access list and is placed at the end of the list." and "if entries with no
+    sequence numbers are applied, the first entry is assigned a sequence
+    number of 10". NX-OS says the same ("assigns a sequence number that is 10
+    greater than the sequence number of the preceding rule", Nexus 3600 10.5
+    "Configuring IP ACLs"). Whether an unnumbered `remark` takes a number is
+    not cited: the caller computes both readings."""
+    live: "dict[int, int]" = {}                # line -> number, entries on the list
+    nums: "dict[int, int]" = {}
+    deleted: set = set()
+    for kind, ln, n in evs:
+        if kind == "delete":
+            for victim in [k for k, v in live.items() if v == n]:
+                del live[victim]
+                deleted.add(victim)
+            continue
+        if n is None:
+            if kind == "remark" and not remark_counts:
+                continue
+            n = (max(live.values()) if live else 0) + 10
+        live[ln] = n
+        nums[ln] = n
+    return nums, deleted
 
-    IOS/NX-OS/EOS number ACL entries (`10 permit ...`, `20 deny ...`) and the
-    device evaluates them in NUMERIC order regardless of the order they appear
-    in the text. `show running-config` normally emits them already sorted, but a
-    hand-edited or automation-pushed config can be out of order — and evaluating
-    the text order would silently mis-rank first-match (a `10 permit` written
-    below a `20 deny` would be wrongly shadowed -> false PASS).
 
-    Conservative: an ACL is reordered ONLY when EVERY one of its entries carries
-    an explicit leading number (mixing numbered and unnumbered is ambiguous, so
-    we leave text order). Entries expanded from one source line share that
-    line's number and keep their relative order (stable sort). The match-order
-    `seq` is reassigned to the sorted position so findings/witnesses rank
-    correctly; `raw`/`line` are preserved."""
+def _apply_numbering(entries: List[ACE], notes: List[str], events: "dict",
+                     acl_meta: "Optional[dict]" = None) -> List[ACE]:
+    """Put each ACL in device order and apply its deletions (round 8, R7-1,
+    R7-2). An ACL with no explicit number and no deletion keeps text order.
+    Otherwise every entry gets its device number (`_device_numbers`), the
+    entries are sorted by it, and a change from text order is noted. When
+    the two readings of an unnumbered remark give different orders or
+    deletions, that is noted too."""
     import dataclasses
 
     order: List[str] = []
@@ -1190,48 +1802,87 @@ def _reorder_by_sequence(entries: List[ACE], notes: List[str]) -> List[ACE]:
     out: List[ACE] = []
     for acl in order:
         group = by_acl[acl]
-        nums = [_SEQ_PREFIX.match(a.raw) for a in group]
-        if all(nums) and len(group) > 1:
-            # One sequence number = ONE entry on the device. A config that
-            # carries the same ACL twice (concatenated `show run` sections) or
-            # re-enters `10 permit ...` repeats the number: an identical
-            # re-entry is the same entry (keep the first; reporting the copy as
-            # "redundant" was noise the device never has). Different text under
-            # the same number is not modeled — keep both, marked imprecise.
-            first_line: "dict[int, tuple]" = {}
-            drop, clash = set(), set()
-            for a, m in zip(group, nums):
-                k = int(m.group(1))
-                txt = re.sub(r"\s+", " ", a.raw.strip()).lower()
-                if k not in first_line:
-                    first_line[k] = (a.line, txt)
-                elif first_line[k][0] != a.line:
-                    (drop if first_line[k][1] == txt else clash).add((k, a.line))
-                    if first_line[k][1] != txt:
-                        clash.add((k, first_line[k][0]))
-            if drop or clash:
-                if drop:
-                    notes.append(f"ACL {acl}: {len(drop)} entr(ies) repeat an existing "
-                                 f"sequence number with identical text — one entry "
-                                 f"on the device, duplicates ignored")
-                if clash:
-                    notes.append(f"ACL {acl}: sequence number(s) "
-                                 f"{sorted({k for k, _ in clash})} appear with "
-                                 f"different entries — not modeled, marked imprecise")
-                keep_i = [i for i, (a, m) in enumerate(zip(group, nums))
-                          if (int(m.group(1)), a.line) not in drop]
-                group = [dataclasses.replace(group[i], imprecise=True)
-                         if (int(nums[i].group(1)), group[i].line) in clash else group[i]
-                         for i in keep_i]
-                nums = [nums[i] for i in keep_i]
-            keyed = sorted(range(len(group)),
-                           key=lambda i: (int(nums[i].group(1)), i))
-            if keyed != list(range(len(group))):
-                group = [group[i] for i in keyed]
-                notes.append(f"ACL {acl}: entries reordered by explicit sequence "
-                             f"number to match device first-match evaluation")
-            group = [dataclasses.replace(a, seq=n)
-                     for n, a in enumerate(group, 1)]
+        evs = events.get(acl, [])
+        if acl == "(unnamed)" or not any(n is not None or k == "delete"
+                                         for k, _, n in evs):
+            out.extend(group)
+            continue
+        nums, deleted = _device_numbers(evs, True)
+        nums_b, deleted_b = _device_numbers(evs, False)
+        vend, v6 = (acl_meta or {}).get(acl, ("ios", False))
+        fam = "IPv6" if v6 else "IPv4"
+        # Round 9 (R8-7): +10 only where it is cited; elsewhere a mixed ACL
+        # is noted. Explicit numbers are range-checked where they are read;
+        # a generated number past the maximum is noted here (IOS XE 17:
+        # "If the generated sequence number exceeds this maximum number ...
+        # Exceeded maximum sequence number.").
+        unnumbered = [k for k, _, n in evs if k != "delete" and n is None]
+        if unnumbered and not _plus_ten_cited(vend, v6):
+            notes.append(f"ACL {acl}: numbered and unnumbered entries are mixed; "
+                         f"the number {vend} {fam} gives an unnumbered entry is not "
+                         f"cited, so the device order is not known")
+        top = _seq_max(vend, v6)
+        if any(n > top for n in list(nums.values()) + list(nums_b.values())):
+            notes.append(f"ACL {acl}: an unnumbered entry would get a number past "
+                         f"the {vend} {fam} maximum {top} (\"Exceeded maximum "
+                         f"sequence number\"); the device does not take it")
+        # A numbered remark takes its number (IOS XE 16.12: "remarks can be
+        # added with or without sequence number"; "If you enter a sequence
+        # number that is already present, the following error message is
+        # generated: Duplicate sequence number."). Whether an entry with the
+        # same number is then rejected is not cited: noted.
+        rem_nums = {n for k, _, n in evs if k == "remark" and n is not None}
+        ent_nums = {nums.get(ln) for k, ln, n in evs if k == "entry"}
+        if rem_nums & ent_nums:
+            notes.append(f"ACL {acl}: sequence number(s) {sorted(rem_nums & ent_nums)} "
+                         f"held by both a remark and an entry; which one the "
+                         f"device keeps is not modelled")
+        lines = [ln for k, ln, _ in evs if k == "entry"]
+        pos = {ln: i for i, ln in enumerate(lines)}
+        rank_a = sorted(lines, key=lambda ln: (nums.get(ln, 0), pos[ln]))
+        rank_b = sorted(lines, key=lambda ln: (nums_b.get(ln, 0), pos[ln]))
+        if [ln for ln in rank_a if ln not in deleted] != \
+                [ln for ln in rank_b if ln not in deleted_b]:
+            notes.append(f"ACL {acl}: the device order depends on whether an "
+                         f"unnumbered remark takes a sequence number, which is "
+                         f"not known")
+        deleted &= deleted_b
+        group = [a for a in group if a.line not in deleted]
+        # One sequence number = ONE entry on the device. A config that
+        # carries the same ACL twice (concatenated `show run` sections) or
+        # re-enters `10 permit ...` repeats the number: an identical re-entry
+        # is the same entry (keep the first; reporting the copy as
+        # "redundant" was noise the device never has). Different text under
+        # the same number is not modeled — keep both, marked imprecise.
+        first_line: "dict[int, tuple]" = {}
+        drop, clash = set(), set()
+        for a in group:
+            k = nums.get(a.line, 0)
+            txt = re.sub(r"\s+", " ", a.raw.strip()).lower()
+            if k not in first_line:
+                first_line[k] = (a.line, txt)
+            elif first_line[k][0] != a.line:
+                (drop if first_line[k][1] == txt else clash).add(a.line)
+                if first_line[k][1] != txt:
+                    clash.add(first_line[k][0])
+        if drop:
+            notes.append(f"ACL {acl}: {len(drop)} entr(ies) repeat an existing "
+                         f"sequence number with identical text — one entry "
+                         f"on the device, duplicates ignored")
+        if clash:
+            notes.append(f"ACL {acl}: sequence number(s) "
+                         f"{sorted({nums.get(ln, 0) for ln in clash})} appear with "
+                         f"different entries — not modeled, marked imprecise")
+        group = [dataclasses.replace(a, imprecise=True) if a.line in clash else a
+                 for a in group if a.line not in drop]
+        keyed = sorted(range(len(group)),
+                       key=lambda i: (nums.get(group[i].line, 0), i))
+        if keyed != list(range(len(group))):
+            group = [group[i] for i in keyed]
+            notes.append(f"ACL {acl}: entries reordered by explicit sequence "
+                         f"number (an unnumbered entry is the last number + 10) "
+                         f"to match device first-match evaluation")
+        group = [dataclasses.replace(a, seq=n) for n, a in enumerate(group, 1)]
         out.extend(group)
     return out
 
@@ -1246,17 +1897,22 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0,
     ported = proto in ("tcp", "udp")
     i = 2
     extra_sp = extra_dp = 0
-    src, i, imp_s = _parse_addr(toks, i, v6)
-    if ported:
-        src_ports, i, imp_sp, extra_sp = _parse_port_op(toks, i)
-    else:
-        src_ports, imp_sp = [ANY_PORTS], False
-    dst, i, imp_d = _parse_addr(toks, i, v6)
-    if ported:
-        dst_ports, i, imp_dp, extra_dp = _parse_port_op(toks, i)
-    else:
-        dst_ports, imp_dp = [ANY_PORTS], False
+    names = _PORT_NAMES.set(_port_names(_DIALECT.get(), [proto]))
+    try:
+        src, i, imp_s = _parse_addr(toks, i, v6)
+        if ported:
+            src_ports, i, imp_sp, extra_sp = _parse_port_op(toks, i)
+        else:
+            src_ports, imp_sp = [ANY_PORTS], False
+        dst, i, imp_d = _parse_addr(toks, i, v6)
+        if ported:
+            dst_ports, i, imp_dp, extra_dp = _parse_port_op(toks, i)
+        else:
+            dst_ports, imp_dp = [ANY_PORTS], False
+    finally:
+        _PORT_NAMES.reset(names)
     rest = toks[i:]
+    cidr = _v4_prefix_operands(toks[2:i]) if not v6 else []
     narrowing, type_tok, extra_unknown, stateful, inactive = _scan_trailer(rest)
     if inactive:
         # ASA `inactive`: the rule is DISABLED on the device — its true match
@@ -1278,8 +1934,10 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0,
         # not an unknown qualifier); only a non-ICMP proto makes it unknown.
         unknown.insert(0, type_tok)
     imprecise = (imp_s or imp_d or imp_sp or imp_dp or bool(narrowing)
-                 or bool(unknown))
+                 or bool(unknown) or bool(cidr))
     notes: List[str] = []
+    if cidr:
+        notes.append(_CIDR_NOTE.format("/".join(cidr)) + raw)
     if imp_s or imp_d:
         notes.append(f"imprecise mask (treated conservatively): {raw}")
     if imp_sp or imp_dp:
@@ -1309,6 +1967,24 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0,
     return aces, notes
 
 
+# IPv4 operand grammar per dialect (round 9, R8-6). IOS: "sequence-number deny
+# protocol source source-wildcard destination destination-wildcard ..." (IOS
+# XE 17 "IP Access List Entry Sequence Numbering", URL above). ASA: "ip_address
+# mask—Specifies an IPv4 network address and subnet mask" and
+# "ipv6-address/prefix-length" for IPv6 only (ASA 9.20 Firewall CLI
+# Configuration Guide, URL above). Neither has an IPv4 `A/len` operand, so on
+# IOS and ASA one is noted (NX-OS and EOS write `A/len`).
+_CIDR_NOTE = ("IPv4 prefix operand(s) {} are not in the IOS / ASA entry grammar "
+              "(address + wildcard or mask); the device may reject the line — "
+              "marked imprecise: ")
+
+
+def _v4_prefix_operands(ops: List[str]) -> List[str]:
+    if _DIALECT.get() not in ("ios", "asa"):
+        return []
+    return [t for t in ops if "/" in t and _is_v4(t.split("/", 1)[0])]
+
+
 def _is_v4(tok: str) -> bool:
     try:
         ipaddress.IPv4Address(tok)
@@ -1327,11 +2003,23 @@ def _parse_std_entry(toks: List[str], seq: int, acl: str, raw: str,
     action = toks[0].lower()
     t = toks[1].lower()
     if t in ("any", "host") or "/" in toks[1]:
-        src, _, imp = _parse_addr(toks, 1)
+        src, nxt, imp = _parse_addr(toks, 1)
     elif len(toks) > 2 and _is_v4(toks[2]):
-        src, _, imp = _parse_addr(toks, 1)   # A MASK
+        src, nxt, imp = _parse_addr(toks, 1)   # A MASK
     else:
-        src, imp = _host_net(toks[1]), False  # bare address == host
+        src, nxt, imp = _host_net(toks[1]), 2, False  # bare address == host
     notes = [f"imprecise mask (treated conservatively): {raw}"] if imp else []
+    cidr = _v4_prefix_operands(toks[1:nxt])
+    if cidr:
+        imp = True
+        notes.append(_CIDR_NOTE.format("/".join(cidr)) + raw)
+    # Every token is read (round 8): after the source only `log` / `log-input`
+    # (which do not change the match) may follow. Anything else means the
+    # device rejects or reads the line differently: imprecise and noted.
+    rest = [w.lower() for w in toks[nxt:]]
+    if rest and rest not in (["log"], ["log-input"]):
+        imp = True
+        notes.append(f"unrecognized trailing word(s) {'/'.join(toks[nxt:])} in a "
+                     f"standard ACL entry — marked imprecise, verify manually: {raw}")
     return [ACE(seq=seq + 1, action=action, proto="ip", src=src, dst=_ANY_NET,
                 imprecise=imp, raw=raw, acl=acl, line=line)], notes

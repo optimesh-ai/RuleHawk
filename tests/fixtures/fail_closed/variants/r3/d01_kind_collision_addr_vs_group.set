@@ -1,0 +1,5 @@
+set vsys vsys1 address-group CORP static [ X ]
+set vsys vsys1 address X ip-netmask 203.0.113.0/24
+set vsys vsys2 address CORP ip-netmask 192.0.2.0/24
+set vsys vsys1 rulebase security rules d from any to any source CORP destination 198.51.100.0/24 application any service any action deny
+set vsys vsys1 rulebase security rules a from any to any source 192.0.2.0/24 destination any application any service any action allow

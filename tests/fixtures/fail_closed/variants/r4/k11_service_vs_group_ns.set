@@ -1,0 +1,3 @@
+set service S protocol tcp port 445
+set vsys vsys2 service-group S members [ X ]
+set vsys vsys1 rulebase security rules d from any to any source 192.0.2.0/24 destination 198.51.100.0/24 application any service S action deny

@@ -140,10 +140,15 @@ def _suppress(f: Finding) -> Finding:
     """Downgrade an infeasible-path violation to an informational note. The permit
     is real (rule reference kept) but no forwarding path delivers the witness, so
     it is not an active segmentation leak — this is what removes the FP."""
+    from .failclosed import Reason
     return dataclasses.replace(
         f,
         kind="segmentation-infeasible-path",
         severity="info",
+        # Fail closed: one unreachable witness does not prove the rest of the
+        # violated space unreachable, so the assertion is neither FAIL nor PASS.
+        verdict="UNKNOWN",
+        reasons=[Reason("pathground-witness-only").to_dict()],
         message=(
             f.message
             + " [PATH-GROUNDED] Hammerhead's forwarding model proves NO path "

@@ -1,0 +1,3 @@
+set address CORP ip-netmask 192.0.2.0/24
+set address CORP description corp
+set rulebase security rules d from any to any source 192.0.2.0/24 destination 198.51.100.0/24 application any service any action deny

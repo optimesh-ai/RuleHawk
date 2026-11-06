@@ -356,7 +356,7 @@ const SAMPLES = {
 };
 const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
                         "parse_iptables", "parse_nxos", "parse_eos", "parse_awssg", "analyze", "report",
-                        "segcheck", "riskaccept", "evidence", "pathground", "boundary"];
+                        "segcheck", "riskaccept", "evidence", "pathground", "boundary", "failclosed"];
 const PYODIDE_VER = "v0.26.4";
 // Fallback (main-thread) analysis stays synchronous, so cap it; the worker path has no cap.
 const FALLBACK_MAX_LINES = 4000;
@@ -418,6 +418,7 @@ from rulehawk.parse_awssg import detect as detect_awssg, parse_awssg
 from rulehawk.analyze import analyze
 from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
+from rulehawk.failclosed import build_context, normalise_vendor
 from rulehawk.evidence import Subject, build_evidence, to_evidence_markdown
 from rulehawk.model import strip_pager
 _pasted = cfg
@@ -442,7 +443,8 @@ _policy_obj = None
 if _pol:
     try:
         _policy_obj = json.loads(_pol)
-        findings = findings + check_segmentation(aces, _policy_obj)
+        _ctx = build_context(cfg, aces, notes, vendor)
+        findings = findings + check_segmentation(aces, _policy_obj, context=_ctx)
     except Exception as e:
         _policy_obj = None
         notes = notes + ["segmentation policy error: " + str(e)]
@@ -455,7 +457,7 @@ _art = build_evidence([_subject], policy=_policy_obj,
                       policy_source=("pasted-policy" if _policy_obj else ""),
                       policy_raw=(_pol.encode("utf-8") if _policy_obj else None),
                       generator="hosted")
-json.dumps({"report_json": json.loads(to_json(findings, notes, len(aces))),
+json.dumps({"report_json": json.loads(to_json(findings, notes, len(aces), normalise_vendor(vendor))),
             "report_text": to_text(findings, notes, len(aces)),
             "rule_lines": _rl, "vendor": vendor,
             "evidence": _art, "evidence_md": to_evidence_markdown(_art)})
@@ -681,6 +683,7 @@ function findingHTML(f){
     ${f.witness ? `<div class="frow"><span class="flabel flabel-why">witness</span></div><div class="witness">${esc(f.witness)}</div>` : ""}
     ${f.cited ? `<div class="frow"><span class="flabel flabel-why">caused by</span> <span style="font-family:var(--mono);font-size:12px">${esc(f.cited)}</span></div>` : ""}
     <div class="frow"><span class="flabel flabel-why">WHY</span> ${esc(f.message)}</div>
+    ${(f.verdict==="UNKNOWN" && (f.reasons||[]).length) ? (f.reasons||[]).map(r => `<div class="frow"><span class="flabel flabel-why">REASON</span> <span style="font-family:var(--mono);font-size:12px">${esc(r.code)}</span> ${esc(r.message)}</div>`).join("") : ""}
     ${f.fix ? `<div class="frow fix"><span class="flabel flabel-fix">FIX</span> ${esc(f.fix)}</div>` : ""}
   </div>`;
 }
@@ -716,11 +719,18 @@ function render(d, vendor){
   // segmentation panel (only when a policy produced seg findings)
   if(seg.length){
     const hasViol = seg.some(f=>f.kind==="segmentation-violation");
+    // Fail-closed: any assertion whose verdict is UNKNOWN (an unproven claim,
+    // an indeterminate search or a policy error) means the page never says
+    // the segmentation holds.
+    const hasUnknown = seg.some(f=>f.verdict==="UNKNOWN");
     const hasInd  = seg.some(f=>f.kind==="segmentation-indeterminate");
-    const cls = hasViol ? "fail" : (hasInd ? "warn" : "pass");
+    const allPass = seg.every(f=>f.verdict==="PASS");
+    const cls = hasViol ? "fail" : ((hasUnknown || hasInd || !allPass) ? "warn" : "pass");
     const label = hasViol ? "Segmentation failed — a forbidden flow is permitted"
+                : hasUnknown ? "Segmentation UNKNOWN — not proven for this config (see the reason codes)"
                 : hasInd  ? "Segmentation indeterminate — manual review needed"
-                : "Segmentation holds at the rule layer — no permitted flow violates the policy";
+                : allPass ? "Segmentation holds at the rule layer — no permitted flow violates the policy"
+                : "Segmentation UNKNOWN — not proven for this config";
     html += `<div class="segpanel"><div class="seghdr">Segmentation policy</div>
       <div class="segbanner ${cls}">${label}</div>`
       + seg.map(findingHTML).join("") + `</div>`;

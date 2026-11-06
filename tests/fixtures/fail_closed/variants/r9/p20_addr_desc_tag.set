@@ -1,0 +1,6 @@
+set address CORP ip-netmask 192.0.2.0/24
+set address PCI ip-netmask 198.51.100.0/24
+set address CORP description "x y"
+set address CORP tag [ t1 ]
+set rulebase security rules d from any to any source CORP destination PCI application any service any action deny
+set rulebase security rules a from any to any source CORP destination any application any service any action allow

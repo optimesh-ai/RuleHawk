@@ -1,0 +1,5 @@
+set shared address CORP ip-netmask 192.0.2.0/24
+set vsys vsys1 address CORP ip-netmask 203.0.113.0/24
+set address PCI ip-netmask 198.51.100.0/24
+set vsys vsys1 rulebase security rules d from any to any source CORP destination PCI application any service any action deny
+set vsys vsys1 rulebase security rules a from any to any source 192.0.2.0/24 destination any application any service any action allow

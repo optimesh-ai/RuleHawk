@@ -75,8 +75,31 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from .failclosed import Ledger, split_lines
+
 from .model import ACE, ANY_PORTS, _PORTED, PortRange, _IPNet
-from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
+from .parse import _port_num
+
+# Junos port names (review of #42, round 10, R9-4): "In place of the numeric
+# value, you can specify one of the following text synonyms (the port numbers
+# are also listed)" (Juniper, "Firewall Filter Match Conditions for IPv4
+# Traffic", destination-port,
+# https://www.juniper.net/documentation/us/en/software/junos/routing-policy/topics/concept/firewall-filter-match-conditions-for-ipv4-traffic.html).
+# Any other name is unresolved (noted).
+_JUNOS_PORTS = {
+    "afs": 1483, "bgp": 179, "biff": 512, "bootpc": 68, "bootps": 67, "cmd": 514,
+    "cvspserver": 2401, "dhcp": 67, "domain": 53, "eklogin": 2105, "ekshell": 2106,
+    "exec": 512, "finger": 79, "ftp": 21, "ftp-data": 20, "http": 80, "https": 443,
+    "ident": 113, "imap": 143, "kerberos-sec": 88, "klogin": 543, "kpasswd": 761,
+    "krb-prop": 754, "krbupdate": 760, "kshell": 544, "ldap": 389, "ldp": 646,
+    "login": 513, "mobileip-agent": 434, "mobilip-mn": 435, "msdp": 639,
+    "netbios-dgm": 138, "netbios-ns": 137, "netbios-ssn": 139, "nfsd": 2049,
+    "nntp": 119, "ntalk": 518, "ntp": 123, "pop3": 110, "pptp": 1723,
+    "printer": 515, "radacct": 1813, "radius": 1812, "rip": 520, "rkinit": 2108,
+    "smtp": 25, "snmp": 161, "snmptrap": 162, "snpp": 444, "socks": 1080, "ssh": 22,
+    "sunrpc": 111, "syslog": 514, "tacacs": 49, "tacacs-ds": 65, "talk": 517,
+    "telnet": 23, "tftp": 69, "timed": 525, "who": 513, "xdmcp": 177,
+}
 
 _ANY_NET: _IPNet = ipaddress.ip_network("0.0.0.0/0")
 _ANY6_NET: _IPNet = ipaddress.ip_network("::/0")
@@ -104,9 +127,15 @@ _TERMINATING = {"accept": "permit", "discard": "deny", "reject": "deny"}
 # `then` modifiers that don't decide the packet's fate — safe to ignore.
 _THEN_MODIFIERS = {
     "count", "log", "syslog", "policer", "forwarding-class", "loss-priority",
-    "dscp", "sample", "port-mirror", "three-color-policer", "service-accounting",
-    "ipsec-sa",
+    "dscp", "sample", "port-mirror", "service-accounting", "ipsec-sa",
 }
+# `three-color-policer` is not one (round 10, R9-7): Juniper's form is the
+# block `three-color-policer { single-rate NAME; }` ("Include the
+# three-color-policer single-rate policer-name action", Three-Color Policer
+# Configuration Overview,
+# https://www.juniper.net/documentation/us/en/software/junos/routing-policy/topics/concept/policer-summary-configuration-three-color.html),
+# not a one-word argument, so either spelling is
+# left to the unmodelled-action note.
 
 # `then` actions that FORWARD the packet somewhere other than the normal
 # lookup (filter-based forwarding). For reachability the packet is let through,
@@ -165,6 +194,95 @@ _SRX_POLICY_RE = re.compile(r"\bfrom-zone\s+\S+\s+to-zone\s+\S+")
 
 
 # --- tokenizer / block readers --------------------------------------------
+
+_IN_STRING_HAZARD = ("#", "/*", "*/", "{", "}", ";", "[", "]")
+
+
+def _quote_hazards(text: str) -> List[str]:
+    """Notes for every place where `_tokenize`, which strips comments and
+    splits on braces without regard to quotes, may read the text differently
+    from the device (review of #42, round 6, N3).
+
+    A scan that does respect double-quoted strings (with backslash escapes),
+    `# ...` line comments and `/* ... */` blocks flags:
+    - `#`, `/*`, `*/`, a brace, `;` or a bracket inside a quoted string;
+    - a string that is not closed on its line, or a block never closed;
+    - `/*` inside a `#` comment, and a `*/` outside any block.
+    A `#` after a statement is a comment, as in the device's own output
+    (`encrypted-password "..."; ## SECRET-DATA`), and is not flagged.
+    Round 7 (R6-3) adds, outside strings and comments:
+    - a `#` glued to a word (not after the line start, whitespace, `;`, `{`
+      or `}`): whether the device reads a comment or a word is not known;
+    - braces that do not balance: the device does not load the file, and
+      `_read_block` takes the rest of the text as the open block.
+    Each one is a note, so the answer is UNKNOWN."""
+    notes: List[str] = []
+
+    def note(line: int, what: str, why: str = "the tokenizer ignores quotes") -> None:
+        if len(notes) < 5:
+            notes.append(f"Junos line {line}: {what}; {why}, so the statements "
+                         f"around it may be misread")
+
+    depth = 0
+    state, line, start, i, n = "code", 1, 1, 0, len(text)
+    while i < n:
+        c, two = text[i], text[i:i + 2]
+        if c == "\n":
+            if state == "string":
+                note(start, "a quoted string runs past the end of its line")
+                state = "code"
+            elif state == "hash":
+                state = "code"
+            line += 1
+            i += 1
+            continue
+        if state == "code":
+            if c == '"':
+                state, start = "string", line
+            elif c == "#":
+                prev = text[i - 1] if i else "\n"
+                if not (prev.isspace() or prev in ";{}"):
+                    note(line, "`#` inside a word", "the device may read it as a word")
+                state = "hash"
+            elif two == "/*":
+                state, start = "block", line
+                i += 1
+            elif two == "*/":
+                note(line, "`*/` outside a comment")
+                i += 1
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == -1:
+                    note(line, "a `}` closes a block that was never opened",
+                         "the device does not load unbalanced braces")
+        elif state == "string":
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                state = "code"
+            else:
+                hit = next((h for h in _IN_STRING_HAZARD if text.startswith(h, i)), None)
+                if hit:
+                    note(line, f"`{hit}` inside a quoted string")
+        elif state == "hash":
+            if two == "/*":
+                note(line, "`/*` inside a `#` comment")
+        elif state == "block":
+            if two == "*/":
+                state = "code"
+                i += 1
+        i += 1
+    if state == "block":
+        note(start, "a `/*` comment is never closed")
+    elif state == "string":
+        note(start, "a quoted string is never closed")
+    if depth > 0:
+        note(line, f"{depth} `{{` never closed",
+             "the device does not load unbalanced braces")
+    return notes
+
 
 def _tokenize(text: str) -> List[str]:
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)   # /* block */ comments
@@ -310,13 +428,13 @@ def _ports(vals: List[str], label: str, key: str,
     ranges: List[PortRange] = []
     widen = False
     for v in vals:
-        p = _port_num(v)
+        p = _port_num(v, _JUNOS_PORTS)
         if p >= 0:
             ranges.append(PortRange(p, p))
             continue
         if "-" in v and not v.startswith("-"):
             lo, hi = v.split("-", 1)
-            ln, hn = _port_num(lo), _port_num(hi)
+            ln, hn = _port_num(lo, _JUNOS_PORTS), _port_num(hi, _JUNOS_PORTS)
             if ln >= 0 and hn >= 0:
                 ranges.append(PortRange(min(ln, hn), max(ln, hn)))
                 continue
@@ -514,29 +632,71 @@ def _parse_from(from_toks: List[str], label: str, notes: List[str],
     return m
 
 
+# Juniper, "Guidelines for Configuring Firewall Filters" (Junos OS, Routing
+# Policy, Firewall Filters, and Traffic Policers User Guide;
+# https://www.juniper.net/documentation/us/en/software/junos/routing-policy/topics/concept/firewall-filter-stateless-guidelines-for-configuring.html),
+# Table 2: "You can specify only one terminating action in a firewall filter
+# term. If you try to specify more than one terminating action within the
+# filter term then the latest terminating action will replace the existing
+# terminating action." and "You cannot configure the next term action with a
+# terminating action in the same filter term." (review of #42, round 9, R8-1).
+_JUNOS_FF_GUIDE = ("https://www.juniper.net/documentation/us/en/software/junos/"
+                   "routing-policy/topics/concept/firewall-filter-stateless-"
+                   "guidelines-for-configuring.html")
+# The argument count of each modelled then-statement (round 9): `accept;`,
+# `discard;`, `count NAME;`, `policer NAME;`, `log;`, `syslog;`. A statement
+# with any other count is noted. Other modifiers keep their old reading
+# (they do not decide the packet) but are checked to carry at most one word.
+_THEN_ARGC = {"accept": 0, "discard": 0, "reject": 0, "count": 1, "policer": 1,
+              "log": 0, "syslog": 0, "sample": 0, "port-mirror": 0,
+              "forwarding-class": 1, "loss-priority": 1, "dscp": 1,
+              "service-accounting": 0, "ipsec-sa": 1}
+
+
 def _parse_then(then_toks: List[str], label: str,
                 notes: List[str]) -> Tuple[Optional[str], bool, bool]:
-    """Return (action or None, fallthrough, uncertain). First terminating
-    action wins; `uncertain` is set by an unmodeled or redirecting action."""
+    """Return (action or None, fallthrough, uncertain). The LATEST terminating
+    action wins (Juniper, `_JUNOS_FF_GUIDE`), and a term with more than one is
+    noted; `uncertain` is set by an unmodeled or redirecting action. Every
+    statement must have its cited argument count (`_THEN_ARGC`); `reject`
+    with a message type is noted (the types are not cited here)."""
     action: Optional[str] = None
     fallthrough = False
     uncertain = False
+    terminating: List[str] = []
     for st in _split_semicolons(then_toks):
         if not st:
             continue
         head = st[0]
         if head in _TERMINATING:
-            if action is None:
-                action = _TERMINATING[head]
+            terminating.append(head)
+            action = _TERMINATING[head]
+            if len(st) != 1:
+                notes.append(f"Junos then-action `{' '.join(st)}` in {label}: "
+                             f"argument(s) the modelled grammar does not have")
         elif head == "next":                 # `then next term;` — fall through
             fallthrough = True
+            if st != ["next", "term"]:
+                notes.append(f"Junos then-action `{' '.join(st)}` in {label} is "
+                             f"not `next term`")
         elif head in _THEN_MODIFIERS:
+            if len(st) != 1 + _THEN_ARGC.get(head, 0):
+                notes.append(f"Junos then-action `{' '.join(st)}` in {label}: "
+                             f"argument count is not the modelled one")
             continue
         elif head in _THEN_REDIRECT:
             uncertain = True
         else:
             uncertain = True
             notes.append(f"unmodeled Junos then-action '{head}' in {label}")
+    if len(terminating) > 1:
+        notes.append(f"Junos term {label} has more than one terminating action "
+                     f"({', '.join(terminating)}): the latest ({terminating[-1]}) "
+                     f"replaces the others (Juniper, \"Guidelines for Configuring "
+                     f"Firewall Filters\"); modelled so, and noted")
+    if terminating and fallthrough:
+        notes.append(f"Junos term {label} has `next term` with a terminating "
+                     f"action, which Juniper does not allow; not modelled")
     return action, fallthrough, uncertain
 
 
@@ -554,7 +714,7 @@ def _raw(tname: str, action: str, proto: str, s: _IPNet, d: _IPNet,
 
 def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
                 entries: List[ACE], notes: List[str], line: int = 0,
-                family: Optional[str] = None) -> int:
+                family: Optional[str] = None, unknown_stmt: bool = False) -> int:
     label = f"{fname}/{tname}"
     from_toks: List[str] = []
     then_toks: List[str] = []
@@ -562,24 +722,33 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
     i, n = 0, len(tbody)
     while i < n:
         t = tbody[i]
-        if t == "filter" and i + 1 < n and tbody[i + 1] not in ("{", ";"):
+        if t == "filter" and i + 2 < n and tbody[i + 1] not in ("{", ";") \
+                and tbody[i + 2] == ";":
             filter_ref = tbody[i + 1]
-            i += 2
+            i += 3
         elif t == "from" and i + 1 < n and tbody[i + 1] == "{":
             blk, i = _read_block(tbody, i + 1)
             from_toks += blk
         elif t == "then":
             if i + 1 < n and tbody[i + 1] == "{":
                 blk, i = _read_block(tbody, i + 1)
-                then_toks += blk
+                then_toks += blk + [";"]
             else:                                    # inline: `then accept;`
                 j = i + 1
                 while j < n and tbody[j] != ";":
                     j += 1
-                then_toks += tbody[i + 1:j]
+                then_toks += tbody[i + 1:j] + [";"]
                 i = j + 1
-        else:
+        elif t == ";":
             i += 1
+        else:
+            # A statement the term grammar here does not have (round 9,
+            # R8-10): read to its end and noted, never skipped silently.
+            head, i = _consume_stmt(tbody, i)
+            notes.append(f"unmodeled Junos statement `{' '.join(head)[:60]}` in "
+                         f"term {label}: what it does is not modelled (the "
+                         f"term is marked imprecise)")
+            unknown_stmt = True
 
     if filter_ref is not None:
         # `term T { filter OTHER; }` evaluates OTHER and falls through when it
@@ -611,7 +780,8 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
             body = ["from", "{", *_toks([(direction if k == "port" else k, v)
                                          for k, v in conds]), "}",
                     "then", "{", *then_toks, "}"]
-            seq = _parse_term(fname, tname, body, seq, entries, notes, line, family)
+            seq = _parse_term(fname, tname, body, seq, entries, notes, line, family,
+                              unknown_stmt)
         return seq
 
     action, fallthrough, uncertain = _parse_then(then_toks, label, notes)
@@ -643,8 +813,8 @@ def _parse_term(fname: str, tname: str, tbody: List[str], seq: int,
     protos = m.protos or ["ip"]
     sports = m.sports or [ANY_PORTS]
     dports = m.dports or [ANY_PORTS]
-    imprecise = m.imprecise or implicit_uncertain
-    other_imprecise = m.other_imprecise or implicit_uncertain
+    imprecise = m.imprecise or implicit_uncertain or unknown_stmt
+    other_imprecise = m.other_imprecise or implicit_uncertain or unknown_stmt
 
     if (m.sports or m.dports) and any(p not in _PORTED for p in protos):
         # covers()/segcheck ignore ports on a non-port-carrying protocol
@@ -812,9 +982,34 @@ def _parse_filter(fname: str, body: List[str], entries: List[ACE],
         if t == ";":
             i += 1
             continue
+        if t == "protect:" and i + 3 < n and body[i + 1] == "term" \
+                and body[i + 3] == "{":
+            # `protect:` guards a statement against edits, not evaluation:
+            # Juniper, "Protect or Unprotect a Configuration Object Using the
+            # Junos XML Protocol"
+            # (https://www.juniper.net/documentation/us/en/software/junos/junos-xml-protocol/topics/task/junos-xml-protocol-protecting-unprotecting-configuration.html):
+            # "The `protect` attribute prevents changes to selected
+            # configuration hierarchies and statements" and, in text format,
+            # "Protected elements are preceded by `protect:`"; the `protect`
+            # attribute reference: "The protect attribute can be combined
+            # with the active and inactive attributes." So the term is read
+            # as written (active). It is still noted (round 9, R8-12): a
+            # must_not_reach answer is UNKNOWN, never a FAIL from a dropped
+            # term; a must_reach the term breaks is FAIL.
+            notes.append(f"Junos `protect:` on term {body[i + 2]} in filter "
+                         f"{fname}: not modelled; the term is read as written")
+            i += 1
+            continue
         if t == "term" and i + 2 < n and body[i + 2] == "{":
             tname = body[i + 1]
             tbody, i = _read_block(body, i + 2)
+            if any(tn == tname for tn, _ in terms):
+                # Juniper (`_JUNOS_FF_GUIDE`): "You must specify a unique name
+                # for each term within a firewall filter". How Junos merges a
+                # second stanza with the same name is not cited: noted.
+                notes.append(f"Junos filter {fname} defines term {tname} more "
+                             f"than once; how the device merges them is not "
+                             f"modelled")
             terms.append((tname, tbody))
             continue
         if t == "inactive:":
@@ -860,9 +1055,21 @@ def _parse_filter(fname: str, body: List[str], entries: List[ACE],
             raw=(f"filter {fname}: apply-groups — inherited terms not visible "
                  f"(indeterminate)"),
             acl=fname, line=0))
+    # Line accounting at term level (review of #42, round 8): a term is
+    # consumed when it made rules and wrote no note, noted when it wrote one;
+    # `Ledger.close` notes a term that did neither.
+    led = _JLEDGER.get()
     for tname, tbody in terms:
+        n0, e0 = len(notes), len(entries)
         seq = _parse_term(fname, tname, tbody, seq, entries, notes,
                           term_lines.get((fname, tname), 0), family=family)
+        if led is not None:
+            key = f"{fname}/{tname}#{len(led.scope)}"
+            led.add(key, f"filter {fname} term {tname}")
+            if len(notes) > n0:
+                led.note(key)
+            elif len(entries) > e0:
+                led.consume(key)
 
 
 def _term_line_map(text: str) -> "dict":
@@ -872,7 +1079,7 @@ def _term_line_map(text: str) -> "dict":
     unique within a filter, so keying by (filter, term) is unambiguous."""
     out: dict = {}
     cur_filter: Optional[str] = None
-    for i, ln in enumerate(text.splitlines(), 1):
+    for i, ln in enumerate(split_lines(text), 1):
         mf = re.search(r"\bfilter\s+(\S+?)\s*\{", ln)
         if mf:
             cur_filter = mf.group(1)
@@ -952,7 +1159,7 @@ def _set_to_brace(text: str):
     filters = {}          # (ls, family, name) -> {"leaves": [], "terms": {}, ...}
     order = []
     notes: List[str] = []
-    for lineno, ln in enumerate(text.splitlines(), 1):
+    for lineno, ln in enumerate(split_lines(text), 1):
         m = _SET_FW_RE.match(ln)
         if not m:
             continue
@@ -1065,7 +1272,82 @@ def parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
         _PREFIX_LISTS.reset(tok)
 
 
+_JLEDGER: "contextvars.ContextVar[Optional[Ledger]]" = contextvars.ContextVar(
+    "rulehawk_junos_ledger",
+                                                     default=None)
+
+
+# Top-level Junos stanzas whose mention of a filter name is read by the
+# model: the filter definitions, the interface bindings, group inheritance
+# (noted where it applies) and bare snippets of a filter.
+_JUNOS_READ_STANZAS = {"interfaces", "firewall", "groups", "apply-groups",
+                       "apply-groups-except", "family", "filter", "term",
+                       "inactive:", "protect:"}
+
+
+def _filter_name_refs(text: str) -> List[Tuple[str, str]]:
+    """(where, filter) for every top-level stanza or set line outside the
+    ones the model reads that names a defined filter (review of #42, round 9:
+    any line that names an in-scope filter is in scope). Such a stanza
+    (`forwarding-options ... filter`, a policy naming the filter) applies or
+    changes the filter in a way the model does not read."""
+    fnames = set(re.findall(r"\bfilter\s+(\S+?)\s*\{", text))
+    fnames |= {m.group(1) for m in re.finditer(
+        r"(?m)^\s*\S+\s+(?:logical-systems\s+\S+\s+)?firewall\s+(?:family\s+\S+\s+)?"
+        r"filter\s+(\S+)", text)}
+    fnames.discard("{")
+    if not fnames:
+        return []
+    out: List[Tuple[str, str]] = []
+    if not re.search(r"\bfilter\s+\S+\s*\{", text) and _SET_FW_RE.search(text):
+        for ln in split_lines(text):
+            w = ln.split()
+            if len(w) < 2 or w[0] not in ("set", "deactivate", "delete", "insert",
+                                          "activate", "rename", "copy", "protect"):
+                continue
+            k = 1
+            if w[1] == "logical-systems" and len(w) > 3:
+                k = 3
+            if w[k] in ("interfaces", "firewall", "groups", "apply-groups"):
+                continue
+            hit = next((t for t in w if t in fnames), None)
+            if hit:
+                out.append((" ".join(w[:k + 1]), hit))
+        return out
+    toks = _tokenize(text)
+    i, n = 0, len(toks)
+    while i < n:
+        if toks[i] in (";", "}"):
+            i += 1
+            continue
+        head, j = _consume_stmt(toks, i)
+        if head and head[0] not in _JUNOS_READ_STANZAS:
+            hit = next((t for t in toks[i:j] if t in fnames), None)
+            if hit:
+                out.append((head[0], hit))
+        i = j
+    return out
+
+
 def _parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
+    led = Ledger("junos")
+    tok = _JLEDGER.set(led)
+    try:
+        entries, notes = _parse_junos_body(text)
+    finally:
+        _JLEDGER.reset(tok)
+    for k, (where, fname) in enumerate(_filter_name_refs(text)):
+        key = f"ref#{k}"
+        led.add(key, f"`{where}` names filter {fname}")
+        led.note(key, notes, f"Junos `{where}` names filter {fname} outside the "
+                             f"filter definitions and interface bindings; what it "
+                             f"does with the filter is not modelled")
+    led.close(notes, lambda k, t: (f"Junos {t} makes no rule and no note: what it "
+                                   f"does is not modelled"))
+    return entries, notes
+
+
+def _parse_junos_body(text: str) -> Tuple[List[ACE], List[str]]:
     entries: List[ACE] = []
     notes: List[str] = []
     rebuilt = None
@@ -1091,6 +1373,7 @@ def _parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
         term_lines = _term_line_map(text)
         _walk(toks, entries, notes, term_lines, None)
 
+    notes.extend(_quote_hazards(text))
     if _SRX_POLICY_RE.search(text):
         notes.append("Junos SRX security policies (from-zone/to-zone) present — "
                      "zone-based security policies are not yet modeled; only "

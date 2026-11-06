@@ -16,7 +16,12 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _S = os.path.join(_ROOT, "samples")
 _POLICY = os.path.join(_S, "policy.json")
 _DIRTY = os.path.join(_S, "ios_acl.txt")      # critical findings -> FAIL
-_CLEAN = os.path.join(_S, "adv_realistic.txt")  # passes the policy
+_CLEAN = os.path.join(_S, "adv_realistic.txt")  # passed the policy before 0.5.0
+# A bound, fully modelled sample whose PASS is genuinely supported under
+# fail-closed (coordinator 11-06); adv_realistic.txt is now UNKNOWN.
+_BOUND = os.path.join(_S, "bound_edge.txt")
+_ADV_UNKNOWN_CODES = {"acl-role-unknown", "no-transit-filter", "tcp-established",
+                      "l4-fragments"}
 
 
 def _result(tmp_path, name, config, *, label=None, job="j", attempt="1") -> str:
@@ -60,7 +65,7 @@ def test_one_result_renders_exactly_the_single_gate_comment(tmp_path):
 
 
 def test_a_failing_check_beside_a_passing_one_heads_the_comment_with_fail(tmp_path):
-    a = _result(tmp_path, "a.json", _CLEAN, label="segmentation")
+    a = _result(tmp_path, "a.json", _BOUND, label="segmentation")
     b = _result(tmp_path, "b.json", _DIRTY, label="egress")
     body, verdict = combine.render([a, b])
     assert verdict == "FAIL"
@@ -75,8 +80,8 @@ def test_a_failing_check_beside_a_passing_one_heads_the_comment_with_fail(tmp_pa
 
 
 def test_two_passing_checks_pass(tmp_path):
-    a = _result(tmp_path, "a.json", _CLEAN, label="one")
-    b = _result(tmp_path, "b.json", _CLEAN, label="two")
+    a = _result(tmp_path, "a.json", _BOUND, label="one")
+    b = _result(tmp_path, "b.json", _BOUND, label="two")
     body, verdict = combine.render([a, b], expect=2)
     assert verdict == "PASS"
     assert "✅" in _headline(body) and "PASS" in _headline(body)
@@ -133,8 +138,8 @@ def test_a_rerun_attempt_replaces_the_same_check_from_an_older_attempt(tmp_path)
     """Re-running a job writes a second result for the same check; only the
     newest attempt of that check counts. Other checks keep theirs."""
     old = _result(tmp_path, "old.json", _DIRTY, label="egress", job="e", attempt="1")
-    new = _result(tmp_path, "new.json", _CLEAN, label="egress", job="e", attempt="2")
-    seg = _result(tmp_path, "seg.json", _CLEAN, label="seg", job="s", attempt="1")
+    new = _result(tmp_path, "new.json", _BOUND, label="egress", job="e", attempt="2")
+    seg = _result(tmp_path, "seg.json", _BOUND, label="seg", job="s", attempt="1")
     body, verdict = combine.render([old, new, seg], expect=2)
     assert verdict == "PASS", body
     assert body.count("| egress |") == 1
@@ -163,7 +168,7 @@ def test_an_oversized_comment_keeps_the_verdict_and_every_row(tmp_path):
 
 
 def test_cli_exit_codes_and_comment_file(tmp_path):
-    a = _result(tmp_path, "a.json", _CLEAN, label="one")
+    a = _result(tmp_path, "a.json", _BOUND, label="one")
     b = _result(tmp_path, "b.json", _DIRTY, label="two")
     out = tmp_path / "c.md"
     assert combine.main([a, "--comment", str(out), "-q"]) == 0
@@ -205,9 +210,11 @@ def test_a_pass_claim_with_findings_at_the_threshold_is_not_a_pass(tmp_path):
 def test_a_pass_claim_with_unparsed_files_is_not_a_pass(tmp_path):
     p = _record(tmp_path, "unparsed", parse_failures=1)
     assert combine.render([p])[1] == "UNKNOWN"
-    # ...except under the advisory threshold, which never blocks.
+    # ...and under the advisory threshold too: `fail-on none` never blocks,
+    # but a record claiming passed with an unparsed file is not a PASS
+    # (review of #42, F3: passed is true only on a real PASS).
     q = _record(tmp_path, "advisory", parse_failures=1, fail_on="none")
-    assert combine.render([q])[1] == "PASS"
+    assert combine.render([q])[1] == "UNKNOWN"
 
 
 def test_a_record_missing_its_counts_is_not_a_pass(tmp_path):
@@ -255,7 +262,7 @@ def test_a_failed_job_that_reported_its_failure_is_plain_fail(tmp_path):
 
 
 def test_a_failed_job_that_runs_no_rulehawk_check_is_ignored(tmp_path):
-    ok = _result(tmp_path, "ok.json", _CLEAN, label="seg", job="segmentation")
+    ok = _result(tmp_path, "ok.json", _BOUND, label="seg", job="segmentation")
     needs = {"segmentation": {"result": "success"}, "lint": {"result": "failure"}}
     assert combine.render([ok], expect=1, needs=needs)[1] == "PASS"
 
@@ -343,8 +350,67 @@ def test_an_unwritable_summary_does_not_split_the_verdict_from_the_comment(tmp_p
     """The step summary is a convenience. Failing to write it must not turn a
     PASS exit code into UNKNOWN while a PASS comment is posted (or vice versa):
     the exit code and the comment always say the same thing."""
-    a = _result(tmp_path, "a.json", _CLEAN, label="one")
+    a = _result(tmp_path, "a.json", _BOUND, label="one")
     out = tmp_path / "c.md"
     rc = combine.main([a, "--comment", str(out), "--summary", str(tmp_path), "-q"])
     body = out.read_text(encoding="utf-8")
     assert rc == 0 and "✅" in _headline(body)
+
+
+# --------------------------------------------------------------------------- #
+# the original fixture (adv_realistic.txt, unbound) is now UNKNOWN
+# --------------------------------------------------------------------------- #
+def _adv_codes():
+    g = gate.run_gate([_CLEAN], json.load(open(_POLICY)), "high", "auto")
+    return {r["code"] for _, f in g.undecided for r in (f.reasons or [])}
+
+
+def test_a_failing_check_beside_a_passing_one__unbound_original_is_unknown(tmp_path):
+    a = _result(tmp_path, "a.json", _CLEAN, label="segmentation")
+    b = _result(tmp_path, "b.json", _DIRTY, label="egress")
+    body, verdict = combine.render([a, b])
+    assert verdict == "FAIL"
+    assert "| segmentation | ✅ PASS |" not in body
+    assert _adv_codes() == _ADV_UNKNOWN_CODES
+
+
+def test_two_passing_checks__unbound_original_is_unknown(tmp_path):
+    a = _result(tmp_path, "a.json", _CLEAN, label="one")
+    b = _result(tmp_path, "b.json", _CLEAN, label="two")
+    body, verdict = combine.render([a, b], expect=2)
+    assert verdict == "UNKNOWN"
+    assert "✅" not in _headline(body)
+    assert _adv_codes() == _ADV_UNKNOWN_CODES
+
+
+def test_a_rerun_attempt__unbound_original_is_unknown(tmp_path):
+    old = _result(tmp_path, "old.json", _DIRTY, label="egress", job="e", attempt="1")
+    new = _result(tmp_path, "new.json", _CLEAN, label="egress", job="e", attempt="2")
+    seg = _result(tmp_path, "seg.json", _CLEAN, label="seg", job="s", attempt="1")
+    body, verdict = combine.render([old, new, seg], expect=2)
+    assert verdict == "UNKNOWN", body
+    assert _adv_codes() == _ADV_UNKNOWN_CODES
+
+
+def test_cli_exit_codes__unbound_original_is_unknown(tmp_path):
+    a = _result(tmp_path, "a.json", _CLEAN, label="one")
+    out = tmp_path / "c.md"
+    assert combine.main([a, "--comment", str(out), "-q"]) == 2   # UNKNOWN
+    assert "UNKNOWN" in out.read_text()
+    assert _adv_codes() == _ADV_UNKNOWN_CODES
+
+
+def test_a_failed_job_that_runs_no_rulehawk_check__unbound_original_is_unknown(tmp_path):
+    ok = _result(tmp_path, "ok.json", _CLEAN, label="seg", job="segmentation")
+    needs = {"segmentation": {"result": "success"}, "lint": {"result": "failure"}}
+    assert combine.render([ok], expect=1, needs=needs)[1] == "UNKNOWN"
+    assert _adv_codes() == _ADV_UNKNOWN_CODES
+
+
+def test_an_unwritable_summary__unbound_original_is_unknown(tmp_path):
+    a = _result(tmp_path, "a.json", _CLEAN, label="one")
+    out = tmp_path / "c.md"
+    rc = combine.main([a, "--comment", str(out), "--summary", str(tmp_path), "-q"])
+    body = out.read_text(encoding="utf-8")
+    assert rc == 2 and "✅" not in _headline(body)
+    assert _adv_codes() == _ADV_UNKNOWN_CODES

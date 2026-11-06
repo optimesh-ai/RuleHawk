@@ -1,0 +1,2 @@
+set address fq fqdn db.example.net
+set rulebase security rules r from any to any source 192.0.2.0/24 destination fq application any service any action allow

@@ -315,14 +315,25 @@ def test_mixed_family_object_range_does_not_crash():
 # --- named-port table additions ----------------------------------------------
 
 def test_new_named_ports_are_exact():
-    aces, _ = parse_acls(
+    # Round 10 (R9-4): names per vendor and protocol. IOS defines `bootps`
+    # (UDP 67) but neither `tacacs` on its TCP list (it has `tacacs-ds`, with
+    # no value in the IOS XE YANG model) nor `radius`: those two are noted.
+    aces, notes = parse_acls(
         "ip access-list extended T\n"
         " permit udp any any eq bootps\n"
         " permit tcp any any eq tacacs\n"
         " permit udp any any eq radius\n")
+    assert [(a.dst_port.lo, a.imprecise) for a in aces] == [(67, False), (0, True), (0, True)]
+    assert notes
+    # ASA: tacacs TCP 49, radius UDP 1645 (ASA 9.19, Port Literal Values; it
+    # was 1812, the IANA port, before round 10).
+    aces, _ = parse_acls(
+        "access-list T extended permit udp any any eq bootps\n"
+        "access-list T extended permit tcp any any eq tacacs\n"
+        "access-list T extended permit udp any any eq radius\n")
     ports = [(a.dst_port.lo, a.dst_port.hi) for a in aces]
-    assert ports == [(67, 67), (49, 49), (1812, 1812)]
-    assert all(not a.imprecise for a in aces)       # no longer ANY+imprecise
+    assert ports == [(67, 67), (49, 49), (1645, 1645)]
+    assert all(not a.imprecise for a in aces)
 
 
 def test_out_of_order_sequence_numbers_are_evaluated_numerically():

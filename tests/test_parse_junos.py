@@ -698,10 +698,14 @@ def test_hyphenated_named_ports_parse_whole_token():
     } } }
     """
     aces, notes = parse_junos(cfg)
-    assert {a.dst_port.lo for a in aces} == {20, 139, 445}
-    assert all(a.dst_port.lo == a.dst_port.hi for a in aces)
-    assert all(a.imprecise is False for a in aces)
-    assert notes == []
+    # Round 10 (R9-4): `ftp-data` (20) and `netbios-ssn` (139) are in Juniper's
+    # destination-port synonym list; `microsoft-ds` is not, so it is noted and
+    # the dimension widened (imprecise).
+    assert len(notes) == 1 and "microsoft-ds" in notes[0], notes
+    assert all(a.imprecise for a in aces)
+    exact, _ = parse_junos(cfg.replace(" microsoft-ds", ""))
+    assert {a.dst_port.lo for a in exact} == {20, 139}
+    assert all(a.dst_port.lo == a.dst_port.hi and a.imprecise is False for a in exact)
 
 
 def test_bracket_list_named_port_deny_stays_live():

@@ -242,14 +242,19 @@ def test_unknown_eq_service_name_does_not_false_pass_segmentation():
 def test_log_and_asa_log_arguments_stay_exact():
     # `log` never narrows the match; ASA log arguments ([level] [interval N] |
     # disable | default) must be consumed, not mistaken for unknown qualifiers.
+    # Round 9 (R8-6): `log-input` is not in the cited ASA grammar, so on an
+    # ASA line it is an unknown word (imprecise, noted).
     aces, notes = parse_acls(
         "access-list OUT extended permit tcp any any eq 443 log 6 interval 300\n"
         "access-list OUT extended deny ip any any log disable\n"
         "access-list OUT extended permit tcp any any eq 80 log default\n"
         "access-list OUT extended permit tcp any any eq 22 log-input\n")
     assert len(aces) == 4
-    assert all(not a.imprecise for a in aces)
-    assert not any("unrecognized" in n for n in notes)
+    assert all(not a.imprecise for a in aces[:3])
+    assert aces[3].imprecise
+    assert [n for n in notes if "unrecognized" in n] == [
+        "unrecognized trailing qualifier log-input — marked imprecise, verify "
+        "manually: access-list OUT extended permit tcp any any eq 22 log-input"]
 
 
 def test_icmp_type_slot_still_exact_and_extra_token_flags():

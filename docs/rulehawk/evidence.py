@@ -57,6 +57,7 @@ from typing import Dict, List, Optional, Sequence
 
 from .analyze import Finding, score
 from .riskaccept import Ledger, accepted_for, evaluate, finalize
+from .failclosed import KNOWN_LIMITS
 from .segcheck import check_segmentation
 
 SCHEMA = "rulehawk.evidence/v1"
@@ -167,11 +168,13 @@ CONTROL_MAP: Dict[str, Dict[str, List[str]]] = {
     "segmentation-violation": _SEGMENTATION,
     "segmentation-ok": _SEGMENTATION,
     "segmentation-indeterminate": _SEGMENTATION,
+    "segmentation-unknown": _SEGMENTATION,
     "segmentation-error": _SEGMENTATION,
     # required connectivity (must_reach) — availability, not confidentiality
     "connectivity-broken": _AVAILABILITY,
     "connectivity-ok": _AVAILABILITY,
     "connectivity-indeterminate": _AVAILABILITY,
+    "connectivity-unknown": _AVAILABILITY,
     # ruleset content
     "permit-any-any": _OVERLY_PERMISSIVE,
     "broad-any-any": _OVERLY_PERMISSIVE,
@@ -196,12 +199,18 @@ SCOPE_LIMITS = [
     "Coverage is exactly the configs listed under `subjects` — a device whose "
     "config was not supplied was not audited and is not covered by any claim "
     "here.",
-    "L7/identity (app-ID, source-user), time-range, inactive rules, interface "
-    "bindings and fragments are over-approximated and surfaced as notes.",
+    "L7/identity (app-ID, source-user), time-range and inactive rules are "
+    "over-approximated and surfaced as notes.",
+    "Fail-closed: a claim is VERIFIED only when no fail-closed reason applies "
+    "— an unknown or non-transit ACL binding, any parse note, a vendor default "
+    "RuleHawk does not model (e.g. PAN-OS default rules, an iptables chain "
+    "with no policy, IPv6 implicit neighbor discovery, non-initial "
+    "fragments), or an ambiguous mask. Otherwise it is INDETERMINATE and the "
+    "reason codes are listed.",
     "RuleHawk fails closed: a config that parses to zero rules is reported as "
     "no_rules_parsed, never as a clean result, and blocks any VERIFIED "
     "attestation for the run.",
-]
+] + [f"Known limit: {lim}." for lim in KNOWN_LIMITS]
 
 # Appended to the scope limits for browser-generated artifacts. In the hosted
 # tool the audited input is the text submitted to the page, which the browser
@@ -239,7 +248,8 @@ _DIRECTIONS = {
         "verb": "cannot reach",
         "ok": "segmentation-ok",
         "bad": "segmentation-violation",
-        "unknown": ("segmentation-indeterminate", "segmentation-error"),
+        "unknown": ("segmentation-unknown", "segmentation-indeterminate",
+                    "segmentation-error"),
         "basis_ok": "no audited ruleset permits this flow",
         "basis_bad": "at least one audited ruleset permits this flow",
     },
@@ -247,7 +257,8 @@ _DIRECTIONS = {
         "verb": "must reach",
         "ok": "connectivity-ok",
         "bad": "connectivity-broken",
-        "unknown": ("connectivity-indeterminate", "segmentation-error"),
+        "unknown": ("connectivity-unknown", "connectivity-indeterminate",
+                    "segmentation-error"),
         "basis_ok": "every audited ruleset permits this flow",
         "basis_bad": "at least one audited ruleset denies this flow",
     },
@@ -271,6 +282,18 @@ class Subject:
         if self.error:
             return "error"
         return "ok" if self.aces else "no_rules_parsed"
+
+    def fail_closed_context(self):
+        """The fail-closed context for this config (built once): bindings,
+        roles, notes and the vendor defaults a PASS would rest on."""
+        ctx = getattr(self, "_fc_ctx", None)
+        if ctx is None:
+            from .failclosed import build_context
+            from .model import strip_pager
+            text = strip_pager(self.raw.decode("utf-8", "replace"))
+            ctx = build_context(text, self.aces, self.notes, self.vendor)
+            self._fc_ctx = ctx
+        return ctx
 
     @property
     def audited(self) -> bool:
@@ -352,6 +375,8 @@ def _assertion_claim(a: dict, direction: str) -> str:
     claim = f"{a.get('src')} {spec['verb']} {a.get('dst')}"
     if proto not in ("ip", "any"):
         claim += f" on {proto}"
+        if ports is not None and not isinstance(ports, (list, tuple)):
+            ports = [ports]             # a scalar, as segcheck accepts it
         if ports:
             claim += "/" + ",".join(str(p) for p in ports)
     return claim
@@ -359,27 +384,31 @@ def _assertion_claim(a: dict, direction: str) -> str:
 
 def _subject_verdict(subject: Subject, zones: dict, assertion: dict,
                      direction: str):
-    """(status, witness, detail) for one assertion against one subject.
+    """(status, witness, detail, reasons) for one assertion against one
+    subject. `reasons` are the fail-closed reason codes behind an
+    INDETERMINATE ([] otherwise).
 
     Each assertion is re-checked alone so the result attributes to it exactly.
     `check_segmentation` evaluates assertions independently, so splitting is
     equivalent to one combined run — tests/test_evidence.py pins that.
     """
     spec = _DIRECTIONS[direction]
-    findings = check_segmentation(
-        subject.aces, {"zones": zones, direction: [assertion]})
+    one = {"zones": zones, direction: [assertion]}
+    ctx = subject.fail_closed_context()
+    findings = check_segmentation(subject.aces, one, context=ctx)
     kinds = {f.kind: f for f in findings}
     if spec["bad"] in kinds:
         f = kinds[spec["bad"]]
-        return FAILED, f.witness, f.message
+        return FAILED, f.witness, f.message, []
     for kind in spec["unknown"]:
         if kind in kinds:
-            return INDETERMINATE, "", kinds[kind].message
-    if spec["ok"] in kinds:
-        return VERIFIED, "", kinds[spec["ok"]].message
+            return (INDETERMINATE, "", kinds[kind].message,
+                    list(kinds[kind].reasons or []))
+    if spec["ok"] in kinds and kinds[spec["ok"]].verdict == "PASS":
+        return VERIFIED, "", kinds[spec["ok"]].message, []
     # Unreachable today; a fail-closed default so a new segmentation finding
     # kind can never default to VERIFIED.
-    return INDETERMINATE, "", "No result produced for this assertion."
+    return INDETERMINATE, "", "No result produced for this assertion.", []
 
 
 def _fleet_status(per_subject: Sequence[dict], all_audited: bool) -> str:
@@ -427,10 +456,11 @@ def build_attestations(subjects: Sequence[Subject],
                 continue        # segcheck already reports this as a policy error
             per_subject = []
             for s in audited:
-                status, witness, detail = _subject_verdict(
+                status, witness, detail, reasons = _subject_verdict(
                     s, zones, assertion, direction)
                 entry = {"subject": s.source, "status": status,
-                         "witness": witness, "detail": detail}
+                         "witness": witness, "detail": detail,
+                         "reasons": reasons}
                 if status == FAILED and ledger is not None:
                     exc = accepted_for(
                         ledger, spec["bad"], assertion.get("src"),
@@ -468,11 +498,37 @@ def build_attestations(subjects: Sequence[Subject],
                                 for p in accepted_on],
                 "failed_on": [{"subject": p["subject"], "witness": p["witness"],
                                "detail": p["detail"]} for p in failed_on],
-                "indeterminate_on": [{"subject": p["subject"], "detail": p["detail"]}
+                "indeterminate_on": [{"subject": p["subject"], "detail": p["detail"],
+                                      "reasons": p["reasons"]}
                                      for p in per_subject
                                      if p["status"] == INDETERMINATE],
                 "controls": control_refs(spec["bad"]),
             }
+            # Machine-readable: every reason code behind an INDETERMINATE,
+            # across the subjects, plus every config that was not audited.
+            reasons: List[dict] = []
+            seen = set()
+            for p in per_subject:
+                if p["status"] != INDETERMINATE:
+                    continue
+                for r in p["reasons"]:
+                    if r["code"] not in seen:
+                        seen.add(r["code"])
+                        reasons.append(r)
+            if not all_audited and status == INDETERMINATE:
+                from .failclosed import Reason
+                reasons.append(Reason(
+                    "no-rules-parsed",
+                    ", ".join(s.source for s in subjects if not s.audited)
+                ).to_dict())
+                for s in subjects:
+                    if s.audited:
+                        continue
+                    for r in s.fail_closed_context().blockers:
+                        if r.code not in seen:
+                            seen.add(r.code)
+                            reasons.append(r.to_dict())
+            entry["reasons"] = reasons
             # The single most useful line for a reader: the concrete packet.
             entry["witness"] = failed_on[0]["witness"] if failed_on else ""
             if not all_audited and status == INDETERMINATE:
@@ -590,7 +646,8 @@ def build_evidence(subjects: Sequence[Subject], *,
             {"subject": s.source, "rule_id": f.rule_id, "kind": f.kind,
              "severity": f.severity, "message": f.message, "rule": f.rule,
              "cited": f.cited, "fix": f.fix, "witness": f.witness,
-             "accepted": f.accepted, "controls": control_refs(f.kind)}
+             "accepted": f.accepted, "controls": control_refs(f.kind),
+             "verdict": f.verdict, "reasons": list(f.reasons or [])}
             for s in subjects for f in s.findings
         ],
         "controls": _control_rollup(all_findings, attestations),
@@ -711,6 +768,12 @@ def to_evidence_markdown(art: dict, *, title: str = "Segmentation evidence") -> 
                        f"**{_STATUS_MARK[a['status']]}** | {ev} |")
         out.append("")
         for a in art["attestations"]:
+            if a["status"] == INDETERMINATE and a.get("reasons"):
+                out.append(f"**{_cell(a['claim'])} — UNKNOWN, not proven:**")
+                out.append("")
+                for r in a["reasons"]:
+                    out.append(f"- `{_cell(r['code'])}`: {_cell(r['message'])}")
+                out.append("")
             if a["status"] == FAILED:
                 out.append(f"**{_cell(a['claim'])} — FAILED on "
                            f"{len(a['failed_on'])} config(s):**")

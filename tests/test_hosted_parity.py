@@ -42,6 +42,7 @@ from rulehawk.parse_panos import detect as detect_panos, parse_panos  # noqa: E4
 from rulehawk.parse_nxos import detect as detect_nxos, parse_nxos  # noqa: E402
 from rulehawk.parse_eos import detect as detect_eos, parse_eos  # noqa: E402
 from rulehawk.segcheck import check_segmentation  # noqa: E402
+from rulehawk.failclosed import build_context  # noqa: E402
 
 _DOCS = os.path.join(_ROOT, "docs")
 _WORKER = os.path.join(_DOCS, "worker.js")
@@ -271,8 +272,11 @@ def test_hosted_findings_match_cli_exactly(cfg):
     """Strongest assertion: the hosted entrypoint's findings == running the CLI's
     detect+parse+analyze+segcheck directly. Same engine, same verdicts."""
     env = _run_hosted(_analyze_py(_read(_WORKER)), cfg, _POLICY)
-    _, (aces, notes) = _cli_route(cfg)
-    findings = analyze(aces) + check_segmentation(aces, json.loads(_POLICY))
+    vendor, (aces, notes) = _cli_route(cfg)
+    # The CLI searches through the fail-closed context (0.5.0), so the parity
+    # reference must too: parity is against the CLI, not the raw search.
+    ctx = build_context(cfg, aces, notes, vendor)
+    findings = analyze(aces) + check_segmentation(aces, json.loads(_POLICY), context=ctx)
     expected = sorted((f.kind, f.severity) for f in findings)
     assert _kinds(env["report_json"]["findings"]) == expected
 

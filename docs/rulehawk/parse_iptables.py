@@ -52,7 +52,10 @@ import shlex
 from typing import Dict, List, Optional, Tuple
 
 from .model import ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet
-from .parse import _canon_icmp_type, _port_num  # reuse IANA maps + icmp canon
+from .failclosed import Ledger, split_lines
+# Port names (round 10, R9-4): none. iptables-save writes numbers, and a name
+# in a script resolves through the host's /etc/services, not the config.
+from .parse import _NO_NAMES, _canon_icmp_type, _port_num
 
 # iptables (`iptables -p icmp -h`) names -> RuleHawk canonical TYPE[/CODE].
 # NB: in iptables `ttl-exceeded` is an alias of time-exceeded (all codes),
@@ -157,8 +160,8 @@ def _ports(spec: str, label: str, key: str,
             continue
         if ":" in part:
             lo, hi = part.split(":", 1)
-            ln = _port_num(lo) if lo else PORT_MIN
-            hn = _port_num(hi) if hi else PORT_MAX
+            ln = _port_num(lo, _NO_NAMES) if lo else PORT_MIN
+            hn = _port_num(hi, _NO_NAMES) if hi else PORT_MAX
             if ln < 0 or hn < 0:
                 imprecise = True
                 notes.append(f"unparsed iptables {key} '{part}' in {label} "
@@ -166,7 +169,7 @@ def _ports(spec: str, label: str, key: str,
                 continue
             ranges.append(PortRange(min(ln, hn), max(ln, hn)))
         else:
-            p = _port_num(part)
+            p = _port_num(part, _NO_NAMES)
             if p < 0:
                 imprecise = True
                 notes.append(f"unparsed iptables {key} '{part}' in {label} "
@@ -289,9 +292,54 @@ def _norm_proto(v: str) -> str:
     return v
 
 
+# Options that hold one value per rule, by the field they set (round 10,
+# R9-2). iptables rejects a rule that gives one twice: xshared.c set_option(),
+# "multiple -%c flags not allowed" (-s -d -p -i -o -j -g,
+# https://android.googlesource.com/platform/external/iptables/+/8902cb0d42754a35febbc79c077bca770c477bf1/iptables/xshared.c),
+# and libxtables xtables_option_parse(), "option \"--%s\" can only be used
+# once" for a match option without XTOPT_MULTI (--dport, --sport of the
+# tcp / udp match,
+# https://android.googlesource.com/platform/external/iptables/+/dda1fee032d9d1d1bae1753249f2e624e85e2b39/libxtables/xtoptions.c).
+_ONCE_OPTS = {"-s": "-s", "--source": "-s", "--src": "-s",
+              "-d": "-d", "--destination": "-d", "--dst": "-d",
+              "-p": "-p", "--protocol": "-p",
+              "-i": "-i", "--in-interface": "-i", "-o": "-o", "--out-interface": "-o",
+              "-j": "-j", "--jump": "-j", "-g": "-g", "--goto": "-g",
+              "--dport": "--dport", "--destination-port": "--dport",
+              "--sport": "--sport", "--source-port": "--sport",
+              "--dports": "--dports", "--destination-ports": "--dports",
+              "--sports": "--sports", "--source-ports": "--sports"}
+
+
+def _repeated_option(toks: List[str]) -> Optional[str]:
+    seen: set = set()
+    i, n = 0, len(toks)
+    while i < n:
+        t = toks[i]
+        key = _ONCE_OPTS.get(t)
+        if key is not None:
+            if key in seen:
+                return key
+            seen.add(key)
+        if t in _VALUE_OPTS:
+            i += 2
+        else:
+            i += 1
+    return None
+
+
 def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
     """Parse the option tokens of one `-A CHAIN <here>` rule into a `_Rule`."""
     r = _Rule()
+    rep = _repeated_option(toks)
+    if rep:
+        # iptables rejects the command; the rule is modelled as one that may
+        # or may not be there (imprecise), and noted.
+        r.imprecise = True
+        notes.append(f"iptables option `{rep}` is given more than once in {label}: "
+                     f"iptables rejects the command (xshared.c: \"multiple -%c flags "
+                     f"not allowed\"; libxtables: \"can only be used once\") — not "
+                     f"modelled (marked imprecise)")
     i, n = 0, len(toks)
     negate = False
     while i < n:
@@ -528,7 +576,7 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
             notes.append(f"iptables fragment match (`-f`) in {label} — applies only to "
                          f"non-first fragments (marked imprecise — verify manually)")
             i += 1
-        elif t.startswith("-") and t not in ("-A", "--append"):
+        elif t.startswith("-"):
             # Unknown narrowing option (e.g. --tcp-flags, --syn, -m limit options):
             # over-approximate and surface, never silently drop the constraint.
             r.imprecise = True
@@ -538,6 +586,14 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                          + f" in {label} (marked imprecise — verify manually)")
             i += consumed
         else:
+            # A word that is no option's value: iptables rejects the line
+            # (`Bad argument`), so the rule may not exist on the device.
+            # Keep it, imprecise, and say so (round 4: skipping the word
+            # silently let a refused DROP prove a PASS).
+            r.imprecise = True
+            notes.append(f"stray word `{t[:40]}` in iptables rule {label} — "
+                         f"iptables rejects such a line, so the rule may not "
+                         f"be applied (marked imprecise — verify manually)")
             i += 1
         negate = False
     return r
@@ -715,6 +771,16 @@ def _resolve_transit_jump(
     return result  # empty = chain matched nothing → all traffic falls through
 
 
+# nftables text (a ruleset file, a `nft` command, or the nft list output):
+# not read by this frontend.
+_NFT_LINE = re.compile(
+    r"^(?:sudo\s+)?(?:nft\b|table\s+(?:inet|ip6?|arp|bridge|netdev)\s+\S+"
+    r"\s*\{|flush\s+ruleset\b|chain\s+\S+\s*\{)")
+# Verbs that never change filtering: -Z zeroes counters, -L / -S list rules.
+_READ_ONLY = frozenset({"-Z", "--zero", "-L", "--list", "-S", "--list-rules"})
+_MAX_LINE_NOTES = 20
+
+
 def _strip_command(line: str) -> Optional[str]:
     """For the command form, drop a leading `iptables`/`ip6tables` (and `sudo`).
     Return the remaining args string, or None if the line isn't an ip(6)tables
@@ -755,6 +821,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     policies: Dict[str, str] = {}                # chain -> permit|deny (from policy)
     policy_lines: Dict[str, int] = {}            # chain -> source line of its `-P`/`:` policy
     table = "filter"                             # iptables-save default before *table
+    n_filter_blocks = 0
     table_is_filter = True
     other_tables_noted: set = set()
     # Chains that contain RETURN or NAT targets — their control flow cannot be
@@ -875,36 +942,185 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             return _Item(None, line)
         return _Item(r, line)
 
+    # iptables(8): "The policy target must be either ACCEPT or DROP", and
+    # libiptc compares the name case-sensitively. `-P FORWARD REJECT` or
+    # `drop` fails on the host (iptables-restore aborts), so it sets nothing
+    # and the line is noted (review of #42, round 5, S1).
+    _POLICIES = {"ACCEPT": "permit", "DROP": "deny"}
+
+    def pol_ok(pol: str) -> bool:
+        return pol in _POLICIES
+
     def set_policy(ch: str, pol: str, line: int = 0) -> None:
-        act = _TERMINATING.get(pol.upper())
+        act = _POLICIES.get(pol)
         if act is not None:
             policies[ch] = act
             policy_lines[ch] = line
             ensure_chain(ch)
 
-    for lineno, raw in enumerate(text.splitlines(), 1):
+    # Every line is consumed by a modelled handler or gets a note (review of
+    # #42, round 3). `consumed` holds the handled line numbers; the rest are
+    # noted after the loop. nftables text has no frontend: its blocks are
+    # noted once each (failclosed also blocks them as nftables-present).
+    consumed: set = set()
+    foreign: set = set()
+    nft_depth = 0
+    is_save = bool(re.search(r"(?m)^\s*\*", text))
+    # Line accounting (round 8): every line that is not blank or a comment is
+    # in scope; `close` notes each one no handler consumed.
+    led = Ledger("iptables")
+    # iptables-restore table blocks (round 8, R7-5): a block runs from a
+    # `*table` header to its `COMMIT`. iptables-restore(8) (iptables 1.8.13,
+    # https://man7.org/linux/man-pages/man8/iptables-restore.8.html) does not
+    # say what it does with a block that has no `COMMIT` or with a line
+    # outside a block, so both are noted.
+    table_open = 0                               # header line of the open block
+    chain_decls: "Dict[Tuple[int, str], List]" = {}   # (block, chain) -> [line, policy]
+    # iptables-restore reads each line as it is (round 9, R8-3). The source,
+    # iptables/iptables-restore.c (netfilter iptables; e.g.
+    # https://github.com/canonical/netfilter-iptables/blob/c509a371/iptables/iptables-restore.c):
+    #   if (buffer[0] == '\n') continue;
+    #   else if (buffer[0] == '#') { ... continue; }
+    #   else if ((strcmp(buffer, "COMMIT\n") == 0) && (in_table)) { ... }
+    #   else if ((buffer[0] == '*') && (!in_table)) { /* New table */ ... }
+    #   else if (in_table) { ... ret = cb->do_command(...); }
+    #   if (!ret) { fprintf(stderr, "%s: line %u failed\n", ...); exit(1); }
+    # So only the exact line `COMMIT` commits, only a line that starts with
+    # `#` is a comment and only an empty line is skipped. Anything else (a
+    # `commit`, `COMMIT ` with a trailing space or CR, an indented `#`, a
+    # line of spaces) is handed to the rule parser: noted, never read as the
+    # thing it looks like.
+    raws = split_lines(text, keep_cr=True)
+    for lineno, raw in enumerate(split_lines(text), 1):
         line = raw.strip()
-        if not line or line.startswith("#"):
+        exact = raws[lineno - 1]
+        if is_save and nft_depth == 0 and exact and not line:
+            led.add(lineno, "(spaces)")
+            led.note(lineno, notes,
+                     f"iptables-restore line {lineno} holds only spaces: "
+                     f"iptables-restore skips only an empty line")
+            continue
+        if not line or (line.startswith("#") and (not is_save or exact.startswith("#"))):
+            continue
+        led.add(lineno, line)
+        if is_save and nft_depth == 0 and line != exact and (
+                line[:1] in "#*:" or line.upper() == "COMMIT"):
+            led.note(lineno, notes,
+                     f"iptables-restore line {lineno} (`{line[:30]}`) has "
+                     f"white space or a CR around it: iptables-restore reads "
+                     f"the line as it is, so it is not the "
+                     f"{'comment' if line[:1] == '#' else 'table header' if line[:1] == '*' else 'chain line' if line[:1] == ':' else 'COMMIT'} "
+                     f"it looks like; not modelled")
+            continue
+        if is_save and nft_depth == 0 and line.upper() == "COMMIT" and line != "COMMIT":
+            led.note(lineno, notes,
+                     f"`{line}` at line {lineno} is not `COMMIT`: iptables-restore "
+                     f"commits only on the exact line `COMMIT`, so the table "
+                     f"block is not committed here")
+            continue
+        if is_save and nft_depth == 0 and not _NFT_LINE.match(line):
+            if line.startswith("*"):
+                if table_open:
+                    led.note(lineno, notes,
+                             f"iptables-restore table block at line {table_open} "
+                             f"has no `COMMIT` before the next table header (line "
+                             f"{lineno}); what iptables-restore loads is not "
+                             f"modelled")
+                table_open = lineno
+            elif line == "COMMIT":
+                if not table_open:
+                    led.note(lineno, notes,
+                             f"`COMMIT` at line {lineno} is outside a table block")
+                table_open = 0
+            elif not table_open:
+                led.note(lineno, notes,
+                         f"iptables-restore line {lineno} (`{line.split()[0][:20]}"
+                         f" ...`) is outside a table block (before the first "
+                         f"`*table` header or after a `COMMIT`); what "
+                         f"iptables-restore does with it is not modelled")
+        # Line forms neither bash nor iptables-restore reads as RuleHawk
+        # would (review of #42, round 6, N5): a trailing backslash joins the
+        # next line into this command (bash), and iptables-restore has no
+        # line continuation at all; in a restore file only a line that starts
+        # with `#` is a comment, and its words are split as RuleHawk does
+        # only on spaces. Each is a note, so the answer is UNKNOWN.
+        if (len(line) - len(line.rstrip("\\"))) % 2 == 1:
+            notes.append(f"iptables line {lineno} ends with `\\`: a line "
+                         f"continuation is not modelled")
+        if is_save and "#" in line:
+            notes.append(f"iptables-restore line {lineno} holds `#` after its "
+                         f"start: only a line that starts with `#` is a comment")
+        if is_save and "\t" in line:
+            notes.append(f"iptables-restore line {lineno} holds a tab: not "
+                         f"modelled")
+
+        if nft_depth > 0:
+            consumed.add(lineno)
+            nft_depth += line.count("{") - line.count("}")
+            continue
+        if _NFT_LINE.match(line):
+            consumed.add(lineno)
+            notes.append(f"nftables text at line {lineno} (`{line[:60]}`) — "
+                         f"RuleHawk does not read nftables; its rules can accept, "
+                         f"drop or forward packets before or after these iptables "
+                         f"chains")
+            nft_depth = max(0, line.count("{") - line.count("}"))
             continue
 
         if line.startswith("*"):                 # iptables-save table header
+            if len(line.split()) != 1 or len(line) == 1:
+                notes.append(f"malformed iptables-save table header at line "
+                             f"{lineno}: `{line[:60]}` — read as `*filter`")
+            consumed.add(lineno)
             table = line[1:].strip().split()[0] if len(line) > 1 else "filter"
             table_is_filter = (table == "filter")
+            if table_is_filter:
+                n_filter_blocks += 1
+                if n_filter_blocks == 2:
+                    # iptables-restore (without --noflush) flushes a table at
+                    # each `*table` header and the last block wins; RuleHawk
+                    # merges the blocks. Not modeled: fail closed.
+                    notes.append(f"more than one `*filter` block (second at line "
+                                 f"{lineno}) — iptables-restore replaces the "
+                                 f"table at each one; the blocks are not "
+                                 f"modeled as replacing each other")
             if not table_is_filter and table not in other_tables_noted:
                 other_tables_noted.add(table)
-                notes.append(f"iptables '{table}' table present — not modeled "
-                             f"(filter-space only; review NAT/mangle/raw manually)")
+                notes.append(f"iptables '{table}' table present (line {lineno}) — "
+                             f"not modeled (filter-space only; review "
+                             f"NAT/mangle/raw manually)")
             continue
-        if line.upper() == "COMMIT":
+        if line == "COMMIT" and is_save:
+            consumed.add(lineno)
             continue
 
         if line.startswith(":"):                 # save-form chain + default policy
-            if not table_is_filter:
-                continue
             parts = line[1:].split()
+            if not table_is_filter:
+                if parts:
+                    consumed.add(lineno)         # the *table header was noted
+                continue
+            if parts:
+                # A chain declared twice in one table block (round 10, R9-2):
+                # a chain has one policy, and what iptables-restore does with
+                # a second declaration is not cited (iptables-restore(8) does
+                # not say). Noted unless the two lines are the same.
+                key = (table_open, parts[0])
+                prev = chain_decls.get(key)
+                if prev is not None and (prev[1:2] != parts[1:2]
+                                         or parts[0] not in _BASE_CHAINS):
+                    notes.append(f"iptables-restore chain `{parts[0]}` is declared "
+                                 f"more than once in one table block (lines "
+                                 f"{prev[0]} and {lineno}); a chain's policy is set "
+                                 f"more than once and which one holds is not cited "
+                                 f"— not modelled")
+                chain_decls.setdefault(key, [lineno] + parts[1:2])
             if len(parts) >= 2 and parts[0] in _BASE_CHAINS:
+                if pol_ok(parts[1]):
+                    consumed.add(lineno)
                 set_policy(parts[0], parts[1], lineno)
-            elif len(parts) >= 1:
+            elif len(parts) >= 1 and parts[0] not in _BASE_CHAINS:
+                consumed.add(lineno)
                 ensure_chain(parts[0])           # custom chain declaration
             continue
 
@@ -920,6 +1136,13 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             unreliable = True                # see parse_one: fail closed
         if not toks:
             continue
+        if cmd is None and not toks[0].startswith("-"):
+            # Not an iptables line (a shell line, `$IPT -A ...`). One that
+            # carries an iptables verb is still parsed (a FAIL it shows is
+            # real), but it is never consumed: what runs it is unknown.
+            foreign.add(lineno)
+            if not _OPS & set(toks):
+                continue
 
         # Honor an explicit `-t TABLE` (command form); default table is filter.
         # Only on a line that is an iptables operation: in a shell script,
@@ -930,34 +1153,41 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             tbl = toks[k + 1] if k + 1 < len(toks) else "filter"
             del toks[k:k + 2]
             if tbl != "filter":
+                consumed.add(lineno)
                 if tbl not in other_tables_noted:
                     other_tables_noted.add(tbl)
-                    notes.append(f"iptables '{tbl}' table rule present — not modeled "
-                                 f"(filter-space only; review manually)")
+                    notes.append(f"iptables '{tbl}' table rule present (line "
+                                 f"{lineno}) — not modeled (filter-space only; "
+                                 f"review manually)")
                 continue
         elif not table_is_filter:
             # ANY rule line (save-form `-A ...` or command form) inside a
             # *nat/*mangle/*raw block: the `*table` header already surfaced the
             # block — skip; a nat ACCEPT must never become a filter permit.
+            consumed.add(lineno)
             continue
 
-        # Dispatch the action verb.
-        if "-A" in toks or "--append" in toks:
-            k = toks.index("-A") if "-A" in toks else toks.index("--append")
+        # Dispatch on the FIRST verb token (review of #42, round 4, R1): a
+        # verb later on the line (`-N X # -A FORWARD ...`) is an argument or a
+        # comment, never the operation.
+        op = next((t for t in toks if t in _OPS or t in _READ_ONLY), None)
+        k = toks.index(op) if op is not None else -1
+        if op in ("-A", "--append"):
             if k + 1 < len(toks):
+                consumed.add(lineno)
                 ch = toks[k + 1]
                 ensure_chain(ch)
                 items_by_chain[ch].append(parse_one(ch, toks[k + 2:], lineno,
                                                     unreliable))
-        elif "-I" in toks or "--insert" in toks:
+        elif op in ("-I", "--insert"):
             # Insert at 1-based position N (no index => the very front). iptables
             # evaluates the inserted rule BEFORE whatever rule currently sits at
             # position N, so we SPLICE it into the chain's ordered item list at
             # that slot — first-match order is thereby modeled (ACE `seq` is
             # assigned in list order at expansion). N past the end appends; N < 1
             # is treated as 1 (front).
-            k = toks.index("-I") if "-I" in toks else toks.index("--insert")
             if k + 1 < len(toks):
+                consumed.add(lineno)
                 ch = toks[k + 1]
                 args = toks[k + 2:]
                 pos = None
@@ -976,16 +1206,35 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                              f"insert modeled at position {idx + 1} of {ch} "
                              f"(first-match order honored; it evaluates before "
                              f"whatever held that slot)")
-        elif "-P" in toks or "--policy" in toks:
-            k = toks.index("-P") if "-P" in toks else toks.index("--policy")
+        elif op in ("-P", "--policy"):
+            # `-P CHAIN TARGET` and nothing after it (round 9, R8-4):
+            # iptables/xtables.c (same source tree) ends option parsing with
+            #   if (optind < argc) xtables_error(PARAMETER_PROBLEM,
+            #       "unknown arguments found on commandline");
+            # so a word left over makes iptables reject the command, and the
+            # policy stays what it was. Noted, not applied. A policy on a
+            # chain that is not built in is not modelled either.
             if k + 2 < len(toks):
-                set_policy(toks[k + 1], toks[k + 2], lineno)
-        elif "-R" in toks or "--replace" in toks:
+                extra = toks[k + 3:]
+                if extra or toks[k + 1] not in _BASE_CHAINS:
+                    led.note(
+                        lineno, notes,
+                        f"iptables `{' '.join(toks[k:])[:60]}` (line {lineno}): "
+                        + (f"word(s) after the policy ({' '.join(extra)[:30]}) — "
+                           f"iptables rejects the command (\"unknown arguments "
+                           f"found on commandline\"), so the policy is not set"
+                           if extra else
+                           f"{toks[k + 1]} is not a built-in chain; not modelled"))
+                else:
+                    if pol_ok(toks[k + 2]):
+                        consumed.add(lineno)
+                    set_policy(toks[k + 1], toks[k + 2], lineno)
+        elif op in ("-R", "--replace"):
             # Replace the rule currently at 1-based position N in place, so the
             # replacement inherits N's first-match slot. An out-of-range (or
             # missing) index fails safe: append at the end + surface the note.
-            k = toks.index("-R") if "-R" in toks else toks.index("--replace")
             if k + 1 < len(toks):
+                consumed.add(lineno)
                 ch = toks[k + 1]
                 args = toks[k + 2:]
                 pos = None
@@ -1006,20 +1255,30 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                                  f"{'' if pos is None else ' ' + str(pos)}` replace "
                                  f"position {'missing' if pos is None else 'out of range'}"
                                  f" — rule appended at end of {ch} (verify)")
-        elif "-D" in toks or "--delete" in toks:
+        elif op in ("-D", "--delete"):
             # Delete: removal not modeled — the deleted rule (if parsed earlier)
             # stays in the analysis. Surfaced, never silent.
-            k = toks.index("-D") if "-D" in toks else toks.index("--delete")
+            consumed.add(lineno)
             ch = toks[k + 1] if k + 1 < len(toks) else "?"
             notes.append(f"iptables `-D {ch}` delete not modeled — the deleted "
                          f"rule may still appear in the analysis (verify manually)")
-        elif "-F" in toks or "--flush" in toks:
+        elif op in ("-F", "--flush"):
             # Flush: an ignored mid-script flush could let a flushed earlier rule
             # falsely prove a later rule dead — clear the accumulated items. Any
             # jump placeholders they carried go with them: deferred expansion
             # never sees flushed rules, so no stale pending resolution survives.
-            k = toks.index("-F") if "-F" in toks else toks.index("--flush")
             ch = toks[k + 1] if k + 1 < len(toks) else None
+            if len(toks) > k + 2:
+                # `-F [CHAIN]` takes one chain at most (round 9, R8-4): with
+                # more, iptables rejects the command (xtables.c, above). The
+                # flush is still applied here (fewer rules can only add FAILs
+                # the note keeps from being a PASS) and the line is noted.
+                led.note(lineno, notes,
+                         f"iptables `{' '.join(toks[k:])[:60]}` (line "
+                         f"{lineno}): word(s) after the chain; iptables "
+                         f"rejects the command")
+            else:
+                consumed.add(lineno)
             if ch is not None:
                 if ch in items_by_chain:
                     items_by_chain[ch] = []
@@ -1030,11 +1289,41 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                     items_by_chain[c] = []
                 notes.append("iptables `-F` flush — all rules accumulated before "
                              "this point cleared from the analysis")
-        elif "-N" in toks or "--new-chain" in toks:
-            k = toks.index("-N") if "-N" in toks else toks.index("--new-chain")
+        elif op in ("-N", "--new-chain"):
             if k + 1 < len(toks):
+                if len(toks) == k + 2:
+                    consumed.add(lineno)
+                else:
+                    led.note(lineno, notes,
+                             f"iptables `{' '.join(toks[k:])[:60]}` (line "
+                             f"{lineno}): word(s) after the chain name; "
+                             f"iptables rejects the command")
                 ensure_chain(toks[k + 1])
-        # -X/-Z and others: no rule contribution; ignored.
+        elif op in _READ_ONLY and not (_OPS - _READ_ONLY) & set(toks):
+            # -Z zeroes counters, -L / -S list: none changes filtering.
+            consumed.add(lineno)
+        # Anything else (-X, -E, a shell line, an unknown verb) is noted below.
+        # A line that carries a second verb or a shell separator holds more
+        # than the one operation dispatched above (`-N X ; iptables -P FORWARD
+        # ACCEPT`): what was dispatched stays, but the line is not consumed,
+        # so it is noted (round 4, R1).
+        if lineno in consumed and (
+                any(t in _OPS or t in _READ_ONLY for t in toks[k + 1:])
+                or any(c in t for t in toks for c in (";", "|", "&", "`", "$("))):
+            consumed.discard(lineno)
+
+    if is_save and table_open:
+        led.note(table_open, notes,
+                 f"iptables-restore table block at line {table_open} has no "
+                 f"`COMMIT`; what iptables-restore loads is not modelled")
+    for n in consumed - foreign:
+        led.consume(n)
+    # Only the first word is quoted: the rest of a shell line can look like an
+    # iptables option (`ssh -t "su -"`) and must not read as one.
+    led.close(notes, lambda n, ln: (
+        f"unmodeled line {n} (`{ln.split()[0][:40]} ...`) — not an iptables "
+        f"filter rule, policy or chain RuleHawk models, so it cannot tell what "
+        f"the line changes"), cap=_MAX_LINE_NOTES)
 
     # ── Expansion: materialize each chain's ACEs in device (first-match) order.
     # Deferred until now so the -A/-I/-R splices above have already fixed each

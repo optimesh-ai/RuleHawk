@@ -65,7 +65,9 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 
 | Output | Description |
 |---|---|
-| `passed` | `true` when no finding met the `fail-on` threshold (and every file parsed). |
+| `passed` | `true` only on a PASS: no finding met the `fail-on` threshold, every file parsed and every policy assertion was proven. Under `fail-on: none` it is `true` only when the real verdict is PASS. |
+| `verdict` | `PASS` \| `FAIL` \| `UNKNOWN` \| `ADVISORY`. UNKNOWN means a policy assertion could not be proven; the finding's reason codes say why. Under `fail-on: none` this is the real verdict (ADVISORY: findings, nothing failed or unproven), reported but not enforced. |
+| `exit-code` | The gate's exit code: `0` PASS, `1` FAIL, `2` parse failure or invalid input, `3` UNKNOWN. |
 | `score` | Lowest hygiene score (0–100) across the audited files. |
 | `worst-severity` | Highest severity found: `critical` \| `high` \| `medium` \| `low` \| `none`. |
 | `evidence-file` | Path to the compliance-evidence JSON artifact (empty unless `evidence: true`). |
@@ -192,8 +194,18 @@ assessor reads the output:
 | `0` | Clean — no finding at/above `fail-on`, every file parsed. |
 | `1` | One or more findings at/above `fail-on`. |
 | `2` | **Fail-closed** — a file parsed to *zero* rules or could not be read (suppressed only by `fail-on: none`), a `configs` pattern matched **no files** (a typo'd path must not mean "never audited, green check"), an unknown `vendor`/flag, or an unwritable output path. RuleHawk will not certify isolation it could not verify. |
+| `3` | **UNKNOWN** — no finding reached `fail-on`, but a policy assertion could not be proven: an ACL with no interface or `access-group` binding, an ACL used as something other than a transit filter (vty `access-class`, SNMP, route-map, NAT, crypto, QoS), a parse note, an unmodelled vendor default (PAN-OS `default-security-rules`, iptables chain policy without `-P`, IPv6 implicit ND), or an ambiguous IOS mask. Each such assertion lists its reason codes in the comment, the job summary and the JSON. UNKNOWN is never a PASS. |
 
-The Action maps both `1` and `2` to a red check. Even on failure it still uploads
+`@v1` resolves to 0.5.0 (it pointed at 0.3.1 before): runs that exited 0 on
+an unprovable assertion now exit 3 and go red. Pin `@v0.3.1` to opt out.
+
+The Action maps `1`, `2` and `3` to a red check. The `verdict` output is
+`PASS`, `FAIL`, `UNKNOWN` or `ADVISORY`, and `exit-code` is the raw code.
+Under `fail-on: none` the step never fails (exit 0), but the verdict, the
+console, the PR comment and `rulehawk combine` all show the real verdict,
+marked *not enforced*: FAIL for a broken assertion or an unparsed file,
+UNKNOWN for an unproven assertion, ADVISORY for other findings. Only a real
+PASS reads as PASS. Before 0.5.0 the UNKNOWN cases exited 0 and printed PASS. Even on failure it still uploads
 SARIF and posts the comment first, so the gate always reports its value.
 
 ## What you get

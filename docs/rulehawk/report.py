@@ -7,6 +7,8 @@ from typing import Dict, List, Optional
 
 from .analyze import Finding, score
 from .boundary import text_lines as boundary_text, to_dict as boundary_dict
+from .failclosed import (KNOWN_LIMITS, LIMITS_STATEMENT, PASS_SCOPE,
+                         REACH_SCOPE, assertion_verdict)
 
 _ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
@@ -47,14 +49,22 @@ def to_json(findings: List[Finding], notes: List[str], n_rules: int,
         "rules_analyzed": n_rules,
         "findings_total": len(findings),
         "findings_by_severity": _counts(findings),
+        # Additive: the worst policy-assertion verdict, PASS | FAIL | UNKNOWN
+        # (null without a policy). UNKNOWN is never a PASS.
+        "assertion_verdict": assertion_verdict(findings),
         "findings": [
             {"rule_id": f.rule_id, "kind": f.kind, "severity": f.severity,
              "message": f.message, "rule": f.rule, "cited": f.cited, "fix": f.fix,
-             "witness": f.witness, "accepted": f.accepted, "line": f.line}
+             "witness": f.witness, "accepted": f.accepted, "line": f.line,
+             # assertion findings only (null on hygiene findings)
+             "verdict": f.verdict, "reasons": list(f.reasons or [])}
             for f in _sorted(findings)
         ],
         "parse_notes": notes,
         "verification_boundary": boundary_dict(findings),
+        # What a PASS rests on and what each frontend reads (round 4, R7).
+        "scope": {"statement": LIMITS_STATEMENT, "must_not_reach": PASS_SCOPE,
+                  "must_reach": REACH_SCOPE, "known_limits": list(KNOWN_LIMITS)},
     }, indent=2)
 
 
@@ -84,6 +94,13 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int,
                 f" Detected format: {_vendor} — but no ACL/firewall rules were parsed.",
                 f" Supported: {_SUPPORTED_VENDORS}.",
             ]
+        asserts = [f for f in findings if f.verdict is not None]
+        if asserts:
+            out.append("")
+            out.append(" Policy assertions: none can be proven over a config "
+                       "with no parsed rules.")
+            for f in asserts:
+                out += _assertion_lines(f)
         if notes:
             out.append("")
             out.append(f" Parse notes ({len(notes)}):")
@@ -122,6 +139,11 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int,
             # already shows it; the CLI text report must too.
             lines.append(f"   pkt  : {f.witness}")
         lines.append(f"   why  : {f.message}")
+        if f.verdict:
+            lines.append(f"   verdict: {f.verdict}")
+        if f.verdict == "UNKNOWN":
+            for r in (f.reasons or []):
+                lines.append(f"   reason: {r['code']}: {r['message']}")
         if f.accepted:
             a = f.accepted
             # Say plainly that the risk is OWNED, not gone: the finding stands,
@@ -157,6 +179,13 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int,
                      f"and lines not fully modeled):")
         lines += _note_lines(notes)
     return "\n".join(lines)
+
+
+def _assertion_lines(f: Finding) -> List[str]:
+    out = [f"   [{f.verdict}] {f.kind} ({f.rule_id}): {f.message}"]
+    for r in (f.reasons or []):
+        out.append(f"      reason: {r['code']}: {r['message']}")
+    return out
 
 
 def _sorted(findings: List[Finding]) -> List[Finding]:

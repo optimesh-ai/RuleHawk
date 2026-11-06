@@ -1,0 +1,9 @@
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT DROP [0:0]
+-A FORWARD -s 192.0.2.0/24 -d 198.51.100.0/24 -j DROP
+COMMIT
+* nat
+-A PREROUTING -d 203.0.113.5 -j DNAT --to-destination 198.51.100.5
+COMMIT

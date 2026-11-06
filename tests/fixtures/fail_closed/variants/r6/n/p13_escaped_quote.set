@@ -1,0 +1,2 @@
+set rulebase security rules a description "x \" action deny"
+set rulebase security rules a from any to any source 192.0.2.0/24 destination 198.51.100.0/24 application any service any action allow

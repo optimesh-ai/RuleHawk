@@ -1,0 +1,19 @@
+{
+ "SecurityGroups": [
+  {
+   "GroupId": "sg-0aa",
+   "GroupName": "pci",
+   "IpPermissions": [
+    {
+     "IpProtocol": "-1",
+     "Ipv6Ranges": [
+      {
+       "CidrIpv6": "2001:db8::/32"
+      }
+     ]
+    }
+   ],
+   "IpPermissionsEgress": []
+  }
+ ]
+}

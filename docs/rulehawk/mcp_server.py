@@ -47,6 +47,7 @@ from typing import Dict, List, Optional, Tuple
 from . import __version__
 from .analyze import Finding
 from .boundary import to_dict as boundary_dict
+from .failclosed import LIMITS_STATEMENT
 from .gate import (_KIND_HELP, _SEV_ORDER, _SEV_RANK, _VENDORS, FileResult,
                    _pick_parser, no_rules_reason, run_gate)
 
@@ -87,7 +88,8 @@ NOT_MODELLED = [
 ]
 
 SCOPE_STATEMENT = ("Rule layer only (ACL/filter semantics). Routing, NAT, "
-                   "topology and change impact were not evaluated.")
+                   "topology and change impact were not evaluated. "
+                   + LIMITS_STATEMENT[0].upper() + LIMITS_STATEMENT[1:] + ".")
 
 _VENDOR_CHOICES = ("auto", "ios-asa", "nxos", "eos", "junos", "panos",
                    "iptables", "aws-sg")
@@ -281,6 +283,8 @@ def _finding_dict(fr: FileResult, f: Finding, base: str) -> dict:
         "witness": f.witness,
         "fix": f.fix,
         "accepted": f.accepted,
+        "verdict": f.verdict,
+        "reasons": list(f.reasons or []),
     }
 
 
@@ -337,7 +341,9 @@ def _coverage(gate, base: str, skipped: List[dict]) -> dict:
     return {
         "state": state,
         "explanation": {
-            "complete": "every file was parsed and every line was modelled",
+            "complete": ("every file was parsed and the parser left no note "
+                         "(Cisco and Junos parsers read ACLs and filters and "
+                         "ignore other configuration)"),
             "partial": ("every file was parsed, but some lines were not "
                         "modelled (see unmodelled_lines); review them"),
             "incomplete": ("at least one input was NOT analysed (see "
@@ -424,6 +430,11 @@ def _verdict(gate, coverage: dict, fail_on: str) -> Tuple[str, str]:
     if fail_on == "none":
         return "ADVISORY", ("fail_on=none: nothing blocks, so no PASS is given; "
                             "read findings_by_severity")
+    und = gate.undecided
+    if und:
+        return "UNKNOWN", (f"{len(und)} policy assertion(s) could not be "
+                           "proven (fail-closed; see segmentation_unknown and "
+                           "its reason codes); UNKNOWN is never a PASS")
     return "PASS", f"no finding at or above fail_on={fail_on}"
 
 
@@ -456,7 +467,14 @@ def audit(path: str, policy_path: str = "", vendor: str = "auto",
         "segmentation_passed": [
             {"file": _rel(fr.path, base), "claim": f.rule_id, "message": f.message}
             for fr in gate.files for f in fr.findings
-            if f.kind in ("segmentation-ok", "connectivity-ok")],
+            if f.kind in ("segmentation-ok", "connectivity-ok")
+            and f.verdict == "PASS"],
+        # Fail-closed: every assertion that could not be proven, with the
+        # machine-readable reason codes (rulehawk/failclosed.py).
+        "segmentation_unknown": [
+            {"file": _rel(fr.path, base), "claim": f.rule_id, "kind": f.kind,
+             "message": f.message, "reasons": list(f.reasons or [])}
+            for fr, f in gate.undecided],
         "coverage": cov,
         "scope": _scope(all_findings),
         "next": ("Call rulehawk_list_findings for every finding, or "
@@ -689,6 +707,11 @@ def compare(before: str, after: str, policy_path: str = "",
     elif fail_on == "none":
         verdict, why = "ADVISORY", (f"fail_on=none: nothing blocks; "
                                     f"{len(introduced)} finding(s) introduced")
+    elif a_gate.undecided:
+        verdict, why = "UNKNOWN", (
+            f"{len(a_gate.undecided)} policy assertion(s) on the after "
+            "config could not be proven (fail-closed, see the reason codes); "
+            "no all-clear is given")
     else:
         verdict, why = "NO_NEW_RISK", (
             f"no new finding at or above fail_on={fail_on}"
@@ -753,7 +776,7 @@ INSTRUCTIONS = (
     "RuleHawk audits firewall/ACL rulesets locally (rule layer only). Before "
     "pushing an ACL or firewall change, call rulehawk_audit (or rulehawk_compare "
     "with the running and candidate configs), using absolute paths. Only PASS "
-    "and NO_NEW_RISK are an all-clear. Treat FAIL, INTRODUCES_RISK, "
+    "and NO_NEW_RISK are an all-clear. Treat FAIL, INTRODUCES_RISK, UNKNOWN, "
     "INCOMPLETE, ADVISORY or ERROR as a stop, and show the human the "
     "blocking findings and the coverage.not_analysed list. RuleHawk does not "
     "model routing, NAT or topology, so a PASS is not a reachability proof."
@@ -780,8 +803,10 @@ def build_server():
         with policy_path, segmentation violations with a witness packet).
         Start here.
 
-        Returns verdict PASS / FAIL / INCOMPLETE / ERROR (ADVISORY when
-        fail_on=none), the blocking findings (severity >= fail_on, each with
+        Returns verdict PASS / FAIL / UNKNOWN / INCOMPLETE / ERROR (ADVISORY
+        when fail_on=none; UNKNOWN when a policy assertion could not be
+        proven, with reason codes in segmentation_unknown), the blocking
+        findings (severity >= fail_on, each with
         file, line, rule and fix), and a coverage block listing every file
         analysed, every file NOT analysed and why, and lines the parser could
         not model. Only PASS is an all-clear. On ERROR, read `error` and `hint`.
@@ -833,7 +858,7 @@ def build_server():
         or both directories (paired by relative path), using absolute paths.
         Use this before pushing a change. Returns the findings the change
         introduces, the ones it resolves, the rules it adds, and verdict
-        INTRODUCES_RISK / NO_NEW_RISK / INCOMPLETE / ERROR (ADVISORY when
+        INTRODUCES_RISK / NO_NEW_RISK / UNKNOWN / INCOMPLETE / ERROR (ADVISORY when
         fail_on=none). Only NO_NEW_RISK is an all-clear. This is a rule-layer
         finding delta, not a forwarding or reachability diff.
         """

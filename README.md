@@ -40,7 +40,150 @@ One of the three findings it prints:
 
 Then `rulehawk edge-fw.txt` for one config, `rulehawk gate configs/` for a
 directory, `--json` for machines. Exit code is non-zero on a critical/high
-finding (1) or when nothing could be audited (2), so it drops into CI.
+finding (1), when nothing could be audited (2), or when a policy assertion
+could not be proven (3, UNKNOWN), so it drops into CI.
+
+### Exit codes and the UNKNOWN verdict
+
+| Code | Verdict | Meaning |
+|---|---|---|
+| `0` | PASS | No finding at or above the threshold, and every policy assertion was proven. |
+| `1` | FAIL | A finding at or above the threshold (a violation, a broken required flow, ...). |
+| `2` | fail-closed | A config parsed to zero rules, a path matched nothing, or an input was invalid. |
+| `3` | UNKNOWN | Nothing reached the threshold, but a policy assertion could not be proven. |
+
+RuleHawk fails closed on a listed set of conditions. An assertion is UNKNOWN,
+with a machine-readable reason code and a message, when the search is empty (no
+rules, or no ACL bound to an interface or `access-group`), when any parse note
+exists in the evaluated config (on PAN-OS and iptables every line the parser
+does not model gets one), when an ACL's role is unknown or is not a transit
+packet filter (`line vty` `access-class`, SNMP, route-map, NAT, crypto, QoS),
+when a binding is removed, reset or deactivated (`no` / `default ip
+access-group`, `default interface`, Junos `inactive:`), when a Cisco interface
+carries a line outside the allowlist below, an unindented line sits where
+RuleHawk cannot tell which mode it belongs to, a line holds a control
+character, a VLAN filter is configured, when a feature that drops, inspects,
+rewrites or bypasses traffic is configured (zone firewall, `ip inspect`,
+`service-policy`, policy routing, `mpls ip` / `xconnect`), when a vendor default it does not model applies (PAN-OS
+`default-security-rules`, the iptables chain policy when no `-P` naming `ACCEPT` or `DROP` is given, IPv6
+implicit ND permits, ...), when NAT or nftables text is present, or when an IOS
+ACL mask is ambiguous. The full list is in the CHANGELOG. A PASS still assumes
+every interface is in the file and does not evaluate routing, NAT translation or
+topology. The `--json` report carries `assertion_verdict` and, per finding,
+`verdict` and `reasons` (`[{"code": ..., "message": ...}]`); `--evidence` marks
+such a claim `INDETERMINATE` with the same reasons, never `VERIFIED`.
+`--fail-on none` stays advisory and exits 0.
+
+Before 0.5.0 these cases printed PASS and exited 0. A CI job that relied on that
+exit 0 now goes red with exit 3: bind the ACL, fix the parse note, or model the
+default, and the verdict becomes a real PASS or FAIL.
+
+### Known limits
+
+Every PASS prints these next to the verdict (text, the `--json` `scope` field,
+`--evidence`, the gate, MCP and the hosted page):
+
+- On every vendor a line ends at \n only, and a control or separator character on any line is UNKNOWN (a CR before the newline is accepted only in Cisco configs and AWS JSON); each line on the evaluated path (a Cisco ACL, ACL header, flat access-list or forwarding interface line, any other Cisco line that names an ACL, every iptables and PAN-OS line, every statement of a Junos term and any Junos stanza that names a filter) is consumed by a handler or makes the answer UNKNOWN; a handler's forms follow a cited vendor document where one is named in the code (EOS has none), so a consumed line is not proven against the whole vendor grammar; object-group bodies are not in that accounting, and every ACL entry that references an object-group is UNKNOWN.
+- A Cisco PASS needs the dialect positively identified: a line only that dialect writes (IOS `Building configuration...`, `Current configuration :`, `version X.Y`, `boot-start-marker`, an `ip access-list extended` header or a numbered `access-list N` line; ASA `ASA Version`, `: Saved` or `access-list NAME extended|standard`; NX-OS `version X.Y(Z)` or `feature`; EOS `! device: ... EOS-`) outside banners and before `end`, and no line of another dialect; a label from a heuristic, the `ios-asa` default or `--vendor` alone is UNKNOWN, and so is an ACL header form the identified dialect does not have (an untyped `ip access-list NAME` on IOS, a typed one on NX-OS or EOS).
+- A field that holds one value, set more than once with different values, is UNKNOWN unless the replace semantics are cited (iptables -P is): a PAN-OS service protocol, port or source-port, rule action, disabled or negate flag, or address value; a Junos interface `filter input` or `output`; an iptables rule option given twice or a chain declared twice in one iptables-restore block; a PAN-OS list holding `any` and another member is UNKNOWN; a port name is read only from the vendor's cited table for that protocol (IOS, ASA, Junos) and is UNKNOWN elsewhere (NX-OS, EOS, PAN-OS, iptables).
+- Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group mode end at a header, `exit` or a recognised top-level command, indented or not; inside an ACL a line is read only if it is a `permit` or `deny` entry, a `remark` or `exit`, with the sequence-number form of its vendor and family (`N` on IOS IPv4, NX-OS and EOS, `sequence N` on IOS IPv6) and a number in range (1-2147483647 on IOS IPv4 and EOS, 1-4294967295 on IOS IPv6 and NX-OS, no leading zero); an unnumbered entry is numbered the last number + 10 on IOS IPv4 and NX-OS and the ACL is evaluated in number order; on EOS and IOS IPv6 an ACL that mixes numbered and unnumbered entries is UNKNOWN; `no N` (IOS IPv4, NX-OS, EOS) and `no sequence N` (IOS IPv6) delete that entry; NX-OS `statistics per-entry` is read on NX-OS only; keywords are case-insensitive on IOS, and on NX-OS and EOS a keyword not in lower case is UNKNOWN; an IPv4 `A/len` operand in an IOS `extended` / `standard` or numbered ACL or on an ASA line, and anything after `log` other than the ASA log arguments on an ASA line, are UNKNOWN; an ACL whose number order differs from its text, that has a deletion, or where a remark and an entry share a number, and every other line in an ACL (`default`, `evaluate`, `dynamic`, `resequence`, another `no` or sequence form, any other command), are UNKNOWN; a line outside ACL mode that names an ACL is UNKNOWN unless it is `access-class`, `match ip address`, `snmp-server community` or ASA `access-group`; any other line in interface mode, an unindented line in those modes that is not a recognised top-level command, `ex` or `en` for `exit` or `end`, an `exit` after a line that opens no known sub-mode, after an opener that is not complete (`router`, `line vty`) or after a sub-mode body that is not checked, and any line after `end` are UNKNOWN; other global commands are not read.
+- PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed; a quoted name with leading or trailing whitespace, and an address object with a word after its value, are UNKNOWN.
+- iptables reads the filter table; a chain's policy comes only from a parsed -P or :CHAIN line naming a built-in chain and ACCEPT or DROP (exact case), with nothing after the policy; in an iptables-restore file only the exact line `COMMIT` commits, only a line that starts with `#` is a comment and only an empty line is skipped; an iptables-restore table block without `COMMIT`, and a line outside a table block, are UNKNOWN.
+- Junos reads firewall filters and their interface bindings; in a term the latest terminating action wins and a term with more than one is noted; a term statement other than `from`, `then` and `filter`, a then-action with an argument count the model does not have, a term name used twice in a filter, `protect:`, a stanza outside `firewall` and `interfaces` that names a filter, SRX security zones or policies, a comment marker, brace, bracket or `;` inside a quoted string, a `#` glued to a word, and braces that do not balance make the answer UNKNOWN.
+
+The Cisco interface allowlist is: `description`, `ip address` (with
+`secondary`), `no ip address` (bare, or with an address and mask and optional
+`secondary`), `ipv6 address`, `ipv6 enable`, the filter bindings
+(`ip access-group`, `ipv6 traffic-filter`, `ipv6 access-group`,
+`ip port access-group`, `ipv6 port traffic-filter`, `ipv4 access-group` with
+`in`/`out`/`ingress`/`egress`), `shutdown`, `no shutdown`, `no switchport`,
+`speed`, `duplex`, `negotiation auto`, `media-type` (one word),
+`load-interval`, `no ip redirects`, `no ip unreachables`, `no ip proxy-arp`,
+`no ipv6 redirects`, `no ipv6 unreachables`, `cdp enable` and
+`no cdp enable`, each spelled in full. Loopback and Null interfaces carry no
+transit traffic and are not checked. Any other line in interface mode, and an
+abbreviated `int X` header or `interface range`, is UNKNOWN with
+`interface-feature-unmodeled`, which names the line's keyword, not the line.
+
+Lines, on every frontend: a line ends at a newline only. Any other control,
+format or separator character (form feed, vertical tab, NEL, U+2028, a
+no-break space, a BOM, ...) is a parse note, so the answer is UNKNOWN. A CR
+before the newline is dropped in Cisco configs and in AWS JSON (where it is
+whitespace); in an iptables script or save file, a PAN-OS set file or a Junos
+config it is a parse note too (bash keeps `DROP\r` as the word).
+
+How RuleHawk reads a Cisco config (one lexer, `cisco_lex`, for every Cisco
+check and for the ACL and object-group parser). The device ignores
+indentation and `!` is a comment, so interface, ACL and object-group mode
+lasts until another `interface` header, `exit`, or one of these top-level
+commands, indented or not, none of which is valid inside those modes: `end`,
+`banner`, `hostname`, `version`, `boot`, `router`, `line`,
+`ip`/`ipv4`/`ipv6`/`mac access-list`, `access-list`, `object-group`,
+`route-map`, `ip`/`ipv6 prefix-list`, `ip`/`ipv6 route`, `ip routing`,
+`ipv6 unicast-routing`, `class-map`, `policy-map`, `control-plane`,
+`vrf definition|context|instance`, `management`, `snmp-server`. An ACL entry
+or object-group member counts only in the mode its own header opened; one
+after a mode change is in no named ACL and is a parse note. Any other
+unindented line in one of those modes, and an indented top-level command
+there, is UNKNOWN (`stanza-boundary-ambiguous`). Inside an ACL the check is
+an allowlist, not a list of what ends the mode: IOS runs a command the ACL
+mode lacks in global mode, so only ACL-entry lines stay in the ACL (an
+optional sequence number, or `sequence N`, then `permit`, `deny`, `remark`,
+`evaluate` or `dynamic`; `no` or `default` of one of those or of a sequence
+number; NX-OS `statistics per-entry`). Any other line there (`ntp server`,
+`no ip domain-lookup`, an abbreviation, EOS `counters per-entry`, NX-OS
+`fragments`) is UNKNOWN (`stanza-boundary-ambiguous`). Of the lines that stay
+in the ACL, the parser reads `permit` / `deny` entries, `remark` and `exit`,
+each with the forms a cited Cisco document gives (EOS has none, so there
+they are RuleHawk's reading and the file must say it is EOS): its vendor's
+sequence-number form (`N` on IOS IPv4, NX-OS and EOS; `sequence N` on IOS
+IPv6) and range (1-2147483647 on IOS IPv4, 1-4294967295 on IOS IPv6 and
+NX-OS; EOS is not cited, so a number above 2147483647 is a note, as is 0 or a
+leading zero), the operand forms of its dialect (an IPv4 `A/len` operand is
+a note in an IOS `extended` / `standard` or numbered ACL and on an ASA line,
+which write address plus wildcard or mask), and after
+`log` only the ASA log arguments on an ASA line. Keywords are
+case-insensitive on IOS (cited); on NX-OS and EOS a keyword that is not lower
+case is a note. An unnumbered entry is numbered the last number + 10 on IOS
+IPv4 and NX-OS, where that is cited, and the ACL is evaluated in number
+order; on EOS and IOS IPv6 an ACL that mixes numbered and unnumbered entries
+is a note. `no N` (IOS IPv4, NX-OS, EOS) and `no sequence N` (IOS IPv6)
+delete entry N. A reordered ACL, a deletion, a number held by both a remark
+and an entry, `default ...`, `resequence`, any other `no` or sequence form,
+`evaluate`, `dynamic` and NX-OS `statistics per-entry` outside NX-OS are
+parse notes, so the answer is UNKNOWN (or FAIL when a leak is proven). Every
+line of an ACL, an ACL header, a flat `access-list` line or a forwarding
+interface, and any other line that names an ACL, is accounted for: read, or
+a note. A line outside ACL mode that names an ACL is read only in the
+reference forms `access-class`, `match ip address`, `snmp-server community`
+and ASA `access-group`. Object-group bodies are not in this accounting;
+every entry that references an object-group is UNKNOWN. The dialect must be
+positively identified for a PASS: a line only IOS, ASA, NX-OS or EOS writes
+(listed under "Known limits") must be in the file and none of another
+dialect's, so a bare ACL with interfaces, or a file labelled only by
+`--vendor`, is UNKNOWN. On IOS an untyped `ip access-list NAME` is not in the
+grammar (`standard` or `extended` is required) and is a note; on NX-OS and
+EOS a typed header is. Port names are read per vendor and protocol from the
+cited tables (IOS: the command reference TCP and UDP lists with the IOS XE
+YANG values; ASA: the port literal table, so `radius` is 1645); any other
+name is a note. IOS accepts any unique
+abbreviation, so `ex`/`exi` and `en` are read as `exit` and `end`, and are
+UNKNOWN too. `end`, or `exit` at the global level, leaves configuration mode:
+every later line is a parse note and no ACL is read from it. So does an
+`exit` straight after a line that opens no known sub-mode (`hostname R1`,
+`ip route ...`). An `exit` after an opener that starts like a sub-mode but is
+not complete (`router`, `router ospf`, `line vty`, `route-map`, `vrf
+definition`, `control-plane xyzzy`) is UNKNOWN; the complete forms are
+`router ospf|ospfv3|eigrp N`, `router bgp N`, `router rip`, `router isis
+[TAG]`, `line vty|con|aux N [M]`, `route-map NAME [permit|deny] [N]`,
+`class-map [match-any|match-all] NAME`, `policy-map NAME`, `control-plane
+[host|transit|cef-exception]`, `vrf definition|context|instance NAME` and
+`mac access-list [extended] NAME`. An `exit` after the body of a mode whose lines RuleHawk
+does not check (a routing process, an object-group) is UNKNOWN: a body line
+may have run in global mode, and then the `exit` left configuration mode. Interface names are case-folded and a separately
+written number is joined (`GigabitEthernet 0/1` is `gigabitethernet0/1`);
+repeated stanzas for one interface are merged in order.
+
 **[Quickstart](docs/quickstart.md)**: install, first audit, agents (Claude, Cursor,
 NetClaw) and what to do when something goes wrong.
 
@@ -72,6 +215,11 @@ jobs:
           fail-on: high
 ```
 
+`@v1` resolves to 0.5.0, which fails closed: an assertion RuleHawk cannot
+prove is UNKNOWN and exits 3, which fails the check, so a run that was green
+on an earlier `@v1` can turn red. To stay on the previous behaviour while you
+read the reason codes, pin `optimesh-ai/RuleHawk@v0.3.1`.
+
 A bad change that opens CORP→PCI on SMB/445 gets blocked with the witness packet
 `10.20.0.1 -> 10.10.0.1:445` annotated on the exact line. A file that parses to
 **zero** rules **fails closed** (exit 2) — RuleHawk never certifies isolation it
@@ -95,7 +243,7 @@ claude mcp add --transport stdio rulehawk --env RULEHAWK_MCP_ROOT="$PWD" -- rule
 
 | Tool | What it does |
 |---|---|
-| `rulehawk_audit` | Audit a config file or a directory: verdict `PASS` / `FAIL` / `INCOMPLETE` / `ERROR`, the blocking findings, and what was and wasn't analysed |
+| `rulehawk_audit` | Audit a config file or a directory: verdict `PASS` / `FAIL` / `UNKNOWN` / `INCOMPLETE` / `ERROR` (`ADVISORY` under `fail_on=none`), the blocking findings, and what was and wasn't analysed |
 | `rulehawk_list_findings` | Every finding, worst first, filterable by severity and kind, each with a stable id |
 | `rulehawk_explain_finding` | One finding by id (rule, source line, witness, fix), or what a finding kind means |
 | `rulehawk_compare` | Before vs after (files or directories): the findings a change introduces or resolves, and the rules it adds |

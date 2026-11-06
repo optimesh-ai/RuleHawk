@@ -63,7 +63,13 @@ import shlex
 from typing import Dict, List, Optional, Tuple
 
 from .model import ACE, ANY_PORTS, _PORTED, PortRange, _IPNet
-from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
+from .failclosed import Ledger, split_lines
+# Port names (round 10, R9-4): none are read. PAN-OS Objects > Services
+# describes the destination port as numbers and ranges ("Multiple ports or
+# ranges must be separated by commas",
+# https://docs.paloaltonetworks.com/ngfw/help/12-2/objects/objects-services);
+# a port name is not cited, so it is noted.
+from .parse import _NO_NAMES, _port_num
 
 _ANY_NET: _IPNet = ipaddress.ip_network("0.0.0.0/0")
 
@@ -80,18 +86,45 @@ _BUILTIN_SERVICES: Dict[str, Tuple[str, List[PortRange], List[PortRange]]] = {
     "service-https": ("tcp", [PortRange(443, 443)], [ANY_PORTS]),
 }
 
-# Recognized security-rule field keywords. Value collection for one field stops
-# at the next of these, so multi-value fields and many-fields-on-one-line both
-# parse, and an unknown field's values are consumed (never misread as a field).
-_RULE_FIELDS = frozenset({
-    "from", "to", "source", "destination", "source-user", "source-hip",
-    "destination-hip", "source-device", "destination-device", "application",
-    "service", "category", "action", "disabled", "negate-source",
-    "negate-destination", "log-start", "log-end", "log-setting",
-    "profile-setting", "description", "tag", "group-tag", "schedule",
-    "rule-type", "icmp-unreachable", "hip-profiles", "uuid", "option",
-    "qos", "target", "disable-server-response-inspection",
+# Security-rule fields, as an ALLOWLIST. A field outside all three sets is
+# one RuleHawk knows nothing about: it may narrow the rule's match (a 5G
+# subscriber or slice, say), so it gets a parse note, which blocks every
+# PASS on the file. Never consume an unknown field silently.
+#
+# Modelled: they decide the ACEs a rule becomes.
+_MODELLED_FIELDS = frozenset({
+    "from", "to", "source", "destination", "application", "service", "action",
+    "disabled", "negate-source", "negate-destination",
 })
+# Consumed but not modelled; failclosed.panos-unmodeled-rule-field blocks the
+# PASS whenever one carries a value other than any.
+_BLOCKED_FIELDS = frozenset({
+    "source-user", "schedule", "category", "source-hip", "destination-hip",
+    "hip-profiles", "source-device", "destination-device", "rule-type", "target",
+})
+# Known harmless: none changes which packets the rule matches or its action.
+_HARMLESS_FIELDS = frozenset({
+    "description",        # free text
+    "tag", "group-tag",   # labels for grouping and display
+    "uuid",               # the rule's identifier
+    "log-start", "log-end", "log-setting",   # logging only
+    "icmp-unreachable",   # what a deny/drop sends back; the match is unchanged
+    "qos",                # marks traffic the rule already allowed
+    # disables inspection of server-to-client traffic: it can only drop less
+    "option", "disable-server-response-inspection",
+    # Security profiles inspect traffic the rule allows and can drop more of
+    # it, never less, so they cannot make an isolation PASS false. They CAN
+    # make a connectivity OK false: failclosed blocks that with
+    # panos-security-profile.
+    "profile-setting",
+})
+_RULE_FIELDS = _MODELLED_FIELDS | _BLOCKED_FIELDS | _HARMLESS_FIELDS
+
+# Container fields whose value is a short path, not one token.
+_PROFILE_TYPES = frozenset({"virus", "spyware", "vulnerability", "url-filtering",
+                            "file-blocking", "wildfire-analysis", "data-filtering"})
+_QOS_MARKING = {"ip-dscp": 1, "ip-precedence": 1, "follow-c2s-flow": 0}
+_TARGET_SUBS = frozenset({"devices", "negate", "tags"})
 
 # Cap the cartesian expansion of one rule so a pathological config can't blow up;
 # beyond it we widen every dimension to ANY (a superset) and mark the entry
@@ -125,24 +158,113 @@ def _tok(line: str) -> List[str]:
         return line.split()
 
 
-def _read_fields(toks: List[str]) -> "Dict[str, List[str]]":
-    """Parse a `key val | key [ v1 v2 ] | key v1 v2 ...` body into key->values."""
+_QUOTED = re.compile(r"""(\S+)[ \t]+(?:"((?:[^"\\]|\\.)*)"|'([^']*)')""")
+
+
+def _padded_names(text: str) -> List[str]:
+    """A quoted name with leading or trailing whitespace (`rules "d "`) is
+    read as its own name; whether PAN-OS trims it, and so names the rule or
+    object without the spaces, is not modelled (review of #42, round 7,
+    R6-5). A description or comment is free text and is not flagged."""
+    out: List[str] = []
+    for no, ln in enumerate(split_lines(text), 1):
+        for m in _QUOTED.finditer(ln):
+            val = m.group(2) if m.group(2) is not None else m.group(3)
+            if val != val.strip() and m.group(1).lower() not in ("description", "comment"):
+                out.append(f"PAN-OS line {no}: quoted name `{val}` has leading or "
+                           f"trailing whitespace; whether the device trims it is not "
+                           f"modelled, so it may name another rule or object")
+    return out
+
+
+def _one(toks: List[str], i: int) -> "Tuple[List[str], int]":
+    """One value: a single token or a `[ ... ]` list (PAN-OS takes no other
+    form: several values need the brackets)."""
+    n = len(toks)
+    if i >= n:
+        return [], i
+    if toks[i] == "[":
+        vals: List[str] = []
+        i += 1
+        while i < n and toks[i] != "]":
+            vals.append(toks[i])
+            i += 1
+        return vals, i + 1                       # skip the closing ]
+    return [toks[i]], i + 1
+
+
+def _container(key: str, toks: List[str], i: int) -> "Tuple[List[str], int, bool]":
+    """(values, next index, well-formed) for qos / option / profile-setting /
+    target, whose value is a short path such as `marking ip-dscp ef`."""
+    n = len(toks)
+    vals: List[str] = []
+    if key == "qos":
+        if i < n and toks[i] == "marking" and i + 1 < n and toks[i + 1] in _QOS_MARKING:
+            want = _QOS_MARKING[toks[i + 1]]
+            vals, i = toks[i:i + 2], i + 2
+            if want:
+                v, i = _one(toks, i)
+                vals += v
+                return vals, i, bool(v)
+            return vals, i, True
+        return vals, i, False
+    if key == "option":
+        if i < n and toks[i] == "disable-server-response-inspection":
+            v, j = _one(toks, i + 1)
+            return [toks[i]] + v, j, bool(v)
+        return vals, i, False
+    if key == "profile-setting":
+        if i < n and toks[i] == "group":
+            v, j = _one(toks, i + 1)
+            return ["group"] + v, j, bool(v)
+        if i < n and toks[i] == "profiles":
+            i += 1
+            vals = ["profiles"]
+            ok = False
+            while i < n and toks[i] in _PROFILE_TYPES:
+                v, i2 = _one(toks, i + 1)
+                if not v:
+                    return vals, i2, False
+                vals += [toks[i]] + v
+                i, ok = i2, True
+            return vals, i, ok
+        return vals, i, False
+    # target
+    ok = False
+    while i < n and toks[i] in _TARGET_SUBS:
+        v, i2 = _one(toks, i + 1)
+        if not v:
+            return vals, i2, False
+        vals += [toks[i]] + v
+        i, ok = i2, True
+    return vals, i, ok
+
+
+_CONTAINERS = frozenset({"qos", "option", "profile-setting", "target"})
+
+
+def _read_fields(toks: List[str], unknown: Optional[List[str]] = None
+                 ) -> "Dict[str, List[str]]":
+    """Parse a `key val | key [ v1 v2 ] | key a b c` body into key->values.
+
+    Each field takes ONE value or a `[ ]` list, except the container fields,
+    which take their short path. A field name not on the allowlist, or a
+    container whose path RuleHawk does not recognise, is appended to
+    `unknown` (the caller notes it); its value is consumed so it is never
+    misread as the next field."""
     out: Dict[str, List[str]] = {}
     i, n = 0, len(toks)
     while i < n:
         key = toks[i]
         i += 1
-        vals: List[str] = []
-        if i < n and toks[i] == "[":
-            i += 1
-            while i < n and toks[i] != "]":
-                vals.append(toks[i])
-                i += 1
-            i += 1                                   # skip the closing ]
+        if key in _CONTAINERS:
+            vals, i, ok = _container(key, toks, i)
+            if not ok and unknown is not None:
+                unknown.append(f"{key} {' '.join(vals)}".strip())
         else:
-            while i < n and toks[i] not in _RULE_FIELDS and toks[i] != "[":
-                vals.append(toks[i])
-                i += 1
+            vals, i = _one(toks, i)
+            if key not in _RULE_FIELDS and unknown is not None:
+                unknown.append(key)
         out.setdefault(key, []).extend(vals)
     return out
 
@@ -162,7 +284,7 @@ def _parse_portspec(spec: str, label: str, key: str,
             continue
         if "-" in part and not part.startswith("-"):
             lo, hi = part.split("-", 1)
-            ln, hn = _port_num(lo), _port_num(hi)
+            ln, hn = _port_num(lo, _NO_NAMES), _port_num(hi, _NO_NAMES)
             if ln < 0 or hn < 0:
                 imprecise = True
                 notes.append(f"unparsed PAN-OS {key} '{part}' in {label} "
@@ -170,7 +292,7 @@ def _parse_portspec(spec: str, label: str, key: str,
                 continue
             ranges.append(PortRange(min(ln, hn), max(ln, hn)))
         else:
-            p = _port_num(part)
+            p = _port_num(part, _NO_NAMES)
             if p < 0:
                 imprecise = True
                 notes.append(f"unparsed PAN-OS {key} '{part}' in {label} "
@@ -180,7 +302,39 @@ def _parse_portspec(spec: str, label: str, key: str,
     return ranges, imprecise
 
 
-def _collect_objects(lines: List[List[str]], notes: List[str]) -> Tuple[
+# Where an object may be defined: the firewall itself, `shared`, a vsys or a
+# Panorama device-group. Objects are resolved by name; a name defined in more
+# than one of these scopes is ambiguous (a vsys1 rule sees vsys1's object, a
+# vsys2 rule vsys2's), and RuleHawk does not resolve per scope, so the name is
+# treated as unresolvable (imprecise) and noted: failclosed blocks the PASS
+# with object-scope-ambiguous.
+def _object_scope(prefix: List[str]) -> Optional[str]:
+    """The scope a `set <prefix> address ...` line defines its object in, or
+    None when the prefix is not one RuleHawk recognises."""
+    if not prefix:
+        return ""
+    if prefix == ["shared"]:
+        return "shared"
+    if len(prefix) == 2 and prefix[0] in ("vsys", "device-group"):
+        return f"{prefix[0]} {prefix[1]}"
+    return None
+
+
+# Object attributes that do not change the object's value.
+_OBJECT_HARMLESS = frozenset({"description", "tag", "disable-override"})
+
+
+# Address and address-group names share one namespace, as do service and
+# service-group names: a rule's `source CORP` can mean either kind, so a name
+# is ambiguous when it is defined as more than one (kind, scope) pair (review
+# of #42, round 4, R3).
+_NAMESPACE = {"address": "addr", "address-group": "addr",
+              "service": "svc", "service-group": "svc"}
+
+
+def _collect_objects(numbered: "List[Tuple[int, List[str]]]", notes: List[str],
+                     consumed: Optional[set] = None,
+                     scope_map: Optional[dict] = None) -> Tuple[
         Dict[str, Optional[Tuple[List[_IPNet], bool]]],
         Dict[str, Optional[List[str]]],
         Dict[str, Optional[Tuple[str, List[PortRange], List[PortRange]]]]]:
@@ -200,17 +354,60 @@ def _collect_objects(lines: List[List[str]], notes: List[str]) -> Tuple[
     # it). Accumulate each service's definition tokens across lines and parse the
     # UNION once, mirroring the address-group member accumulation above.
     service_defs: "Dict[str, List[str]]" = {}
+    # Each address object's value(s) (round 10, R9-2): an address holds one
+    # value, so two different ones are a redefinition whose semantics are
+    # not cited.
+    addr_vals: "Dict[str, set]" = {}
+    if consumed is None:
+        consumed = set()
+    # (namespace, name) -> {(kind, scope)}; handed back through `scope_map`
+    # so the caller can check each rule sees the objects it names.
+    scopes: "Dict[Tuple[str, str], set]" = {} if scope_map is None else scope_map
 
-    for toks in lines:
+    def _take(lineno: int, kind: str, name: str, prefix: List[str]) -> None:
+        consumed.add(lineno)
+        scopes.setdefault((_NAMESPACE[kind], name), set()).add(
+            (kind, _object_scope(prefix)))
+
+    for lineno, toks in numbered:
         if not toks or toks[0] != "set":
             continue
-        # `set [vsys X | device-group Y] address NAME ...` — anchor on the keyword.
-        if "address" in toks:
-            k = toks.index("address")
+        # `set [shared | vsys X | device-group Y] address NAME ...`: the object
+        # keyword must follow a recognised scope prefix, else the line is not
+        # an object definition RuleHawk reads (and is noted as unmodelled).
+        kw = next((k for k, t in enumerate(toks[1:4], 1)
+                   if t in ("address", "address-group", "service", "service-group")
+                   and _object_scope(toks[1:k]) is not None), None)
+        if kw is None:
+            continue
+        if toks[kw] == "address":
+            k = kw
             if k + 2 < len(toks):
                 name, kind = toks[k + 1], toks[k + 2]
                 rest = toks[k + 3:]
-                if kind == "ip-netmask" and rest:
+                if kind in _OBJECT_HARMLESS:
+                    _take(lineno, "address", name, toks[1:k])
+                    continue
+                if kind in ("ip-netmask", "ip-range", "fqdn", "ip-wildcard") \
+                        and len(rest) > 1:
+                    # `set address NAME ip-netmask VALUE` takes ONE value
+                    # (round 9, R8-9): a word after it is not this grammar
+                    # (PAN-OS rejects the line). The object is unresolved,
+                    # and the line is left unconsumed, so it is noted.
+                    addresses[name] = None
+                    notes.append(f"PAN-OS address '{name}' {kind} has word(s) after "
+                                 f"its value ({' '.join(rest[1:])[:30]}); not "
+                                 f"modelled (referencing rule imprecise)")
+                    continue
+                if kind in ("fqdn", "ip-wildcard") or (
+                        kind in ("ip-netmask", "ip-range") and rest):
+                    _take(lineno, "address", name, toks[1:k])
+                    addr_vals.setdefault(name, set()).add((kind, rest[0] if rest else ""))
+                if kind == "ip-range" and rest and "-" not in rest[0]:
+                    addresses[name] = None
+                    notes.append(f"unparsed PAN-OS address '{name}' "
+                                 f"ip-range '{rest[0]}' (referencing rule imprecise)")
+                elif kind == "ip-netmask" and rest:
                     try:
                         # ip_network() on a bare address yields the host route
                         # (/32 for v4, /128 for v6) — never widen v6 to a /32.
@@ -236,15 +433,29 @@ def _collect_objects(lines: List[List[str]], notes: List[str]) -> Tuple[
                     notes.append(f"unmodeled PAN-OS address '{name}' ({kind}) — "
                                  f"no fixed L3 space; referencing rule marked imprecise")
                 continue
-        if "address-group" in toks:
-            k = toks.index("address-group")
+            continue
+        if toks[kw] == "address-group":
+            k = kw
             if k + 2 < len(toks):
                 name = toks[k + 1]
+                if toks[k + 2] in _OBJECT_HARMLESS:
+                    _take(lineno, "address-group", name, toks[1:k])
+                    continue
+                if toks[k + 2] not in ("static", "dynamic"):
+                    continue                           # unmodelled: noted
+                _take(lineno, "address-group", name, toks[1:k])
                 if toks[k + 2] == "static":
                     # Repeated `set address-group G static ...` lines APPEND
                     # (exports commonly emit one member per line); overwriting
                     # would model a subset of the group. A group already marked
                     # unresolvable (None) stays unresolvable (superset).
+                    # Cited (round 9): Palo Alto Networks, "Modify Configuration
+                    # - set and edit", panos-xml-api-rtd 1.4
+                    # (http://api-lab.paloaltonetworks.com/set-edit-object.html):
+                    # `set address-group group1 static addr4` is the API
+                    # request `cmd="set"` on .../static, and "set | merge at
+                    # node specified by XPath"; the group then holds addr1,
+                    # addr2, addr3 and addr4.
                     members = [t for t in toks[k + 3:] if t not in ("[", "]")]
                     prev = addr_groups.get(name)
                     if isinstance(prev, list):
@@ -256,27 +467,89 @@ def _collect_objects(lines: List[List[str]], notes: List[str]) -> Tuple[
                     notes.append(f"unmodeled PAN-OS dynamic address-group "
                                  f"'{name}' — referencing rule marked imprecise")
             continue
-        if "service" in toks:
-            k = toks.index("service")
+        if toks[kw] == "service":
+            k = kw
+            if k + 2 < len(toks) and toks[k + 2] in _OBJECT_HARMLESS:
+                _take(lineno, "service", toks[k + 1], toks[1:k])
+                continue
             if k + 2 < len(toks) and toks[k + 2] == "protocol":
                 name = toks[k + 1]
+                _take(lineno, "service", name, toks[1:k])
                 # Concatenate this line's `protocol ... port ...` segment onto any
                 # prior lines for the same service; _parse_service_def then unions
                 # every `port` spec (and keeps a single protocol per service).
                 service_defs.setdefault(name, []).extend(toks[k + 2:])
             continue
-        if "service-group" in toks:
-            k = toks.index("service-group")
+        if toks[kw] == "service-group":
+            k = kw
             if k + 1 < len(toks):
+                _take(lineno, "service-group", toks[k + 1], toks[1:k])
                 notes.append(f"unmodeled PAN-OS service-group '{toks[k + 1]}' — "
                              f"referencing rule marked imprecise")
             continue
 
-    # Parse each service's accumulated definition once (union of all its port
-    # members across lines). A user redefinition overrides a same-named builtin.
+    # A name defined as more than one (kind, scope): resolve it to nothing
+    # exact, whichever kind a rule would have picked.
+    for (ns, name), where in sorted(scopes.items()):
+        if len(where) < 2:
+            continue
+        defs = ", ".join(sorted(f"{k} in {w or 'firewall'}" for k, w in where))
+        notes.append(f"PAN-OS object '{name}' is defined more than once "
+                     f"({defs}) — objects are not resolved per kind and vsys / "
+                     f"device-group, so '{name}' is treated as unresolved "
+                     f"(object-scope-ambiguous)")
+        if ns == "addr":
+            addresses[name] = None
+            addr_groups[name] = None
+        else:
+            service_defs.pop(name, None)
+            services[name] = None
+
+    for name, vals in sorted(addr_vals.items()):
+        if len(vals) > 1:
+            addresses[name] = None
+            shown = ", ".join(f"{k} {v}" for k, v in sorted(vals))
+            notes.append(f"PAN-OS address '{name}' is set more than once with "
+                         f"different values ({shown[:80]}): an address holds one "
+                         f"value and whether a later `set` replaces it is not "
+                         f"cited — not modelled (referencing rule imprecise)")
+
+    # Parse each service's definition once. A user redefinition overrides a
+    # same-named builtin. `protocol`, `port` and `source-port` each hold ONE
+    # value (several ports are one comma-separated value: "Multiple ports or
+    # ranges must be separated by commas", PAN-OS Objects > Services), so a
+    # second line giving one of them another value is not read as a union
+    # (round 10, R9-2): whether it replaces or merges is not cited.
     for name, deftoks in service_defs.items():
+        dup = _service_leaf_redefined(deftoks)
+        if dup:
+            services[name] = None
+            notes.append(f"PAN-OS service '{name}' {dup[0]} is set more than once "
+                         f"with different values ({', '.join(dup[1])[:80]}): whether "
+                         f"a later `set` replaces or merges it is not cited — not "
+                         f"modelled (referencing rule imprecise)")
+            continue
         services[name] = _parse_service_def(deftoks, name, notes)
     return addresses, addr_groups, services
+
+
+def _service_leaf_redefined(toks: List[str]) -> "Optional[Tuple[str, List[str]]]":
+    """The first of `protocol` / `port` / `source-port` given two different
+    values across a service's lines, or None."""
+    seen: "Dict[str, set]" = {}
+    i, n = 0, len(toks)
+    while i < n:
+        t = toks[i]
+        if t in ("protocol", "port", "source-port") and i + 1 < n:
+            v = toks[i + 1]
+            seen.setdefault(t, set()).add(v.lower() if t == "protocol" else v)
+            i += 2
+        else:
+            i += 1
+    for leaf in ("protocol", "port", "source-port"):
+        if len(seen.get(leaf, ())) > 1:
+            return leaf, sorted(seen[leaf])
+    return None
 
 
 def _parse_service_def(toks: List[str], name: str, notes: List[str]
@@ -441,7 +714,28 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
                 acl: str = "security") -> int:
     label = f"{acl}/{name}"
 
-    # Scalar fields set on several lines follow `set` semantics: last wins.
+    # A field that holds one value, set more than once with different values
+    # (round 10, R9-2): whether a later `set` replaces the value is not cited,
+    # so neither value is taken. Modelled as the superset: enabled, negated dimensions widened to any,
+    # and the rule imprecise so it never decides (whichever action it has,
+    # an imprecise rule neither proves a block nor a leak).
+    redefined = []
+    for leaf in ("action", "disabled", "negate-source", "negate-destination"):
+        vals = sorted({v.lower() for v in fields.get(leaf, [])})
+        if len(vals) > 1:
+            redefined.append(leaf)
+            notes.append(f"PAN-OS rule {label}: `{leaf}` is set more than once with "
+                         f"different values ({', '.join(vals)[:60]}); whether a later "
+                         f"`set` replaces it is not cited — not modelled (marked "
+                         f"imprecise)")
+    if redefined:
+        fields = dict(fields)
+        if "disabled" in redefined:
+            fields["disabled"] = ["no"]
+        for nk in ("negate-source", "negate-destination"):
+            if nk in redefined:
+                fields[nk] = ["yes"]
+
     if fields.get("disabled", []) and fields["disabled"][-1].lower() == "yes":
         notes.append(f"PAN-OS rule {label} is disabled — skipped (not enforced)")
         return seq
@@ -455,7 +749,18 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
         notes.append(f"unmodeled PAN-OS action '{act_vals[-1]}' in {label} — skipped")
         return seq
 
-    imprecise = False
+    imprecise = bool(redefined)
+
+    # `any` and another member in one list (round 10, R9-5): whether the
+    # device keeps `any`, drops it or rejects the list is not cited.
+    for leaf in ("source", "destination", "service", "application"):
+        vals = fields.get(leaf, [])
+        if "any" in vals and any(v != "any" for v in vals):
+            imprecise = True
+            notes.append(f"PAN-OS rule {label}: `{leaf}` holds `any` and other "
+                         f"member(s) ({', '.join(v for v in vals if v != 'any')[:60]}); "
+                         f"what the device makes of the list is not cited — not "
+                         f"modelled (marked imprecise)")
 
     # Zones: a specific from/to constrains the match in a dimension we don't
     # model -> over-approximation -> imprecise (the RH-3 line). `any` is exact.
@@ -512,6 +817,17 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
     imprecise = imprecise or imp_s or imp_d or imp_v
 
     has_resolved_src, has_resolved_dst = bool(srcs), bool(dsts)
+    for nets, dim in ((srcs, "source"), (dsts, "destination")):
+        if not nets and not (imp_s if dim == "source" else imp_d):
+            # Nothing unresolved, yet no address: an EMPTY static address-group.
+            # It was widened to an EXACT any, so a deny on it shadowed every
+            # later rule (false PASS, false "permit never takes effect"). What
+            # an empty group matches on the device is not modeled: widen to any
+            # (a superset) and mark the rule imprecise so it never decides.
+            imprecise = True
+            notes.append(f"PAN-OS rule {label}: {dim} resolves to no address "
+                         f"(empty address-group) — not modeled, widened to any "
+                         f"and marked imprecise")
     if not srcs:                                   # all unresolved -> widen to ANY
         srcs = [_ANY_NET]
     if not dsts:
@@ -608,6 +924,81 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
     return seq
 
 
+# Top-level `set` subtrees that cannot change which security rule matches a
+# packet or what it does, so their lines are consumed without a note. Each is
+# justified; anything not listed is noted. The scope prefix (`shared`,
+# `vsys X`, `device-group Y`) is stripped first.
+_HARMLESS_SUBTREES = frozenset({
+    # management plane: admin access, logging, reporting, certificates. None
+    # of it is on the data path.
+    "deviceconfig", "mgt-config", "admin-role", "local-user-database",
+    "authentication-profile", "authentication-sequence", "certificate",
+    "certificate-profile", "ssl-tls-service-profile", "server-profile",
+    "log-settings", "reports", "report-group", "pdf-summary-report",
+    "email-scheduler", "response-page", "display-name",
+    # labels
+    "tag",
+    # Definitions a rule refers to by name. A rule naming a specific zone or
+    # application is already imprecise (parse_panos), a rule with a schedule
+    # or an external list is blocked or imprecise, and security profiles only
+    # drop more of what a rule allows (connectivity OK is blocked separately
+    # by panos-security-profile).
+    "zone", "application", "application-group", "application-filter",
+    "profiles", "profile-group", "schedule", "external-list",
+    # Interfaces, routing and tunnels: every forwarded packet still crosses
+    # the security rulebase, and the PASS states that routing and topology
+    # are not evaluated.
+    "network",
+})
+
+
+def _subtree(toks: List[str]) -> str:
+    """The first keyword of a `set` line after its scope prefix."""
+    i = 1
+    if i < len(toks) and toks[i] == "shared":
+        i += 1
+    elif i + 1 < len(toks) and toks[i] in ("vsys", "device-group"):
+        i += 2
+    return toks[i] if i < len(toks) else ""
+
+
+_MAX_LINE_NOTES = 20
+
+
+def _note_unconsumed(numbered: "List[Tuple[int, List[str]]]", consumed: set,
+                     notes: List[str], noted: Optional[set] = None) -> None:
+    """Line accounting (review of #42, round 8): every line is in scope; a
+    line a handler consumed, or one in a subtree that does not change which
+    packets a rule matches, is consumed; a rule line with an unmodelled field
+    is noted; `Ledger.close` notes the rest. NAT rules get their own wording
+    (failclosed also blocks them as nat-present)."""
+    led = Ledger("panos")
+    by_no = dict(numbered)
+    for lineno, toks in numbered:
+        if not toks:
+            continue
+        led.add(lineno, " ".join(toks))
+        if lineno in (noted or ()):
+            led.note(lineno)
+        elif lineno in consumed or (toks[0] == "set"
+                                    and _subtree(toks) in _HARMLESS_SUBTREES):
+            led.consume(lineno)
+
+    def fmt(lineno: int, text: str) -> str:
+        toks = by_no[lineno]
+        if len(text) > 100:
+            text = text[:97] + "..."
+        if toks[0] == "set" and _subtree(toks).endswith("rulebase") and \
+                len(toks) > 2 and "nat" in toks:
+            return (f"PAN-OS NAT rule (line {lineno}) not modeled — security "
+                    f"rules match the pre-NAT address, so a translated "
+                    f"flow is not checked: `{text}`")
+        return (f"unmodeled PAN-OS line {lineno}: `{text}` — RuleHawk "
+                f"reads only `set` object and security-rule lines, so "
+                f"it cannot tell what this line changes")
+    led.close(notes, fmt, cap=_MAX_LINE_NOTES)
+
+
 def _rule_anchor(toks: List[str]) -> int:
     """Index of `rules` in a `... rulebase security rules NAME ...` line, else -1."""
     for k in range(1, len(toks) - 1):
@@ -649,6 +1040,40 @@ def _rule_path(toks: List[str]) -> "Tuple[int, str, str]":
     return k, phase, scope
 
 
+def _visible_scopes(rule_scope: str) -> set:
+    if not rule_scope:
+        return {"", "shared"}
+    return {f"vsys {rule_scope}", f"device-group {rule_scope}", "shared"}
+
+
+def _check_visible(rule_scope: str, rule: str, fields: "Dict[str, List[str]]",
+                   scope_map: dict, addr_groups: dict, notes: List[str]) -> None:
+    """Note (object-scope-ambiguous) each object the rule names, directly or
+    through a static group, that is defined only outside the rule's view.
+    Names RuleHawk does not define (literals, `any`, builtins) are left to
+    the resolver."""
+    vis = _visible_scopes(rule_scope)
+    todo = [("addr", v) for f in ("source", "destination") for v in fields.get(f, [])]
+    todo += [("svc", v) for v in fields.get("service", [])]
+    seen: set = set()
+    while todo:
+        ns, name = todo.pop()
+        if (ns, name) in seen:
+            continue
+        seen.add((ns, name))
+        where = scope_map.get((ns, name))
+        if not where:
+            continue
+        if not any(w in vis for _, w in where):
+            defs = ", ".join(sorted(f"{k} in {w or 'firewall'}" for k, w in where))
+            notes.append(f"PAN-OS rule {rule} ({rule_scope or 'firewall'}) names "
+                         f"'{name}', defined only outside its scope ({defs}) — "
+                         f"not resolved (object-scope-ambiguous)")
+            continue
+        if ns == "addr" and isinstance(addr_groups.get(name), list):
+            todo += [("addr", m) for m in addr_groups[name]]
+
+
 def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
     """Parse a PAN-OS set-format security policy; return (entries, notes).
 
@@ -658,13 +1083,20 @@ def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
     within a scope, ordered pre-rulebase -> local rulebase -> post-rulebase (the
     real PAN-OS evaluation order), preserving textual order within a phase.
     """
-    numbered = [(i, _tok(ln)) for i, ln in enumerate(text.splitlines(), 1)
-                if ln.strip()]
-    lines = [toks for _, toks in numbered]
+    numbered = [(i, _tok(ln)) for i, ln in enumerate(split_lines(text), 1)
+                if ln.strip() and not ln.lstrip().startswith("#")]
     notes: List[str] = []
     entries: List[ACE] = []
+    notes.extend(_padded_names(text))
+    # Every line is consumed by a modelled handler or gets a note (review of
+    # #42, round 3): a line skipped silently (a `delete`, an `edit` followed
+    # by relative `set`s, a NAT rule) could change what the rulebase does.
+    consumed: set = set()
+    noted: set = set()
 
-    addresses, addr_groups, services = _collect_objects(lines, notes)
+    scope_map: dict = {}
+    addresses, addr_groups, services = _collect_objects(numbered, notes, consumed,
+                                                        scope_map)
 
     # Second pass: accumulate each rule's fields (split across lines) keyed by
     # (scope, phase, name) so same-named rules in different vsys / device-groups
@@ -681,16 +1113,31 @@ def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
         k, phase, scope = _rule_path(toks)
         if k < 0 or k + 1 >= len(toks):
             continue
+        consumed.add(lineno)
         name = toks[k + 1]
         key: Key = (scope, phase, name)
         if key not in rules:
             rules[key] = {}
             order.append(key)
-        fields_here = _read_fields(toks[k + 2:])
+        unknown: List[str] = []
+        fields_here = _read_fields(toks[k + 2:], unknown)
+        if unknown:
+            noted.add(lineno)
+        for u in unknown:
+            notes.append(f"unmodeled PAN-OS rule field '{u}' in rule {name} "
+                         f"(line {lineno}) — not modeled; RuleHawk cannot tell "
+                         f"which packets the rule matches")
         for fk, vals in fields_here.items():
             rules[key].setdefault(fk, []).extend(vals)
         if "action" in fields_here or key not in rule_lines:
             rule_lines[key] = lineno
+
+    # Each name a rule uses must be defined where the rule can see it: its own
+    # vsys / device-group, then shared (a firewall rulebase sees the firewall
+    # objects and shared). A name defined only elsewhere would resolve on the
+    # device to something else, or not at all (round 4, R3).
+    for key in order:
+        _check_visible(key[0], key[2], rules[key], scope_map, addr_groups, notes)
 
     # Emit ordered per scope. Each scope is an independent first-match context
     # (its own `acl`, so segcheck searches it in isolation); WITHIN a scope rules
@@ -711,6 +1158,8 @@ def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
         for key in sorted(by_scope[scope], key=lambda kk: _PHASE_RANK[kk[1]]):
             seq = _build_rule(key[2], rules[key], seq, addresses, addr_groups,
                               services, entries, notes, rule_lines.get(key, 0), acl)
+
+    _note_unconsumed(numbered, consumed, notes, noted)
 
     if not entries and re.search(r"<\s*(?:rulebase|security|entry)\b", text):
         notes.append("PAN-OS XML config detected but not yet supported — export "

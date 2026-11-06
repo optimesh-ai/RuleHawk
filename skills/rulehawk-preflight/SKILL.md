@@ -43,6 +43,7 @@ Before any of these, for any file that holds firewall or ACL rules:
    |---|---|
    | `INTRODUCES_RISK` (compare) or `FAIL` (audit) | **Stop.** Do not push or apply. |
    | `INCOMPLETE` | **Stop.** Something was not analysed. |
+   | `UNKNOWN` (audit or compare) | **Stop.** A policy assertion could not be proven. Show the human `segmentation_unknown` (audit) or the unknown findings with their `reasons` codes (for example an ACL with no interface binding, a parse note, an unmodelled vendor default). UNKNOWN is never a pass. |
    | `ERROR` | **Stop.** Read `error` and `hint`, fix the call (usually the path: make it absolute) and re-run. |
 | `ADVISORY` | You ran with `fail_on: none`, which never blocks. Not an all-clear: re-run with the default unless the human asked for advisory. |
    | `PASS` / `NO_NEW_RISK` with `coverage.state` = `partial` | Show the `unmodelled_lines` to the human and wait for them to confirm before going on. |
@@ -102,6 +103,8 @@ rulehawk gate CONFIG_DIR_OR_FILES... --policy policy.json --fail-on high
 ```
 
 Exit 0 is a pass, 1 means a finding at or above the threshold, 2 means a file
-could not be read or parsed to zero rules. Treat 1 and 2 as a stop, exactly as
-above. The CLI has no compare mode: audit the candidate, then the current
+could not be read or parsed to zero rules, and 3 means UNKNOWN: a policy
+assertion could not be proven (the finding's `reasons` say why, e.g. an
+unbound ACL or a parse note). Treat 1, 2 and 3 as a stop, exactly as above.
+UNKNOWN is never a pass. The CLI has no compare mode: audit the candidate, then the current
 config, and compare the two finding lists yourself.

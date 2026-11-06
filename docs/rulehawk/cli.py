@@ -26,6 +26,7 @@ import sys
 
 from .analyze import analyze, score
 from .evidence import Subject, build_evidence, to_evidence_markdown
+from .failclosed import build_context, undecided
 from .model import strip_pager
 from .parse import parse_acls
 from .parse_awssg import detect as detect_awssg, parse_awssg
@@ -80,9 +81,13 @@ Scope: the rule layer only. RuleHawk does not evaluate routing, NAT or
 topology, so it cannot tell you what a change breaks on your network.
 
 exit codes:
-  0  config parsed; no critical/high findings
-  1  at least one critical/high finding
+  0  PASS: config parsed; no critical/high findings; every policy assertion
+     proven
+  1  FAIL: at least one critical/high finding (a violation included)
   2  parse failure (no rules parsed), unreadable input, or bad usage
+  3  UNKNOWN: no critical/high finding, but at least one policy assertion
+     could not be proven (fail-closed; each one lists its reason codes).
+     Never 0: an assertion RuleHawk cannot support is not a PASS.
 """
 
 
@@ -240,7 +245,8 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as e:
             print(f"rulehawk: cannot read policy {policy_path!r}: {e}", file=sys.stderr)
             return 2
-        seg = check_segmentation(aces, policy)
+        ctx = build_context(text, aces, notes, vendor)
+        seg = check_segmentation(aces, policy, context=ctx)
         _ledger = evaluate(policy)
         seg = apply_to_findings(seg, _ledger, source)
         finalize(_ledger)
@@ -263,7 +269,8 @@ def main(argv: list[str] | None = None) -> int:
         print(to_json(findings, notes, n_rules, vendor))
     else:
         print(to_text(findings, notes, n_rules, vendor))
-    # Distinct exit codes: 0 clean · 1 finding at critical/high · 2 parse failure.
+    # Distinct exit codes: 0 PASS · 1 finding at critical/high · 2 parse
+    # failure · 3 UNKNOWN (a policy assertion could not be proven).
     # Exit 2 (fail-closed) when NOTHING was parsed: absence of findings must NOT
     # imply a clean audit when the input was never read as a firewall config.
     if not n_rules:
@@ -271,8 +278,11 @@ def main(argv: list[str] | None = None) -> int:
     # An ACCEPTED finding is reported but does not fail the run — that is what a
     # time-boxed, attributed risk acceptance is for. It goes red again the day
     # the acceptance expires, by itself.
-    return 1 if any(f.severity in ("critical", "high") and f.accepted is None
-                    for f in findings) else 0
+    if any(f.severity in ("critical", "high") and f.accepted is None
+           for f in findings):
+        return 1
+    # Fail-closed: an assertion RuleHawk could not prove never exits 0.
+    return 3 if undecided(findings) else 0
 
 
 if __name__ == "__main__":
