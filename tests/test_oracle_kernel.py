@@ -72,9 +72,10 @@ def test_samples_agree_with_the_kernel(image):
 _HOST, _PEER, _FAR = "192.0.2.130", "198.51.100.7", "203.0.113.9"
 
 
-def _rules(chain, target):
+def _rules(chain, *rules):
+    body = "".join(f"-A {chain} {r}\n" for r in rules)
     return ("*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n"
-            f":OUTPUT ACCEPT [0:0]\n-A {chain} -j {target}\nCOMMIT\n")
+            f":OUTPUT ACCEPT [0:0]\n{body}COMMIT\n")
 
 
 def _pkt(proto, src, dst, **kw):
@@ -88,51 +89,75 @@ def _pkt(proto, src, dst, **kw):
     return d
 
 
-def _kernel(ruleset, mode, pkts):
+def _probe(ruleset, mode, pkts):
     from tools.oracle.iptables_diff import ensure_containers, probe
     [c] = ensure_containers(1, os.path.join(ROOT, "tools", "oracle"))
     out = probe(c, ruleset, mode, pkts)
     assert out["load_error"] is None, out
-    return out["verdicts"]
+    return out
+
+
+def _kernel(ruleset, mode, pkts):
+    return _probe(ruleset, mode, pkts)["verdicts"]
+
+
+def _count(out, chain, idx):
+    return {(c, i): n for c, i, n in out["counters"]}.get((chain, idx), 0)
+
+
+# Rule 1 lets the reply back in (as the seed-10 ruleset did, by never
+# matching it): without it the catch-all REJECT also eats the reply on its
+# way back through INPUT and the misreading can't happen. The rule-1 counter
+# proves each reply really reached the capture socket.
+_LET_ERRORS_IN = "-p icmp --icmp-type destination-unreachable -j ACCEPT"
 
 
 @pytest.mark.parametrize("reject_with", ["icmp-port-unreachable", "icmp-net-unreachable",
                                          "icmp-host-unreachable", "icmp-admin-prohibited"])
 def test_self_addressed_packet_hitting_reject_reads_deny(image, reject_with):
-    rs = _rules("INPUT", f"REJECT --reject-with {reject_with}")
-    pk = [_pkt("icmp", _HOST, _HOST), _pkt("icmp", _HOST, _HOST, icmp_type=13),
-          _pkt("udp", _HOST, _HOST)]
-    assert _kernel(rs, "input", pk) == ["drop"] * len(pk)
+    rs = _rules("INPUT", _LET_ERRORS_IN, f"-j REJECT --reject-with {reject_with}")
+    pk = [_pkt("icmp", _HOST, _HOST), _pkt("icmp", _HOST, _HOST, icmp_code=1),
+          _pkt("icmp", _HOST, _HOST, icmp_type=13), _pkt("udp", _HOST, _HOST)]
+    out = _probe(rs, "input", pk)
+    assert _count(out, "INPUT", 2) >= len(pk), out          # every probe REJECTed
+    assert _count(out, "INPUT", 1) >= len(pk), out          # every error came back in
+    assert out["verdicts"] == ["drop"] * len(pk), out
 
 
 def test_self_addressed_tcp_hitting_reject_with_reset_reads_deny(image):
-    rs = _rules("INPUT", "REJECT --reject-with tcp-reset")
-    assert _kernel(rs, "input", [_pkt("tcp", _HOST, _HOST)]) == ["drop"]
+    rs = _rules("INPUT", "-p tcp --tcp-flags RST RST -j ACCEPT",
+                "-p tcp -j REJECT --reject-with tcp-reset")
+    out = _probe(rs, "input", [_pkt("tcp", _HOST, _HOST)])
+    assert _count(out, "INPUT", 2) >= 1 and _count(out, "INPUT", 1) >= 1, out
+    assert out["verdicts"] == ["drop"], out
 
 
 def test_reject_with_non_local_source_reads_deny(image):
-    rs = _rules("INPUT", "REJECT --reject-with icmp-port-unreachable")
-    assert _kernel(rs, "input", [_pkt("icmp", _PEER, _HOST)]) == ["drop"]
-    rs = _rules("FORWARD", "REJECT --reject-with icmp-port-unreachable")
-    assert _kernel(rs, "forward", [_pkt("icmp", _PEER, _FAR),
-                                   _pkt("udp", _PEER, _FAR)]) == ["drop", "drop"]
+    rs = _rules("INPUT", _LET_ERRORS_IN, "-j REJECT --reject-with icmp-port-unreachable")
+    out = _probe(rs, "input", [_pkt("icmp", _PEER, _HOST), _pkt("udp", _PEER, _HOST)])
+    assert _count(out, "INPUT", 1) >= 2, out
+    assert out["verdicts"] == ["drop", "drop"], out
+    rs = _rules("FORWARD", "-j REJECT --reject-with icmp-port-unreachable")
+    out = _probe(rs, "forward", [_pkt("icmp", _PEER, _FAR), _pkt("udp", _PEER, _FAR)])
+    assert _count(out, "FORWARD", 1) >= 2, out
+    assert out["verdicts"] == ["drop", "drop"], out
 
 
 def test_true_accept_still_reads_accept(image):
     """The capture check must not blind the oracle to real accepts."""
     pk = [_pkt("icmp", _HOST, _HOST), _pkt("icmp", _PEER, _HOST), _pkt("tcp", _PEER, _HOST),
           _pkt("udp", _PEER, _HOST), _pkt("gre", _PEER, _HOST)]
-    assert _kernel(_rules("INPUT", "ACCEPT"), "input", pk) == ["accept"] * len(pk)
+    assert _kernel(_rules("INPUT", "-j ACCEPT"), "input", pk) == ["accept"] * len(pk)
     pk = [_pkt("icmp", _PEER, _FAR), _pkt("tcp", _PEER, _FAR), _pkt("udp", _PEER, _FAR),
           _pkt("gre", _PEER, _FAR)]
-    assert _kernel(_rules("FORWARD", "ACCEPT"), "forward", pk) == ["accept"] * len(pk)
+    assert _kernel(_rules("FORWARD", "-j ACCEPT"), "forward", pk) == ["accept"] * len(pk)
 
 
 def test_drop_reads_drop(image):
     pk = [_pkt("icmp", _HOST, _HOST), _pkt("tcp", _PEER, _HOST)]
-    assert _kernel(_rules("INPUT", "DROP"), "input", pk) == ["drop", "drop"]
+    assert _kernel(_rules("INPUT", "-j DROP"), "input", pk) == ["drop", "drop"]
     pk = [_pkt("icmp", _PEER, _FAR), _pkt("udp", _PEER, _FAR)]
-    assert _kernel(_rules("FORWARD", "DROP"), "forward", pk) == ["drop", "drop"]
+    assert _kernel(_rules("FORWARD", "-j DROP"), "forward", pk) == ["drop", "drop"]
 
 
 def test_seed_10_ruleset_142_agrees_with_the_kernel(image):
