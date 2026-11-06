@@ -230,12 +230,17 @@ def _quiet(fn, *a):
 # to UNKNOWN, and any other kind reads as UNRECOGNISED:<kind>, which no
 # allowed set holds. test_every_engine_assertion_kind_is_in_the_reader_table
 # keeps the table complete.
+# `segmentation-infeasible-path` is pathground._suppress's rewrite of a
+# violation once the path model proves no path delivers the witness: an
+# isolation claim, so it reads SUPPRESSED, an all-clear (review of #46,
+# R2-M1). No attack file allows it, and _boundary_bad treats it as a PASS.
 _KIND_VERDICT = {"segmentation-ok": "PASS", "segmentation-violation": "FAIL",
-                 "connectivity-ok": "PASS", "connectivity-broken": "FAIL"}
+                 "connectivity-ok": "PASS", "connectivity-broken": "FAIL",
+                 "segmentation-infeasible-path": "SUPPRESSED"}
+_ALL_CLEAR_READS = frozenset({"PASS", "SUPPRESSED"})
 _UNDECIDED_KINDS = frozenset({
     "segmentation-unknown", "segmentation-indeterminate", "segmentation-error",
-    "segmentation-infeasible-path", "connectivity-unknown",
-    "connectivity-indeterminate"})
+    "connectivity-unknown", "connectivity-indeterminate"})
 _ASSERTION_KINDS = ("segmentation-", "connectivity-")
 _ASSERTION_OK = frozenset(k for k, v in _KIND_VERDICT.items() if v == "PASS")
 
@@ -719,7 +724,8 @@ def _obs_boundary(rel, vendor):
 
 def _boundary_bad(obs):
     v, a = obs.split("/")
-    return v in ("PASS", "ACCEPTED") or "PASS" in a[len("assert="):].split(",")
+    return (v in ("PASS", "ACCEPTED")
+            or bool(_ALL_CLEAR_READS & set(a[len("assert="):].split(","))))
 
 
 # Non-assertion findings each attack file carries, counted per kind (review
@@ -995,22 +1001,56 @@ def test_assertion_reader_reads_known_kinds(kind, verdict, want):
     assert _assertion_of(_one_finding(kind, verdict)) == want
 
 
+# The bare prefixes appear as string constants only at these sites, for
+# startswith() tests (review of #46, R2-L1). Any other constant that starts
+# with a prefix must be a kind the reader knows.
+_KIND_PREFIX_SITES = collections.Counter({"segmentation-": 1, "connectivity-": 1})
+
+
+def _kind_guard_sources() -> dict:
+    """label -> Python source: every engine module, and the hosted page's
+    ANALYZE_PY glue (docs/rulehawk/ is byte-identical to rulehawk/, which
+    tests/test_vendor_sync.py enforces)."""
+    pkg = os.path.join(_ROOT, "rulehawk")
+    out = {f"rulehawk/{n}": open(os.path.join(pkg, n), encoding="utf-8").read()
+           for n in sorted(os.listdir(pkg)) if n.endswith(".py")}
+    js = open(os.path.join(_ROOT, "docs", "worker.js"), encoding="utf-8").read()
+    m = re.search(r"const ANALYZE_PY = `(.*?)`;", js, re.S)
+    assert m, "ANALYZE_PY not found in docs/worker.js"
+    out["docs/worker.js:ANALYZE_PY"] = m.group(1)
+    return out
+
+
+def _assertion_kind_literals(sources: dict) -> collections.Counter:
+    """Every string constant that starts with an assertion prefix."""
+    import ast
+    found = collections.Counter()
+    for src in sources.values():
+        for x in ast.walk(ast.parse(src)):
+            if isinstance(x, ast.Constant) and isinstance(x.value, str) \
+                    and x.value.startswith(_ASSERTION_KINDS):
+                found[x.value] += 1
+    return found
+
+
+def _unknown_kind_literals(found: collections.Counter) -> list:
+    known = set(_KIND_VERDICT) | _UNDECIDED_KINDS
+    prefixes = collections.Counter({k: v for k, v in found.items() if k in _KIND_PREFIX_SITES})
+    extra = sorted(k for k in found if k not in known and k not in _KIND_PREFIX_SITES)
+    extra += sorted((prefixes - _KIND_PREFIX_SITES).elements())
+    return extra
+
+
 def test_every_engine_assertion_kind_is_in_the_reader_table():
     """A kind the engine can emit must be in _KIND_VERDICT or
-    _UNDECIDED_KINDS, so the reader never meets one by surprise."""
-    import ast
+    _UNDECIDED_KINDS, so the reader never meets one by surprise. A kind built
+    at run time (an f-string or a concatenation) is invisible here; the
+    reader still reads it as UNRECOGNISED on any fixture that reaches it."""
     known = set(_KIND_VERDICT) | _UNDECIDED_KINDS
     help_kinds = {k for k in g._KIND_HELP if k.startswith(_ASSERTION_KINDS)}
     assert help_kinds <= known, sorted(help_kinds - known)
-    pkg = os.path.join(_ROOT, "rulehawk")
-    lit = set()
-    for n in sorted(os.listdir(pkg)):
-        if n.endswith(".py"):
-            tree = ast.parse(open(os.path.join(pkg, n), encoding="utf-8").read())
-            lit |= {x.value for x in ast.walk(tree)
-                    if isinstance(x, ast.Constant) and isinstance(x.value, str)
-                    and re.fullmatch(r"(segmentation|connectivity)(-[a-z]+)+", x.value)}
-    assert lit <= known, sorted(lit - known)
+    found = _assertion_kind_literals(_kind_guard_sources())
+    assert not _unknown_kind_literals(found), _unknown_kind_literals(found)
 
 
 def test_sarif_ok_result_on_an_attack_file_is_bad(monkeypatch, tmp_path):
@@ -1085,9 +1125,12 @@ def test_kind_guard_flags_a_planted_kind(planted):
     """R2-L1: the guard sees any string constant that starts with an
     assertion prefix (digits and underscores included), in rulehawk/ and in
     docs/worker.js's ANALYZE_PY, beyond the pinned prefix sites."""
-    src = f"x = {planted!r}\n"
+    src = f"\nx = {planted!r}\n"
+    assert not _unknown_kind_literals(_assertion_kind_literals(_kind_guard_sources()))
     for label in ("rulehawk/planted.py", "docs/worker.js:ANALYZE_PY"):
-        found = _assertion_kind_literals({label: src})
+        sources = _kind_guard_sources()
+        sources[label] = sources.get(label, "") + src
+        found = _assertion_kind_literals(sources)
         assert _unknown_kind_literals(found), (label, planted)
 
 
