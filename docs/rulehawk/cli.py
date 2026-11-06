@@ -35,7 +35,7 @@ from .parse_junos import detect as detect_junos, parse_junos
 from .parse_nxos import detect as detect_nxos, parse_nxos
 from .parse_panos import detect as detect_panos, parse_panos
 from .pathground import HammerheadReachOracle, path_ground
-from .report import to_json, to_text
+from .report import exit_code, to_json, to_text
 from .riskaccept import apply_to_findings, evaluate, finalize
 from .segcheck import check_segmentation
 
@@ -54,7 +54,8 @@ usage:
 options:
   --json               emit the machine-readable JSON report instead of text
   --evidence           emit the compliance-evidence artifact (JSON): provenance,
-                       VERIFIED/FAILED policy attestations, control references
+                       policy attestations (FAILED / INDETERMINATE), control
+                       references
   --evidence-md        the same artifact as a readable markdown document
   --junos              force the Juniper Junos parser (skip auto-detection)
   --panos              force the Palo Alto PAN-OS parser (skip auto-detection)
@@ -79,10 +80,12 @@ passing extra files here is an error (exit 2), never a partial audit.
 Scope: the rule layer only. RuleHawk does not evaluate routing, NAT or
 topology, so it cannot tell you what a change breaks on your network.
 
-exit codes:
-  0  config parsed; no critical/high findings
-  1  at least one critical/high finding
+exit codes (0.4.1, fail-closed stopgap: PASS is never reported):
+  1  FAIL: at least one critical/high finding
   2  parse failure (no rules parsed), unreadable input, or bad usage
+  3  UNKNOWN: no critical/high finding, but not certified (reason
+     fail-closed-stopgap: fail-closed stopgap pending soundness review)
+  0  only for --help; an audited run never exits 0
 """
 
 
@@ -263,16 +266,14 @@ def main(argv: list[str] | None = None) -> int:
         print(to_json(findings, notes, n_rules, vendor))
     else:
         print(to_text(findings, notes, n_rules, vendor))
-    # Distinct exit codes: 0 clean · 1 finding at critical/high · 2 parse failure.
+    # Distinct exit codes: 1 finding at critical/high · 2 parse failure · 3
+    # UNKNOWN (fail-closed stopgap: never 0, which would read as a PASS).
     # Exit 2 (fail-closed) when NOTHING was parsed: absence of findings must NOT
     # imply a clean audit when the input was never read as a firewall config.
-    if not n_rules:
-        return 2
     # An ACCEPTED finding is reported but does not fail the run — that is what a
     # time-boxed, attributed risk acceptance is for. It goes red again the day
-    # the acceptance expires, by itself.
-    return 1 if any(f.severity in ("critical", "high") and f.accepted is None
-                    for f in findings) else 0
+    # the acceptance expires, by itself. See report.exit_code.
+    return exit_code(findings, n_rules)
 
 
 if __name__ == "__main__":

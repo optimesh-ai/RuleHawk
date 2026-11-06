@@ -186,12 +186,13 @@ def test_fail_on_high_blocks_on_critical(tmp_path):
 
 def test_fail_on_critical_still_blocks_here(tmp_path):
     g = _gate(tmp_path, "critical")
-    assert not g.passed                         # there IS a critical
+    assert not g.passed and g.exit_code() == 1  # there IS a critical
 
 
 def test_fail_on_none_never_blocks(tmp_path):
     g = _gate(tmp_path, "none")
-    assert g.passed and g.violations == []
+    # fail-closed stopgap: exits 0 (advisory) but never reads as passed
+    assert g.exit_code() == 0 and not g.passed and g.violations == []
     assert g.worst == "critical"                # worst still reported, just not gated
 
 
@@ -201,15 +202,15 @@ def test_low_only_config_passes_at_high(tmp_path):
            " permit tcp host 1.2.3.4 host 10.0.0.1 eq 443\n")
     p = _write(str(tmp_path), "r.acl", cfg)
     g = gate.run_gate([p], None, "high")
-    assert g.passed and g.worst == "low"
+    assert g.exit_code() == 3 and g.worst == "low"     # stopgap UNKNOWN, not FAIL
     g_low = gate.run_gate([p], None, "low")
-    assert not g_low.passed                     # ...but fails when low is gated
+    assert not g_low.passed and g_low.exit_code() == 1  # ...but fails when low is gated
 
 
 def test_clean_config_passes(tmp_path):
     p = _write(str(tmp_path), "clean.acl", _CLEAN)
     g = gate.run_gate([p], _POLICY, "high")
-    assert g.passed and g.worst == "none"
+    assert g.exit_code() == 3 and g.worst == "none"    # fail-closed stopgap: UNKNOWN
 
 
 # --------------------------------------------------------------------------- #
@@ -219,7 +220,7 @@ def test_segmentation_ok_is_info_not_a_violation(tmp_path):
     p = _write(str(tmp_path), "clean.acl", _CLEAN)
     g = gate.run_gate([p], _POLICY, "high")
     kinds = {f.kind for fr in g.files for f in fr.findings}
-    assert "segmentation-ok" in kinds           # the PASS is recorded...
+    assert "segmentation-unknown" in kinds      # the UNKNOWN is recorded...
     assert g.real_findings == []                # ...but is not a "real" finding
     sarif = json.loads(gate.to_sarif(g))
     assert sarif["runs"][0]["results"] == []    # ...and never annotates a line
@@ -379,7 +380,7 @@ def test_worst_and_json_survive_unknown_severity():
                          findings=[Finding("x:1", "weird", "bogus", "m", "r")])
     g = gate.GateResult([fr], "high")
     assert g.worst == "bogus"            # unknown rank 0, still surfaced, no crash
-    assert g.passed                      # rank 0 < high threshold -> not a violation
+    assert g.exit_code() == 3            # rank 0 < high threshold -> not a violation
     json.loads(gate.to_json(g))          # must not raise
     json.loads(gate.to_sarif(g))         # must not raise
 
@@ -413,7 +414,7 @@ def test_main_returns_0_on_clean(tmp_path):
     p = _write(d, "clean.acl", _CLEAN)
     pol = _write(d, "policy.json", json.dumps(_POLICY))
     rc = gate.main([p, "--policy", pol, "--fail-on", "high", "-q"])
-    assert rc == 0
+    assert rc == 3                       # fail-closed stopgap: UNKNOWN, never 0
 
 
 def test_main_writes_github_step_summary_env(tmp_path, monkeypatch):

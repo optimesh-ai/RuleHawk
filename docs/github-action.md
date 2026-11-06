@@ -65,7 +65,9 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 
 | Output | Description |
 |---|---|
-| `passed` | `true` when no finding met the `fail-on` threshold (and every file parsed). |
+| `passed` | Never `true` in 0.4.1 (fail-closed stopgap: no PASS is reported). Read `verdict` and `exit-code`. |
+| `verdict` | `FAIL` \| `UNKNOWN`. UNKNOWN (exit 3): nothing reached the `fail-on` threshold, but the run is not certified (reason `fail-closed-stopgap`, "fail-closed stopgap pending soundness review"). Under `fail-on: none` the real verdict, reported but not enforced. |
+| `exit-code` | The gate's exit code: `1` FAIL, `2` parse failure or invalid input, `3` UNKNOWN; `0` only under `fail-on: none`. |
 | `score` | Lowest hygiene score (0–100) across the audited files. |
 | `worst-severity` | Highest severity found: `critical` \| `high` \| `medium` \| `low` \| `none`. |
 | `evidence-file` | Path to the compliance-evidence JSON artifact (empty unless `evidence: true`). |

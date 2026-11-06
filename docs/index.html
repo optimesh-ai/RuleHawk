@@ -654,6 +654,7 @@ function verdictBlock(d, vendor){
     <div class="verdict-body">
       <div class="verdict-chips">${chips}</div>
       <div class="verdict-meta">${vendorLine}${d.rules_analyzed} rules analyzed &middot; ${d.findings_total} finding${d.findings_total===1?'':'s'}</div>
+      <div class="verdict-meta"><b>Verdict: ${esc(d.verdict || "UNKNOWN")}</b>${(d.reasons||[]).length ? " &middot; " + reasonsText(d.reasons) : ""}</div>
       <div class="verdict-actions">
         <button class="small" data-act="copy">Copy report</button>
         <button class="small" data-act="json">Download JSON</button>
@@ -663,6 +664,11 @@ function verdictBlock(d, vendor){
       </div>
     </div>
   </div>`;
+}
+
+// Fail-closed stopgap (0.4.1): the reason a verdict is UNKNOWN, as text.
+function reasonsText(rs){
+  return (rs||[]).map(r => `${esc(r.code)}: ${esc(r.message)}`).join("; ");
 }
 
 // ---- render a single finding card ----
@@ -681,6 +687,7 @@ function findingHTML(f){
     ${f.witness ? `<div class="frow"><span class="flabel flabel-why">witness</span></div><div class="witness">${esc(f.witness)}</div>` : ""}
     ${f.cited ? `<div class="frow"><span class="flabel flabel-why">caused by</span> <span style="font-family:var(--mono);font-size:12px">${esc(f.cited)}</span></div>` : ""}
     <div class="frow"><span class="flabel flabel-why">WHY</span> ${esc(f.message)}</div>
+    ${(f.reasons||[]).map(r => `<div class="frow"><span class="flabel flabel-why">REASON</span> <span style="font-family:var(--mono);font-size:12px">${esc(r.code)}</span> ${esc(r.message)}</div>`).join("")}
     ${f.fix ? `<div class="frow fix"><span class="flabel flabel-fix">FIX</span> ${esc(f.fix)}</div>` : ""}
   </div>`;
 }
@@ -717,10 +724,12 @@ function render(d, vendor){
   if(seg.length){
     const hasViol = seg.some(f=>f.kind==="segmentation-violation");
     const hasInd  = seg.some(f=>f.kind==="segmentation-indeterminate");
-    const cls = hasViol ? "fail" : (hasInd ? "warn" : "pass");
+    // Fail-closed stopgap: the page never says the segmentation holds; with
+    // no violation the result is UNKNOWN, with its reason.
+    const cls = hasViol ? "fail" : "warn";
     const label = hasViol ? "Segmentation failed — a forbidden flow is permitted"
                 : hasInd  ? "Segmentation indeterminate — manual review needed"
-                : "Segmentation holds at the rule layer — no permitted flow violates the policy";
+                : "Segmentation UNKNOWN — not certified (" + reasonsText(d.reasons) + ")";
     html += `<div class="segpanel"><div class="seghdr">Segmentation policy</div>
       <div class="segbanner ${cls}">${label}</div>`
       + seg.map(findingHTML).join("") + `</div>`;
@@ -736,10 +745,8 @@ function render(d, vendor){
   }
 
   if(!rest.length && !seg.length){
-    html += `<div class="all-clear">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
-      No issues found — all rules analyzed, nothing flagged.
-    </div>`;
+    // Fail-closed stopgap: nothing flagged is UNKNOWN, never an all-clear.
+    html += `<div class="segbanner warn">UNKNOWN — all rules analyzed and nothing flagged, but this result is not certified (${reasonsText(d.reasons)}).</div>`;
   } else {
     html += rest.map(findingHTML).join("");
   }

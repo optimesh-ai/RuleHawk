@@ -149,7 +149,7 @@ def test_negated_ctstate_repro_indeterminate_not_pass():
     aces, _ = parse_iptables(cfg)
     findings = check_segmentation(aces, _SEG_POLICY)
     kinds = {f.kind for f in findings}
-    assert "segmentation-ok" not in kinds, (
+    assert "segmentation-unknown" not in kinds, (
         "FALSE PASS: negated-ctstate ACCEPT hidden as stateful — CORP->PCI:445 "
         "reported isolated while the rule permits NEW flows")
     assert "segmentation-indeterminate" in kinds
@@ -166,7 +166,7 @@ def test_non_negated_ctstate_still_stateful_no_regression():
     assert rule.stateful is True and rule.imprecise is False
     # Stateful-only permit never opens a NEW flow -> the isolation check PASSes.
     kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
     assert "segmentation-violation" not in kinds
     assert "segmentation-indeterminate" not in kinds
 
@@ -282,7 +282,7 @@ def test_multichain_no_false_pass_for_dmz_rule_and_legit_flow_passes():
     findings = check_segmentation(aces, _MULTI_CHAIN_POLICY)
     by_label = {f.rule_id: f for f in findings}
     # DMZ!->PCI: no permit on that path anywhere -> a clean PASS, not a violation.
-    dmz_oks = [f for f in findings if f.kind == "segmentation-ok" and "DMZ" in f.rule_id]
+    dmz_oks = [f for f in findings if f.kind == "segmentation-unknown" and "DMZ" in f.rule_id]
     assert dmz_oks, "DMZ->PCI should PASS (isolated), not be silently dropped"
     assert not [f for f in findings
                 if f.kind == "segmentation-violation" and "DMZ" in (f.rule_id or "")]
@@ -327,7 +327,7 @@ def test_custom_chain_jump_on_transit_path_is_indeterminate_not_ok():
                   "as CRITICAL (precision resolution)")
     assert viol[0].severity == "critical"
     assert not [f for f in findings
-                if f.kind == "segmentation-ok" and "CORP" in (f.rule_id or "")], \
+                if f.kind == "segmentation-unknown" and "CORP" in (f.rule_id or "")], \
         "CORP->PCI must not FALSE-PASS"
     # Precision resolution note must be present
     assert any("resolved precisely" in n and "CROSSZONE" in n for n in notes)
@@ -374,7 +374,7 @@ def test_clean_fully_modeled_config_still_passes():
     aces, _ = parse_iptables(cfg)
     findings = check_segmentation(aces, _MULTI_CHAIN_POLICY)
     kinds = {f.kind for f in findings}
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
     assert "segmentation-indeterminate" not in kinds
     assert "segmentation-violation" not in kinds
 
@@ -388,7 +388,7 @@ def test_earlier_drop_blocks_no_false_alarm():
     aces, _ = parse_iptables(cfg)
     kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
 
 
 def test_default_accept_policy_flagged_overly_permissive():
@@ -549,7 +549,7 @@ def test_return_in_base_chain_fails_closed_not_false_pass():
     aces, notes = parse_iptables(cfg)
     findings = check_segmentation(aces, _SEG_POLICY)
     kinds = {f.kind for f in findings}
-    assert "segmentation-ok" not in kinds, \
+    assert "segmentation-unknown" not in kinds, \
         "FALSE PASS: RETURN->policy-ACCEPT leak reported as isolated"
     assert kinds & {"segmentation-indeterminate", "segmentation-violation"}
     assert any("RETURN" in n and "fail-closed" in n for n in notes)
@@ -681,7 +681,7 @@ def test_lowercase_jump_accept_is_a_custom_chain_not_builtin():
     assert any("custom chain" in n and "accept" in n for n in notes)
     findings = check_segmentation(aces, _SEG_POLICY)
     kinds = {f.kind for f in findings}
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
     assert kinds & {"segmentation-indeterminate", "segmentation-violation"}
 
 
@@ -732,7 +732,7 @@ def test_precision_modeled_chain_drop_gives_pass():
     aces, notes = parse_iptables(cfg)
     findings = check_segmentation(aces, _PREC_POLICY)
     kinds = {f.kind for f in findings}
-    assert "segmentation-ok" in kinds, \
+    assert "segmentation-unknown" in kinds, \
         "DROP in fully-modeled chain must give precise PASS"
     assert "segmentation-indeterminate" not in kinds, \
         "fully-modeled chain must not remain INDETERMINATE"
@@ -798,7 +798,7 @@ def test_precision_absent_chain_stays_indeterminate():
     kinds = {f.kind for f in findings}
     assert "segmentation-indeterminate" in kinds, \
         "absent chain must keep imprecise placeholder → INDETERMINATE (fail closed)"
-    assert "segmentation-ok" not in kinds, \
+    assert "segmentation-unknown" not in kinds, \
         "must not FALSE-PASS when target chain is absent"
     # Jump must still be surfaced as a note (never an invisible hole)
     assert any("custom chain" in n and "MISSING_CHAIN" in n for n in notes)
@@ -830,7 +830,7 @@ def test_precision_fallthrough_return_parent_rule_fires():
     # tcp/445 must be blocked by the resolved deny → PASS (no isolation violation)
     findings_445 = check_segmentation(aces, _PREC_POLICY)
     kinds_445 = {f.kind for f in findings_445}
-    assert "segmentation-ok" in kinds_445, \
+    assert "segmentation-unknown" in kinds_445, \
         "tcp/445 must be precisely denied → PASS for isolation"
     assert "segmentation-indeterminate" not in kinds_445, \
         "fully-modeled PORTCHECK must not remain INDETERMINATE"
@@ -871,7 +871,7 @@ def test_precision_chain_cycle_fails_closed_no_hang():
     kinds = {f.kind for f in findings}
     assert "segmentation-indeterminate" in kinds, \
         "chain cycle must fail closed to INDETERMINATE (not hang, not FALSE-PASS)"
-    assert "segmentation-ok" not in kinds, \
+    assert "segmentation-unknown" not in kinds, \
         "must not FALSE-PASS on a cyclic chain structure"
     # Resolution was NOT applied (cycle blocked by imprecise-ACE gate)
     assert not any("resolved precisely" in n for n in notes)
@@ -1094,7 +1094,7 @@ class TestImpreciseMarkingBranches:
         aces, notes = parse_iptables(cfg)
         findings = check_segmentation(aces, _SEG_POLICY)
         kinds = {f.kind for f in findings}
-        assert "segmentation-ok" not in kinds, (
+        assert "segmentation-unknown" not in kinds, (
             "FALSE PASS: a negated-dst ACCEPT was modeled as dst ANY without the "
             "imprecise flag — RuleHawk certified isolation it cannot prove")
         assert "segmentation-indeterminate" in kinds
@@ -1136,7 +1136,7 @@ def test_insert_index1_drop_before_accept_isolates():
         "the inserted DROP must occupy the FRONT (seq before the ACCEPT)"
     assert fwd[0].seq < fwd[1].seq                     # seq monotonic in device order
     kinds = {f.kind for f in check_segmentation(aces, _INSERT_POLICY)}
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
     assert "segmentation-violation" not in kinds
 
 
@@ -1154,7 +1154,7 @@ def test_insert_index1_permit_before_deny_is_violation_not_false_pass():
     kinds = {f.kind for f in check_segmentation(aces, _INSERT_POLICY)}
     assert "segmentation-violation" in kinds, \
         "front-inserted ACCEPT permits the flow — the FALSE-PASS this fix kills"
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
 
 
 def test_insert_no_index_goes_to_front():
@@ -1167,7 +1167,7 @@ def test_insert_no_index_goes_to_front():
     assert [a.action for a in fwd] == ["deny", "permit"], \
         "`-I` with no index must land at the FRONT, not the end"
     kinds = {f.kind for f in check_segmentation(aces, _INSERT_POLICY)}
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
     assert "segmentation-violation" not in kinds
 
 
@@ -1211,7 +1211,7 @@ def test_replace_at_position_changes_first_match_verdict():
     assert len(fwd) == 1 and fwd[0].action == "deny", \
         "replace must swap the rule at position 1 in place, not add a second rule"
     kinds = {f.kind for f in check_segmentation(aces, _INSERT_POLICY)}
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
     assert "segmentation-violation" not in kinds
     assert any("replace" in n for n in notes)         # still surfaced
 

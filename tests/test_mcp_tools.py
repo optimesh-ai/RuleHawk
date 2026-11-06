@@ -84,7 +84,7 @@ def _assert_contract(r):
 def test_audit_clean_file_passes_with_complete_coverage(tmp_path):
     r = m.audit(_write(tmp_path, "edge.cfg", _CLEAN))
     _assert_contract(r)
-    assert r["verdict"] == "PASS"
+    assert r["verdict"] == "UNKNOWN"         # fail-closed stopgap: never PASS
     assert r["coverage"]["state"] == "complete"
     assert r["coverage"]["files_analysed"] == 1
     assert r["coverage"]["not_analysed"] == []
@@ -129,7 +129,7 @@ def test_audit_directory_reports_every_file_and_skips_hidden(tmp_path):
 def test_audit_unmodelled_lines_make_coverage_partial(tmp_path):
     r = m.audit(_write(tmp_path, "edge.cfg", _PARTIAL))
     cov = r["coverage"]
-    assert r["verdict"] == "PASS"            # nothing blocking was found...
+    assert r["verdict"] == "UNKNOWN"         # nothing blocking was found (stopgap)...
     assert cov["state"] == "partial"         # ...but not every line was modelled
     assert cov["files_with_unmodelled_lines"] == 1
     assert "time-range" in cov["analysed"][0]["unmodelled_lines"][0]
@@ -162,7 +162,7 @@ def test_audit_refuses_paths_outside_the_root(tmp_path, monkeypatch):
     outside = _write(tmp_path, "out/edge.cfg", _CLEAN)
     _write(inside, "edge.cfg", _CLEAN)
     monkeypatch.setenv("RULEHAWK_MCP_ROOT", str(inside))
-    assert m.audit(str(inside / "edge.cfg"))["verdict"] == "PASS"
+    assert m.audit(str(inside / "edge.cfg"))["verdict"] == "UNKNOWN"   # stopgap
     r = m.audit(outside)
     assert r["verdict"] == "ERROR" and "outside RULEHAWK_MCP_ROOT" in r["error"]
 
@@ -254,16 +254,17 @@ def test_compare_no_change_and_fix(tmp_path):
     clean = _write(tmp_path, "clean.cfg", _CLEAN)
     risky = _write(tmp_path, "risky.cfg", _RISKY)
     same = m.compare(clean, clean)
-    assert same["verdict"] == "NO_NEW_RISK" and same["introduced_total"] == 0
+    # fail-closed stopgap: no all-clear, so the old NO_NEW_RISK is UNKNOWN
+    assert same["verdict"] == "UNKNOWN" and same["introduced_total"] == 0
     fixed = m.compare(risky, clean)
-    assert fixed["verdict"] == "NO_NEW_RISK"
+    assert fixed["verdict"] == "UNKNOWN"
     assert [f["kind"] for f in fixed["resolved"]] == ["dangerous-exposure"]
 
 
 def test_compare_pre_existing_risk_is_counted_not_introduced(tmp_path):
     dirty = _write(tmp_path, "dirty.cfg", _DIRTY)
     c = m.compare(dirty, dirty)
-    assert c["verdict"] == "NO_NEW_RISK"
+    assert c["verdict"] == "UNKNOWN"         # fail-closed stopgap (was NO_NEW_RISK)
     assert c["pre_existing_blocking"] >= 1
     assert "pre-existing" in c["verdict_reason"]
 

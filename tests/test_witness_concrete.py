@@ -88,7 +88,7 @@ def test_connectivity_ok_witness_carries_source_port():
                              "COMMIT\n")
     pol = dict(_POL, must_reach=[{"src": "CORP", "dst": "PCI", "proto": "tcp",
                                   "ports": [443]}])
-    ok = [f for f in check_segmentation(aces, pol) if f.kind == "connectivity-ok"]
+    ok = [f for f in check_segmentation(aces, pol) if f.kind == "connectivity-unknown"]
     assert ok
     src = ok[0].witness.split(" -> ")[0]
     assert ":" in src, ok[0].witness

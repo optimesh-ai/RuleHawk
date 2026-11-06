@@ -410,10 +410,17 @@ def test_hosted_page_renders_unknown_never_a_pass():
 # token sweep: no output path emits PASS / VERIFIED / segmentation-ok /
 # "no violation"
 # --------------------------------------------------------------------------- #
-# Pre-existing negated sentences that name the word only to deny it ("no PASS
-# is given", "This is NOT a PASS"). They are removed before the sweep; each is
-# an exact phrase, so a new positive PASS anywhere still fails the test.
+# Pre-existing negated sentences that name the word only to deny it. They are
+# removed before the sweep; each is an exact phrase, so a new positive PASS
+# anywhere still fails the test. The segmentation-error ones are FAIL finding
+# messages (high), which the stopgap must leave byte-identical.
 NEGATIONS = (
+    "fail-closed: no assertion gets a PASS until the policy is fixed",   # segcheck
+    "assertions over this zone get no PASS until the policy is fixed",    # segcheck
+    "fail-closed: the affected assertion gets no PASS until fixed",       # gate help
+    "fail_on=none: nothing blocks, so no PASS is given",                  # mcp ADVISORY
+    "not_analysed); no PASS is given",                                    # mcp coverage
+    "unrecognised or unreadable input makes the result INCOMPLETE, never PASS",  # mcp
 )
 BANNED = [re.compile(r"\bPASS\b"), re.compile(r"\bVERIFIED\b"),
           re.compile(r"segmentation-ok", re.I), re.compile(r"connectivity-ok", re.I),
@@ -482,6 +489,30 @@ def test_no_output_path_emits_a_pass_token_on_a_must_reach_proof(tmp_path, reach
     cfg, pol = reach
     for label, text in _all_outputs(tmp_path, cfg, pol, REACH_POLICY).items():
         _sweep(f"reach [{label}]", text)
+
+
+BAD_POLICY = {"zones": {"PCI": ["10.10.0.0/16", "not-a-cidr"],
+                        "CORP": ["10.20.0.0/16"]},
+              "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp",
+                                  "ports": [445]},
+                                 {"src": "CORP", "dst": "NOPE"}]}
+
+
+def test_no_output_path_emits_a_pass_token_on_bad_input(tmp_path):
+    pol = tmp_path / "bad_policy.json"
+    pol.write_text(json.dumps(BAD_POLICY))
+    for cfg in (CLEAN, DIRTY):
+        sub = tmp_path / os.path.basename(cfg)
+        sub.mkdir()
+        for label, text in _all_outputs(sub, cfg, str(pol), BAD_POLICY).items():
+            _sweep(f"bad policy {os.path.basename(cfg)} [{label}]", text)
+    empty = tmp_path / "no_rules.txt"
+    empty.write_text("hostname r1\n")
+    sub = tmp_path / "empty"
+    sub.mkdir()
+    for label, text in _all_outputs(sub, str(empty), POLICY,
+                                    json.load(open(POLICY))).items():
+        _sweep(f"no rules [{label}]", text)
 
 
 def test_mcp_instructions_and_kind_help_name_no_pass():

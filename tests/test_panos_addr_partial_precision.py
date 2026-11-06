@@ -72,7 +72,7 @@ def test_partial_addr_resolved_member_proves_leak_emits_critical():
     assert "segmentation-violation" in kinds, (
         "resolved 10.20.0.1/32 (CORP) proves CORP->PCI:445 leak; expect CRITICAL"
     )
-    assert "segmentation-ok" not in kinds, "must not produce a false PASS"
+    assert "segmentation-unknown" not in kinds, "must not produce a false PASS"
 
     # Structural check: one precise ACE for the resolved member, one opaque ACE.
     precise = [a for a in aces if not a.imprecise]
@@ -112,7 +112,7 @@ def test_partial_addr_resolved_member_outside_corp_no_false_pass():
         "unresolved fqdn remainder must keep the assertion INDETERMINATE"
     )
     assert "segmentation-violation" not in kinds, "must not invent a false CRITICAL"
-    assert "segmentation-ok" not in kinds, (
+    assert "segmentation-unknown" not in kinds, (
         "the pre-fix bug: resolved-subset-only modeling produced a false PASS"
     )
 
@@ -139,7 +139,7 @@ def test_fully_resolved_rule_stays_precise_no_opaque():
 
     # Exact rule: CORP->PCI on tcp/443 (not 445) — segcheck policy checks
     # tcp/445, so this is clean.
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
     assert "segmentation-violation" not in kinds
     assert "segmentation-indeterminate" not in kinds
 
@@ -170,7 +170,7 @@ def test_all_unresolved_src_stays_fully_opaque():
 
     assert "segmentation-indeterminate" in kinds
     assert "segmentation-violation" not in kinds, "must not emit a false CRITICAL"
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
 
     # The note surfaces the dynamic group; no 'partially resolved' note.
     assert not any("partially resolved" in n for n in notes)
@@ -200,7 +200,7 @@ def test_blocked_partial_widens_unresolved_dim_no_false_pass():
         "unresolved src members must widen the src dimension to ANY, not keep "
         "the resolved subset (under-approximation → false PASS)"
     )
-    assert "segmentation-ok" not in kinds, "must not produce a false PASS"
+    assert "segmentation-unknown" not in kinds, "must not produce a false PASS"
     assert "segmentation-violation" not in kinds, (
         "imprecise ACEs must never prove a CRITICAL"
     )
