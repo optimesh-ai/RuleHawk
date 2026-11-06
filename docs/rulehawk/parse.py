@@ -1006,6 +1006,76 @@ _ALIAS_RESERVED = frozenset({"any", "any4", "any6", "host", "object", "object-gr
                              "permit", "deny", "ip", "tcp", "udp", "icmp"})
 
 
+_BANNER_RE = re.compile(
+    r"(?i)^\s*banner(?:\s+(exec|login|motd|incoming|slip-ppp|prompt-timeout|"
+    r"config-save|asdm))?(?:\s+(.*))?$")
+
+
+def strip_banners(text: str) -> Tuple[str, List[str]]:
+    """Blank every banner line, so banner text is never read as config.
+
+    IOS / NX-OS: `banner TYPE D text D`, where D is the first character after
+    the type (running-config shows Ctrl-C as `^C`); the text may span lines
+    and ends at the next D. Arista EOS: `banner TYPE` alone, then text lines
+    up to a line `EOF`. ASA: `banner TYPE text`, one line each. A delimiter
+    RuleHawk cannot determine (a letter or digit, which ASA uses as text and
+    IOS as a delimiter) or a banner that never ends gets a note, so no PASS
+    rests on it. Line numbers are kept (blanked lines stay as empty lines)."""
+    lines = text.split("\n")
+    notes: List[str] = []
+    asa = bool(re.search(r"(?im)^\s*(?:ASA|PIX|FWSM)\s+Version\b", text))
+    i, n = 0, len(lines)
+    while i < n:
+        m = _BANNER_RE.match(lines[i])
+        if not m or lines[i][:1] in (" ", "\t"):
+            i += 1
+            continue
+        start, rest = i, (m.group(2) or "").lstrip()
+        if asa:
+            lines[i] = ""
+            i += 1
+            continue
+        if not rest:
+            # EOS form: text lines up to `EOF`.
+            j = next((k for k in range(i + 1, n) if lines[k].strip() == "EOF"), None)
+            if j is None:
+                notes.append(f"banner without a delimiter (line {start + 1}): "
+                             f"`{lines[i].strip()}` — its extent is unknown")
+                lines[i] = ""
+                i += 1
+                continue
+            for k in range(i, j + 1):
+                lines[k] = ""
+            i = j + 1
+            continue
+        delim = "^C" if rest.startswith("^C") else rest[0]
+        if delim.isalnum():
+            notes.append(f"banner delimiter could not be determined (line "
+                         f"{start + 1}): `{lines[i].strip()}`")
+            lines[i] = ""
+            i += 1
+            continue
+        body = rest[len(delim):]
+        if delim in body:
+            lines[i] = ""
+            i += 1
+            continue
+        j = next((k for k in range(i + 1, n) if delim in lines[k]), None)
+        if j is None:
+            notes.append(f"banner with no closing delimiter {delim!r} (line "
+                         f"{start + 1}): the rest of the file was read as banner "
+                         f"text")
+            j = n - 1
+        for k in range(i, j + 1):
+            lines[k] = ""
+        i = j + 1
+    return "\n".join(lines), notes
+
+
+_NO_ACL_RE = re.compile(r"(?i)^no\s+(?:(?:ip|ipv4|ipv6)\s+)?access-list\b")
+_NO_ENTRY_RE = re.compile(r"(?i)^no\s+(?:\d+|permit|deny)\b")
+
+
 def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     """Parse all ACLs in `text`; return (entries, notes).
 
@@ -1022,6 +1092,8 @@ def parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
 def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     entries: List[ACE] = []
     notes: List[str] = []
+    text, notes_b = strip_banners(text)
+    notes += notes_b
     text, n_alias = _apply_asa_names(text)
     if n_alias:
         notes.append(f"ASA `name` aliases resolved: {n_alias} name(s) substituted "
@@ -1035,6 +1107,16 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     for lineno, raw in enumerate(text.splitlines(), 1):
         stripped = raw.strip()
         if not stripped or stripped.startswith("!"):
+            continue
+        if _NO_ACL_RE.match(stripped) or (
+                raw[:1] in (" ", "\t") and _NO_ENTRY_RE.match(stripped)
+                and not in_other):
+            # IOS deletes the ACL (or the entry) at this point in the file;
+            # RuleHawk does not replay deletions, so it keeps rules the device
+            # no longer has. Fail closed: the note blocks every PASS.
+            notes.append(f"unmodeled `{stripped}` (line {lineno}): the deletion "
+                         f"is not applied, so the parsed ACL may hold rules the "
+                         f"device removed")
             continue
         m = re.match(r"(?i)^(ip|ipv4|ipv6)\s+access-list\s+(?:(extended|standard)\s+)?(\S+)",
                      stripped)

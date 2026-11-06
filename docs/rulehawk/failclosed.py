@@ -644,6 +644,8 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
     acls = sorted({a.acl for a in transit_aces})
 
     if v in _CISCO:
+        from .parse import strip_banners
+        text = strip_banners(text)[0]          # banner text is not config
         transit, other = _cisco_bindings(text)
         role = _role_reasons(acls, transit, other)
         b += role
