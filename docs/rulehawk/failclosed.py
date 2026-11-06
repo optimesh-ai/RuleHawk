@@ -665,7 +665,8 @@ def _panos_unmodeled_fields(text: str) -> List[str]:
 _CISCO_NEGATED_BIND = re.compile(
     r"(?im)^\s*(?:no|default)\s+(?:(?:ip|ipv4|ipv6)\s+(?:port\s+)?"
     r"(?:access-group|traffic-filter|access-class)|access-group|access-class|"
-    r"ipv6\s+port\s+traffic-filter)\b.*$|^(?:no|default)\s+interface\b.*$")
+    r"ipv6\s+port\s+traffic-filter)\b.*$|"
+    r"^(?:no|default)\s+in(?:t(?:e(?:r(?:f(?:a(?:ce?)?)?)?)?)?)?\s.*$")
 _JUNOS_SET_NEGATED = re.compile(
     r"(?m)^\s*(?:deactivate|delete)\s+(?:logical-systems\s+\S+\s+)?"
     r"(?:interfaces\b|firewall\s+(?:family\s+\S+\s+)?filter\s+\S+\s*$).*$")
@@ -801,6 +802,9 @@ def _keyword(line: str) -> str:
     return " ".join(out) or "(not a keyword)"
 
 
+_IF_ABBREV = re.compile(r"(?i)^(in(?:t(?:e(?:r(?:f(?:a(?:ce?)?)?)?)?)?)?)\s+(\S+)")
+
+
 def _cisco_unallowed(text: str) -> List[str]:
     """`interface: keyword` for each interface line not on the allowlist."""
     out: List[str] = []
@@ -811,6 +815,12 @@ def _cisco_unallowed(text: str) -> List[str]:
         if raw[:1] not in (" ", "\t"):
             m = re.match(r"(?i)^interface\s+(\S+)", raw)
             cur = m.group(1) if m and not _NO_FORWARD_IF.match(m.group(1)) else None
+            ab = _IF_ABBREV.match(raw)
+            if ab and not m:
+                # `int X`: the CLI accepts it, but the binding and path
+                # passes only read `interface X`, so the stanza is unmodeled.
+                cur = ab.group(2)
+                out.append(f"{cur}: {ab.group(1).lower()} (abbreviated interface)")
             continue
         if cur is None:
             continue
