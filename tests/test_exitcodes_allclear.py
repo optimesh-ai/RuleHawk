@@ -251,6 +251,8 @@ def _scan_module(name: str):
         elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             if node.value.id in ec and node.attr in _EXIT_NAMES:
                 hit(node, "exit-code", f"exitcodes.{node.attr}")
+            if node.value.id in ac and node.attr == "certified":
+                hit(node, "allclear-name", "allclear.certified")   # review of #48, L2
             if node.value.id in ac and node.attr in _ALLCLEAR_NAMES:
                 p = par.get(node)
                 first_arg_of_emit = (
@@ -263,7 +265,7 @@ def _scan_module(name: str):
                 hit(node, "cert-override", ast.unparse(node))
         elif isinstance(node, ast.ImportFrom) and node.module in ("exitcodes", "allclear"):
             for a in node.names:
-                if a.name in (_EXIT_NAMES | {"RULEHAWK_CERT"}) | _ALLCLEAR_NAMES:
+                if a.name in (_EXIT_NAMES | {"RULEHAWK_CERT", "certified"}) | _ALLCLEAR_NAMES:
                     hit(node, "import-name", f"{node.module}.{a.name}")
         elif isinstance(node, ast.Global) and "RULEHAWK_CERT" in node.names:
             hit(node, "cert-override", "global RULEHAWK_CERT")
@@ -295,7 +297,81 @@ def _scan_module(name: str):
             if f in ("setattr", "delattr", "vars") and node.args \
                     and isinstance(node.args[0], ast.Name) and node.args[0].id in ac:
                 hit(node, "allclear-write", ast.unparse(node))
+        _passed_sets(node, ac, hit)
     return out
+
+
+def _is_passed_call(v, ac) -> bool:
+    return (isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "passed" and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in ac)
+
+
+def _names_passed(t) -> bool:
+    return ((isinstance(t, ast.Name) and t.id == "passed")
+            or (isinstance(t, ast.Attribute) and t.attr == "passed")
+            or (isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)
+                and t.slice.value == "passed"))
+
+
+def _flat(t):
+    if isinstance(t, (ast.Tuple, ast.List)):
+        for e in t.elts:
+            yield from _flat(e)
+    elif isinstance(t, ast.Starred):
+        yield from _flat(t.value)
+    else:
+        yield t
+
+
+def _passed_sets(node, ac, hit):
+    """Review of #47 (optional rule): a `passed` name, attribute, keyword or
+    dict key set to anything but an allclear.passed() call. Spelling only, like
+    the rest of the scan: `passed` read back from something set elsewhere is a
+    hit at the site that sets it."""
+    def h(n, text):
+        hit(n, "passed-set", text[:72])
+
+    if isinstance(node, ast.keyword) and node.arg == "passed" \
+            and not _is_passed_call(node.value, ac):
+        h(node, f"passed={ast.unparse(node.value)}")
+    elif isinstance(node, ast.Dict):
+        for k, v in zip(node.keys, node.values):
+            if isinstance(k, ast.Constant) and k.value == "passed" \
+                    and not _is_passed_call(v, ac):
+                h(node, f'"passed": {ast.unparse(v)}')
+    elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+        if node.value is None:                      # `passed: bool`, no value
+            return
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        aug = isinstance(node, ast.AugAssign)
+        for t in targets:
+            if _names_passed(t):
+                if aug or not _is_passed_call(node.value, ac):
+                    h(node, f"{ast.unparse(t)} = {ast.unparse(node.value)}")
+            else:
+                for e in _flat(t):
+                    if _names_passed(e):            # unpacked: never a passed() call
+                        h(node, ast.unparse(e))
+    elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension, ast.withitem)):
+        t = node.optional_vars if isinstance(node, ast.withitem) else node.target
+        for e in _flat(t) if t is not None else ():
+            if _names_passed(e):
+                h(e if isinstance(node, ast.comprehension) else node, ast.unparse(e))
+    elif isinstance(node, ast.Call):
+        f = ast.unparse(node.func)
+        if f in ("setattr", "dict.__setitem__") or f.endswith((".setdefault", ".__setitem__")):
+            key = node.args[1] if f == "setattr" and len(node.args) > 1 else (
+                node.args[0] if node.args and f != "setattr" else None)
+            val = node.args[2 if f == "setattr" else 1] if len(node.args) > (
+                2 if f == "setattr" else 1) else None
+            if isinstance(key, ast.Constant) and key.value == "passed" \
+                    and not _is_passed_call(val, ac):
+                h(node, ast.unparse(node))
+    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "passed":
+        for r in ast.walk(node):
+            if isinstance(r, ast.Return) and not _is_passed_call(r.value, ac):
+                h(r, f"def passed: return {ast.unparse(r.value) if r.value else 'None'}")
 
 
 def _scan():

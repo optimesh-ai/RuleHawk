@@ -639,10 +639,16 @@ def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
     # so (design v2 section 3.1, review v4 delta R4-L2). Level `note`, so a repo
     # that blocks on warnings is not newly blocked: blocking stays with exit 3.
     # The fingerprint is the rule id and the file path, never a line, so the
-    # alert does not churn between runs.
+    # alert does not churn between runs. One note per distinct URI: a file
+    # given twice (a.cfg and ./a.cfg) is one file.
+    seen = set()
     for fr in gate.files:
         if allclear.certified():
             continue
+        uri = _sarif_uri(fr.path)
+        if uri in seen:
+            continue
+        seen.add(uri)
         if UNCERTIFIED_RULE not in rule_index:
             rule_index[UNCERTIFIED_RULE] = len(rules)
             rules.append({
@@ -654,7 +660,6 @@ def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
                 "defaultConfiguration": {"level": "note"},
                 "properties": {"tags": ["firewall", "certification"]},
             })
-        uri = _sarif_uri(fr.path)
         results.append({
             "ruleId": UNCERTIFIED_RULE,
             "ruleIndex": rule_index[UNCERTIFIED_RULE],

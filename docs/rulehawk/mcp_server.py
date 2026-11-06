@@ -330,9 +330,10 @@ def _coverage(gate, base: str, skipped: List[dict]) -> dict:
                                  "reason": f"cannot read: {fr.error}"})
     for na in not_analysed:
         na["path"] = _rel(na["path"], base) if os.path.isabs(na["path"]) else na["path"]
-    # No file is certified in this release (allclear), so every analysed file
-    # is uncertified and coverage is never complete (design v2 section 3.1).
-    uncertified = sum(1 for _ in analysed if not allclear.certified())
+    # No file is certified in this release (allclear), so every input file,
+    # analysed or not, is uncertified and coverage is never complete (design
+    # v2 section 3.1). A file that was not analysed is never certified.
+    uncertified = sum(1 for _ in analysed if not allclear.certified()) + len(not_analysed)
     if not_analysed:
         state, why = "incomplete", ("at least one input was NOT analysed (see "
                                     "not_analysed); no PASS is given")
@@ -342,9 +343,10 @@ def _coverage(gate, base: str, skipped: List[dict]) -> dict:
     else:
         # complete only when every file is file-certified; partial until then.
         state = allclear.emit(allclear.COMPLETE)
-        why = ("every file was parsed and every line was modelled, but "
+        # The text names the state emit() gave, so the two cannot disagree.
+        why = ("every file was parsed and every line was modelled; "
                f"{uncertified} file(s) are not certified (fail-closed stopgap "
-               "pending soundness review), so coverage is partial")
+               f"pending soundness review), so coverage is {state}")
     return {
         "state": state,
         "explanation": why,
