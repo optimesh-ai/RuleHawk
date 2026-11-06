@@ -810,3 +810,30 @@ def test_red_sets_stay_within_the_stopgap():
     on the two surfaces slice 2 turns green. Widening either is an edit here."""
     assert not _RED_B, sorted(_RED_B)
     assert {s for _, s in _RED} <= {"sarif", "mcp_audit"}, sorted({s for _, s in _RED})
+
+
+@pytest.mark.parametrize("top", ["PASS", "ACCEPTED", "VERIFIED", "NO_NEW_RISK", "CLEAN", None])
+@pytest.mark.parametrize("rel", ["cfg/a02_ios_seq_reorder_permit_first.cfg",
+                                 "cfg3/k15_junos_pci_nexthop_on_corp_segment.conf"])
+def test_cli_json_top_level_all_clear_is_bad(rel, top, monkeypatch, tmp_path):
+    """Departure 6 (review of #46, Q2): an all-clear in the CLI JSON's
+    top-level `verdict` makes the cli_json cell bad even when every
+    assertion finding still reads FAIL or UNKNOWN. A missing or unknown
+    top-level verdict is bad too."""
+    real = _quiet
+
+    def top_says(fn, argv):
+        rc, out = real(fn, argv)
+        d = json.loads(out)
+        if top is None:
+            d.pop("verdict", None)
+        else:
+            d["verdict"] = top
+        return rc, json.dumps(d)
+
+    pol, allowed = _ATTACKS[rel]
+    before = _observe("cli_json", rel, pol, tmp_path)
+    assert not _SURFACES["cli_json"][1](before, allowed, rel), before
+    monkeypatch.setattr(sys.modules[__name__], "_quiet", top_says)
+    after = _observe("cli_json", rel, pol, tmp_path)
+    assert _SURFACES["cli_json"][1](after, allowed, rel), after
