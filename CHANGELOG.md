@@ -34,7 +34,9 @@ exit **3**.
 
 `0` PASS · `1` FAIL · `2` parse failure or invalid input · `3` UNKNOWN (new).
 UNKNOWN never shares the PASS code. Precedence: 2, then 1, then 3, then 0.
-`--fail-on none` stays advisory and exits 0.
+`--fail-on none` stays advisory and exits 0, but it reports the real
+verdict (FAIL / UNKNOWN / ADVISORY, "not enforced"), never PASS unless the
+run is one.
 
 ### False-PASS fixes (each was `segmentation-ok`, exit 0 and `VERIFIED` in 0.4.0)
 
@@ -77,9 +79,27 @@ UNKNOWN never shares the PASS code. Precedence: 2, then 1, then 3, then 0.
   `255.255.255.255` -> UNKNOWN (`ios-wildcard-all-ones`). 14.
 - An unrecognised vendor label -> UNKNOWN (`vendor-unknown`).
 - An interface that admits a family unfiltered plus another that emits it
-  unfiltered (a way across the device that meets no audited rule) -> UNKNOWN
-  (`unfiltered-path`; IOS/NX-OS/EOS and Junos, per address family). ASA
-  interface coverage is not modelled and is blocked.
+  unfiltered, or one interface with no filter in either direction (a
+  hairpin between a primary and a secondary subnet), is a way across the
+  device that meets no audited rule -> UNKNOWN (`unfiltered-path`;
+  IOS/NX-OS/EOS and Junos, per address family). A Junos unit family other
+  than inet/inet6 (mpls, iso, ccc, ...) counts as unfiltered. ASA interface
+  coverage is not modelled and is blocked; `access-group NAME global` now
+  counts as an ASA marker. An ACL bound only on `shutdown` interfaces covers
+  nothing -> UNKNOWN (`acl-role-unknown`).
+- PAN-OS rule fields are an allowlist: a field RuleHawk neither models nor
+  knows to be harmless (`source-imsi`, `source-imei`, `source-nw-slice`, or
+  any unknown name) is a parse note -> UNKNOWN (`parse-note`). Each field
+  takes one value or a `[ ]` list, so an unknown field is never swallowed as
+  the previous field's value. A rule with `profile-setting` blocks a
+  connectivity OK (`panos-security-profile`); isolation is unaffected.
+- Cisco: banner text (`banner motd|login|exec|incoming ...`, delimited or
+  Arista `EOF` form) is skipped, never parsed as ACL lines; a banner whose
+  delimiter cannot be determined or that never closes is a parse note.
+  `no access-list N` and other ACL deletions are not replayed: a parse note
+  -> UNKNOWN.
+- iptables-restore input with more than one `*filter` block is a parse note
+  -> UNKNOWN (restore replaces the table at each block).
 - iptables rules that match ports or other L4 fields, which a non-initial
   fragment never matches -> UNKNOWN (`iptables-fragments`).
 - A violation that Hammerhead path-grounding suppresses (one witness proven
@@ -109,9 +129,27 @@ UNKNOWN never shares the PASS code. Precedence: 2, then 1, then 3, then 0.
 - A run that exited 0 with PASS in 0.4.0 can now exit 3 with UNKNOWN. This
   hits most often on a config whose ACLs have no `ip access-group` /
   `access-group` binding (a bare ACL snippet), a config with any parse note,
-  and any L4 rule on IOS/Junos (`l4-fragments`). CI that treats non-zero as
-  failure will go red; read the reason codes, then bind the ACL, fix the
-  note, or keep the job advisory with `fail-on: none`.
+  any L4 rule on IOS/Junos (`l4-fragments`), and any iptables rule that
+  matches ports or other L4 fields (`iptables-fragments`). CI that treats
+  non-zero as failure will go red; read the reason codes, then bind the ACL
+  or fix the note. `fail-on: none` keeps the job from failing, but it no
+  longer turns these into a PASS: the job reports UNKNOWN (not enforced) and
+  `passed` is false.
+- `fail-on: none` / `--fail-on none`: the gate JSON and result record
+  `verdict` is now the real verdict (`PASS`, `ADVISORY`, `UNKNOWN` or
+  `FAIL`; it used to be `ADVISORY` always), with a new `enforced: false`.
+  `passed` is true only when that verdict is PASS (it used to be true on
+  every advisory run). The console, the PR comment, `rulehawk combine` and
+  the Action outputs show the verdict marked "not enforced"; the exit code
+  is still 0, and combine's exit code counts enforced checks only. A result
+  record from an earlier version with `fail_on: none` and `passed: true` but
+  no real verdict is read as UNKNOWN by `rulehawk combine`.
+- MCP `rulehawk_compare` returns `UNKNOWN` where it used to return
+  `NO_NEW_RISK` when the after-config has an assertion RuleHawk cannot
+  prove; only `NO_NEW_RISK` is an all-clear.
+- PASS messages now end with their scope ("no audited ruleset permits this
+  flow; assumes every interface is in the file; routing, NAT and topology
+  not evaluated"); match on the `verdict` field, not the message text.
 - An indeterminate assertion used to exit 0 below the threshold; it now exits 3.
 - A violation suppressed by Hammerhead path-grounding used to exit 0; it is now UNKNOWN (`pathground-witness-only`) and exits 3.
 - The evidence schema stays `rulehawk.evidence/v1`; `reasons` is additive.
