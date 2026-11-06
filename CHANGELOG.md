@@ -49,7 +49,8 @@ same codes with its fixed critical/high threshold, so a clean config now exits
 - GitHub Action: exit 3 fails the check with an error annotation naming the
   stopgap. New outputs `verdict` and `exit-code`; `passed` is never true.
   Under `fail-on: none` the step succeeds with a warning that names the
-  verdict.
+  verdict. If the gate step aborts before RuleHawk records an exit code, the
+  check fails with "No verdict was recorded" (0.3.1 treated that as exit 0).
 - The hosted page is served from the main line, not from 0.3.x; its stopgap
   ships in 0.4.1.
 
@@ -61,3 +62,29 @@ already fail, until PASS returns in the next release. Steps that read
 `outputs.passed` see `false`. To keep a non-blocking run meanwhile, set
 `fail-on: none`: the step exits 0 and reports the verdict without enforcing
 it.
+
+`fail-on: none` turns off **all** blocking, not just UNKNOWN: a FAIL (exit 1)
+and a config that parses to zero rules (exit 2) no longer fail the step
+either. To keep blocking on FAIL while UNKNOWN stays non-blocking, keep
+`fail-on` at your threshold and gate on the verdict yourself:
+
+```yaml
+- id: rh
+  uses: optimesh-ai/RuleHawk@v1
+  continue-on-error: true
+  with:
+    configs: 'firewall/**/*.txt'
+    fail-on: high
+- if: steps.rh.outputs.verdict == 'FAIL' || steps.rh.outputs.exit-code == '2'
+  run: exit 1
+```
+
+### Other changes you may notice
+
+- CLI text output now carries a `VERDICT:` line on every run, FAIL runs
+  included, so the text output is not byte-identical to 0.3.1; the findings
+  themselves are unchanged.
+- SARIF: a run that is UNKNOWN with no FAIL findings uploads an **empty**
+  SARIF file. GitHub code scanning reads that as "no alerts", and it can close
+  alerts left open by an earlier run. It is not a pass; read the check's
+  verdict, not the alert count.

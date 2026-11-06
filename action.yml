@@ -211,8 +211,11 @@ runs:
         RH_WORST: ${{ steps.gate.outputs.worst }}
         RH_VERDICT: ${{ steps.gate.outputs.verdict }}
       run: |
-        RC="$(cat "${RUNNER_TEMP:-/tmp}/rulehawk.rc" 2>/dev/null || echo 0)"
-        if [ "${RC}" = "2" ]; then
+        RC="$(cat "${RUNNER_TEMP:-/tmp}/rulehawk.rc" 2>/dev/null || echo missing)"
+        if [ "${RC}" = "missing" ]; then
+          echo "::error title=RuleHawk gate did not complete::No verdict was recorded — the gate step aborted before RuleHawk ran. See the step log above."
+          exit 1
+        elif [ "${RC}" = "2" ]; then
           echo "::error title=RuleHawk gate failed (fail-closed)::One or more configs parsed to zero rules — RuleHawk will not certify isolation it could not verify. Check the vendor/format, or set the 'vendor' input."
           exit 1
         elif [ "${RC}" = "3" ]; then

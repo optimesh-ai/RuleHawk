@@ -44,7 +44,7 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 |---|---|---|
 | `configs` | — (**required**) | Files/globs to audit, whitespace or newline separated. Recursive `**` supported (e.g. `firewall/**/*.conf`). |
 | `policy` | `''` | Path to a segmentation policy JSON (zones + `must_not_reach`; see [`policy.md`](policy.md)). Omit for hygiene checks only. |
-| `fail-on` | `high` | Fail the check at this severity or worse: `critical` \| `high` \| `medium` \| `low` \| `none`. `none` is advisory (never blocks). |
+| `fail-on` | `high` | Fail the check at this severity or worse: `critical` \| `high` \| `medium` \| `low` \| `none`. `none` is advisory (never blocks): it stops FAIL (exit 1) and zero-rule parses (exit 2) from failing the step too, not just UNKNOWN. |
 | `vendor` | `auto` | Force a vendor for every file: `auto` \| `ios` \| `junos` \| `panos` \| `iptables`. |
 | `comment` | `true` | Post/update a single sticky PR comment with the findings. |
 | `upload-sarif` | `true` | Upload SARIF to code scanning so findings annotate the exact diff line. |
