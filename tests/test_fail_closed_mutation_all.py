@@ -40,6 +40,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from rulehawk import cli  # noqa: E402
 from rulehawk import gate as g  # noqa: E402
 
+try:
+    from rulehawk.failclosed import collect_ledgers  # noqa: E402
+except ImportError:                      # before round 8: no ledger
+    collect_ledgers = None
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _FX = os.path.join(_ROOT, "tests", "fixtures", "fail_closed")
 _POL = os.path.join(_FX, "pol")
@@ -67,7 +72,11 @@ def _corpus() -> List[Tuple[str, str]]:
     for d in ("rev42", "rev42r2", "rev42r3", "variants"):
         for path in sorted(glob.glob(os.path.join(_FX, d, "**", "*"), recursive=True)):
             if os.path.isfile(path):
-                pol = "v4_reach_ip.json" if "reach" in os.path.basename(path) else "v4_ip.json"
+                base = os.path.basename(path)
+                pol = "v4_reach_ip.json" if "reach" in base else "v4_ip.json"
+                if os.sep + "r7" + os.sep in path:      # the reviewer's round-8 driver
+                    pol = ("v6_ip.json" if base.startswith("v6") else
+                           "v4_tcp445.json" if "tcp445" in base else pol)
                 out.append((path, os.path.join(_POL, pol)))
     for path in sorted(glob.glob(os.path.join(_ROOT, "samples", "*"))):
         if not path.endswith("policy.json"):
@@ -103,11 +112,16 @@ _NEUTRAL_BREAKS = {" hostname R1", "router ospf 1", " line vty 0 4",
 # allowlist, abbreviations of `exit` / `end` / `hostname`, and tab or Unicode
 # indentation. On IOS a command the sub-mode lacks is run in global mode, so
 # the ACL entries after it are rejected: the reference drops them.
-_INDEPENDENT_BREAKS = [" ntp server 203.0.113.1", " ex", " exi", " EX", "\tex", " hostn R1",
+_INDEPENDENT_BREAKS = [" ntp server 203.0.113.1", " hostn R1",
                        "\tlogging host 203.0.113.9", " no ip domain-lookup",
                        " aaa new-model", " username u secret x", " service timestamps",
-                       " ip ssh version 2", " en", "\u00a0ntp server 203.0.113.1",
-                       "\u2003exit"]
+                       " ip ssh version 2", "\u00a0ntp server 203.0.113.1",
+                       " ip name-server 203.0.113.53", " clock timezone UTC 0",
+                       " ip domain name example.net"]
+# Abbreviations of `exit` / `end`: they are on the lexer's own `_EXIT_END`
+# list, so they are a known-breaks family of their own, not independent ones
+# (round 8, R7-8).
+_ABBREV_BREAKS = [" ex", " exi", " EX", "\tex", " en", "\u2003exit"]
 
 Mutant = Tuple[str, str, str, str, Optional[str]]   # family, tag, text, kind, ref
 
@@ -181,15 +195,18 @@ def _cisco(lines: List[str]) -> Iterator[Mutant]:
             for i in range(s, e):
                 if not lines[i].strip() or lines[i].lstrip().startswith("!"):
                     continue
-                for b in _INDEPENDENT_BREAKS:
-                    mutant = _j(lines[:i] + [b] + lines[i:])
-                    if b[:1] not in (" ", "\t"):
-                        kind, ref = "never", None        # a Unicode space
-                    elif b.strip().lower() == "en":
-                        kind, ref = "ref", _j(lines[:i])
-                    else:
-                        kind, ref = "ref", _j(lines[:i] + lines[e:])
-                    yield (fam + "-unlisted", f"{i + 1}:{b.strip()}", mutant, kind, ref)
+                for sfx, brks in (("-unlisted", _INDEPENDENT_BREAKS),
+                                  ("-abbrev", _ABBREV_BREAKS)):
+                    for b in brks:
+                        mutant = _j(lines[:i] + [b] + lines[i:])
+                        if b[:1] not in (" ", "\t"):
+                            kind, ref = "never", None        # a Unicode space
+                        elif b.strip().lower() == "en":
+                            kind, ref = "ref", _j(lines[:i])
+                        else:
+                            kind, ref = "ref", _j(lines[:i] + lines[e:])
+                        yield (fam + sfx, f"{i + 1}:{b.strip()}", mutant, kind, ref)
+    yield from _cisco_acl_meaning(lines)
     # R6-2: `exit` after a one-line global command leaves configuration mode;
     # after the body of a mode RuleHawk does not model, it may.
     for i in range(1, len(lines)):
@@ -203,6 +220,58 @@ def _cisco(lines: List[str]) -> Iterator[Mutant]:
                "ref", _j(lines[:i] + ["router ospf 9"]))
     yield ("crlf", "", "\r\n".join(lines), "preserve", None)
     yield ("tabs", "", _j(re.sub(r"^ +", "\t", ln) for ln in lines), "preserve", None)
+
+
+_NUM = re.compile(r"^\s*(sequence\s+)?(\d+)\s")
+_PD = re.compile(r"(?i)\b(?:permit|deny)\b")
+
+
+def _cisco_acl_meaning(lines: List[str]) -> Iterator[Mutant]:
+    """Lines the ACL grammar admits whose meaning must be modelled (round 8,
+    R7-8): a deletion, a `default` line, a numbered entry among unnumbered
+    ones, a trailing token. The test's own reading of the device:
+
+    - `no N` deletes entry N of a fully numbered body (IOS XE 17 "IP Access
+      List Entry Sequence Numbering": "Use the no sequence-number command to
+      delete an entry."): ref = the body without it.
+    - `default N`, `default sequence N`, `no sequence N`, `default remark`:
+      what the device does is not cited here: never.
+    - `1 permit ... any any` at the end of an unnumbered body runs first on
+      the device ("the first entry is assigned a sequence number of 10, and
+      successive entries are incremented by 10"): ref = the permit first.
+    - an entry with an unknown trailing word is rejected (`% Invalid input`):
+      ref = the line dropped."""
+    for s, e in _bodies(lines, _ACL_HDR):
+        body = [(i, lines[i]) for i in range(s, e)
+                if lines[i].strip() and not lines[i].lstrip().startswith("!")]
+        ents = [(i, ln) for i, ln in body if _ENTRY.match(ln) and _PD.search(ln)]
+        if not ents:
+            continue
+        ind = re.match(r"^[ \t]*", ents[0][1]).group(0) or " "
+        nums = [_NUM.match(ln) for _, ln in body]
+        v6 = "ipv6" in lines[s - 1].lower()
+        ins = lambda extra: _j(lines[:e] + [ind + extra] + lines[e:])  # noqa: E731
+        for i, ln in ents:
+            mm = _NUM.match(ln)
+            if mm and all(nums):
+                n = mm.group(2)
+                yield ("cisco-acl-entry-delete", f"{i + 1}:no {n}", ins("no " + n), "ref",
+                       _j(lines[:i] + lines[i + 1:]))
+                yield ("cisco-acl-entry-delete", f"{i + 1}:no sequence {n}",
+                       ins("no sequence " + n), "never", None)
+                yield ("cisco-acl-default", f"{i + 1}:default {n}", ins("default " + n),
+                       "never", None)
+                yield ("cisco-acl-default", f"{i + 1}:default sequence {n}",
+                       ins("default sequence " + n), "never", None)
+            yield ("cisco-acl-trailing-token", f"{i + 1}",
+                   _j(lines[:i] + [ln.rstrip() + " xyzzy"] + lines[i + 1:]), "ref",
+                   _j(lines[:i] + lines[i + 1:]))
+        yield ("cisco-acl-default", f"{s + 1}:default remark", ins("default remark"),
+               "never", None)
+        if not any(nums):
+            anyany = "permit ipv6 any any" if v6 else "permit ip any any"
+            yield ("cisco-acl-seq-mix", f"{s + 1}", ins("1 " + anyany), "ref",
+                   _j(lines[:s] + [ind + anyany] + lines[s:]))
 
 
 def _iptables(lines: List[str]) -> Iterator[Mutant]:
@@ -299,10 +368,6 @@ def _junos(lines: List[str]) -> Iterator[Mutant]:
         starts.append(off + len(ln) - len(ln.lstrip()))
         off += len(ln) + 1
 
-    def in_comment(i: int) -> bool:
-        # the first word of line i is inside a comment
-        return cmt[min(starts[i], len(text))]
-
     def in_block(i: int) -> bool:
         # the newline before line i is inside a /* */ block
         return 0 < i < len(heads) and cmt[heads[i] - 1]
@@ -334,16 +399,21 @@ def _junos(lines: List[str]) -> Iterator[Mutant]:
         if i + 2 < len(lines) and not in_block(i) and not in_block(i + 2):
             m = lines[:i] + ["# a /*"] + lines[i:i + 2] + ["# b */"] + lines[i + 2:]
             yield ("junos-hash-block", f"{i + 1}", _j(m), "never", None)
-        # Junos comments do not nest (R6-4): no annotation inside a block.
-        if not in_block(i):
-            yield ("junos-annotation", f"{i + 1}", _j(lines[:i] + ["/* x */"] + lines[i:]),
-                   "preserve", None)
+        # Junos comments do not nest (R6-4): inside a block, the annotation's
+        # `*/` ends the block early, so the rest of it is read as statements
+        # (round 8: restored, labelled never).
+        yield ("junos-annotation", f"{i + 1}", _j(lines[:i] + ["/* x */"] + lines[i:]),
+               "never" if in_block(i) else "preserve", None)
         words = ln.split(" ")
         lead = next((w for w, x in enumerate(words) if x and x[0].isalpha()), None)
-        if lead is not None and words[lead].upper() != words[lead] and not in_comment(i):
+        if lead is not None and words[lead].upper() != words[lead]:
             up = words[:lead] + [words[lead].upper()] + words[lead + 1:]
+            # A word inside a comment changes nothing on the device (round 8:
+            # restored, labelled preserve); anywhere else the upper-case
+            # keyword is rejected.
+            at = heads[i] + len(" ".join(words[:lead])) + (1 if lead else 0)
             yield ("junos-keyword-case", f"{i + 1}", _j(lines[:i] + [" ".join(up)] + lines[i + 1:]),
-                   "never", None)
+                   "preserve" if cmt[min(at, len(text))] else "never", None)
     yield ("crlf", "", "\r\n".join(lines), "never", None)
     yield ("tabs", "", _j(re.sub(r"^ +", "\t", ln) for ln in lines), "preserve", None)
 
@@ -391,6 +461,8 @@ class _Runner:
         self.n = 0
         self.cache: Dict[Tuple[str, str], Tuple[str, str]] = {}
         self.policies: Dict[str, dict] = {}
+        self.ledger: Counter = Counter()
+        self.ledger_bad: List[str] = []
 
     def path_for(self, text: str, ext: str) -> str:
         self.n += 1
@@ -404,9 +476,26 @@ class _Runner:
         if key not in self.cache:
             p = self.path_for(text, ext)
             buf = io.StringIO()
-            with redirect_stdout(buf):
-                cli.main([p, "--json", "--policy", pol])
+            if collect_ledgers is None:
+                with redirect_stdout(buf):
+                    cli.main([p, "--json", "--policy", pol])
+                leds = []
+            else:
+                with collect_ledgers() as leds, redirect_stdout(buf):
+                    cli.main([p, "--json", "--policy", pol])
             v_cli = json.loads(buf.getvalue())["assertion_verdict"] or "NONE"
+            # The line-accounting invariant on every mutant (round 8): every
+            # ledger closed, nothing unaccounted, a noted line means no PASS.
+            self.ledger["configs"] += 1
+            flagged = False
+            for led in leds:
+                c = led.counts()
+                self.ledger.update(c)
+                flagged |= bool(c["noted"] or c["caught"])
+                if not led.closed or c["unaccounted"]:
+                    self.ledger_bad.append(f"m{self.n} {led.frontend} {c}")
+            if flagged and v_cli == "PASS":
+                self.ledger_bad.append(f"m{self.n}: noted line but PASS")
             if pol not in self.policies:
                 with open(pol, encoding="utf-8") as fh:
                     self.policies[pol] = json.load(fh)
@@ -484,7 +573,17 @@ def test_no_mutant_passes_where_the_device_would_not(tmp_path_factory):
             fh.write(table + "\n" + "\n".join(bad) + "\n")
     total = sum(s["mutants"] for s in stats.values())
     assert seeds["PASS"] >= 60 and total >= 20000, (dict(seeds), total)
-    for fam in ("cisco-acl-mode-break", "cisco-acl-mode-break-unlisted",
+    led = dict(run.ledger)
+    print("ledger:", led)
+    if out:
+        with open(out, "a", encoding="utf-8") as fh:
+            fh.write("ledger: " + json.dumps(led) + "\n")
+    assert collect_ledgers is not None, "no line-accounting ledger (round 8)"
+    assert not run.ledger_bad, "\n".join(run.ledger_bad[:40])
+    assert led.get("unaccounted", 0) == 0 and led.get("scope", 0) > 0, led
+    for fam in ("cisco-acl-entry-delete", "cisco-acl-seq-mix", "cisco-acl-default",
+                "cisco-acl-trailing-token", "cisco-acl-mode-break-abbrev",
+                "cisco-acl-mode-break", "cisco-acl-mode-break-unlisted",
                 "cisco-global-exit", "cisco-submode-body-exit", "junos-brace",
                 "junos-hash-in-word", "panos-quoted-name-space",
                 "cisco-post-end", "ipt-comment-out",
