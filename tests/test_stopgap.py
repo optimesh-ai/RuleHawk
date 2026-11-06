@@ -568,7 +568,8 @@ def test_hosted_page_never_shows_an_empty_reason():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from stopgap_fail_baseline import MUST_REACH_POLICY
     cases = [(open(CLEAN).read(), json.dumps(MUST_REACH_POLICY)),
-             ("ip access-list extended EDGE\n permit tcp any any eq 23\n",
+             # telnet from any to a host in no zone: a high finding, no violation
+             ("ip access-list extended EDGE\n permit tcp any host 192.0.2.10 eq 23\n",
               open(POLICY).read())]
     envs = [_hosted(cfg, pol) for cfg, pol in cases]
     assert [e["report_json"]["verdict"] for e in envs] == ["FAIL", "FAIL"]

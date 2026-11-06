@@ -205,9 +205,10 @@ def test_a_pass_claim_with_findings_at_the_threshold_is_not_a_pass(tmp_path):
 def test_a_pass_claim_with_unparsed_files_is_not_a_pass(tmp_path):
     p = _record(tmp_path, "unparsed", parse_failures=1)
     assert combine.render([p])[1] == "UNKNOWN"
-    # ...except under the advisory threshold, which never blocks.
+    # Under the advisory threshold it never blocks, but a `passed: true`
+    # record (a gate before 0.4.1) is still never a pass (fail-closed stopgap).
     q = _record(tmp_path, "advisory", parse_failures=1, fail_on="none")
-    assert combine.render([q])[1] == "PASS"
+    assert combine.render([q])[1] == "UNKNOWN"
 
 
 def test_a_record_missing_its_counts_is_not_a_pass(tmp_path):

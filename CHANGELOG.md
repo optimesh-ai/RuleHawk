@@ -33,9 +33,11 @@ release.
 Precedence: 2, then 1, then 3. The single-file CLI (`rulehawk FILE`) uses the
 same codes with its fixed critical/high threshold, so a clean config now exits
 3, including a hygiene-only run with no policy. `rulehawk combine` keeps its
-own codes (0 PASS, 1 FAIL, 2 UNKNOWN): a check that reports UNKNOWN makes it
-exit 2, and a `fail-on none` check is shown as "UNKNOWN (not enforced)"
-without changing its exit code. `--help` still exits 0.
+own codes (1 FAIL, 2 UNKNOWN; 0 only when no check is enforced, and it never
+reports PASS): a check that reports UNKNOWN makes it exit 2, and a `fail-on
+none` check is shown as "UNKNOWN (not enforced)" or "FAIL (not enforced)"
+without changing its exit code, so the headline can read FAIL while combine
+exits 2. `--help` still exits 0.
 
 ### What each surface reports
 
@@ -58,7 +60,10 @@ without changing its exit code. `--help` still exits 0.
   verdict.
 - `rulehawk combine` and `optimesh-ai/RuleHawk/comment`: a gate result with
   exit 3 is UNKNOWN; new `--verdict PATH`; `fail-on none` checks are shown but
-  not enforced.
+  not enforced. A result file from a gate before 0.4.1 (`passed: true`) is read
+  as UNKNOWN, never PASS, and the comment action never maps an exit 0 to PASS:
+  its `verdict` output is `FAIL` or `UNKNOWN`, and it no longer prints "Every
+  RuleHawk check in this run passed."
 - MCP server: `rulehawk_audit` returns `UNKNOWN` (with `reasons` and
   `segmentation_unknown`) where it returned `PASS`, and `rulehawk_compare`
   returns `UNKNOWN` where it returned `NO_NEW_RISK`.
@@ -73,3 +78,34 @@ already fail, until PASS returns in the next release. Steps that read
 `outputs.passed` see `false`. To keep a non-blocking run meanwhile, set
 `fail-on: none`: the step exits 0 and reports the verdict without enforcing
 it.
+
+`fail-on: none` turns off **all** blocking, not just UNKNOWN: a FAIL (exit 1)
+and a config that parses to zero rules (exit 2) no longer fail the step
+either. To keep blocking on FAIL while UNKNOWN stays non-blocking, keep
+`fail-on` at your threshold and gate on the verdict yourself:
+
+```yaml
+- id: rh
+  uses: optimesh-ai/RuleHawk@v1
+  continue-on-error: true
+  with:
+    configs: 'firewall/**/*.txt'
+    fail-on: high
+- if: steps.rh.outputs.verdict == 'FAIL' || steps.rh.outputs.exit-code == '2'
+  run: exit 1
+```
+
+### Other changes you may notice
+
+- CLI text output now ends with a `VERDICT:` line on every run, FAIL runs
+  included, so the text output is not byte-identical to 0.4.0; the findings
+  themselves are unchanged.
+- A run whose only findings are accepted risks (`--accept`) exited 0 in 0.4.0
+  and now exits 3 (UNKNOWN).
+- Evidence control rows that read REVIEW now read UNKNOWN.
+- MCP `rulehawk_audit`: `segmentation_passed` is now always empty (`[]`);
+  undecided assertions are listed in `segmentation_unknown`.
+- SARIF: a run that is UNKNOWN with no FAIL findings uploads an **empty**
+  SARIF file. GitHub code scanning reads that as "no alerts", and it can close
+  alerts left open by an earlier run. It is not a pass; read the check's
+  verdict, not the alert count.

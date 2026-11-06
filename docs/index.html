@@ -659,7 +659,7 @@ function verdictBlock(d, vendor){
         <button class="small" data-act="copy">Copy report</button>
         <button class="small" data-act="json">Download JSON</button>
         <button class="small" data-act="txt">Download .txt</button>
-        <button class="small" data-act="ev-md" title="Audit-ready evidence document: what was audited, its SHA-256, which policy claims passed or failed, and the PCI/NIST/ISO/CIS/SOC 2/HIPAA controls each bears on">Download evidence (.md)</button>
+        <button class="small" data-act="ev-md" title="Audit-ready evidence document: what was audited, its SHA-256, which policy claims failed or stayed undecided, and the PCI/NIST/ISO/CIS/SOC 2/HIPAA controls each bears on">Download evidence (.md)</button>
         <button class="small" data-act="ev-json" title="The same evidence artifact as JSON, for a GRC platform or evidence vault">Evidence (.json)</button>
       </div>
     </div>
@@ -667,8 +667,15 @@ function verdictBlock(d, vendor){
 }
 
 // Fail-closed stopgap (0.4.1): the reason a verdict is UNKNOWN, as text.
+// An UNKNOWN banner always names it: a FAIL run's own reasons are [], but its
+// undecided assertions are still UNKNOWN for this reason.
+const STOPGAP_REASONS = [{code: "fail-closed-stopgap",
+                          message: "fail-closed stopgap pending soundness review"}];
 function reasonsText(rs){
   return (rs||[]).map(r => `${esc(r.code)}: ${esc(r.message)}`).join("; ");
+}
+function unknownReasonsText(rs){
+  return reasonsText((rs||[]).length ? rs : STOPGAP_REASONS);
 }
 
 // ---- render a single finding card ----
@@ -729,7 +736,7 @@ function render(d, vendor){
     const cls = hasViol ? "fail" : "warn";
     const label = hasViol ? "Segmentation failed — a forbidden flow is permitted"
                 : hasInd  ? "Segmentation indeterminate — manual review needed"
-                : "Segmentation UNKNOWN — not certified (" + reasonsText(d.reasons) + ")";
+                : "Segmentation UNKNOWN — not certified (" + unknownReasonsText(d.reasons) + ")";
     html += `<div class="segpanel"><div class="seghdr">Segmentation policy</div>
       <div class="segbanner ${cls}">${label}</div>`
       + seg.map(findingHTML).join("") + `</div>`;
@@ -746,7 +753,7 @@ function render(d, vendor){
 
   if(!rest.length && !seg.length){
     // Fail-closed stopgap: nothing flagged is UNKNOWN, never an all-clear.
-    html += `<div class="segbanner warn">UNKNOWN — all rules analyzed and nothing flagged, but this result is not certified (${reasonsText(d.reasons)}).</div>`;
+    html += `<div class="segbanner warn">UNKNOWN — all rules analyzed and nothing flagged, but this result is not certified (${unknownReasonsText(d.reasons)}).</div>`;
   } else {
     html += rest.map(findingHTML).join("");
   }
@@ -837,7 +844,7 @@ function ctaHTML(){
   return `<div class="cta">
     <div class="cta-h">This audits one config, once.</div>
     <div class="cta-b">You just got an evidence artifact for this config — provenance, the
-      isolation claims that passed or failed, and the PCI&nbsp;DSS / NIST&nbsp;800-53 /
+      isolation claims that failed or stayed undecided, and the PCI&nbsp;DSS / NIST&nbsp;800-53 /
       ISO&nbsp;27001 / CIS / SOC&nbsp;2 / HIPAA controls each bears on. The free
       <code>rulehawk</code> CLI and GitHub Action repeat this audit on every pull request.
       Want a verdict on what a change does to the whole network, not just the rules it

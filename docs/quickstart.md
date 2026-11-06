@@ -122,17 +122,20 @@ RuleHawk"* or *"Before I push it, compare running.cfg with candidate.cfg"*.
 
 ### What the agent gets back
 
-- `verdict`: `PASS` (only all-clear for an audit), `FAIL`, `INCOMPLETE`
-  (something was not analysed), `ADVISORY` (`fail_on: none`), or `ERROR`
-  (with `error_code` and a `hint` saying what to change). `rulehawk_compare`
-  returns `NO_NEW_RISK` / `INTRODUCES_RISK` instead of PASS/FAIL.
+- `verdict`: `UNKNOWN` (nothing blocking was found, but the result is not
+  certified: reason `fail-closed-stopgap`, "fail-closed stopgap pending
+  soundness review" — treat it as a stop), `FAIL`, `INCOMPLETE` (something
+  was not analysed), `ADVISORY` (`fail_on: none`), or `ERROR` (with
+  `error_code` and a `hint` saying what to change). `rulehawk_compare`
+  returns `UNKNOWN` / `INTRODUCES_RISK`. RuleHawk 0.4.1 never returns `PASS`
+  or `NO_NEW_RISK` (fail-closed stopgap).
 - `blocking_findings`: file, line, rule, severity, witness packet, fix, and an
   `id` that stays the same across calls while the file is unchanged.
 - `coverage`: every file analysed, every file **not** analysed and why (empty,
   unrecognised format, wrong forced vendor, ACL over 10,000 rules), and lines
   the parser could not model.
-- `scope`: rule layer only. Routing, NAT and topology are not evaluated, so a
-  PASS is not a reachability proof.
+- `scope`: rule layer only. Routing, NAT and topology are not evaluated, so
+  even a future PASS is not a reachability proof.
 
 ### The skill
 

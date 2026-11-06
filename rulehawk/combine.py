@@ -11,8 +11,8 @@ worst verdict:
              does not fail, the fail-closed stopgap), or a check that was
              expected left no readable result (it crashed, was cancelled or
              skipped) — never read as a pass
-    PASS     every expected check reported and passed (a 0.4.1 gate never
-             reports one)
+    PASS     never in 0.4.1: a 0.4.1 gate never reports one, and a record
+             an older gate wrote with `passed: true` reads UNKNOWN
 
 usage:
   rulehawk combine <result-file-or-dir>... [--expect N] [--needs JSON]
@@ -20,9 +20,9 @@ usage:
 
 --needs takes the combining job's `toJSON(needs)`: a gate job that did not
 succeed, but whose results show no failure, is UNKNOWN. Directories are
-searched recursively for *.json. Exit code: 0 PASS, 1 FAIL,
-2 UNKNOWN (or a usage error), over the enforced checks; a `fail-on none`
-check is shown with its verdict, not enforced.
+searched recursively for *.json. Exit code, over the enforced checks: 1
+FAIL, 2 UNKNOWN (or a usage error), 0 only when no enforced check exists
+(every check is `fail-on none`, shown with its verdict, not enforced).
 """
 
 from __future__ import annotations
@@ -95,8 +95,9 @@ usage:
   -q, --quiet      no console report
 
 Directories are searched recursively for *.json.
-Exit code: 0 PASS, 1 FAIL, 2 UNKNOWN (or a usage error), over the enforced
-checks; a `fail-on none` check is shown with its verdict, not enforced.
+Exit code, over the enforced checks: 1 FAIL, 2 UNKNOWN (or a usage error);
+0 only when no enforced check exists (every check is `fail-on none`, shown
+with its verdict, not enforced).
 """
 
 
@@ -187,12 +188,15 @@ def _load(path: str) -> Check:
                      markdown=md, job=job, attempt=attempt, reported=True,
                      enforced=False)
     if passed:
-        # PASS only when every field agrees: exit 0, nothing at the threshold,
-        # every file parsed (advisory `none` never blocks), a passing report.
-        ok = (code == 0 and n == 0 and (pf == 0 or fail_on == "none")
-              and _report_verdict(md) == "PASS")
-        verdict, detail = "PASS", f"no findings at or above `{fail_on}`"
-    elif code == 3:
+        # A 0.4.1 gate never writes `passed: true`: this record comes from an
+        # older gate (a step pinned to an older ref, or a cached artifact).
+        # Fail-closed stopgap: its PASS is not certified, so it is UNKNOWN,
+        # enforced, and its PASS report is not shown.
+        return Check(label=label or name, verdict="UNKNOWN",
+                     detail=(f"`{name}` is a pre-stopgap record (`passed: true`, "
+                             f"from a gate before 0.4.1); not certified: "
+                             f"{STOPGAP_MESSAGE}"))
+    if code == 3:
         # The gate's own UNKNOWN (exit 3): nothing at the threshold, but not
         # certified (fail-closed stopgap). Never a PASS.
         ok = (n == 0 and pf == 0 and _report_verdict(md) == "UNKNOWN")
