@@ -1054,3 +1054,42 @@ def test_red_sets_stay_within_the_stopgap():
     on the two surfaces slice 2 turns green. Widening either is an edit here."""
     assert not _RED_B, sorted(_RED_B)
     assert {s for _, s in _RED} <= {"sarif", "mcp_audit"}, sorted({s for _, s in _RED})
+
+
+# Round 2 of the #46 review: R2-M1 and R2-L1.
+@pytest.mark.parametrize("verdict", [None])
+def test_assertion_reader_reads_a_suppression_as_an_all_clear(verdict):
+    """R2-M1: `segmentation-infeasible-path` (pathground._suppress) says the
+    path model proves isolation for the witness, an all-clear claim. It reads
+    SUPPRESSED, which no attack file's allowed set holds and which the
+    boundary predicate treats as a PASS."""
+    a = _assertion_of(_one_finding("segmentation-infeasible-path", verdict))
+    assert a == "SUPPRESSED", a
+    for allowed in ({"UNKNOWN"}, {"FAIL", "UNKNOWN"}, {"FAIL"}):
+        assert _assert_bad(a, allowed)
+    assert _boundary_bad(f"UNKNOWN/assert={a}")
+    assert _boundary_bad("UNKNOWN/assert=SUPPRESSED,UNKNOWN")
+
+
+@pytest.mark.parametrize("verdict", ["UNKNOWN", "FAIL", "PASS"])
+def test_assertion_reader_rejects_a_suppression_with_a_verdict(verdict):
+    a = _assertion_of(_one_finding("segmentation-infeasible-path", verdict))
+    assert a.startswith("MISMATCH:"), a
+
+
+@pytest.mark.parametrize("planted", [
+    "segmentation-ok2", "segmentation-certified", "connectivity-proven_v2",
+    "segmentation-violation: by message", "segmentation-", "connectivity-",
+])
+def test_kind_guard_flags_a_planted_kind(planted):
+    """R2-L1: the guard sees any string constant that starts with an
+    assertion prefix (digits and underscores included), in rulehawk/ and in
+    docs/worker.js's ANALYZE_PY, beyond the pinned prefix sites."""
+    src = f"x = {planted!r}\n"
+    for label in ("rulehawk/planted.py", "docs/worker.js:ANALYZE_PY"):
+        found = _assertion_kind_literals({label: src})
+        assert _unknown_kind_literals(found), (label, planted)
+
+
+def test_kind_guard_scans_analyze_py():
+    assert "docs/worker.js:ANALYZE_PY" in _kind_guard_sources()
