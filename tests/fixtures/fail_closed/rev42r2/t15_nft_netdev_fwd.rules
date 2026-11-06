@@ -1,0 +1,9 @@
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A FORWARD -s 192.0.2.0/24 -d 198.51.100.0/24 -j DROP
+COMMIT
+table netdev bypass {
+ chain ingress { type filter hook ingress device "eth0" priority 0; ip saddr 192.0.2.0/24 ip daddr 198.51.100.0/24 fwd to "eth1"; }
+}
