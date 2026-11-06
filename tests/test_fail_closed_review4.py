@@ -126,6 +126,8 @@ def test_allowlisted_interface_lines_keep_the_pass(tmp_path, line):
     (" tunnel destination 203.0.113.7", "tunnel"),
     (" ip helper-address 203.0.113.8", "ip helper-address"),
     (" frobnicate 198.51.100.77", "frobnicate"),
+    (" ipv6 nd prefix 2001:db8::/64 300 300", "ipv6 nd"),
+    (" ipv4 verify unicast source reachable-via rx", "ipv4 verify"),
 ])
 def test_any_other_interface_line_is_unknown_and_names_only_its_keyword(
         tmp_path, line, keyword):
