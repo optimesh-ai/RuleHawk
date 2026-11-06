@@ -271,3 +271,39 @@ def test_r7_readme_carries_the_known_limits():
         readme = fh.read()
     for lim in KNOWN_LIMITS:
         assert lim in readme, lim
+
+
+# --------------------------------------------------------------------------- #
+# R1 follow-up: verb-first dispatch must not hide a second command, and a
+# stray word in a rule (iptables rejects the line) is never skipped silently
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("line", [
+    "iptables -N X ; iptables -P FORWARD ACCEPT",
+    "iptables -N X && iptables -P FORWARD ACCEPT",
+    "iptables -L -n; iptables -P FORWARD ACCEPT",
+])
+def test_r1_a_second_command_on_the_line_is_not_lost(tmp_path, line):
+    text = ("iptables -P FORWARD DROP\n"
+            "iptables -A FORWARD -s 203.0.113.0/24 -j ACCEPT\n" + line + "\n")
+    path = _write(tmp_path, "x.sh", text)
+    _unknown_on_every_surface(path, "parse-note")
+
+
+@pytest.mark.parametrize("rule", [
+    "iptables -A FORWARD -s 192.0.2.0/24 -d 198.51.100.0/24 bogus -j DROP",
+    "iptables -A FORWARD -s 192.0.2.0/24 -d 198.51.100.0/24 -j DROP extra",
+])
+def test_r1_a_stray_word_in_a_rule_is_not_skipped(tmp_path, rule):
+    """iptables rejects a rule with a stray word, so the DROP is not applied
+    and the ACCEPT policy decides: a PASS here would be false."""
+    text = "iptables -P FORWARD ACCEPT\n" + rule + "\n"
+    _unknown_on_every_surface(_write(tmp_path, "x.sh", text), "parse-note")
+
+
+def test_r1_c03_comment_value_that_looks_like_a_verb():
+    """c03: `--comment -A x` — `-A` is the comment, `x` a stray word that
+    makes iptables reject the line. UNKNOWN, never a FAIL or PASS built on a
+    rule the kernel refused."""
+    path = os.path.join(_ROOT, "tests", "fixtures", "fail_closed", "rev42r3",
+                        "c03_comment_dash_A_hides_insert.sh")
+    _unknown_on_every_surface(path, "parse-note")
