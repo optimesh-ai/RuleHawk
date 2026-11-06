@@ -33,7 +33,7 @@ def _write(d, name, text):
 
 def test_clean_config_exits_0(tmp_path, capsys):
     p = _write(str(tmp_path), "clean.acl", _CLEAN)
-    assert cli.main([p]) == 0
+    assert cli.main([p]) == 3          # fail-closed stopgap: UNKNOWN, never 0
     assert "Hygiene score" in capsys.readouterr().out
 
 
@@ -108,5 +108,5 @@ def test_non_utf8_stdin_does_not_crash(monkeypatch, capsys):
         buffer = io.BytesIO(payload)
     monkeypatch.setattr(sys, "stdin", _Stdin())
     rc = cli.main(["-"])
-    assert rc in (0, 1)                          # parsed, not a traceback/2
+    assert rc in (1, 3)                          # parsed, not a traceback/2
     assert "Hygiene score" in capsys.readouterr().out

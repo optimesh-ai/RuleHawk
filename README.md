@@ -6,6 +6,16 @@
 > [Optimesh](https://optimesh.ai); for checks across routing and reachability too, see
 > [where RuleHawk stops](#where-rulehawk-stops-and-hammerhead-starts).
 
+> **0.4.1: fail-closed stopgap.** This release never reports PASS or VERIFIED.
+> A run with nothing at or above the threshold is **UNKNOWN**, exit **3**, with
+> reason `fail-closed-stopgap` ("fail-closed stopgap pending soundness
+> review"); FAIL (exit 1) and parse failures (exit 2) are unchanged. A GitHub
+> Action check with `fail-on` set fails with exit 3 until PASS returns, where
+> proven, in the next release; for a non-blocking run meanwhile, set
+> `fail-on: none`. Where this README describes a PASS, `segmentation-ok` or a
+> `VERIFIED` claim, this release reports UNKNOWN / INDETERMINATE instead. See
+> [CHANGELOG.md](CHANGELOG.md).
+
 **Point it at a firewall/ACL config → get a ranked list of dead, shadowed, and
 dangerously-permissive rules, each with the line to change.** Free, local, no
 account, no API key.

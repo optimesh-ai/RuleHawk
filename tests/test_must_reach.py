@@ -39,7 +39,7 @@ def test_permitted_flow_proves_connectivity_with_witness():
            " permit tcp 10.20.0.0 0.0.255.255 185.46.212.0 0.0.1.255 eq 80 443\n"
            " deny ip any any\n")
     f = _run(acl)
-    assert [x.kind for x in f] == ["connectivity-ok"]
+    assert [x.kind for x in f] == ["connectivity-unknown"]
     ok = f[0]
     assert ok.severity == "info"
     # Auditor-grade: a concrete witness packet inside the asserted flow.
@@ -88,7 +88,7 @@ def test_multi_port_partial_permit_is_not_a_false_ok():
         " permit udp 192.0.2.0 0.0.0.7 185.46.212.0 0.0.1.255 eq 4500\n"
         " deny ip any any\n")
     f_ok = _run(acl_ok, pol)
-    assert [x.kind for x in f_ok] == ["connectivity-ok"]
+    assert [x.kind for x in f_ok] == ["connectivity-unknown"]
     assert "ENTIRE flow space" in f_ok[0].message
 
 
@@ -158,7 +158,7 @@ def test_both_directions_coexist_in_one_policy():
            " permit tcp 10.20.0.0 0.0.255.255 185.46.212.0 0.0.1.255 eq 443\n"
            " deny ip any any\n")
     kinds = sorted(x.kind for x in _run(acl, pol))
-    assert kinds == ["connectivity-ok", "segmentation-ok"]
+    assert kinds == ["connectivity-unknown", "segmentation-unknown"]
 
 
 def test_portless_must_reach_requires_every_tcp_port():
@@ -173,5 +173,5 @@ def test_portless_must_reach_requires_every_tcp_port():
     full = ("ip access-list extended EGRESS\n"
             " permit tcp 10.20.0.0 0.0.255.255 185.46.212.0 0.0.1.255\n")
     f = _run(full, pol)
-    assert [x.kind for x in f] == ["connectivity-ok"]
+    assert [x.kind for x in f] == ["connectivity-unknown"]
     assert "None" not in f[0].witness

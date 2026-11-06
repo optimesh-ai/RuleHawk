@@ -56,7 +56,7 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 | `comment` | `true` | Post/update a single sticky PR comment with the findings. Several gate steps in one job share that one comment, headed by the worst verdict (see [Several checks on one PR](#several-checks-on-one-pr)). |
 | `label` | `''` | A short name for this check in the PR comment, e.g. `PCI segmentation`. Defaults to the configs and policy it checked. |
 | `share-results` | `false` | Upload this check's result as a workflow artifact, so a later job running `optimesh-ai/RuleHawk/comment` can put every check of the run in one comment. |
-| `evidence` | `false` | Emit a **compliance-evidence artifact** (JSON + markdown) for the run: provenance (SHA-256 of every config audited, tool version, timestamp), `VERIFIED`/`FAILED` policy attestations, and PCI DSS / NIST 800-53 / ISO 27001 / CIS / SOC 2 / HIPAA control references. Paths land in the `evidence-file` / `evidence-md-file` outputs. |
+| `evidence` | `false` | Emit a **compliance-evidence artifact** (JSON + markdown) for the run: provenance (SHA-256 of every config audited, tool version, timestamp), per-assertion `FAILED`/`UNKNOWN` status (0.4.1 never marks one verified), and PCI DSS / NIST 800-53 / ISO 27001 / CIS / SOC 2 / HIPAA control references. Paths land in the `evidence-file` / `evidence-md-file` outputs. |
 | `upload-sarif` | `true` | Upload SARIF to code scanning so findings annotate the exact diff line. |
 | `working-directory` | `.` | Directory to run the audit in. |
 | `python-version` | `''` | Optionally set up a specific Python (≥3.9). Empty uses the runner's `python3` — the fast path. |
@@ -65,7 +65,9 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 
 | Output | Description |
 |---|---|
-| `passed` | `true` when no finding met the `fail-on` threshold (and every file parsed). |
+| `passed` | Never `true` in 0.4.1 (fail-closed stopgap: no PASS is reported). Read `verdict` and `exit-code`. |
+| `verdict` | `FAIL` \| `UNKNOWN`. UNKNOWN (exit 3): nothing reached the `fail-on` threshold, but the run is not certified (reason `fail-closed-stopgap`, "fail-closed stopgap pending soundness review"). Under `fail-on: none` the real verdict, reported but not enforced. |
+| `exit-code` | The gate's exit code: `1` FAIL, `2` parse failure or invalid input, `3` UNKNOWN; `0` only under `fail-on: none`. |
 | `score` | Lowest hygiene score (0–100) across the audited files. |
 | `worst-severity` | Highest severity found: `critical` \| `high` \| `medium` \| `low` \| `none`. |
 | `evidence-file` | Path to the compliance-evidence JSON artifact (empty unless `evidence: true`). |
@@ -79,8 +81,9 @@ A PR is often checked more than once: hygiene and segmentation over every
 config, and a connectivity proof over the configs that own an egress path. The
 PR still gets **one** comment, and its headline is the **worst** verdict:
 **FAIL** if any check failed, **UNKNOWN** if a check that should have reported
-did not, **PASS** only when every check passed. A passing check never hides a
-failing one.
+did not or did not fail. RuleHawk 0.4.1 (fail-closed stopgap) never reports
+PASS, so the best headline is **UNKNOWN**. A check that did not fail never hides
+a failing one.
 
 **Several gate steps in one job** need nothing extra. Each step's comment
 includes every check the job has run so far, so the comment the last step
@@ -136,9 +139,10 @@ jobs:
 | `jobs` | — (**required**) | Pass `${{ toJSON(needs) }}`. A gate job that did not succeed, but whose results show no failure (a re-run whose result never uploaded leaves the first attempt's PASS behind), makes the verdict `UNKNOWN`. |
 | `results` | `''` | Result files or directories to combine. Empty downloads this run's `rulehawk-results-*` artifacts. |
 | `comment` | `true` | Post/update the sticky PR comment on `pull_request` events. |
-| `fail` | `true` | Fail the step unless the combined verdict is `PASS`. |
+| `fail` | `true` | Fail the step on FAIL or UNKNOWN. In 0.4.1 no combined verdict is a pass, so with `true` this step fails on every run that has an enforced check. |
 
-Its outputs are `verdict` (`PASS` \| `FAIL` \| `UNKNOWN`) and `comment-file`.
+Its outputs are `verdict` (`FAIL` \| `UNKNOWN`) and `comment-file`. A result
+file written by a gate before 0.4.1 (`passed: true`) reads as UNKNOWN, never PASS.
 After *Re-run failed jobs*, only each job's newest attempt counts: a job that
 re-ran replaces all of its earlier results, so a check skipped on the re-run
 is not still passing. Matrix legs share one job id, so re-running only some
@@ -146,7 +150,7 @@ legs leaves the verdict `UNKNOWN` until the whole job re-runs. Do not put
 `continue-on-error` on a gate step that shares its result: it would also hide a
 failed upload, and on a re-run the previous attempt's result would stand. The
 same combination runs locally: `rulehawk combine results/ --expect 2 --comment
-comment.md` (exit 0 PASS, 1 FAIL, 2 UNKNOWN). The comment is only ever written by
+comment.md` (exit 1 FAIL, 2 UNKNOWN; 0 only when no enforced check exists). The comment is only ever written by
 the workflow's `GITHUB_TOKEN` (`github-actions[bot]`), and only that account's
 marked comment is updated.
 
@@ -176,24 +180,26 @@ One artifact covers every config in the run, and a failed claim names the config
 that broke it. Three honesty properties are enforced by tests, and matter when an
 assessor reads the output:
 
-* **`VERIFIED` means proved.** Only a passing assertion earns it; with no policy
-  the artifact makes no isolation claim at all and says so.
+* **Nothing is marked verified in 0.4.1.** The fail-closed stopgap reports an
+  assertion that did not fail as `UNKNOWN` (control rows read UNKNOWN, not
+  REVIEW); with no policy the artifact makes no isolation claim at all and says so.
 * **An unparseable config poisons the run.** If any supplied config fails to
   parse, *no* claim is marked verified — the leak could be in the file that was
   never read. The report states that coverage is incomplete.
 * **The claim is scoped to the rulesets audited, never to the network.** With no
-  routing or NAT model, a pass proves "no audited ruleset permits this flow",
+  routing or NAT model, a future pass would prove only "no audited ruleset permits this flow",
   which is the exact wording the artifact carries.
 
 ## Exit codes / verdict
 
 | Code | Meaning |
 |---|---|
-| `0` | Clean — no finding at/above `fail-on`, every file parsed. |
-| `1` | One or more findings at/above `fail-on`. |
+| `0` | Only under `fail-on: none` (advisory). Fail-closed stopgap (0.4.1): an enforced run never exits 0, and no run reports PASS. |
+| `1` | FAIL: one or more findings at/above `fail-on`. |
 | `2` | **Fail-closed** — a file parsed to *zero* rules or could not be read (suppressed only by `fail-on: none`), a `configs` pattern matched **no files** (a typo'd path must not mean "never audited, green check"), an unknown `vendor`/flag, or an unwritable output path. RuleHawk will not certify isolation it could not verify. |
+| `3` | UNKNOWN (new): no finding at/above `fail-on`, but the run is not certified — reason `fail-closed-stopgap`, "fail-closed stopgap pending soundness review". Precedence: `2`, then `1`, then `3`. |
 
-The Action maps both `1` and `2` to a red check. Even on failure it still uploads
+The Action maps `1`, `2` and `3` to a red check (exit 3 with an error annotation that names the stopgap). Even on failure it still uploads
 SARIF and posts the comment first, so the gate always reports its value.
 
 ## What you get

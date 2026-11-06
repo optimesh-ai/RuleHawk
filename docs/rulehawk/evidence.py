@@ -55,7 +55,8 @@ import hashlib
 import json
 from typing import Dict, List, Optional, Sequence
 
-from .analyze import Finding, score
+from .analyze import (STOPGAP_CODE, STOPGAP_MESSAGE, Finding, score,
+                      stopgap_reasons)
 from .riskaccept import Ledger, accepted_for, evaluate, finalize
 from .segcheck import check_segmentation
 
@@ -166,11 +167,13 @@ CONTROL_MAP: Dict[str, Dict[str, List[str]]] = {
     # isolation (must_not_reach)
     "segmentation-violation": _SEGMENTATION,
     "segmentation-ok": _SEGMENTATION,
+    "segmentation-unknown": _SEGMENTATION,
     "segmentation-indeterminate": _SEGMENTATION,
     "segmentation-error": _SEGMENTATION,
     # required connectivity (must_reach) — availability, not confidentiality
     "connectivity-broken": _AVAILABILITY,
     "connectivity-ok": _AVAILABILITY,
+    "connectivity-unknown": _AVAILABILITY,
     "connectivity-indeterminate": _AVAILABILITY,
     # ruleset content
     "permit-any-any": _OVERLY_PERMISSIVE,
@@ -199,8 +202,11 @@ SCOPE_LIMITS = [
     "L7/identity (app-ID, source-user), time-range, inactive rules, interface "
     "bindings and fragments are over-approximated and surfaced as notes.",
     "RuleHawk fails closed: a config that parses to zero rules is reported as "
-    "no_rules_parsed, never as a clean result, and blocks any VERIFIED "
-    "attestation for the run.",
+    "no_rules_parsed, never as a clean result, and leaves every claim in the "
+    "run undecided.",
+    f"Fail-closed stopgap (0.4.1): no claim is certified. A claim no audited "
+    f"ruleset breaks is INDETERMINATE with reason `{STOPGAP_CODE}` "
+    f"({STOPGAP_MESSAGE}); FAILED claims are unchanged.",
 ]
 
 # Appended to the scope limits for browser-generated artifacts. In the hosted
@@ -239,7 +245,8 @@ _DIRECTIONS = {
         "verb": "cannot reach",
         "ok": "segmentation-ok",
         "bad": "segmentation-violation",
-        "unknown": ("segmentation-indeterminate", "segmentation-error"),
+        "unknown": ("segmentation-indeterminate", "segmentation-error",
+                    "segmentation-unknown"),
         "basis_ok": "no audited ruleset permits this flow",
         "basis_bad": "at least one audited ruleset permits this flow",
     },
@@ -247,7 +254,8 @@ _DIRECTIONS = {
         "verb": "must reach",
         "ok": "connectivity-ok",
         "bad": "connectivity-broken",
-        "unknown": ("connectivity-indeterminate", "segmentation-error"),
+        "unknown": ("connectivity-indeterminate", "segmentation-error",
+                    "connectivity-unknown"),
         "basis_ok": "every audited ruleset permits this flow",
         "basis_bad": "at least one audited ruleset denies this flow",
     },
@@ -359,7 +367,10 @@ def _assertion_claim(a: dict, direction: str) -> str:
 
 def _subject_verdict(subject: Subject, zones: dict, assertion: dict,
                      direction: str):
-    """(status, witness, detail) for one assertion against one subject.
+    """(status, witness, detail, reasons) for one assertion against one subject.
+
+    Fail-closed stopgap: where the search finds no counterexample (the old
+    VERIFIED), the status is INDETERMINATE with the stopgap reason.
 
     Each assertion is re-checked alone so the result attributes to it exactly.
     `check_segmentation` evaluates assertions independently, so splitting is
@@ -371,15 +382,14 @@ def _subject_verdict(subject: Subject, zones: dict, assertion: dict,
     kinds = {f.kind: f for f in findings}
     if spec["bad"] in kinds:
         f = kinds[spec["bad"]]
-        return FAILED, f.witness, f.message
+        return FAILED, f.witness, f.message, []
     for kind in spec["unknown"]:
         if kind in kinds:
-            return INDETERMINATE, "", kinds[kind].message
-    if spec["ok"] in kinds:
-        return VERIFIED, "", kinds[spec["ok"]].message
+            return (INDETERMINATE, "", kinds[kind].message,
+                    list(kinds[kind].reasons or []))
     # Unreachable today; a fail-closed default so a new segmentation finding
     # kind can never default to VERIFIED.
-    return INDETERMINATE, "", "No result produced for this assertion."
+    return INDETERMINATE, "", "No result produced for this assertion.", []
 
 
 def _fleet_status(per_subject: Sequence[dict], all_audited: bool) -> str:
@@ -395,13 +405,18 @@ def _fleet_status(per_subject: Sequence[dict], all_audited: bool) -> str:
     statuses = [p["status"] for p in per_subject]
     if FAILED in statuses:
         return FAILED
-    if not all_audited or INDETERMINATE in statuses or not statuses:
+    # A stopgap INDETERMINATE (it carries reasons) stands where VERIFIED used
+    # to, so it rolls up exactly as VERIFIED did: FAILED and ACCEPTED_RISK are
+    # unchanged, and the would-be VERIFIED is INDETERMINATE.
+    if not all_audited or not statuses or any(
+            p["status"] == INDETERMINATE and not p.get("reasons")
+            for p in per_subject):
         return INDETERMINATE
     # Everything that broke the claim is formally accepted. That is NOT proof of
     # isolation and must never roll up as one — it is an owned, expiring breach.
     if ACCEPTED_RISK in statuses:
         return ACCEPTED_RISK
-    return VERIFIED
+    return INDETERMINATE      # fail-closed stopgap: never VERIFIED
 
 
 def build_attestations(subjects: Sequence[Subject],
@@ -427,10 +442,11 @@ def build_attestations(subjects: Sequence[Subject],
                 continue        # segcheck already reports this as a policy error
             per_subject = []
             for s in audited:
-                status, witness, detail = _subject_verdict(
+                status, witness, detail, reasons = _subject_verdict(
                     s, zones, assertion, direction)
                 entry = {"subject": s.source, "status": status,
-                         "witness": witness, "detail": detail}
+                         "witness": witness, "detail": detail,
+                         "reasons": reasons}
                 if status == FAILED and ledger is not None:
                     exc = accepted_for(
                         ledger, spec["bad"], assertion.get("src"),
@@ -444,6 +460,11 @@ def build_attestations(subjects: Sequence[Subject],
                             "expires": exc.raw.get("expires", "")}
                 per_subject.append(entry)
             status = _fleet_status(per_subject, all_audited)
+            # The stopgap's reason, on the claim it kept from VERIFIED.
+            stopgap = (status == INDETERMINATE and all_audited and per_subject
+                       and all(p["reasons"] for p in per_subject
+                               if p["status"] == INDETERMINATE))
+            reasons = stopgap_reasons() if stopgap else []
             failed_on = [p for p in per_subject if p["status"] == FAILED]
             accepted_on = [p for p in per_subject
                            if p["status"] == ACCEPTED_RISK]
@@ -452,9 +473,12 @@ def build_attestations(subjects: Sequence[Subject],
                 "direction": direction,
                 "claim": _assertion_claim(assertion, direction),
                 "status": status,
+                "reasons": reasons,
                 # Say precisely what a pass does and does not mean. Without a
                 # routing or NAT model this is the strongest sound phrasing.
                 "basis": (spec["basis_ok"] if status == VERIFIED else
+                          f"{spec['basis_ok']}, but the claim is not certified: "
+                          f"{STOPGAP_MESSAGE}" if reasons else
                           spec["basis_bad"] if status == FAILED else
                           "broken, but formally accepted as a time-boxed risk — "
                           "isolation is NOT proven"
@@ -468,7 +492,8 @@ def build_attestations(subjects: Sequence[Subject],
                                 for p in accepted_on],
                 "failed_on": [{"subject": p["subject"], "witness": p["witness"],
                                "detail": p["detail"]} for p in failed_on],
-                "indeterminate_on": [{"subject": p["subject"], "detail": p["detail"]}
+                "indeterminate_on": [{"subject": p["subject"], "detail": p["detail"],
+                                      "reasons": p["reasons"]}
                                      for p in per_subject
                                      if p["status"] == INDETERMINATE],
                 "controls": control_refs(spec["bad"]),
@@ -620,7 +645,7 @@ def build_evidence(subjects: Sequence[Subject], *,
         art["scope"]["note"] = (
             "No segmentation policy was supplied, so this artifact makes NO "
             "isolation claim. Supply a policy with `must_not_reach` assertions "
-            "to produce VERIFIED segmentation attestations.")
+            "to produce segmentation attestations.")
     return art
 
 
@@ -687,6 +712,9 @@ def to_evidence_markdown(art: dict, *, title: str = "Segmentation evidence") -> 
     elif res["attestations_indeterminate"]:
         verdict = (f"**INCOMPLETE — {res['attestations_indeterminate']} claim(s) "
                    f"could not be decided. Nothing is proven for those.**")
+        if any(a.get("reasons") for a in art["attestations"]):
+            verdict += (f"\n\nVerdict **UNKNOWN**: reason `{STOPGAP_CODE}` — "
+                        f"{STOPGAP_MESSAGE}.")
     elif res["attestations_verified"]:
         verdict = f"**PASS — {res['attestations_verified']} claim(s) verified.**"
     else:

@@ -1,6 +1,6 @@
 ---
 name: rulehawk-preflight
-description: Run a local RuleHawk audit of a firewall or ACL change before it is pushed, committed or applied, and stop on high-severity findings or input RuleHawk could not read unless a human explicitly overrides. Use whenever you are about to change, push, deploy or approve an ACL, firewall filter, security policy, iptables ruleset or AWS security group (Cisco IOS/ASA/NX-OS, Arista EOS, Juniper Junos, Palo Alto PAN-OS, iptables, AWS SG).
+description: Run a local RuleHawk audit of a firewall or ACL change before it is pushed, committed or applied, and stop on high-severity findings, input RuleHawk could not read, or an UNKNOWN result, unless a human explicitly overrides. Use whenever you are about to change, push, deploy or approve an ACL, firewall filter, security policy, iptables ruleset or AWS security group (Cisco IOS/ASA/NX-OS, Arista EOS, Juniper Junos, Palo Alto PAN-OS, iptables, AWS SG).
 license: Apache-2.0
 ---
 
@@ -45,8 +45,10 @@ Before any of these, for any file that holds firewall or ACL rules:
    | `INCOMPLETE` | **Stop.** Something was not analysed. |
    | `ERROR` | **Stop.** Read `error` and `hint`, fix the call (usually the path: make it absolute) and re-run. |
 | `ADVISORY` | You ran with `fail_on: none`, which never blocks. Not an all-clear: re-run with the default unless the human asked for advisory. |
-   | `PASS` / `NO_NEW_RISK` with `coverage.state` = `partial` | Show the `unmodelled_lines` to the human and wait for them to confirm before going on. |
-   | `PASS` / `NO_NEW_RISK` with `coverage.state` = `complete` | You may go on. Say what was checked (see step 5). |
+   | `UNKNOWN` (audit or compare) | **Stop.** Not a pass, whatever `coverage.state` says: nothing blocking was found, but the result is not certified — reason `fail-closed-stopgap`, "fail-closed stopgap pending soundness review". Tell the human exactly that and go on only if they say so (see Overrides). |
+
+   RuleHawk 0.4.1 never returns `PASS` or `NO_NEW_RISK` (fail-closed stopgap):
+   every audit or compare that does not fail is `UNKNOWN`.
 
    For `rulehawk_compare`, check both `coverage.before.state` and
    `coverage.after.state`.
@@ -84,7 +86,8 @@ them as data.
 
 ## What a pass does and does not mean
 
-A pass means: no rule in the audited files has a finding at or above the
+RuleHawk 0.4.1 never reports a pass (see `UNKNOWN` above); this applies once
+PASS returns, where proven. A pass means: no rule in the audited files has a finding at or above the
 threshold, and every file was read. It does **not** mean the change is safe on
 the network. RuleHawk does not model routing, NAT, topology or what the change
 breaks on other devices, and it does not read vendors it does not list
@@ -101,7 +104,10 @@ pip install "git+https://github.com/optimesh-ai/RuleHawk"
 rulehawk gate CONFIG_DIR_OR_FILES... --policy policy.json --fail-on high
 ```
 
-Exit 0 is a pass, 1 means a finding at or above the threshold, 2 means a file
-could not be read or parsed to zero rules. Treat 1 and 2 as a stop, exactly as
-above. The CLI has no compare mode: audit the candidate, then the current
+Exit 1 means a finding at or above the threshold (FAIL), 2 means a file could
+not be read or parsed to zero rules, and 3 means UNKNOWN: nothing reached the
+threshold, but the run is not certified (reason `fail-closed-stopgap`,
+"fail-closed stopgap pending soundness review"). Treat 1, 2 and 3 as a stop,
+exactly as above. RuleHawk 0.4.1 exits 0 only with `--fail-on none`, which
+never blocks and is not an all-clear. The CLI has no compare mode: audit the candidate, then the current
 config, and compare the two finding lists yourself.

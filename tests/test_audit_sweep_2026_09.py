@@ -68,7 +68,7 @@ def test_ios_ipv6_sequence_entries_are_parsed_in_sequence_order():
     assert aces[0].imprecise is False
     assert not any(n.startswith("unparsed") for n in notes)
     kinds = _kinds(aces, _V6)
-    assert "segmentation-violation" in kinds and "segmentation-ok" not in kinds, \
+    assert "segmentation-violation" in kinds and "segmentation-unknown" not in kinds, \
         "FALSE PASS: the v6 permit was invisible while it parsed as 'unparsed'"
 
 
@@ -87,7 +87,7 @@ def test_awssg_unresolved_remainder_is_opaque_for_both_address_families():
     assert sorted(a.src.version for a in aces) == [4, 6]
     assert all(a.imprecise for a in aces)
     v6 = _kinds(aces, _V6)
-    assert "segmentation-ok" not in v6, \
+    assert "segmentation-unknown" not in v6, \
         "FALSE PASS: a v4-only opaque marker never intersects a v6 witness"
     assert "segmentation-indeterminate" in v6
     assert "segmentation-indeterminate" in _kinds(aces, _V4)
@@ -112,7 +112,7 @@ def test_iptables_goto_is_kept_indeterminate_not_resolved_as_a_jump():
            "-A CHK -s 192.168.0.0/16 -j DROP\nCOMMIT\n")
     aces, notes = parse_iptables(cfg)
     kinds = _kinds(aces, _V4)
-    assert "segmentation-ok" not in kinds, \
+    assert "segmentation-unknown" not in kinds, \
         "FALSE PASS: goto fall-through resolved as if the next FORWARD rule ran"
     assert "segmentation-indeterminate" in kinds
     assert any("goto" in n and "fail-closed" in n for n in notes)
@@ -125,7 +125,7 @@ def test_iptables_plain_jump_still_resolves_precisely():
            "-A CHK -s 192.168.0.0/16 -j DROP\nCOMMIT\n")
     aces, notes = parse_iptables(cfg)
     assert any("resolved precisely" in n for n in notes)
-    assert "segmentation-ok" in _kinds(aces, _V4)
+    assert "segmentation-unknown" in _kinds(aces, _V4)
 
 
 def test_mixed_iptables_ip6tables_file_fails_closed_for_ipv6_only():
@@ -136,9 +136,9 @@ def test_mixed_iptables_ip6tables_file_fails_closed_for_ipv6_only():
            "ip6tables -A FORWARD -p tcp --dport 22 -j DROP\n")
     aces, notes = parse_iptables(cfg)
     assert any("ip6tables" in n and "INDETERMINATE" in n for n in notes)
-    assert "segmentation-ok" in _kinds(aces, _V4), "IPv4 verdict must stay exact"
+    assert "segmentation-unknown" in _kinds(aces, _V4), "IPv4 verdict must stay exact"
     v6 = _kinds(aces, _V6)
-    assert "segmentation-ok" not in v6 and "segmentation-indeterminate" in v6, \
+    assert "segmentation-unknown" not in v6 and "segmentation-indeterminate" in v6, \
         "FALSE PASS: the ip6tables ACCEPT policy was modeled as 0.0.0.0/0"
 
 

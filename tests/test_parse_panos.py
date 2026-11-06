@@ -138,7 +138,7 @@ def test_earlier_deny_blocks_no_false_alarm():
     aces, _ = parse_panos(cfg)
     kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
 
 
 def test_permit_any_any_flagged_overly_permissive():
@@ -290,7 +290,7 @@ def test_mixed_static_group_unresolved_member_never_false_passes():
     assert opaque[0].src_any and opaque[0].dst_any   # marker covers the remainder
     assert any("partially resolved" in n for n in notes)
     kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
-    assert "segmentation-ok" not in kinds            # never a false PASS
+    assert "segmentation-unknown" not in kinds            # never a false PASS
     assert "segmentation-violation" not in kinds     # never a false CRITICAL
     assert "segmentation-indeterminate" in kinds
 
@@ -311,7 +311,7 @@ def test_max_expand_widens_to_any_never_truncates():
     assert aces[0].src_any and aces[0].imprecise is True
     assert any("widened" in n for n in notes)
     kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
 
 
 def test_bare_ipv6_address_is_host_route_not_slash32():
@@ -414,7 +414,7 @@ def test_negate_source_repro_indeterminate_not_pass():
     aces, _ = parse_panos(cfg)
     findings = check_segmentation(aces, _SEG_POLICY)
     kinds = {f.kind for f in findings}
-    assert "segmentation-ok" not in kinds, (
+    assert "segmentation-unknown" not in kinds, (
         "FALSE PASS: negate-source permit modeled as the listed net — the real "
         "firewall permits CORP->PCI (CORP is outside the negated set)")
     # Fail-closed, not fail-wrong: no concrete witness exists in the modeled
@@ -443,7 +443,7 @@ def test_pre_rulebase_deny_isolates_before_local_allow():
     assert [a.action for a in aces] == ["deny", "permit"]
     assert aces[0].seq < aces[1].seq
     kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
-    assert "segmentation-ok" in kinds, (
+    assert "segmentation-unknown" in kinds, (
         "pre-rulebase deny runs before the local allow -> flow is isolated")
     assert "segmentation-violation" not in kinds
 
@@ -462,7 +462,7 @@ def test_post_rulebase_deny_runs_after_local_allow_no_false_ok():
     kinds = {f.kind for f in check_segmentation(aces, _SEG_POLICY)}
     assert "segmentation-violation" in kinds, (
         "the local allow wins; a post-rulebase deny runs too late to isolate")
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
 
 
 def test_textual_order_preserved_within_a_phase():
@@ -518,7 +518,7 @@ def test_two_vsys_independent_must_reach_not_merged():
            "must_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp",
                            "ports": [443]}]}
     kinds = {f.kind for f in check_segmentation(aces, pol)}
-    assert "connectivity-ok" in kinds, (
+    assert "connectivity-unknown" in kinds, (
         "vsys2 independently permits the whole flow -> path is open")
     assert "connectivity-broken" not in kinds
 
@@ -569,7 +569,7 @@ def test_multiline_service_ports_accumulate_no_false_pass():
               "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp",
                                   "ports": [443]}]}
     kinds443 = {f.kind for f in check_segmentation(aces, pol443)}
-    assert "segmentation-ok" not in kinds443, (
+    assert "segmentation-unknown" not in kinds443, (
         "dropped port 443 must not certify isolation")
     assert "segmentation-violation" in kinds443
     # The retained port (445) still leaks too.

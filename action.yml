@@ -19,7 +19,14 @@ inputs:
     required: false
     default: ''
   fail-on:
-    description: 'Fail the check at this severity or worse: critical | high | medium | low | none'
+    description: >-
+      Fail the check at this severity or worse: critical | high | medium | low
+      | none. Fail-closed stopgap (0.4.1): the gate never reports PASS. It
+      exits 1 FAIL (a finding at or above this threshold), 2 a config parsed
+      to zero rules or an input was invalid, or 3 UNKNOWN (nothing reached the
+      threshold, but the run is not certified: fail-closed stopgap pending
+      soundness review). Exits 1, 2 and 3 all fail the check. `none` is
+      advisory and always exits 0; its verdict still reads UNKNOWN or FAIL.
     required: false
     default: 'high'
   vendor:
@@ -51,7 +58,8 @@ inputs:
     description: >-
       Emit a compliance-evidence artifact (JSON + markdown) for every run:
       provenance (SHA-256 of each config audited, tool version, timestamp),
-      VERIFIED/FAILED policy attestations, and PCI/NIST/ISO/CIS/SOC 2/HIPAA
+      policy attestations (FAILED, or INDETERMINATE under the 0.4.1
+      fail-closed stopgap), and PCI/NIST/ISO/CIS/SOC 2/HIPAA
       control references. Paths are exposed as the `evidence-file` and
       `evidence-md-file` outputs; upload them with actions/upload-artifact to
       keep a dated audit trail of every change. (true|false)
@@ -77,8 +85,22 @@ inputs:
 
 outputs:
   passed:
-    description: 'true when no finding met the fail-on threshold'
+    description: >-
+      Never true in 0.4.1 (fail-closed stopgap: no PASS is reported, under
+      fail-on none too). Read `verdict` and `exit-code`.
     value: ${{ steps.gate.outputs.passed }}
+  verdict:
+    description: >-
+      FAIL | UNKNOWN. UNKNOWN (exit 3) means nothing reached the fail-on
+      threshold but the run is not certified: reason fail-closed-stopgap,
+      "fail-closed stopgap pending soundness review". Under fail-on none this
+      is the real verdict, reported but not enforced.
+    value: ${{ steps.gate.outputs.verdict }}
+  exit-code:
+    description: >-
+      The gate's exit code: 1 FAIL, 2 parse failure or invalid input, 3
+      UNKNOWN; 0 only under fail-on none.
+    value: ${{ steps.gate.outputs.exit_code }}
   score:
     description: 'Lowest hygiene score (0-100) across the audited files'
     value: ${{ steps.gate.outputs.score }}
@@ -175,8 +197,7 @@ runs:
         # run wrote it, so a file left behind by an earlier gate step in the
         # same job (RUNNER_TEMP is shared) can never pass as this step's
         # artifact or verdict.
-        rm -f "${SARIF}" "${JSON}" "${COMMENT}" "${EVIDENCE}" "${EVIDENCE_MD}" \
-              "${RUNNER_TEMP:-/tmp}/rulehawk.rc"
+        rm -f "${SARIF}" "${JSON}" "${COMMENT}" "${EVIDENCE}" "${EVIDENCE_MD}"
 
         # `set -f` (noglob) hands ** / * patterns to RuleHawk verbatim so its own
         # recursive globber expands them — whitespace still splits multiple
@@ -188,7 +209,7 @@ runs:
         # ${arr[@]+...} guards EVERY empty-array expansion: bash 3.2 (macOS
         # runners, still the default `bash` there) treats "${ARR[@]}" on an
         # empty array as an unbound variable under `set -u` and aborts the step
-        # before the verdict file is even written. Bash 4.4 fixed it, so Linux
+        # before the exit code is even recorded. Bash 4.4 fixed it, so Linux
         # runners never see this — which is exactly why it must be guarded here
         # rather than trusted to CI. tests/test_action.py pins the form AND
         # executes the command line under the system bash.
@@ -206,8 +227,11 @@ runs:
         set +f
 
         # Persist the verdict FIRST so nothing below can mask it (the final
-        # 'Enforce' step re-raises it after SARIF + comment have posted).
-        echo "${RC}" > "${RUNNER_TEMP:-/tmp}/rulehawk.rc"
+        # 'Enforce' step re-raises it after SARIF + comment have posted). It is
+        # this step's own output, never a file in the shared RUNNER_TEMP: a
+        # later use of the action in the same job whose gate step is skipped or
+        # aborts must find no verdict, not this one.
+        echo "exit_code=${RC}" >> "${GITHUB_OUTPUT}"
 
         # Surface paths + parsed outputs for later steps (best-effort; never abort).
         # Only advertise an artifact path when the file truly exists, so the SARIF
@@ -219,7 +243,6 @@ runs:
           [ -f "${EVIDENCE}" ] && echo "evidence=${EVIDENCE}" || echo "evidence="
           [ -f "${EVIDENCE_MD}" ] && echo "evidence_md=${EVIDENCE_MD}" \
                                   || echo "evidence_md="
-          echo "exit_code=${RC}"
         } >> "${GITHUB_OUTPUT}"
         python3 - "${JSON}" >> "${GITHUB_OUTPUT}" <<'PY' || true
         import json, sys
@@ -227,6 +250,7 @@ runs:
         print("passed=" + ("true" if d["passed"] else "false"))
         print("score=" + ("" if d["score"] is None else str(d["score"])))
         print("worst=" + str(d["worst_severity"]))
+        print("verdict=" + str(d.get("verdict", "")))
         PY
         exit 0
 
@@ -296,9 +320,9 @@ runs:
                         issueNumber: context.payload.pull_request.number});
 
     # Re-raise the gate verdict so the check goes red exactly when it should.
-    # Fails CLOSED when the verdict file is missing: that means the gate step
-    # aborted before it could run RuleHawk, and a missing verdict must never
-    # read as "passed".
+    # Fails CLOSED when this use's gate step recorded no exit code: that step
+    # was skipped or aborted before RuleHawk returned, and a missing verdict
+    # must never read as "passed".
     - name: Enforce gate verdict
       if: always()
       shell: bash
@@ -307,16 +331,31 @@ runs:
         # script-injection hygiene as the comment step).
         RH_FAIL_ON: ${{ inputs.fail-on }}
         RH_WORST: ${{ steps.gate.outputs.worst }}
+        RH_VERDICT: ${{ steps.gate.outputs.verdict }}
+        # This use's own gate step output: empty when that step was skipped
+        # or aborted before RuleHawk returned, whatever an earlier use left.
+        RH_RC: ${{ steps.gate.outputs.exit_code }}
       run: |
-        RC="$(cat "${RUNNER_TEMP:-/tmp}/rulehawk.rc" 2>/dev/null || echo missing)"
+        RC="${RH_RC:-missing}"
         if [ "${RC}" = "missing" ]; then
-          echo "::error title=RuleHawk gate did not complete::No verdict was recorded — the gate step aborted before RuleHawk ran. See the step log above."
+          echo "::error title=RuleHawk gate did not complete::No verdict was recorded — the gate step was skipped or aborted before RuleHawk returned. See the step log above."
           exit 1
         elif [ "${RC}" = "2" ]; then
           echo "::error title=RuleHawk gate failed (fail-closed)::RuleHawk exited 2: a config parsed to zero rules, a 'configs' pattern matched no files, or an input was invalid — it will not certify isolation it could not verify. See the step log; check the vendor/format or set the 'vendor' input."
+          exit 1
+        elif [ "${RC}" = "3" ]; then
+          echo "::error title=RuleHawk gate UNKNOWN (fail-closed-stopgap)::RuleHawk exited 3: no finding reached '${RH_FAIL_ON}', but this release reports no PASS — fail-closed stopgap pending soundness review (reason fail-closed-stopgap). Exit 3 fails the check until PASS returns where proven; for a non-blocking run, set fail-on: none."
           exit 1
         elif [ "${RC}" != "0" ]; then
           echo "::error title=RuleHawk gate failed::Findings at or above '${RH_FAIL_ON}' block this change — see the job summary and PR comment."
           exit 1
         fi
-        echo "RuleHawk gate passed (worst severity: ${RH_WORST})."
+        # Exit 0 only under fail-on none (advisory): never blocks, never reads
+        # as a pass (fail-closed stopgap). An enforced exit 0 is unexpected in
+        # 0.4.1 and fails closed.
+        if [ "${RH_FAIL_ON}" != "none" ]; then
+          echo "::error title=RuleHawk gate (fail-closed-stopgap)::RuleHawk exited 0 under fail-on '${RH_FAIL_ON}', which this release never does; failing closed (fail-closed stopgap pending soundness review)."
+          exit 1
+        fi
+        echo "::warning title=RuleHawk verdict ${RH_VERDICT:-UNKNOWN} (not enforced)::fail-on is none, so this step does not fail, but the verdict is ${RH_VERDICT:-UNKNOWN} (fail-closed stopgap pending soundness review). See the PR comment and job summary."
+        echo "RuleHawk verdict: ${RH_VERDICT:-UNKNOWN} (not enforced: fail-on none; worst severity: ${RH_WORST})."

@@ -1,0 +1,13 @@
+{
+  "schema": "rulehawk.result/v1",
+  "label": "clean",
+  "job": "gate",
+  "attempt": 1,
+  "passed": true,
+  "exit_code": 0,
+  "fail_on": "high",
+  "worst": "none",
+  "violations": 0,
+  "parse_failures": 0,
+  "markdown": "## \u2705 RuleHawk firewall gate\n\n**PASS** \u2014 no findings at or above `high`.\n\n<sub>Rule-layer audit: routing, NAT and topology are not evaluated.</sub>\n\n| Score | Files | Rules | Critical | High | Medium | Low |\n|---|---|---|---|---|---|---|\n| 100/100 | 1 | 8 | 0 | 0 | 0 | 0 |\n\n<details><summary>\u2705 <code>samples/adv_realistic.txt</code> <sub>(ios-asa, 8 rules, score 100/100, 0 finding(s))</sub></summary>\n\nNo hygiene/segmentation findings. \u2705\n\nSegmentation proven (rule layer): `CORP \u2192 PCI/tcp`, `DMZ \u2192 PCI`\n</details>\n\n\n<sub>RuleHawk runs entirely inside your runner \u2014 your config never leaves your infrastructure. \u00b7 [docs](https://github.com/optimesh-ai/RuleHawk)</sub>"
+}

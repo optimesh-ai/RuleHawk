@@ -148,7 +148,7 @@ def test_disjoint_src_spaces_resolve_to_zero_aces_fall_through():
     assert _fwd_non_policy(aces) == [], "disjoint src must resolve to zero ACEs"
     assert any("resolved precisely" in n and "0 ACE(s)" in n for n in notes)
     kinds = {f.kind for f in check_segmentation(aces, _POLICY)}
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
     assert "segmentation-indeterminate" not in kinds
     assert "segmentation-violation" not in kinds
 
@@ -170,7 +170,7 @@ def test_disjoint_dst_spaces_resolve_to_zero_aces():
     assert _fwd_non_policy(aces) == [], "disjoint dst must resolve to zero ACEs"
     assert any("resolved precisely" in n and "0 ACE(s)" in n for n in notes)
     kinds = {f.kind for f in check_segmentation(aces, _POLICY)}
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
     assert "segmentation-violation" not in kinds
 
 
@@ -193,7 +193,7 @@ def test_imprecise_child_matchset_keeps_placeholder_indeterminate():
     kinds = {f.kind for f in check_segmentation(aces, _POLICY)}
     assert "segmentation-indeterminate" in kinds, \
         "imprecise subchain must fail closed to INDETERMINATE"
-    assert "segmentation-ok" not in kinds, \
+    assert "segmentation-unknown" not in kinds, \
         "must not FALSE-PASS through an over-approximated subchain"
     assert not any("resolved precisely" in n for n in notes)
     # The fail-closed placeholder is still there, imprecise, in FORWARD.
@@ -219,7 +219,7 @@ def test_disjoint_dport_ranges_resolve_to_zero_aces():
     assert _fwd_non_policy(aces) == [], "disjoint dports must resolve to zero ACEs"
     assert any("resolved precisely" in n and "0 ACE(s)" in n for n in notes)
     kinds = {f.kind for f in check_segmentation(aces, _POLICY)}
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
     assert "segmentation-violation" not in kinds
     assert "segmentation-indeterminate" not in kinds
 
@@ -294,7 +294,7 @@ def test_insert_with_position_parsed_and_note_present():
     assert ace.imprecise is False, "position token must not poison the parse"
     # Deny sits before the appended permit-any policy → isolation PASSes.
     kinds = {f.kind for f in check_segmentation(aces, _POLICY)}
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
     assert "segmentation-violation" not in kinds
 
 
@@ -390,6 +390,6 @@ def test_unbalanced_quote_falls_back_and_fails_closed():
     assert ace.imprecise is True, "an unreliably tokenized line must fail closed"
     assert any("unbalanced quote" in n and "imprecise" in n for n in notes)
     kinds = {f.kind for f in check_segmentation(aces, _POLICY)}
-    assert "segmentation-ok" not in kinds, \
+    assert "segmentation-unknown" not in kinds, \
         "imprecise permit for the forbidden flow must not PASS"
     assert "segmentation-indeterminate" in kinds

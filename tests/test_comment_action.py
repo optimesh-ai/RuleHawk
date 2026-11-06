@@ -83,7 +83,7 @@ def test_a_failing_job_and_a_passing_job_combine_to_fail(tmp_path):
     body = _posted_body(_run_comment_script(env["__script__"], env, [], str(tmp_path)))
     head = next(l for l in body.splitlines() if l.startswith("## "))
     assert "FAIL" in head and "✅" not in head
-    assert "| Segmentation | ✅ PASS |" in body and "| Egress | ❌ FAIL" in body
+    assert "| Segmentation | ❌ UNKNOWN |" in body and "| Egress | ❌ FAIL" in body
 
 
 @needs_node_and_bash
@@ -114,9 +114,9 @@ def test_a_bad_expect_value_is_unknown_not_pass(tmp_path):
 def test_every_check_passing_passes(tmp_path):
     res = _results(tmp_path, ("adv_realistic.txt", "One"), ("adv_realistic.txt", "Two"))
     run = _run(tmp_path, res, "2")
-    assert run["outputs"]["combine"]["verdict"] == "PASS"
+    assert run["outputs"]["combine"]["verdict"] == "UNKNOWN"   # fail-closed stopgap
     enforce = [v for k, v in run["outputs"].items() if k.startswith("_step")]
-    assert enforce[-1]["__rc__"] == 0
+    assert enforce[-1]["__rc__"] == 1
 
 
 @needs_node_and_bash
@@ -183,7 +183,7 @@ def test_a_second_invocation_does_not_overwrite_the_first_comment_file(tmp_path)
     second = _run_invocation(_manifest(), {"expect": "1", "results": clean, "jobs": ""},
                              str(runner), str(tmp_path), action_path=_DIR)
     assert first["outputs"]["combine"]["verdict"] == "FAIL"
-    assert second["outputs"]["combine"]["verdict"] == "PASS"
+    assert second["outputs"]["combine"]["verdict"] == "UNKNOWN"   # fail-closed stopgap
     body = open(first["outputs"]["combine"]["comment"], encoding="utf-8").read()
     assert body.splitlines()[1].startswith("## ❌"), body
 

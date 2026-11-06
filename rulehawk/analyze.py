@@ -54,6 +54,23 @@ _DANGEROUS_PORTS = {
 }
 _SSH_PORT = 22  # reported at MEDIUM
 
+# --------------------------------------------------------------------------- #
+# Fail-closed stopgap (0.4.1). RuleHawk could print PASS on configurations it
+# could not fully read or model, so until the full fail-closed release proves a
+# pass, no surface emits PASS or VERIFIED: every would-be pass is UNKNOWN with
+# this reason. FAIL is unchanged. Exit codes: 1 FAIL, 2 parse failure or
+# invalid input, 3 UNKNOWN; 0 only for the advisory `--fail-on none`.
+# --------------------------------------------------------------------------- #
+STOPGAP_CODE = "fail-closed-stopgap"
+STOPGAP_MESSAGE = "fail-closed stopgap pending soundness review"
+# The assertion findings that replace `segmentation-ok` / `connectivity-ok`.
+UNKNOWN_KINDS = ("segmentation-unknown", "connectivity-unknown")
+
+
+def stopgap_reasons() -> List[dict]:
+    """The machine-readable reason every UNKNOWN carries (a fresh list)."""
+    return [{"code": STOPGAP_CODE, "message": STOPGAP_MESSAGE}]
+
 
 @dataclasses.dataclass
 class Finding:
@@ -75,6 +92,11 @@ class Finding:
     # finding is NOT removed and NOT downgraded; the gate simply stops counting
     # it as a violation, and every report shows who accepted it and until when.
     accepted: Optional[dict] = None
+    # Policy-assertion verdict, set only on the stopgap's UNKNOWN findings
+    # (UNKNOWN_KINDS): "UNKNOWN", with reasons [{"code", "message"}]. None on
+    # every other finding.
+    verdict: Optional[str] = None
+    reasons: Optional[List[dict]] = None
 
 
 def _id(a: ACE) -> str:

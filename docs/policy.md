@@ -165,12 +165,15 @@ section above. For `must_not_reach` entries:
   RuleHawk can't model exactly (a non-contiguous mask, an unresolved object-group,
   a `neq` operator). RuleHawk **fails closed** and asks you to review, rather than
   guess "isolated."
-- **`segmentation-ok`** (info) — proven isolated: no permitted witness flow exists.
-  This is a positive attestation, not just the absence of a finding.
+- **`segmentation-unknown`** (info) — no permitted witness flow was found, but
+  RuleHawk 0.4.1 does not certify the assertion: reason `fail-closed-stopgap`,
+  "fail-closed stopgap pending soundness review". It is not an isolation claim.
+  (Before 0.4.1 this case was reported as `segmentation-ok`; that ID is no
+  longer emitted.)
 - **`segmentation-error`** (high) — the policy itself is invalid: a
   `src`/`dst` naming a zone that isn't defined, an unparseable CIDR in `zones`,
   or an unusable `ports` value. RuleHawk **fails closed**: the affected
-  assertion is never given a PASS until the policy is fixed (a typo must not
+  assertion is never certified until the policy is fixed (a typo must not
   certify isolation over an empty search space).
 
 ## AWS Security Groups

@@ -199,7 +199,8 @@ def test_clean_config_text_says_policy_is_clean():
     aces, notes = parse_acls(_CLEAN_IOS)
     findings = analyze(aces)
     out = to_text(findings, notes, len(aces), vendor="ios-asa")
-    assert "policy is clean" in out
+    # fail-closed stopgap: a clean config says UNKNOWN with the reason
+    assert "verdict UNKNOWN: fail-closed stopgap pending soundness review" in out
 
 
 def test_clean_config_json_has_vendor_field():
@@ -226,7 +227,7 @@ def test_clean_config_cli_exits_0(tmp_path):
     p = tmp_path / "clean.acl"
     p.write_text(_CLEAN_IOS, encoding="utf-8")
     rc = cli_main([str(p)])
-    assert rc == 0, f"expected exit 0 on clean config, got {rc}"
+    assert rc == 3, f"expected exit 3 (stopgap UNKNOWN) on clean config, got {rc}"
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +269,7 @@ def test_nxos_exit_code_on_clean_config(tmp_path):
     p = tmp_path / "nxos.cfg"
     p.write_text(_NXOS_CFG, encoding="utf-8")
     rc = cli_main([str(p)])
-    assert rc == 0, f"expected exit 0 on clean NX-OS config, got {rc}"
+    assert rc == 3, f"expected exit 3 (stopgap UNKNOWN) on clean NX-OS config, got {rc}"
 
 
 def test_eos_exit_code_on_clean_config(tmp_path):
@@ -276,7 +277,7 @@ def test_eos_exit_code_on_clean_config(tmp_path):
     p = tmp_path / "eos.cfg"
     p.write_text(_EOS_CFG, encoding="utf-8")
     rc = cli_main([str(p)])
-    assert rc == 0, f"expected exit 0 on clean EOS config, got {rc}"
+    assert rc == 3, f"expected exit 3 (stopgap UNKNOWN) on clean EOS config, got {rc}"
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +375,7 @@ def test_piped_stdin_still_audited(monkeypatch):
     day-1 `cat config | rulehawk` flow is unchanged. Clean config -> exit 0."""
     import io
     monkeypatch.setattr(sys, "stdin", io.StringIO(_CLEAN_IOS))
-    assert cli_main([]) == 0
+    assert cli_main([]) == 3                 # fail-closed stopgap: UNKNOWN
 
 
 def test_explicit_dash_reads_stdin_even_on_tty(monkeypatch):
@@ -382,7 +383,7 @@ def test_explicit_dash_reads_stdin_even_on_tty(monkeypatch):
     clean config), independent of the TTY guard on the bare invocation."""
     import io
     monkeypatch.setattr(sys, "stdin", io.StringIO(_CLEAN_IOS))
-    assert cli_main(["-"]) == 0
+    assert cli_main(["-"]) == 3              # fail-closed stopgap: UNKNOWN
 
 
 def test_garbage_via_piped_stdin_still_exit_2(monkeypatch):
@@ -428,7 +429,7 @@ def test_single_config_file_still_audited_exit_0(tmp_path, capsys):
     p.write_text(_CLEAN_IOS, encoding="utf-8")
     rc = cli_main([str(p)])
     captured = capsys.readouterr()
-    assert rc == 0
+    assert rc == 3                           # fail-closed stopgap: UNKNOWN
     assert "rules analyzed" in captured.out
     assert captured.err == ""
 

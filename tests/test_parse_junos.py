@@ -175,7 +175,7 @@ def test_earlier_discard_blocks_no_false_alarm():
     aces, _ = parse_junos(cfg)
     kinds = {f.kind for f in check_segmentation(aces, _POLICY)}
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
 
 
 def test_default_accept_flagged_overly_permissive():
@@ -258,7 +258,7 @@ def test_apply_groups_filter_yields_indeterminate_not_false_pass():
     aces, _ = parse_junos(_APPLY_GROUPS_FILTER)
     kinds = {f.kind for f in check_segmentation(aces, _POLICY)}
     assert "segmentation-indeterminate" in kinds
-    assert "segmentation-ok" not in kinds, (
+    assert "segmentation-unknown" not in kinds, (
         "a filter with apply-groups (invisible inherited terms) must never "
         "PASS a segmentation assertion")
     assert "segmentation-violation" not in kinds  # opaque never proves a leak
@@ -386,7 +386,7 @@ def test_inet6_segmentation_violation_no_longer_false_passes():
     aces, _ = parse_junos(_V6_LEAK)
     findings = check_segmentation(aces, _POLICY6)
     kinds = {f.kind for f in findings}
-    assert "segmentation-ok" not in kinds, (
+    assert "segmentation-unknown" not in kinds, (
         "an inet6 permit the device enforces must never false-PASS a v6 "
         "segmentation assertion")
     viol = [f for f in findings if f.kind == "segmentation-violation"]
@@ -411,7 +411,7 @@ def test_inet6_default_term_and_earlier_discard_still_sound():
     assert all(a.src.version == 6 and a.dst.version == 6 for a in aces)
     kinds = {f.kind for f in check_segmentation(aces, _POLICY6)}
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
 
 
 def test_inet6_apply_groups_opaque_is_v6_fail_closed():
@@ -431,7 +431,7 @@ def test_inet6_apply_groups_opaque_is_v6_fail_closed():
     assert opaque.dst.version == 6 and str(opaque.dst) == "::/0"
     kinds = {f.kind for f in check_segmentation(aces, _POLICY6)}
     assert "segmentation-indeterminate" in kinds
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
     assert any("apply-groups" in n for n in notes)
 
 
@@ -571,7 +571,7 @@ def test_tcp_flags_permit_visible_to_witness_search():
     assert aces[0].imprecise is True        # flag restriction over-approximated
     assert any("tcp-flags" in n for n in notes)
     kinds = {f.kind for f in check_segmentation(aces, _POLICY)}
-    assert "segmentation-ok" not in kinds   # never a false PASS
+    assert "segmentation-unknown" not in kinds   # never a false PASS
 
 
 def test_tcp_established_still_stateful_tcp_initial_not():
@@ -609,7 +609,7 @@ def test_inactive_term_is_not_enforced():
     assert any("inactive" in n and "BLOCK" in n for n in notes)
     kinds = {f.kind for f in check_segmentation(aces, _POLICY)}
     assert "segmentation-violation" in kinds
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
 
 
 def test_inactive_filter_is_not_enforced():
@@ -733,7 +733,7 @@ def test_bracket_list_named_port_deny_stays_live():
            "must_not_reach": [{"src": "CORP", "dst": "PCI",
                                "proto": "tcp", "ports": [20]}]}
     kinds = {f.kind for f in check_segmentation(aces, pol)}
-    assert kinds == {"segmentation-ok"}                   # deny blocks port 20
+    assert kinds == {"segmentation-unknown"}                   # deny blocks port 20
 
 
 def test_unparseable_port_in_list_widens_dimension_to_any():
@@ -819,4 +819,4 @@ def test_max_expand_widens_to_any_never_truncates():
     assert aces[0].src_any and aces[0].imprecise is True
     assert any("widened" in n for n in notes)
     kinds = {f.kind for f in check_segmentation(aces, _POLICY)}
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds

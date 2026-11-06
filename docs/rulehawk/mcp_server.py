@@ -45,7 +45,7 @@ from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 from . import __version__
-from .analyze import Finding
+from .analyze import STOPGAP_CODE, STOPGAP_MESSAGE, Finding, stopgap_reasons
 from .boundary import to_dict as boundary_dict
 from .gate import (_KIND_HELP, _SEV_ORDER, _SEV_RANK, _VENDORS, FileResult,
                    _pick_parser, no_rules_reason, run_gate)
@@ -281,6 +281,8 @@ def _finding_dict(fr: FileResult, f: Finding, base: str) -> dict:
         "witness": f.witness,
         "fix": f.fix,
         "accepted": f.accepted,
+        "verdict": f.verdict,
+        "reasons": list(f.reasons or []),
     }
 
 
@@ -424,7 +426,10 @@ def _verdict(gate, coverage: dict, fail_on: str) -> Tuple[str, str]:
     if fail_on == "none":
         return "ADVISORY", ("fail_on=none: nothing blocks, so no PASS is given; "
                             "read findings_by_severity")
-    return "PASS", f"no finding at or above fail_on={fail_on}"
+    # Fail-closed stopgap: the would-be PASS is UNKNOWN.
+    return "UNKNOWN", (f"no finding at or above fail_on={fail_on}, but the "
+                       f"result is not certified ({STOPGAP_CODE}: "
+                       f"{STOPGAP_MESSAGE})")
 
 
 # --------------------------------------------------------------------------- #
@@ -447,6 +452,7 @@ def audit(path: str, policy_path: str = "", vendor: str = "auto",
         "rulehawk_version": __version__,
         "verdict": verdict,
         "verdict_reason": why,
+        "reasons": stopgap_reasons() if verdict in ("UNKNOWN", "ADVISORY") else [],
         "fail_on": fail_on,
         "policy_applied": has_policy,
         "worst_severity": gate.worst,
@@ -457,6 +463,12 @@ def audit(path: str, policy_path: str = "", vendor: str = "auto",
             {"file": _rel(fr.path, base), "claim": f.rule_id, "message": f.message}
             for fr in gate.files for f in fr.findings
             if f.kind in ("segmentation-ok", "connectivity-ok")],
+        # Fail-closed stopgap: every assertion the search found no
+        # counterexample for, reported UNKNOWN with its reason.
+        "segmentation_unknown": [
+            {"file": _rel(fr.path, base), "claim": f.rule_id, "kind": f.kind,
+             "message": f.message, "reasons": list(f.reasons or [])}
+            for fr, f in gate.undecided],
         "coverage": cov,
         "scope": _scope(all_findings),
         "next": ("Call rulehawk_list_findings for every finding, or "
@@ -690,16 +702,19 @@ def compare(before: str, after: str, policy_path: str = "",
         verdict, why = "ADVISORY", (f"fail_on=none: nothing blocks; "
                                     f"{len(introduced)} finding(s) introduced")
     else:
-        verdict, why = "NO_NEW_RISK", (
+        # Fail-closed stopgap: no all-clear (the old NO_NEW_RISK) is given.
+        verdict, why = "UNKNOWN", (
             f"no new finding at or above fail_on={fail_on}"
             + (f"; {still_blocking} pre-existing blocking finding(s) remain"
-               if still_blocking else ""))
+               if still_blocking else "")
+            + f"; not certified ({STOPGAP_CODE}: {STOPGAP_MESSAGE})")
     introduced.sort(key=lambda d: (-_SEV_RANK.get(d["severity"], 0), d["file"], d["line"]))
     return {
         "tool": tool,
         "rulehawk_version": __version__,
         "verdict": verdict,
         "verdict_reason": why,
+        "reasons": stopgap_reasons() if verdict in ("UNKNOWN", "ADVISORY") else [],
         "fail_on": fail_on,
         "policy_applied": policy is not None,
         "introduced": introduced[:MAX_LIMIT],
@@ -752,11 +767,12 @@ def supported_inputs() -> dict:
 INSTRUCTIONS = (
     "RuleHawk audits firewall/ACL rulesets locally (rule layer only). Before "
     "pushing an ACL or firewall change, call rulehawk_audit (or rulehawk_compare "
-    "with the running and candidate configs), using absolute paths. Only PASS "
-    "and NO_NEW_RISK are an all-clear. Treat FAIL, INTRODUCES_RISK, "
-    "INCOMPLETE, ADVISORY or ERROR as a stop, and show the human the "
-    "blocking findings and the coverage.not_analysed list. RuleHawk does not "
-    "model routing, NAT or topology, so a PASS is not a reachability proof."
+    "with the running and candidate configs), using absolute paths. This "
+    "release gives no all-clear (fail-closed stopgap pending soundness "
+    "review): a run with nothing blocking is UNKNOWN. Treat FAIL, "
+    "INTRODUCES_RISK, UNKNOWN, INCOMPLETE, ADVISORY or ERROR as a stop, and "
+    "show the human the blocking findings and the coverage.not_analysed list. "
+    "RuleHawk does not model routing, NAT or topology."
 )
 
 
@@ -780,11 +796,13 @@ def build_server():
         with policy_path, segmentation violations with a witness packet).
         Start here.
 
-        Returns verdict PASS / FAIL / INCOMPLETE / ERROR (ADVISORY when
+        Returns verdict FAIL / UNKNOWN / INCOMPLETE / ERROR (ADVISORY when
         fail_on=none), the blocking findings (severity >= fail_on, each with
         file, line, rule and fix), and a coverage block listing every file
         analysed, every file NOT analysed and why, and lines the parser could
-        not model. Only PASS is an all-clear. On ERROR, read `error` and `hint`.
+        not model. This release gives no all-clear: with nothing blocking the
+        verdict is UNKNOWN (reason fail-closed-stopgap, in `reasons` and
+        `segmentation_unknown`). On ERROR, read `error` and `hint`.
         Rule layer only: routing, NAT and topology are not evaluated.
 
         path: absolute path of a config file (show running-config, iptables-save,
@@ -833,8 +851,9 @@ def build_server():
         or both directories (paired by relative path), using absolute paths.
         Use this before pushing a change. Returns the findings the change
         introduces, the ones it resolves, the rules it adds, and verdict
-        INTRODUCES_RISK / NO_NEW_RISK / INCOMPLETE / ERROR (ADVISORY when
-        fail_on=none). Only NO_NEW_RISK is an all-clear. This is a rule-layer
+        INTRODUCES_RISK / UNKNOWN / INCOMPLETE / ERROR (ADVISORY when
+        fail_on=none). This release gives no all-clear: with no new blocking
+        finding the verdict is UNKNOWN (fail-closed stopgap). This is a rule-layer
         finding delta, not a forwarding or reachability diff.
         """
         return compare(before, after, policy_path, vendor, fail_on)
