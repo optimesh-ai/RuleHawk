@@ -260,12 +260,15 @@ def test_f3_a_legacy_advisory_record_is_not_a_pass(tmp_path):
     assert render([str(rec)])[1] != "PASS"
 
 
-_yaml = pytest.importorskip("yaml", reason="PyYAML not installed")
+def _load_yaml(fh):
+    # Skip only the tests that read YAML: a module-level importorskip would
+    # skip every test in this file without PyYAML.
+    return pytest.importorskip("yaml", reason="PyYAML not installed").safe_load(fh)
 
 
 def _enforce_step() -> str:
     with open(os.path.join(_ROOT, "action.yml"), encoding="utf-8") as fh:
-        steps = _yaml.safe_load(fh)["runs"]["steps"]
+        steps = _load_yaml(fh)["runs"]["steps"]
     [s] = [s for s in steps if s.get("name") == "Enforce gate verdict"]
     return s["run"]
 
@@ -295,7 +298,7 @@ def test_f3_action_still_says_passed_on_pass(tmp_path):
 
 def test_f3_action_passed_output_follows_the_json():
     with open(os.path.join(_ROOT, "action.yml"), encoding="utf-8") as fh:
-        a = _yaml.safe_load(fh)
+        a = _load_yaml(fh)
     assert "steps.gate.outputs.verdict" in str(
         [s.get("env") for s in a["runs"]["steps"] if s.get("name") == "Enforce gate verdict"])
     desc = a["outputs"]["passed"]["description"]
