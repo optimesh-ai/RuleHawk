@@ -31,7 +31,7 @@ from .parse_junos import detect as detect_junos, parse_junos
 from .parse_nxos import detect as detect_nxos, parse_nxos
 from .parse_panos import detect as detect_panos, parse_panos
 from .pathground import HammerheadReachOracle, path_ground
-from .report import to_json, to_text
+from .report import exit_code, to_json, to_text
 from .segcheck import check_segmentation
 
 
@@ -60,10 +60,12 @@ Single-file mode takes exactly one config file. To audit several at once (e.g.
 a shell glob like `rulehawk configs/*.txt`), use `rulehawk gate <files...>` —
 passing extra files here is an error (exit 2), never a partial audit.
 
-exit codes:
-  0  config parsed; no critical/high findings
-  1  at least one critical/high finding
+exit codes (0.3.2, fail-closed stopgap: PASS is never reported):
+  1  FAIL: at least one critical/high finding
   2  parse failure (no rules parsed), unreadable input, or bad usage
+  3  UNKNOWN: no critical/high finding, but not certified (reason
+     fail-closed-stopgap: fail-closed stopgap pending soundness review)
+  0  only for --help; an audited run never exits 0
 """
 
 
@@ -195,12 +197,12 @@ def main(argv: list[str] | None = None) -> int:
         print(to_json(findings, notes, n_rules, vendor))
     else:
         print(to_text(findings, notes, n_rules, vendor))
-    # Distinct exit codes: 0 clean · 1 finding at critical/high · 2 parse failure.
+    # Distinct exit codes: 1 finding at critical/high · 2 parse failure · 3
+    # UNKNOWN (fail-closed stopgap: never 0, which would read as a PASS).
     # Exit 2 (fail-closed) when NOTHING was parsed: absence of findings must NOT
     # imply a clean audit when the input was never read as a firewall config.
-    if not n_rules:
-        return 2
-    return 1 if any(f.severity in ("critical", "high") for f in findings) else 0
+    # See report.exit_code.
+    return exit_code(findings, n_rules)
 
 
 if __name__ == "__main__":

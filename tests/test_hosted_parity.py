@@ -289,7 +289,7 @@ def test_hosted_is_fail_closed_indeterminate_never_false_pass():
     env = _run_hosted(_analyze_py(_read(_WORKER)), _CISCO_INDET, _POLICY)
     kinds = {f["kind"] for f in env["report_json"]["findings"]}
     assert "segmentation-indeterminate" in kinds   # unmodeled ref -> fail closed
-    assert "segmentation-ok" not in kinds          # never a false PASS
+    assert "segmentation-unknown" not in kinds          # never a false PASS
 
 
 def test_hosted_rule_lines_cover_expanded_object_group_aces():

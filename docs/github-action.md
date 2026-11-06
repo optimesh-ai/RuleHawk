@@ -55,7 +55,9 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 
 | Output | Description |
 |---|---|
-| `passed` | `true` when no finding met the `fail-on` threshold (and every file parsed). |
+| `passed` | Never `true` in 0.3.2 (fail-closed stopgap: no PASS is reported). Read `verdict` and `exit-code`. |
+| `verdict` | `FAIL` \| `UNKNOWN`. UNKNOWN (exit 3): nothing reached the `fail-on` threshold, but the run is not certified (reason `fail-closed-stopgap`, "fail-closed stopgap pending soundness review"). Under `fail-on: none` the real verdict, reported but not enforced. |
+| `exit-code` | The gate's exit code: `1` FAIL, `2` parse failure or invalid input, `3` UNKNOWN; `0` only under `fail-on: none`. |
 | `score` | Lowest hygiene score (0–100) across the audited files. |
 | `worst-severity` | Highest severity found: `critical` \| `high` \| `medium` \| `low` \| `none`. |
 | `sarif-file` | Path to the generated SARIF report. |
@@ -64,11 +66,12 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 
 | Code | Meaning |
 |---|---|
-| `0` | Clean — no finding at/above `fail-on`, every file parsed. |
-| `1` | One or more findings at/above `fail-on`. |
+| `0` | Only under `fail-on: none` (advisory). Fail-closed stopgap (0.3.2): an enforced run never exits 0, and no run reports PASS. |
+| `1` | FAIL: one or more findings at/above `fail-on`. |
 | `2` | **Fail-closed** — a file parsed to *zero* rules or could not be read (suppressed only by `fail-on: none`), a `configs` pattern matched **no files** (a typo'd path must not mean "never audited, green check"), an unknown `vendor`/flag, or an unwritable output path. RuleHawk will not certify isolation it could not verify. |
+| `3` | UNKNOWN (new): no finding at/above `fail-on`, but the run is not certified — reason `fail-closed-stopgap`, "fail-closed stopgap pending soundness review". Precedence: `2`, then `1`, then `3`. |
 
-The Action maps both `1` and `2` to a red check. Even on failure it still uploads
+The Action maps `1`, `2` and `3` to a red check (exit 3 with an error annotation that names the stopgap). Even on failure it still uploads
 SARIF and posts the comment first, so the gate always reports its value.
 
 ## What you get

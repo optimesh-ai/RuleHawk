@@ -66,4 +66,4 @@ def test_large_fully_denied_audit_is_a_genuine_pass():
     lines.append(" deny tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255")
     aces, _ = parse_acls("\n".join(lines) + "\n")
     findings = check_segmentation(aces, _PORTLESS_POLICY)
-    assert [f.kind for f in findings] == ["segmentation-ok"]
+    assert [f.kind for f in findings] == ["segmentation-unknown"]

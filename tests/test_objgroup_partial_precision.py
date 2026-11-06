@@ -55,7 +55,7 @@ def test_partial_group_resolved_member_proves_leak_emits_critical():
     assert "segmentation-violation" in kinds, (
         "resolved member proves CORP->PCI:445 leak; expect CRITICAL"
     )
-    assert "segmentation-ok" not in kinds, "must not produce a false PASS"
+    assert "segmentation-unknown" not in kinds, "must not produce a false PASS"
     assert "segmentation-indeterminate" not in kinds, (
         "CRITICAL should be reported (segcheck breaks on first hit per assertion)"
     )
@@ -94,7 +94,7 @@ def test_partial_group_resolved_member_not_in_source_zone_stays_indeterminate():
         "no resolved member covers CORP zone; unresolved remainder must stay INDETERMINATE"
     )
     assert "segmentation-violation" not in kinds, "must not invent a false CRITICAL"
-    assert "segmentation-ok" not in kinds, "must not produce a false PASS"
+    assert "segmentation-unknown" not in kinds, "must not produce a false PASS"
 
     # Parser still emits precise + opaque ACEs (partial resolution happened).
     precise = [a for a in aces if not a.imprecise]
@@ -120,7 +120,7 @@ def test_fully_resolved_clean_group_stays_pass():
     kinds = _kinds(aces)
 
     # No CORP->PCI:445 path; full resolution took effect; nothing partial.
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
     assert "segmentation-violation" not in kinds
     assert "segmentation-indeterminate" not in kinds
 
@@ -146,6 +146,6 @@ def test_entirely_undefined_group_still_opaque_not_partial():
     assert len(aces) == 1 and aces[0].imprecise is True
     assert "segmentation-indeterminate" in kinds
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
     # The fallback path, not partial resolution — note says "unmodeled (object-group)".
     assert any("unmodeled (object-group)" in n for n in notes)

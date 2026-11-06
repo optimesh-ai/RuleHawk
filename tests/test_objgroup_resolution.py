@@ -48,7 +48,7 @@ def test_resolved_groups_report_precise_critical_not_indeterminate():
     kinds = _kinds(aces)
     assert "segmentation-violation" in kinds          # PRECISE critical
     assert "segmentation-indeterminate" not in kinds  # no longer fail-closed
-    assert "segmentation-ok" not in kinds             # and never a false PASS
+    assert "segmentation-unknown" not in kinds             # and never a false PASS
     # exactly one exact ACE (10.20/16 -> 10.10/16 tcp/445), not imprecise.
     leak = [a for a in aces if a.proto == "tcp"]
     assert len(leak) == 1 and leak[0].imprecise is False
@@ -100,7 +100,7 @@ def test_undefined_group_stays_indeterminate():
     aces, _ = parse_acls(cfg)
     kinds = _kinds(aces)
     assert "segmentation-indeterminate" in kinds
-    assert "segmentation-ok" not in kinds              # never a false PASS
+    assert "segmentation-unknown" not in kinds              # never a false PASS
     assert "segmentation-violation" not in kinds       # never invent a witness
     assert aces[0].imprecise is True
 
@@ -118,7 +118,7 @@ def test_clean_resolved_config_passes():
     )  # CORP can reach DMZ (not PCI) — no forbidden path
     aces, _ = parse_acls(cfg)
     kinds = _kinds(aces)
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
     assert "segmentation-violation" not in kinds
     assert "segmentation-indeterminate" not in kinds   # resolved precisely -> clean PASS
     assert all(not a.imprecise for a in aces)
@@ -140,7 +140,7 @@ def test_over_cap_expansion_stays_imprecise():
     assert len(aces) == 1 and aces[0].imprecise is True
     kinds = _kinds(aces)
     assert "segmentation-indeterminate" in kinds       # fail-closed, not truncated
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
     assert any("unmodeled (object-group)" in n for n in notes)
 
 
@@ -181,7 +181,7 @@ def test_partial_group_proven_leak_is_critical():
     kinds = _kinds(aces)
     # Resolved member (10.20/16 -> PCI:445) is a proven CORP->PCI:445 violation.
     assert "segmentation-violation" in kinds          # CRITICAL, not suppressed
-    assert "segmentation-ok" not in kinds             # no false PASS
+    assert "segmentation-unknown" not in kinds             # no false PASS
     # Parser emits: one precise ACE for the resolved member + one opaque ACE.
     assert len(aces) == 2
     assert aces[0].imprecise is False                 # precise ACE for 10.20/16
@@ -204,5 +204,5 @@ def test_cyclic_group_reference_fails_closed():
     aces, _ = parse_acls(cfg)
     kinds = _kinds(aces)
     assert "segmentation-indeterminate" in kinds       # cycle -> fail closed
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
     assert aces[0].imprecise is True

@@ -33,7 +33,7 @@ from __future__ import annotations
 import ipaddress
 from typing import Dict, List, Optional
 
-from .analyze import Finding
+from .analyze import STOPGAP_MESSAGE, Finding, stopgap_reasons
 from .model import (ACE, ANY_PORTS, _ICMP_PROTOS, _IPNet, _PORTED,
                     _WILDCARD_PROTO, PortRange)
 
@@ -393,18 +393,22 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                                    proto, ports)
                 kind, info = res
                 if kind == "ok":
+                    # Fail-closed stopgap: a must_reach the rule search finds
+                    # open is reported UNKNOWN, never as proven connectivity.
                     rule, probe, swit, dwit, wport = info
                     portsfx = f":{wport}" if wport is not None else ""
                     _line_part = f" (line {rule.line})" if rule.line else ""
                     findings.append(Finding(
-                        f"{rule.acl}:{rule.seq}", "connectivity-ok", "info",
-                        f"CONNECTIVITY OK ({sname} must reach {dname}{scope}): "
-                        f"the ENTIRE flow space is provably permitted — e.g. "
-                        f"rule {rule.seq}{_line_part} permits "
-                        f"{swit} -> {dwit}{portsfx} ({probe}).",
+                        f"{rule.acl}:{rule.seq}", "connectivity-unknown", "info",
+                        f"UNKNOWN ({sname} must reach {dname}{scope}): the "
+                        f"ENTIRE flow space is permitted by the parsed rules "
+                        f"— e.g. rule {rule.seq}{_line_part} permits "
+                        f"{swit} -> {dwit}{portsfx} ({probe}) — but "
+                        f"connectivity is not certified: {STOPGAP_MESSAGE}.",
                         rule.raw,
                         witness=f"{swit} -> {dwit}{portsfx} ({probe})",
-                        line=rule.line))
+                        line=rule.line,
+                        verdict="UNKNOWN", reasons=stopgap_reasons()))
                 elif kind == "indeterminate":
                     rule, acl_name = info
                     if rule is not None:
@@ -499,11 +503,14 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                     f"cannot be certified.",
                     "fix the segmentation policy file"))
                 continue
+            # Fail-closed stopgap: no permitted witness was found, but that
+            # is reported UNKNOWN, never as proven isolation.
             findings.append(Finding(
-                label, "segmentation-ok", "info",
-                f"PASS: {sname} cannot reach {dname}{scope}"
-                + " (no permitted witness flow found).", "",
-                fix=""))
+                label, "segmentation-unknown", "info",
+                f"UNKNOWN ({sname} must not reach {dname}{scope}): no parsed "
+                f"rule permits a witness flow, but isolation is not "
+                f"certified: {STOPGAP_MESSAGE}.", "",
+                fix="", verdict="UNKNOWN", reasons=stopgap_reasons()))
     return findings
 
 

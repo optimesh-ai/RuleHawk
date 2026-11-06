@@ -29,7 +29,7 @@ def test_misspelled_src_zone_fails_closed_not_pass():
     }
     fs = _find(policy)
     kinds = {f.kind for f in fs}
-    assert "segmentation-ok" not in kinds, "must NOT fabricate a PASS"
+    assert "segmentation-unknown" not in kinds, "must NOT fabricate a PASS"
     assert kinds == {"segmentation-error"}
     err = fs[0]
     assert err.severity == "high"
@@ -77,5 +77,5 @@ def test_valid_zones_still_pass_or_evaluate():
         "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp", "ports": [445]}],
     }
     fs = _find(policy)  # empty ACL -> default deny -> PASS
-    assert [f.kind for f in fs] == ["segmentation-ok"]
+    assert [f.kind for f in fs] == ["segmentation-unknown"]
     assert "segmentation-error" not in {f.kind for f in fs}

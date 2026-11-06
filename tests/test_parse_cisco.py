@@ -108,7 +108,7 @@ def test_undefined_service_group_fails_closed_not_any_ports():
     assert aces[0].imprecise is True                # opaque, not exact any-port
     skinds = _seg_kinds(aces)
     assert "segmentation-indeterminate" in skinds
-    assert "segmentation-ok" not in skinds
+    assert "segmentation-unknown" not in skinds
     assert "redundant" not in _kinds(aces)          # opaque ACE proves nothing dead
 
 
@@ -238,7 +238,7 @@ def test_numeric_protocol_matches_named_assertion():
     assert aces[0].proto == "udp"
     pol = {"zones": {"C": ["10.20.0.0/16"], "P": ["10.10.0.0/16"]},
            "must_not_reach": [{"src": "C", "dst": "P", "proto": "udp", "ports": [53]}]}
-    assert "segmentation-ok" not in {f.kind for f in check_segmentation(aces, pol)}
+    assert "segmentation-unknown" not in {f.kind for f in check_segmentation(aces, pol)}
 
 
 # --- standard ACLs (ASA named, IOS numbered, IOS named) ---------------------
@@ -338,7 +338,7 @@ def test_out_of_order_sequence_numbers_are_evaluated_numerically():
     assert [a.action for a in aces] == ["permit", "deny"]   # 10 before 20
     pol = {"zones": {"C": ["10.20.0.0/16"], "P": ["10.99.0.0/16"]},
            "must_not_reach": [{"src": "C", "dst": "P", "proto": "ip"}]}
-    assert "segmentation-ok" not in {f.kind for f in check_segmentation(aces, pol)}
+    assert "segmentation-unknown" not in {f.kind for f in check_segmentation(aces, pol)}
     assert any("reordered by explicit sequence" in n for n in notes)
 
 

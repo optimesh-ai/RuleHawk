@@ -64,7 +64,7 @@ def test_segmentation_ip_assertion_catches_specific_proto_rule():
               "must_not_reach": [{"src": "C", "dst": "P"}]}
     kinds = [f.kind for f in check_segmentation(aces, policy)]
     assert "segmentation-violation" in kinds
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
 
 
 def test_asa_show_access_list_line_number_parses():
@@ -89,7 +89,7 @@ def test_multiport_eq_does_not_false_pass_segmentation():
         "ip access-list extended OUT\n"
         " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq www 445\n")
     kinds = _seg_kinds(aces)
-    assert "segmentation-ok" not in kinds, "FALSE PASS: eq www 445 hides port 445"
+    assert "segmentation-unknown" not in kinds, "FALSE PASS: eq www 445 hides port 445"
     assert "segmentation-violation" in kinds
 
 
@@ -115,7 +115,7 @@ def test_object_group_permit_resolves_to_precise_violation():
         "ip access-list extended OUT\n"
         " permit tcp object-group CORP_NET object-group PCI_NET eq 445\n")
     kinds = _seg_kinds(aces)
-    assert "segmentation-ok" not in kinds, "FALSE PASS: object-group leak hidden"
+    assert "segmentation-unknown" not in kinds, "FALSE PASS: object-group leak hidden"
     assert "segmentation-violation" in kinds
     assert all(not a.imprecise for a in aces)   # resolved exactly, not fail-closed
 
@@ -127,7 +127,7 @@ def test_asa_object_reference_fails_closed_not_ok():
         "object network CORP\n subnet 10.20.0.0 255.255.0.0\n"
         "object network PCI\n subnet 10.10.0.0 255.255.0.0\n"
         "access-list OUT extended permit tcp object CORP object PCI eq 445\n")
-    assert "segmentation-ok" not in _seg_kinds(aces), \
+    assert "segmentation-unknown" not in _seg_kinds(aces), \
         "FALSE PASS: ASA object-reference leak hidden"
 
 
@@ -144,7 +144,7 @@ def test_cross_acl_deny_does_not_shadow_other_acl_permit():
         "ip access-list extended INSIDE-IN\n"
         " permit ip 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255\n")
     kinds = _seg_kinds(aces)
-    assert "segmentation-ok" not in kinds, "FALSE PASS: ACL1 deny shadowed ACL2 permit"
+    assert "segmentation-unknown" not in kinds, "FALSE PASS: ACL1 deny shadowed ACL2 permit"
     assert "segmentation-violation" in kinds
 
 
@@ -164,7 +164,7 @@ def test_cross_filter_deny_does_not_shadow_other_filter_permit_junos():
     """
     aces, _ = parse_junos(cfg)
     kinds = _seg_kinds(aces)
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
     assert "segmentation-violation" in kinds
 
 
@@ -177,7 +177,7 @@ def test_per_acl_scoping_does_not_over_fail_clean_multi_acl():
         "ip access-list extended INSIDE-IN\n"
         " permit tcp 10.20.0.0 0.0.255.255 10.40.0.0 0.0.255.255 eq 443\n deny ip any any\n")
     kinds = _seg_kinds(aces)
-    assert "segmentation-ok" in kinds and "segmentation-violation" not in kinds
+    assert "segmentation-unknown" in kinds and "segmentation-violation" not in kinds
 
 
 def test_within_acl_earlier_deny_still_blocks():
@@ -188,7 +188,7 @@ def test_within_acl_earlier_deny_still_blocks():
         " deny tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq 445\n"
         " permit ip any any\n")
     kinds = _seg_kinds(aces)
-    assert "segmentation-ok" in kinds and "segmentation-violation" not in kinds
+    assert "segmentation-unknown" in kinds and "segmentation-violation" not in kinds
 
 
 # === Unknown trailing tokens (2026-W27): tcp flags / unresolvable eq names ===
@@ -209,7 +209,7 @@ def test_tcp_flag_deny_does_not_false_pass_segmentation():
     assert aces[0].action == "deny" and aces[0].imprecise is True
     assert any("unrecognized trailing qualifier syn" in n for n in notes)
     kinds = _seg_kinds(aces)
-    assert "segmentation-ok" not in kinds, \
+    assert "segmentation-unknown" not in kinds, \
         "FALSE PASS: syn-narrowed deny treated as full-width"
     assert "segmentation-indeterminate" in kinds
 
@@ -235,7 +235,7 @@ def test_unknown_eq_service_name_does_not_false_pass_segmentation():
         "ip access-list extended OUT\n"
         " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq www frobnicate\n")
     kinds = _seg_kinds(aces)
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
     assert "segmentation-indeterminate" in kinds
 
 
@@ -276,7 +276,7 @@ def test_object_group_resolved_deny_with_tcp_flag_fails_closed():
     assert denies and all(a.imprecise for a in denies)
     assert any("unrecognized trailing qualifier syn" in n for n in notes)
     kinds = _seg_kinds(aces)
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
 
 
 def test_show_access_list_hitcnt_residue_fails_closed():
