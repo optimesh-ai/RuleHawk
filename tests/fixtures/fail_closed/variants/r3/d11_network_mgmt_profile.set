@@ -1,0 +1,4 @@
+set network profiles interface-management-profile M permitted-ip 192.0.2.0/24
+set network interface ethernet ethernet1/2 layer3 interface-management-profile M
+set rulebase security rules d from any to any source 192.0.2.0/24 destination 198.51.100.0/24 application any service any action deny
+set rulebase security rules a from any to any source 192.0.2.0/24 destination any application any service any action allow

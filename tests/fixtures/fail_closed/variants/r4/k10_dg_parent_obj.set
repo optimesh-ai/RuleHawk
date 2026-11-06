@@ -1,0 +1,3 @@
+set device-group PARENT address CORP ip-netmask 192.0.2.0/24
+set device-group CHILD pre-rulebase security rules d from any to any source CORP destination 198.51.100.0/24 application any service any action deny
+set device-group CHILD pre-rulebase security rules a from any to any source 192.0.2.0/24 destination any application any service any action allow
