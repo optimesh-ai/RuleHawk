@@ -159,14 +159,16 @@ run is one.
   route`) ends configuration mode (later lines are a parse note); an `exit`
   after an unchecked sub-mode body -> UNKNOWN.
 - Line accounting: every line of an object on the evaluated path ends read
-  (every word in the model) or noted. The frontends fill one ledger and one
+  (by a cited grammar, see below) or noted. The frontends fill one ledger and one
   check notes any line nothing read: Cisco ACL lines, ACL headers, flat
   `access-list` lines and forwarding interface lines; every iptables and
   PAN-OS line; every Junos term. A line the lexer keeps in ACL mode but the
   parser does not read (`default 10`, `30 xyzzy`) -> parse note -> UNKNOWN.
 - Cisco ACL numbering: an unnumbered entry is numbered the last number + 10
-  (Cisco IOS XE 17 and NX-OS), the ACL is evaluated in number order, and an
-  order that differs from the text is a parse note. A mixed ACL such as
+  on IOS IPv4 and NX-OS (Cisco IOS XE 17 and NX-OS), the ACL is evaluated in
+  number order, and an order that differs from the text is a parse note. On
+  EOS and IOS IPv6, where +10 is not cited, an ACL that mixes numbered and
+  unnumbered entries is a parse note. A mixed ACL such as
   `deny ...` then `5 permit ...` used to be evaluated in text order (PASS);
   it is now FAIL when the permit leaks, else UNKNOWN.
 - Cisco ACL deletions: `no N` (IOS IPv4, NX-OS, EOS) and `no sequence N`
@@ -186,8 +188,40 @@ run is one.
   `log-input` -> parse note, imprecise.
 - iptables-restore: a table block without `COMMIT`, a `COMMIT` outside a
   block and any line outside a block -> parse note.
-- `rulehawk gate`: a failed policy assertion blocks at every `--fail-on`
-  threshold (a broken `must_reach`, HIGH, used to exit 0 at `critical`).
+- `rulehawk gate`: a failed policy assertion blocks at every enforcing
+  `--fail-on` threshold (`critical`, `high`, `medium`, `low`; a broken
+  `must_reach`, HIGH, used to exit 0 at `critical`). `--fail-on none` is
+  advisory and still exits 0.
+- Strict grammars (review round 9). Every handler that reads a line reads it
+  by a grammar written from a cited vendor document or source; any other
+  form is a parse note -> UNKNOWN:
+  - Junos: the latest terminating action in a term wins (Juniper: "the
+    latest terminating action will replace the existing terminating
+    action"); a term with more than one is noted. `then discard; then
+    accept;` used to read as discard (PASS); it is now FAIL. A term name
+    used twice, a term statement other than `from` / `then` / `filter`, a
+    then-action with another argument count, `next term` with a terminating
+    action, and a stanza outside `firewall` / `interfaces` that names a
+    filter are noted. `protect:` on a term is UNKNOWN (it was FAIL).
+  - Cisco sequence numbers: 0, a leading zero, a number outside the range
+    (IOS IPv4 1-2147483647; IOS IPv6 and NX-OS 1-4294967295; EOS above
+    2147483647) and a generated number past the maximum are noted.
+  - Cisco `resequence` (NX-OS global, IOS `ip access-list resequence`, in
+    ACL mode) is noted, as is any other line outside ACL mode that names an
+    ACL, except `access-class`, `match ip address`, `snmp-server community`
+    and ASA `access-group`.
+  - Cisco IOS / ASA IPv4: an `A/len` operand is noted; a word after `log`
+    is noted except the ASA log arguments (`[level] [interval secs] |
+    disable | default`) on an ASA line; `log-input` on an ASA line is noted.
+  - Cisco NX-OS / EOS: a keyword that is not lower case is noted (IOS is
+    case-insensitive, cited).
+  - Cisco: a remark and an entry with the same number are noted.
+  - iptables-restore: only the exact line `COMMIT` commits (the source
+    compares `"COMMIT\n"`); `commit`, `COMMIT ` and an indented `#` line or
+    a line of spaces are noted. `-P CHAIN POLICY extra` (iptables rejects it:
+    "unknown arguments found on commandline") and `-P` on a chain that is not
+    built in are noted, not applied; so are `-N` / `-F` with extra words.
+  - PAN-OS: an address object with a word after its value is noted.
 - Junos: braces that do not balance, and a `#` glued to a word (`x#y`), are
   parse notes -> UNKNOWN.
 - PAN-OS: a quoted rule or object name with leading or trailing whitespace
@@ -241,14 +275,14 @@ run is one.
   interface is assumed to be in the file. NAT is detected (`nat-present`)
   but never applied.
 - Every frontend accounts for every line of an object on the evaluated
-  path (Junos per term); a line it does not read is a parse note. Every PASS
+  path (Junos per term statement); a line it does not read is a parse note. Every PASS
   prints these per-vendor limits next to the verdict (text, `--json`
   `scope`, `--evidence`, gate, MCP, hosted page):
-  - On every vendor a line ends at \n only, and a control or separator character on any line is UNKNOWN (a CR before the newline is accepted only in Cisco configs and AWS JSON); every line of an object on the evaluated path (a Cisco ACL, ACL header, flat access-list or forwarding interface line, every iptables and PAN-OS line, every Junos term) is either read into the model, every word of it, or makes the answer UNKNOWN.
-  - Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group mode end at a header, `exit` or a recognised top-level command, indented or not; inside an ACL a line is read only if it is a `permit` or `deny` entry, a `remark` or `exit`, with the sequence-number form of its vendor and family (`N` on IOS IPv4, NX-OS and EOS, `sequence N` on IOS IPv6); an unnumbered entry is numbered the last number + 10 and the ACL is evaluated in number order; `no N` (IOS IPv4, NX-OS, EOS) and `no sequence N` (IOS IPv6) delete that entry; NX-OS `statistics per-entry` is read on NX-OS only; an ACL whose number order differs from its text or that has a deletion, and every other line in an ACL (`default`, `evaluate`, `dynamic`, another `no` or sequence form, any other command), are UNKNOWN; any other line in interface mode, an unindented line in those modes that is not a recognised top-level command, `ex` or `en` for `exit` or `end`, an `exit` after a line that opens no known sub-mode, after an opener that is not complete (`router`, `line vty`) or after a sub-mode body that is not checked, and any line after `end` are UNKNOWN; other global commands are not read.
-  - PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed; a quoted name with leading or trailing whitespace is UNKNOWN.
-  - iptables reads the filter table; a chain's policy comes only from a parsed -P or :CHAIN line naming ACCEPT or DROP (exact case); an iptables-restore table block without `COMMIT`, and a line outside a table block, are UNKNOWN.
-  - Junos reads firewall filters and their interface bindings; SRX security zones or policies, a comment marker, brace, bracket or `;` inside a quoted string, a `#` glued to a word, and braces that do not balance make the answer UNKNOWN.
+  - On every vendor a line ends at \n only, and a control or separator character on any line is UNKNOWN (a CR before the newline is accepted only in Cisco configs and AWS JSON); every line of an object on the evaluated path (a Cisco ACL, ACL header, flat access-list or forwarding interface line, any other Cisco line that names an ACL, every iptables and PAN-OS line, every statement of a Junos term and any Junos stanza that names a filter) is either read by a grammar written from a cited vendor document or source (keywords, case, number ranges, operand forms, argument counts) or makes the answer UNKNOWN; object-group bodies are not in that accounting, and every ACL entry that references an object-group is UNKNOWN.
+  - Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group mode end at a header, `exit` or a recognised top-level command, indented or not; inside an ACL a line is read only if it is a `permit` or `deny` entry, a `remark` or `exit`, with the sequence-number form of its vendor and family (`N` on IOS IPv4, NX-OS and EOS, `sequence N` on IOS IPv6) and a number in range (1-2147483647 on IOS IPv4 and EOS, 1-4294967295 on IOS IPv6 and NX-OS, no leading zero); an unnumbered entry is numbered the last number + 10 on IOS IPv4 and NX-OS and the ACL is evaluated in number order; on EOS and IOS IPv6 an ACL that mixes numbered and unnumbered entries is UNKNOWN; `no N` (IOS IPv4, NX-OS, EOS) and `no sequence N` (IOS IPv6) delete that entry; NX-OS `statistics per-entry` is read on NX-OS only; keywords are case-insensitive on IOS, and on NX-OS and EOS a keyword not in lower case is UNKNOWN; an IPv4 `A/len` operand on IOS or ASA, and anything after `log` other than the ASA log arguments on an ASA line, are UNKNOWN; an ACL whose number order differs from its text, that has a deletion, or where a remark and an entry share a number, and every other line in an ACL (`default`, `evaluate`, `dynamic`, `resequence`, another `no` or sequence form, any other command), are UNKNOWN; a line outside ACL mode that names an ACL is UNKNOWN unless it is `access-class`, `match ip address`, `snmp-server community` or ASA `access-group`; any other line in interface mode, an unindented line in those modes that is not a recognised top-level command, `ex` or `en` for `exit` or `end`, an `exit` after a line that opens no known sub-mode, after an opener that is not complete (`router`, `line vty`) or after a sub-mode body that is not checked, and any line after `end` are UNKNOWN; other global commands are not read.
+  - PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed; a quoted name with leading or trailing whitespace, and an address object with a word after its value, are UNKNOWN.
+  - iptables reads the filter table; a chain's policy comes only from a parsed -P or :CHAIN line naming a built-in chain and ACCEPT or DROP (exact case), with nothing after the policy; in an iptables-restore file only the exact line `COMMIT` commits, only a line that starts with `#` is a comment and only an empty line is skipped; an iptables-restore table block without `COMMIT`, and a line outside a table block, are UNKNOWN.
+  - Junos reads firewall filters and their interface bindings; in a term the latest terminating action wins and a term with more than one is noted; a term statement other than `from`, `then` and `filter`, a then-action with an argument count the model does not have, a term name used twice in a filter, `protect:`, a stanza outside `firewall` and `interfaces` that names a filter, SRX security zones or policies, a comment marker, brace, bracket or `;` inside a quoted string, a `#` glued to a word, and braces that do not balance make the answer UNKNOWN.
 - RuleHawk models the L3/L4 packet space.
 - iptables: only the filter table is modelled; other tables are noted.
 - A pasted snippet is audited as if it were the whole config.
@@ -272,6 +306,15 @@ run is one.
   overrides.
 
 ### Compatibility
+
+- **`rulehawk gate` exit code.** A failed policy assertion now exits 1 at
+  every enforcing `--fail-on` threshold, also below its severity: a broken
+  `must_reach` (HIGH) under `fail-on: critical` exited 0 in 0.4.0 and 0.3.1
+  and exits 1 now. Every `@v1` user with `fail-on: critical` (or `high` for
+  a MEDIUM assertion) is affected. `fail-on: none` still exits 0.
+- **Strict grammars.** Configs with forms the cited grammars do not have
+  (see "Strict grammars" above) move from PASS to UNKNOWN; a Junos term with
+  `then discard; then accept;` moves from PASS to FAIL.
 
 - **`@v1` now resolves to 0.5.0.** The moving Action tag `v1` pointed at
   0.3.1; it now points at this release, so `optimesh-ai/RuleHawk@v1` jumps

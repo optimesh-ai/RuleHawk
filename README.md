@@ -83,11 +83,11 @@ default, and the verdict becomes a real PASS or FAIL.
 Every PASS prints these next to the verdict (text, the `--json` `scope` field,
 `--evidence`, the gate, MCP and the hosted page):
 
-- On every vendor a line ends at \n only, and a control or separator character on any line is UNKNOWN (a CR before the newline is accepted only in Cisco configs and AWS JSON); every line of an object on the evaluated path (a Cisco ACL, ACL header, flat access-list or forwarding interface line, every iptables and PAN-OS line, every Junos term) is either read into the model, every word of it, or makes the answer UNKNOWN.
-- Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group mode end at a header, `exit` or a recognised top-level command, indented or not; inside an ACL a line is read only if it is a `permit` or `deny` entry, a `remark` or `exit`, with the sequence-number form of its vendor and family (`N` on IOS IPv4, NX-OS and EOS, `sequence N` on IOS IPv6); an unnumbered entry is numbered the last number + 10 and the ACL is evaluated in number order; `no N` (IOS IPv4, NX-OS, EOS) and `no sequence N` (IOS IPv6) delete that entry; NX-OS `statistics per-entry` is read on NX-OS only; an ACL whose number order differs from its text or that has a deletion, and every other line in an ACL (`default`, `evaluate`, `dynamic`, another `no` or sequence form, any other command), are UNKNOWN; any other line in interface mode, an unindented line in those modes that is not a recognised top-level command, `ex` or `en` for `exit` or `end`, an `exit` after a line that opens no known sub-mode, after an opener that is not complete (`router`, `line vty`) or after a sub-mode body that is not checked, and any line after `end` are UNKNOWN; other global commands are not read.
-- PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed; a quoted name with leading or trailing whitespace is UNKNOWN.
-- iptables reads the filter table; a chain's policy comes only from a parsed -P or :CHAIN line naming ACCEPT or DROP (exact case); an iptables-restore table block without `COMMIT`, and a line outside a table block, are UNKNOWN.
-- Junos reads firewall filters and their interface bindings; SRX security zones or policies, a comment marker, brace, bracket or `;` inside a quoted string, a `#` glued to a word, and braces that do not balance make the answer UNKNOWN.
+- On every vendor a line ends at \n only, and a control or separator character on any line is UNKNOWN (a CR before the newline is accepted only in Cisco configs and AWS JSON); every line of an object on the evaluated path (a Cisco ACL, ACL header, flat access-list or forwarding interface line, any other Cisco line that names an ACL, every iptables and PAN-OS line, every statement of a Junos term and any Junos stanza that names a filter) is either read by a grammar written from a cited vendor document or source (keywords, case, number ranges, operand forms, argument counts) or makes the answer UNKNOWN; object-group bodies are not in that accounting, and every ACL entry that references an object-group is UNKNOWN.
+- Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group mode end at a header, `exit` or a recognised top-level command, indented or not; inside an ACL a line is read only if it is a `permit` or `deny` entry, a `remark` or `exit`, with the sequence-number form of its vendor and family (`N` on IOS IPv4, NX-OS and EOS, `sequence N` on IOS IPv6) and a number in range (1-2147483647 on IOS IPv4 and EOS, 1-4294967295 on IOS IPv6 and NX-OS, no leading zero); an unnumbered entry is numbered the last number + 10 on IOS IPv4 and NX-OS and the ACL is evaluated in number order; on EOS and IOS IPv6 an ACL that mixes numbered and unnumbered entries is UNKNOWN; `no N` (IOS IPv4, NX-OS, EOS) and `no sequence N` (IOS IPv6) delete that entry; NX-OS `statistics per-entry` is read on NX-OS only; keywords are case-insensitive on IOS, and on NX-OS and EOS a keyword not in lower case is UNKNOWN; an IPv4 `A/len` operand on IOS or ASA, and anything after `log` other than the ASA log arguments on an ASA line, are UNKNOWN; an ACL whose number order differs from its text, that has a deletion, or where a remark and an entry share a number, and every other line in an ACL (`default`, `evaluate`, `dynamic`, `resequence`, another `no` or sequence form, any other command), are UNKNOWN; a line outside ACL mode that names an ACL is UNKNOWN unless it is `access-class`, `match ip address`, `snmp-server community` or ASA `access-group`; any other line in interface mode, an unindented line in those modes that is not a recognised top-level command, `ex` or `en` for `exit` or `end`, an `exit` after a line that opens no known sub-mode, after an opener that is not complete (`router`, `line vty`) or after a sub-mode body that is not checked, and any line after `end` are UNKNOWN; other global commands are not read.
+- PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed; a quoted name with leading or trailing whitespace, and an address object with a word after its value, are UNKNOWN.
+- iptables reads the filter table; a chain's policy comes only from a parsed -P or :CHAIN line naming a built-in chain and ACCEPT or DROP (exact case), with nothing after the policy; in an iptables-restore file only the exact line `COMMIT` commits, only a line that starts with `#` is a comment and only an empty line is skipped; an iptables-restore table block without `COMMIT`, and a line outside a table block, are UNKNOWN.
+- Junos reads firewall filters and their interface bindings; in a term the latest terminating action wins and a term with more than one is noted; a term statement other than `from`, `then` and `filter`, a then-action with an argument count the model does not have, a term name used twice in a filter, `protect:`, a stanza outside `firewall` and `interfaces` that names a filter, SRX security zones or policies, a comment marker, brace, bracket or `;` inside a quoted string, a `#` glued to a word, and braces that do not balance make the answer UNKNOWN.
 
 The Cisco interface allowlist is: `description`, `ip address` (with
 `secondary`), `no ip address` (bare, or with an address and mask and optional
@@ -131,16 +131,29 @@ optional sequence number, or `sequence N`, then `permit`, `deny`, `remark`,
 number; NX-OS `statistics per-entry`). Any other line there (`ntp server`,
 `no ip domain-lookup`, an abbreviation, EOS `counters per-entry`, NX-OS
 `fragments`) is UNKNOWN (`stanza-boundary-ambiguous`). Of the lines that stay
-in the ACL, the parser reads `permit` / `deny` entries (every word), `remark`
-and `exit`, each with its vendor's sequence-number form (`N` on IOS IPv4,
-NX-OS and EOS; `sequence N` on IOS IPv6). An unnumbered entry is numbered the
-last number + 10 and the ACL is evaluated in number order; `no N` (IOS IPv4,
-NX-OS, EOS) and `no sequence N` (IOS IPv6) delete entry N. A reordered ACL, a
-deletion, `default ...`, any other `no` or sequence form, `evaluate`,
-`dynamic` and NX-OS `statistics per-entry` outside NX-OS are parse notes, so
-the answer is UNKNOWN (or FAIL when a leak is proven). Every line of an ACL,
-an ACL header, a flat `access-list` line or a forwarding interface is
-accounted for: read, or a note. IOS accepts any unique
+in the ACL, the parser reads `permit` / `deny` entries, `remark` and `exit`,
+each by a grammar written from a cited Cisco document: its vendor's
+sequence-number form (`N` on IOS IPv4, NX-OS and EOS; `sequence N` on IOS
+IPv6) and range (1-2147483647 on IOS IPv4, 1-4294967295 on IOS IPv6 and
+NX-OS; EOS is not cited, so a number above 2147483647 is a note, as is 0 or a
+leading zero), the operand forms of its dialect (an IPv4 `A/len` operand is
+a note on IOS and ASA, which write address plus wildcard or mask), and after
+`log` only the ASA log arguments on an ASA line. Keywords are
+case-insensitive on IOS (cited); on NX-OS and EOS a keyword that is not lower
+case is a note. An unnumbered entry is numbered the last number + 10 on IOS
+IPv4 and NX-OS, where that is cited, and the ACL is evaluated in number
+order; on EOS and IOS IPv6 an ACL that mixes numbered and unnumbered entries
+is a note. `no N` (IOS IPv4, NX-OS, EOS) and `no sequence N` (IOS IPv6)
+delete entry N. A reordered ACL, a deletion, a number held by both a remark
+and an entry, `default ...`, `resequence`, any other `no` or sequence form,
+`evaluate`, `dynamic` and NX-OS `statistics per-entry` outside NX-OS are
+parse notes, so the answer is UNKNOWN (or FAIL when a leak is proven). Every
+line of an ACL, an ACL header, a flat `access-list` line or a forwarding
+interface, and any other line that names an ACL, is accounted for: read, or
+a note. A line outside ACL mode that names an ACL is read only in the
+reference forms `access-class`, `match ip address`, `snmp-server community`
+and ASA `access-group`. Object-group bodies are not in this accounting;
+every entry that references an object-group is UNKNOWN. IOS accepts any unique
 abbreviation, so `ex`/`exi` and `en` are read as `exit` and `end`, and are
 UNKNOWN too. `end`, or `exit` at the global level, leaves configuration mode:
 every later line is a parse note and no ACL is read from it. So does an
