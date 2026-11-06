@@ -957,10 +957,18 @@ def _parse_filter(fname: str, body: List[str], entries: List[ACE],
             continue
         if t == "protect:" and i + 3 < n and body[i + 1] == "term" \
                 and body[i + 3] == "{":
-            # `protect:` guards a statement against edits; what it does to
-            # evaluation is not cited here (round 9, R8-12). The term is read
-            # as written and the filter is noted: UNKNOWN, never a FAIL from
-            # a dropped term.
+            # `protect:` guards a statement against edits, not evaluation:
+            # Juniper, "Protect or Unprotect a Configuration Object Using the
+            # Junos XML Protocol"
+            # (https://www.juniper.net/documentation/us/en/software/junos/junos-xml-protocol/topics/task/junos-xml-protocol-protecting-unprotecting-configuration.html):
+            # "The `protect` attribute prevents changes to selected
+            # configuration hierarchies and statements" and, in text format,
+            # "Protected elements are preceded by `protect:`"; the `protect`
+            # attribute reference: "The protect attribute can be combined
+            # with the active and inactive attributes." So the term is read
+            # as written (active). It is still noted (round 9, R8-12): a
+            # must_not_reach answer is UNKNOWN, never a FAIL from a dropped
+            # term; a must_reach the term breaks is FAIL.
             notes.append(f"Junos `protect:` on term {body[i + 2]} in filter "
                          f"{fname}: not modelled; the term is read as written")
             i += 1
