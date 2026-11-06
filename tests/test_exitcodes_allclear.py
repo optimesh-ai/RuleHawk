@@ -404,3 +404,14 @@ def test_no_surface_sets_shadow_or_cert(rel):
     RULEHAWK_SHADOW, and nothing outside allclear.py names RULEHAWK_CERT."""
     text = _read(rel)
     assert "RULEHAWK_SHADOW" not in text and "RULEHAWK_CERT" not in text
+
+
+def test_literal_scan_catches_a_planted_all_clear(monkeypatch):
+    """The non-Python scan is not vacuous: each pattern fires on a planted line."""
+    planted = ["## ✅ RuleHawk", "verdict: PASS", "VERIFIED", "NO_NEW_RISK",
+               "passed=true", '{"passed": true}', "allPass", "No issues found",
+               "all-clear", "all clear", "all_clear"]
+    monkeypatch.setattr(sys.modules[__name__], "_SURFACES",
+                        {"planted": lambda: "\n".join(planted)})
+    found = _literal_scan()
+    assert set(found) == {f"planted::{p}" for p in planted}, found
