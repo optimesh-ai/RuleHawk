@@ -299,10 +299,13 @@ def test_r6_3_unbalanced_braces(tmp_path, edit):
     ("then discard; }", "then discard; } # note"),
     ("then discard; }", "then discard; } ## SECRET-DATA"),
     ("firewall {", "# header\nfirewall {"),
-    ("then accept;", "then accept;# x"),
+    ("firewall {", "system { host-name r1;# x\n}\nfirewall {"),
     ("then accept; }", "then accept; }# x"),
 ])
 def test_r6_3_comments_after_a_statement_stay_pass(tmp_path, old, new):
+    # (`then accept;# x` was here in the red commit: on that line the comment
+    # also hides the term's closing `}`, so UNKNOWN is the right answer; the
+    # `;#` case now sits on a line that ends with the statement.)
     _stays_pass(_write(tmp_path, "j.conf", _J.replace(old, new, 1)))
 
 
