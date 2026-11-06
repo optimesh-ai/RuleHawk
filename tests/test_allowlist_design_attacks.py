@@ -272,10 +272,24 @@ def _assert_bad(a: str, allowed) -> bool:
     return any(v not in allowed for v in a.split(",")) or a == "none"
 
 
+# Top-level CLI JSON verdicts that are not an all-clear. PASS passes through
+# only when every assertion reads PASS, so a control or a _MAY_PASS file can
+# show it; anything else (an all-clear next to an undecided assertion,
+# ACCEPTED, a missing or unknown verdict) reads as TOPLEVEL:<verdict>/..., which
+# no allowed set holds (departure 6 of slice 2; review of #46, Q2).
+_TOP_NOT_ALL_CLEAR = frozenset({"FAIL", "UNKNOWN"})
+
+
 def _obs_cli_json(path, pol, _tmp):
-    # The stopgap removed `assertion_verdict`; read the assertion findings.
+    # The stopgap removed `assertion_verdict`; read the assertion findings and
+    # the file-level verdict.
     _, out = _quiet(cli.main, [path, "--json", "--policy", _pol(pol)])
-    return _assertion_of({"files": [json.loads(out)]})
+    d = json.loads(out)
+    a = _assertion_of({"files": [d]})
+    top = d.get("verdict", "missing")
+    if top in _TOP_NOT_ALL_CLEAR or (top == "PASS" and a == "PASS"):
+        return a
+    return f"TOPLEVEL:{top}/{a}"
 
 
 def _obs_cli_text(path, pol, _tmp):
