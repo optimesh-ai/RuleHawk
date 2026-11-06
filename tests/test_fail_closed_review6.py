@@ -166,11 +166,24 @@ def test_the_i10_set_is_complete():
     assert len(_I10) == 6, _I10
 
 
-@pytest.mark.parametrize("cfg", _I10 + ["i11_u2028_hides_append_drop.sh",
-                                        "i12_save_u2028_hides_policy.rules",
+@pytest.mark.parametrize("cfg", _I10 + ["i12_save_u2028_hides_policy.rules",
                                         "p01_u2028_unquoted_description.set"])
 def test_n2_a_separator_hides_a_line_outside_cisco(cfg):
     _unknown_on_every_surface(_r5(cfg), "parse-note")
+
+
+def test_n2_i11_the_hidden_drop_is_not_read():
+    """i11: `-P FORWARD ACCEPT`, then a `-j DROP` hidden in a comment. Bash
+    never runs the DROP, so FORWARD accepts CORP -> PCI: a proven violation,
+    FAIL on every surface (the red version of this test asked for UNKNOWN)."""
+    from rulehawk import gate as g
+    from rulehawk import mcp_server as m
+    from test_fail_closed_review3 import _hosted
+    path = _r5("i11_u2028_hides_append_drop.sh")
+    assert _report(path)["assertion_verdict"] == "FAIL"
+    assert g.run_gate([path], _load_policy("v4_ip.json")).verdict == "FAIL"
+    assert m.audit(path, _pol("v4_ip.json"))["verdict"] == "FAIL"
+    assert _hosted(path, "v4_ip.json")["report_json"]["assertion_verdict"] == "FAIL"
 
 
 @pytest.mark.parametrize("cfg", ["i13_control_policy_visible.sh"])
