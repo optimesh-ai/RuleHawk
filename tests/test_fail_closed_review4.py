@@ -183,6 +183,9 @@ def test_cisco_features_that_bypass_or_drop_are_unknown(cfg, code):
     ("nat64 prefix stateful 2001:db8:ff::/96\n", "nat-present"),
     ("control-plane\n service-policy input COPP\n", "qos-policy"),
     ("mpls ip\n", "mpls-forwarding"),
+    ("mpls label protocol ldp\n", "mpls-forwarding"),
+    ("mpls traffic-eng tunnels\n", "mpls-forwarding"),
+    ("l2vpn xconnect context PW1\n", "mpls-forwarding"),
 ])
 def test_global_feature_lines_are_unknown(tmp_path, extra, code):
     _unknown_on_every_surface(_write(tmp_path, "x.cfg", _BOUND_IOS + extra), code)
