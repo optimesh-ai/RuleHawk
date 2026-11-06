@@ -83,10 +83,11 @@ default, and the verdict becomes a real PASS or FAIL.
 Every PASS prints these next to the verdict (text, the `--json` `scope` field,
 `--evidence`, the gate, MCP and the hosted page):
 
-- Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); any other line in interface mode, an unindented line in interface, ACL or object-group mode that is not a recognised top-level command, and a control or separator character are UNKNOWN; other global commands are not read.
+- On every vendor a line ends at \n only, and a control or separator character on any line is UNKNOWN (a CR before the newline is accepted only in Cisco configs and AWS JSON).
+- Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group mode end at a header, `exit` or a recognised top-level command, indented or not; any other line in interface mode, an unindented line in those modes that is not a recognised top-level command, and any line after `end` are UNKNOWN; other global commands are not read.
 - PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed.
 - iptables reads the filter table; a chain's policy comes only from a parsed -P or :CHAIN line naming ACCEPT or DROP (exact case).
-- Junos reads firewall filters and their interface bindings; SRX security zones or policies make the answer UNKNOWN.
+- Junos reads firewall filters and their interface bindings; SRX security zones or policies, and a comment marker, brace, bracket or `;` inside a quoted string, make the answer UNKNOWN.
 
 The Cisco interface allowlist is: `description`, `ip address` (with
 `secondary`), `no ip address` (bare, or with an address and mask and optional
@@ -102,20 +103,31 @@ transit traffic and are not checked. Any other line in interface mode, and an
 abbreviated `int X` header or `interface range`, is UNKNOWN with
 `interface-feature-unmodeled`, which names the line's keyword, not the line.
 
-How RuleHawk reads a Cisco config (one lexer for every Cisco check): a line
-ends at a newline only (a trailing CR is dropped); any other control, format
-or separator character, or a space character other than an ASCII space, is a
-parse note. The device ignores indentation and `!` is a comment, so interface,
-ACL and object-group mode lasts until another `interface` header, `exit`, or
-one of these top-level commands, none of which is valid inside those modes:
-`end`, `hostname`, `version`, `boot`, `router`, `line`, `ip`/`ipv6`/`mac
-access-list`, `access-list`, `object-group`, `route-map`, `ip`/`ipv6
-prefix-list`, `ip`/`ipv6 route`, `ip routing`, `ipv6 unicast-routing`,
-`class-map`, `policy-map`, `control-plane`, `vrf definition|context|instance`,
-`management`, `snmp-server`. Any other unindented line in one of those modes is
-UNKNOWN (`stanza-boundary-ambiguous`). Interface names are case-folded and a
-separately written number is joined (`GigabitEthernet 0/1` is
-`gigabitethernet0/1`); repeated stanzas for one interface are merged in order.
+Lines, on every frontend: a line ends at a newline only. Any other control,
+format or separator character (form feed, vertical tab, NEL, U+2028, a
+no-break space, a BOM, ...) is a parse note, so the answer is UNKNOWN. A CR
+before the newline is dropped in Cisco configs and in AWS JSON (where it is
+whitespace); in an iptables script or save file, a PAN-OS set file or a Junos
+config it is a parse note too (bash keeps `DROP\r` as the word).
+
+How RuleHawk reads a Cisco config (one lexer, `cisco_lex`, for every Cisco
+check and for the ACL and object-group parser). The device ignores
+indentation and `!` is a comment, so interface, ACL and object-group mode
+lasts until another `interface` header, `exit`, or one of these top-level
+commands, indented or not, none of which is valid inside those modes: `end`,
+`banner`, `hostname`, `version`, `boot`, `router`, `line`,
+`ip`/`ipv4`/`ipv6`/`mac access-list`, `access-list`, `object-group`,
+`route-map`, `ip`/`ipv6 prefix-list`, `ip`/`ipv6 route`, `ip routing`,
+`ipv6 unicast-routing`, `class-map`, `policy-map`, `control-plane`,
+`vrf definition|context|instance`, `management`, `snmp-server`. An ACL entry
+or object-group member counts only in the mode its own header opened; one
+after a mode change is in no named ACL and is a parse note. Any other
+unindented line in one of those modes, and an indented top-level command
+there, is UNKNOWN (`stanza-boundary-ambiguous`). `end`, or `exit` at the
+global level, leaves configuration mode: every later line is a parse note
+and no ACL is read from it. Interface names are case-folded and a separately
+written number is joined (`GigabitEthernet 0/1` is `gigabitethernet0/1`);
+repeated stanzas for one interface are merged in order.
 
 **[Quickstart](docs/quickstart.md)**: install, first audit, agents (Claude, Cursor,
 NetClaw) and what to do when something goes wrong.

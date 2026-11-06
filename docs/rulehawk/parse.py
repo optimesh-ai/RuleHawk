@@ -33,7 +33,7 @@ import ipaddress
 import re
 from typing import List, Optional, Tuple
 
-from .failclosed import cisco_dialect_ambiguous, split_lines
+from .failclosed import cisco_dialect_ambiguous, cisco_lex, split_lines
 from .model import (ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet,
                     _PORTED)
 
@@ -581,34 +581,54 @@ def _svc_members(rest: List[str], header_proto: Optional[str]) -> List[Tuple]:
         return [("bad",)]
 
 
-def _collect_defs(text: str) -> _Defs:
-    """Pass 1: read every object-group / object definition in the config."""
+def _collect_defs(text: str, lex=None) -> _Defs:
+    """Pass 1: read every object-group / object definition in the config.
+
+    A member line counts only when the lexer puts it in the mode its group's
+    header opened (indentation does not matter to the device). A member-like
+    line anywhere else makes that group fail closed (a malformed member)."""
+    lex = lex if lex is not None else cisco_lex(text)
+    by_no = {ln.no: ln for ln in lex.lines}
     defs = _Defs()
     cur = None          # ("ng"|"no"|"sg"|"so"|"other", name)
+    cur_no = -1         # header line of `cur`
     header_proto = None
-    for raw in split_lines(text):
+    for lineno, raw in enumerate(split_lines(text), 1):
         s = raw.strip()
-        if not s or s.startswith("!"):
+        lx = by_no.get(lineno)
+        if lx is None or lx.post_end or not s.split() or s.startswith("!"):
             continue
+        if cur is not None and lx.opener != cur_no and not (
+                lx.opener == lineno or lx.header):
+            # The mode changed since the header (a top-level command, `exit`,
+            # an interface): later member lines are not in this group.
+            if cur[0] in ("ng", "no", "sg", "so") and re.match(
+                    r"(?i)^(?:network-object|group-object|service-object|"
+                    r"port-object|host|subnet|range|service)\b", s):
+                (defs.net_groups if cur[0] == "ng" else defs.net_objs if cur[0] == "no"
+                 else defs.svc_groups if cur[0] == "sg" else defs.svc_objs
+                 )[cur[1]].append(("malformed",))
+            cur = None
         low = s.lower()
         m = re.match(r"(?i)^object-group\s+network\s+(\S+)", s)
         if m:
-            cur, header_proto = ("ng", m.group(1)), None
+            cur, header_proto, cur_no = ("ng", m.group(1)), None, lx.opener
             defs.net_groups.setdefault(m.group(1), [])
             continue
         m = re.match(r"(?i)^object-group\s+service\s+(\S+)(?:\s+(\S+))?", s)
         if m:
             cur, header_proto = ("sg", m.group(1)), (m.group(2) or "").lower() or None
+            cur_no = lx.opener
             defs.svc_groups.setdefault(m.group(1), [])
             continue
         m = re.match(r"(?i)^object\s+network\s+(\S+)", s)
         if m:
-            cur, header_proto = ("no", m.group(1)), None
+            cur, header_proto, cur_no = ("no", m.group(1)), None, lx.opener
             defs.net_objs.setdefault(m.group(1), [])
             continue
         m = re.match(r"(?i)^object\s+service\s+(\S+)", s)
         if m:
-            cur, header_proto = ("so", m.group(1)), None
+            cur, header_proto, cur_no = ("so", m.group(1)), None, lx.opener
             defs.svc_objs.setdefault(m.group(1), [])
             continue
         if low.startswith("object-group "):          # protocol / icmp-type / ... groups
@@ -1020,19 +1040,27 @@ def strip_banners(text: str) -> Tuple[str, List[str]]:
     up to a line `EOF`. ASA: `banner TYPE text`, one line each. A delimiter
     RuleHawk cannot determine (a letter or digit, which ASA uses as text and
     IOS as a delimiter) or a banner that never ends gets a note, so no PASS
-    rests on it. Line numbers are kept (blanked lines stay as empty lines)."""
+    rests on it. Line numbers are kept (blanked lines stay as empty lines).
+
+    `banner` is a global command wherever it is indented, so the first line
+    keeps a bare `banner TYPE ^C^C` header: the lexer reads it as the top-level
+    command that ends an interface / ACL / object-group mode."""
     lines = text.split("\n")
     notes: List[str] = []
     asa = bool(re.search(r"(?im)^\s*(?:ASA|PIX|FWSM)\s+Version\b", text))
     i, n = 0, len(lines)
     while i < n:
         m = _BANNER_RE.match(lines[i])
-        if not m or lines[i][:1] in (" ", "\t"):
+        if not m:
             i += 1
             continue
         start, rest = i, (m.group(2) or "").lstrip()
+        lead = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+        # `^C^C` makes the header a closed one-line banner, so a second pass
+        # leaves it as it is.
+        header = f"{lead}banner {(m.group(1) or 'motd').lower()} ^C^C"
         if asa:
-            lines[i] = ""
+            lines[i] = header
             i += 1
             continue
         if not rest:
@@ -1041,23 +1069,24 @@ def strip_banners(text: str) -> Tuple[str, List[str]]:
             if j is None:
                 notes.append(f"banner without a delimiter (line {start + 1}): "
                              f"`{lines[i].strip()}` — its extent is unknown")
-                lines[i] = ""
+                lines[i] = header
                 i += 1
                 continue
-            for k in range(i, j + 1):
+            for k in range(i + 1, j + 1):
                 lines[k] = ""
+            lines[i] = header
             i = j + 1
             continue
         delim = "^C" if rest.startswith("^C") else rest[0]
         if delim.isalnum():
             notes.append(f"banner delimiter could not be determined (line "
                          f"{start + 1}): `{lines[i].strip()}`")
-            lines[i] = ""
+            lines[i] = header
             i += 1
             continue
         body = rest[len(delim):]
         if delim in body:
-            lines[i] = ""
+            lines[i] = header
             i += 1
             continue
         j = next((k for k in range(i + 1, n) if delim in lines[k]), None)
@@ -1066,8 +1095,9 @@ def strip_banners(text: str) -> Tuple[str, List[str]]:
                          f"{start + 1}): the rest of the file was read as banner "
                          f"text")
             j = n - 1
-        for k in range(i, j + 1):
+        for k in range(i + 1, j + 1):
             lines[k] = ""
+        lines[i] = header
         i = j + 1
     return "\n".join(lines), notes
 
@@ -1098,19 +1128,33 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     if n_alias:
         notes.append(f"ASA `name` aliases resolved: {n_alias} name(s) substituted "
                      f"with their address")
-    defs = _collect_defs(text)               # pass 1: object-group / object defs
+    # Stanza membership comes from the lexer, as the device reads modes: an
+    # entry belongs to the named ACL whose header opened the mode it is in,
+    # whatever its indentation (review of #42, round 6, N1).
+    lex = cisco_lex(text)
+    by_no = {ln.no: ln for ln in lex.lines}
+    srcs = split_lines(text)
+    defs = _collect_defs(text, lex)          # pass 1: object-group / object defs
     pix_dialect = cisco_dialect_ambiguous(text)
     current_acl = "(unnamed)"
+    acl_opener = -1                          # header line of the current named ACL
     cur_v6 = cur_std = False                 # family/kind of the current named ACL
     seq = 0
-    in_other = False                         # inside a non-filter block (see below)
-    for lineno, raw in enumerate(split_lines(text), 1):
+    if lex.post_end:
+        no = lex.post_end[0]
+        notes.append(f"line {no} (`{srcs[no - 1].strip()[:60]}`) and "
+                     f"{len(lex.post_end) - 1} more come after `end` (or a global "
+                     f"`exit`): not configuration, not read")
+    for lineno, raw in enumerate(srcs, 1):
         stripped = raw.strip()
-        if not stripped or stripped.startswith("!"):
-            continue
-        if _NO_ACL_RE.match(stripped) or (
-                raw[:1] in (" ", "\t") and _NO_ENTRY_RE.match(stripped)
-                and not in_other):
+        lx = by_no.get(lineno)
+        if lx is None or lx.post_end or not stripped.split() or stripped.startswith("!"):
+            continue                         # blank, `!`, or after `end`
+        in_acl = lx.mode == "acl" and lx.opener == acl_opener
+        opener_txt = srcs[lx.opener - 1].strip() if lx.opener else ""
+        in_block = (lx.mode != "acl" and not lx.header
+                    and lx.opener != lineno and bool(_NON_FILTER_HDR.match(opener_txt)))
+        if _NO_ACL_RE.match(stripped) or (in_acl and _NO_ENTRY_RE.match(stripped)):
             # IOS deletes the ACL (or the entry) at this point in the file;
             # RuleHawk does not replay deletions, so it keeps rules the device
             # no longer has. Fail closed: the note blocks every PASS.
@@ -1121,9 +1165,9 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
         m = re.match(r"(?i)^(ip|ipv4|ipv6)\s+access-list\s+(?:(extended|standard)\s+)?(\S+)",
                      stripped)
         if m:
-            in_other = False
             _WILDCARD_ONLY.set(True)
             current_acl, seq = m.group(3), 0
+            acl_opener = lineno if lx.mode == "acl" and lx.opener == lineno else -2
             cur_v6 = m.group(1).lower() == "ipv6"
             cur_std = (m.group(2) or "").lower() == "standard"
             continue
@@ -1133,15 +1177,12 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             # permit/deny are not packet filters. A block header starts a
             # non-filter context: its indented `seq N permit ...` lines belong
             # to it, never to the last IP ACL.
-            in_other = raw[:1] not in (" ", "\t")
             if stripped.lower().startswith("mac access-list"):
                 notes.append(f"L2 {stripped} not modeled (MAC filtering is out "
                              f"of scope; its entries are not IP rules)")
             continue
-        if in_other:
-            if raw[:1] in (" ", "\t"):
-                continue                     # body line of a non-filter block
-            in_other = False
+        if in_block:
+            continue                         # body line of a non-filter block
         line_v6, line_std = cur_v6, cur_std
         m = re.match(r"(?i)^access-list\s+(\S+)\s+(?:line\s+\d+\s+)?(standard\s+)?",
                      stripped)
@@ -1174,6 +1215,18 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
             continue
         if not re.search(r"(?i)\b(permit|deny)\b", stripped):
             continue
+        if not m and not in_acl:
+            # Not a flat `access-list` line and not in the mode of a named ACL
+            # header: on the device this line is rejected (or belongs to a
+            # mode that is not a packet filter), so it is in no named ACL. It
+            # is kept under "(unnamed)", which nothing binds, with a note.
+            where = (f"after line {lx.opener} (`{opener_txt[:40]}`)" if lx.opener
+                     else "before any ACL header")
+            notes.append(f"line {lineno}: `{stripped[:60]}` is not in ACL mode "
+                         f"on the device ({where}); not added to any named ACL")
+            if current_acl != "(unnamed)":
+                current_acl, seq, acl_opener = "(unnamed)", 0, -3
+            cur_v6 = cur_std = line_v6 = line_std = False
         toks = _entry_tokens(raw.strip())
         if not toks or toks[0].lower() not in _ACTIONS:
             if "remark" not in stripped.lower():

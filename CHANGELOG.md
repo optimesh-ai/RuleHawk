@@ -135,16 +135,24 @@ run is one.
   abbreviated `int X` header -> UNKNOWN (`interface-feature-unmodeled`; the
   detail names the keyword, not the line). `no ip address` (exact forms) and
   `media-type WORD` are on the list.
-- Cisco configs are read by one lexer that every Cisco check uses. A line
-  ends at a newline only; any other control, format or separator character,
-  or a space other than ASCII space, is a parse note -> UNKNOWN. Mode, not
-  indentation, decides which stanza a line belongs to: an unindented line in
-  interface, ACL or object-group mode that is not one of a short list of
-  top-level commands (listed in the README) -> UNKNOWN
-  (`stanza-boundary-ambiguous`). Interface names are case-folded and a
-  separately written number is joined, so `GigabitEthernet 0/2` is its own
-  port and repeated stanzas merge in order. The Cisco ACL parser splits
-  lines the same way.
+- Every frontend splits lines at a newline only. Any other control, format
+  or separator character, or a space other than ASCII space, is a parse note
+  -> UNKNOWN. A CR before the newline is dropped only in Cisco configs and
+  AWS JSON; in iptables, PAN-OS set and Junos input it is a parse note.
+- Cisco configs are read by one lexer that every Cisco check and the ACL /
+  object-group parser use. Interface, ACL and object-group mode end at a
+  header, `exit` or one of a short list of top-level commands (listed in the
+  README), indented or not. An ACL entry or object-group member after a mode
+  change is in no named ACL (parse note). An unindented line in those modes
+  that is not on the list, or an indented top-level command there -> UNKNOWN
+  (`stanza-boundary-ambiguous`). Lines after `end` (or a global `exit`) are
+  a parse note and no ACL is read from them. Interface names are case-folded
+  and a separately written number is joined, so `GigabitEthernet 0/2` is its
+  own port and repeated stanzas merge in order.
+- Junos: `#`, `/*`, `*/`, a brace, a bracket or `;` inside a quoted string,
+  an unclosed string or block comment, and `/*` inside a `#` comment are
+  parse notes -> UNKNOWN (the tokenizer strips comments and splits on braces
+  without regard to quotes).
 - Cisco VLAN ACLs (`vlan access-map`, `vlan filter`) -> UNKNOWN
   (`vlan-filter`).
 - Junos: a statement keyword written in upper case (Junos keywords are
@@ -192,10 +200,11 @@ run is one.
 - Only the PAN-OS and iptables frontends account for every line. Every PASS
   prints these per-vendor limits next to the verdict (text, `--json`
   `scope`, `--evidence`, gate, MCP, hosted page):
-  - Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); any other line in interface mode, an unindented line in interface, ACL or object-group mode that is not a recognised top-level command, and a control or separator character are UNKNOWN; other global commands are not read.
+  - On every vendor a line ends at \n only, and a control or separator character on any line is UNKNOWN (a CR before the newline is accepted only in Cisco configs and AWS JSON).
+  - Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group mode end at a header, `exit` or a recognised top-level command, indented or not; any other line in interface mode, an unindented line in those modes that is not a recognised top-level command, and any line after `end` are UNKNOWN; other global commands are not read.
   - PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed.
   - iptables reads the filter table; a chain's policy comes only from a parsed -P or :CHAIN line naming ACCEPT or DROP (exact case).
-  - Junos reads firewall filters and their interface bindings; SRX security zones or policies make the answer UNKNOWN.
+  - Junos reads firewall filters and their interface bindings; SRX security zones or policies, and a comment marker, brace, bracket or `;` inside a quoted string, make the answer UNKNOWN.
 - RuleHawk models the L3/L4 packet space.
 - iptables: only the filter table is modelled; other tables are noted.
 - A pasted snippet is audited as if it were the whole config.

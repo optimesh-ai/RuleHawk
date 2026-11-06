@@ -52,6 +52,7 @@ import shlex
 from typing import Dict, List, Optional, Tuple
 
 from .model import ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet
+from .failclosed import split_lines
 from .parse import _canon_icmp_type, _port_num  # reuse IANA maps + icmp canon
 
 # iptables (`iptables -p icmp -h`) names -> RuleHawk canonical TYPE[/CODE].
@@ -917,10 +918,26 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     consumed: set = set()
     foreign: set = set()
     nft_depth = 0
-    for lineno, raw in enumerate(text.splitlines(), 1):
+    is_save = bool(re.search(r"(?m)^\s*\*", text))
+    for lineno, raw in enumerate(split_lines(text), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        # Line forms neither bash nor iptables-restore reads as RuleHawk
+        # would (review of #42, round 6, N5): a trailing backslash joins the
+        # next line into this command (bash), and iptables-restore has no
+        # line continuation at all; in a restore file only a line that starts
+        # with `#` is a comment, and its words are split as RuleHawk does
+        # only on spaces. Each is a note, so the answer is UNKNOWN.
+        if (len(line) - len(line.rstrip("\\"))) % 2 == 1:
+            notes.append(f"iptables line {lineno} ends with `\\`: a line "
+                         f"continuation is not modelled")
+        if is_save and "#" in line:
+            notes.append(f"iptables-restore line {lineno} holds `#` after its "
+                         f"start: only a line that starts with `#` is a comment")
+        if is_save and "\t" in line:
+            notes.append(f"iptables-restore line {lineno} holds a tab: not "
+                         f"modelled")
 
         if nft_depth > 0:
             consumed.add(lineno)
@@ -1131,7 +1148,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                 or any(c in t for t in toks for c in (";", "|", "&", "`", "$("))):
             consumed.discard(lineno)
 
-    missed = [(n, ln.strip()) for n, ln in enumerate(text.splitlines(), 1)
+    missed = [(n, ln.strip()) for n, ln in enumerate(split_lines(text), 1)
               if ln.strip() and not ln.strip().startswith("#")
               and (n not in consumed or n in foreign)]
     for n, ln in missed[:_MAX_LINE_NOTES]:

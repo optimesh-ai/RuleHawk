@@ -30,6 +30,7 @@ import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from .failclosed import split_lines
 from .gate import FOOTER, RESULT_SCHEMA, _COMMENT_MARKER
 
 # GitHub rejects a comment over 65,536 characters. A rejected update leaves the
@@ -55,7 +56,7 @@ def _report_verdict(md: str) -> Optional[str]:
     """PASS / FAIL / UNKNOWN as the report itself states it — its title icon
     AND its verdict line must agree — or None when they do not. An
     unenforced (`fail-on none`) report reads e.g. "UNKNOWN (not enforced)"."""
-    lines = [l for l in md.splitlines() if l.strip()]
+    lines = [l for l in split_lines(md) if l.strip()]
     if len(lines) < 2:
         return None
     title, line = lines[0], lines[1]
@@ -299,7 +300,7 @@ def _cell(text: str) -> str:
 
 def _section(c: Check) -> str:
     """The check's own report, retitled with its label and nested one level."""
-    lines = c.markdown.rstrip("\n").splitlines()
+    lines = split_lines(c.markdown.rstrip("\n"))
     if lines and lines[-1] == FOOTER:
         lines = lines[:-1]
     if lines and lines[0].startswith("## "):

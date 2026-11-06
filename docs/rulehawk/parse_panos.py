@@ -63,6 +63,7 @@ import shlex
 from typing import Dict, List, Optional, Tuple
 
 from .model import ACE, ANY_PORTS, _PORTED, PortRange, _IPNet
+from .failclosed import split_lines
 from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
 
 _ANY_NET: _IPNet = ipaddress.ip_network("0.0.0.0/0")
@@ -958,7 +959,7 @@ def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
     within a scope, ordered pre-rulebase -> local rulebase -> post-rulebase (the
     real PAN-OS evaluation order), preserving textual order within a phase.
     """
-    numbered = [(i, _tok(ln)) for i, ln in enumerate(text.splitlines(), 1)
+    numbered = [(i, _tok(ln)) for i, ln in enumerate(split_lines(text), 1)
                 if ln.strip() and not ln.lstrip().startswith("#")]
     notes: List[str] = []
     entries: List[ACE] = []

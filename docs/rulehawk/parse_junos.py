@@ -75,6 +75,8 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from .failclosed import split_lines
+
 from .model import ACE, ANY_PORTS, _PORTED, PortRange, _IPNet
 from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
 
@@ -165,6 +167,76 @@ _SRX_POLICY_RE = re.compile(r"\bfrom-zone\s+\S+\s+to-zone\s+\S+")
 
 
 # --- tokenizer / block readers --------------------------------------------
+
+_IN_STRING_HAZARD = ("#", "/*", "*/", "{", "}", ";", "[", "]")
+
+
+def _quote_hazards(text: str) -> List[str]:
+    """Notes for every place where `_tokenize`, which strips comments and
+    splits on braces without regard to quotes, may read the text differently
+    from the device (review of #42, round 6, N3).
+
+    A scan that does respect double-quoted strings (with backslash escapes),
+    `# ...` line comments and `/* ... */` blocks flags:
+    - `#`, `/*`, `*/`, a brace, `;` or a bracket inside a quoted string;
+    - a string that is not closed on its line, or a block never closed;
+    - `/*` inside a `#` comment, and a `*/` outside any block.
+    A `#` after other text is a comment, as in the device's own output
+    (`encrypted-password "..."; ## SECRET-DATA`), and is not flagged.
+    Each one is a note, so the answer is UNKNOWN."""
+    notes: List[str] = []
+
+    def note(line: int, what: str) -> None:
+        if len(notes) < 5:
+            notes.append(f"Junos line {line}: {what}; the tokenizer ignores "
+                         f"quotes, so the statements around it may be misread")
+
+    state, line, start, i, n = "code", 1, 1, 0, len(text)
+    while i < n:
+        c, two = text[i], text[i:i + 2]
+        if c == "\n":
+            if state == "string":
+                note(start, "a quoted string runs past the end of its line")
+                state = "code"
+            elif state == "hash":
+                state = "code"
+            line += 1
+            i += 1
+            continue
+        if state == "code":
+            if c == '"':
+                state, start = "string", line
+            elif c == "#":
+                state = "hash"
+            elif two == "/*":
+                state, start = "block", line
+                i += 1
+            elif two == "*/":
+                note(line, "`*/` outside a comment")
+                i += 1
+        elif state == "string":
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                state = "code"
+            else:
+                hit = next((h for h in _IN_STRING_HAZARD if text.startswith(h, i)), None)
+                if hit:
+                    note(line, f"`{hit}` inside a quoted string")
+        elif state == "hash":
+            if two == "/*":
+                note(line, "`/*` inside a `#` comment")
+        elif state == "block":
+            if two == "*/":
+                state = "code"
+                i += 1
+        i += 1
+    if state == "block":
+        note(start, "a `/*` comment is never closed")
+    elif state == "string":
+        note(start, "a quoted string is never closed")
+    return notes
+
 
 def _tokenize(text: str) -> List[str]:
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)   # /* block */ comments
@@ -872,7 +944,7 @@ def _term_line_map(text: str) -> "dict":
     unique within a filter, so keying by (filter, term) is unambiguous."""
     out: dict = {}
     cur_filter: Optional[str] = None
-    for i, ln in enumerate(text.splitlines(), 1):
+    for i, ln in enumerate(split_lines(text), 1):
         mf = re.search(r"\bfilter\s+(\S+?)\s*\{", ln)
         if mf:
             cur_filter = mf.group(1)
@@ -952,7 +1024,7 @@ def _set_to_brace(text: str):
     filters = {}          # (ls, family, name) -> {"leaves": [], "terms": {}, ...}
     order = []
     notes: List[str] = []
-    for lineno, ln in enumerate(text.splitlines(), 1):
+    for lineno, ln in enumerate(split_lines(text), 1):
         m = _SET_FW_RE.match(ln)
         if not m:
             continue
@@ -1091,6 +1163,7 @@ def _parse_junos(text: str) -> Tuple[List[ACE], List[str]]:
         term_lines = _term_line_map(text)
         _walk(toks, entries, notes, term_lines, None)
 
+    notes.extend(_quote_hazards(text))
     if _SRX_POLICY_RE.search(text):
         notes.append("Junos SRX security policies (from-zone/to-zone) present — "
                      "zone-based security policies are not yet modeled; only "

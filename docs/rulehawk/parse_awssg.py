@@ -62,6 +62,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .model import ACE, ANY_PORTS, PortRange
+from .failclosed import split_lines
 from .parse import _PROTO_NUM, _canon_icmp_type
 
 # `-1` in the IpProtocol slot means EVERY protocol (and forbids ports).
@@ -78,7 +79,7 @@ def _load(text: str) -> Tuple[Any, int]:
     try:
         return json.loads(text), 0
     except ValueError as first:
-        lines = text.splitlines()
+        lines = split_lines(text)
         for k, ln in enumerate(lines[:20]):
             if ln.lstrip()[:1] in ("{", "["):
                 if k == 0:
@@ -150,7 +151,7 @@ def _line_index(text: str) -> Dict[str, int]:
     per-rule lines to recover after json.loads, and a wrong line is worse than
     none — so findings anchor to their GROUP, and 0 when even that is unknown."""
     out: Dict[str, int] = {}
-    for i, line in enumerate(text.splitlines(), 1):
+    for i, line in enumerate(split_lines(text), 1):
         m = re.search(r'"GroupId"\s*:\s*"([^"]+)"', line)
         if m and m.group(1) not in out:
             out[m.group(1)] = i
