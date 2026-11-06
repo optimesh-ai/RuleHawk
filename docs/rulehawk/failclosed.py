@@ -92,6 +92,9 @@ REASONS: Dict[str, str] = {
         "part of the flow space reaches the end of the PAN-OS rulebase, where "
         "the predefined intrazone-default (allow) / interzone-default (deny) "
         "rules decide it; zones are not modeled",
+    "panos-security-profile":
+        "a PAN-OS allow rule carries security profiles, which can drop traffic "
+        "the rule permits; a connectivity OK cannot rest on the rule alone",
     "panos-unmodeled-rule-field":
         "a PAN-OS rule uses a match field RuleHawk consumes but does not "
         "model (source-user, schedule, category, HIP, device, rule-type, "
@@ -234,18 +237,24 @@ class FailClosedContext:
     v4_blockers: List[Reason] = field(default_factory=list)
     fallthrough: List[Reason] = field(default_factory=list)
     v6_icmp_fallthrough: List[Reason] = field(default_factory=list)
+    reach_blockers: List[Reason] = field(default_factory=list)
     n_rules: int = 0
 
     def pass_blockers(self, *, families: Set[int], proto: str,
                       fell_through: Set[Tuple[str, int]],
-                      context_families: Dict[str, Set[int]]) -> List[Reason]:
+                      context_families: Dict[str, Set[int]],
+                      reach: bool = False) -> List[Reason]:
         """Every reason a would-be PASS for this assertion is unsupported.
 
         `families` are the IP versions of the assertion's zones, `proto` its
         protocol, `fell_through` the (ACL, IP version) pairs whose search
         reached the implicit end-of-context default, and `context_families`
-        the IP versions each searched context has a rule for."""
+        the IP versions each searched context has a rule for. `reach` is
+        True for a must_reach (connectivity) answer, which `reach_blockers`
+        also block."""
         out: List[Reason] = list(self.blockers)
+        if reach:
+            out += self.reach_blockers
         if 4 in families:
             out += self.v4_blockers
         if 6 in families:
@@ -692,6 +701,9 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
         fields = _panos_unmodeled_fields(text)
         if fields:
             b.append(Reason("panos-unmodeled-rule-field", ", ".join(fields)))
+        if re.search(r"(?m)^\s*set\s.*\bsecurity\s+rules\s+\S+\s.*\bprofile-setting\b",
+                     text):
+            ctx.reach_blockers.append(Reason("panos-security-profile"))
         ctx.fallthrough.append(Reason("panos-implicit-default"))
     elif v == "iptables":
         if not transit_aces and any(not a.transit for a in aces):

@@ -368,7 +368,7 @@ def check_segmentation(aces: List[ACE], policy: dict, *,
     ctx_families: Dict[str, set] = {
         acl: {a.src.version for a in acl_aces} for acl, acl_aces in by_acl.items()}
 
-    def _blockers(sname, dname, proto, fell) -> List[Reason]:
+    def _blockers(sname, dname, proto, fell, reach=False) -> List[Reason]:
         if context is None:
             return []
         rs: List[Reason] = []
@@ -377,7 +377,8 @@ def check_segmentation(aces: List[ACE], policy: dict, *,
                              "no transit rule context was searched"))
         rs += context.pass_blockers(
             families=families_of(zones[sname]) | families_of(zones[dname]),
-            proto=proto, fell_through=fell, context_families=ctx_families)
+            proto=proto, fell_through=fell, context_families=ctx_families,
+            reach=reach)
         return rs
 
     zones: Dict[str, List[_IPNet]] = {}
@@ -505,7 +506,8 @@ def check_segmentation(aces: List[ACE], policy: dict, *,
                 if kind == "ok":
                     rule, wit = info
                     _line_part = f" (line {rule.line})" if rule.line else ""
-                    blk = reason_dicts(_blockers(sname, dname, proto, set()))
+                    blk = reason_dicts(_blockers(sname, dname, proto, set(),
+                                                 reach=True))
                     if blk:
                         findings.append(Finding(
                             label, "connectivity-unknown", "medium",

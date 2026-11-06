@@ -80,18 +80,45 @@ _BUILTIN_SERVICES: Dict[str, Tuple[str, List[PortRange], List[PortRange]]] = {
     "service-https": ("tcp", [PortRange(443, 443)], [ANY_PORTS]),
 }
 
-# Recognized security-rule field keywords. Value collection for one field stops
-# at the next of these, so multi-value fields and many-fields-on-one-line both
-# parse, and an unknown field's values are consumed (never misread as a field).
-_RULE_FIELDS = frozenset({
-    "from", "to", "source", "destination", "source-user", "source-hip",
-    "destination-hip", "source-device", "destination-device", "application",
-    "service", "category", "action", "disabled", "negate-source",
-    "negate-destination", "log-start", "log-end", "log-setting",
-    "profile-setting", "description", "tag", "group-tag", "schedule",
-    "rule-type", "icmp-unreachable", "hip-profiles", "uuid", "option",
-    "qos", "target", "disable-server-response-inspection",
+# Security-rule fields, as an ALLOWLIST. A field outside all three sets is
+# one RuleHawk knows nothing about: it may narrow the rule's match (a 5G
+# subscriber or slice, say), so it gets a parse note, which blocks every
+# PASS on the file. Never consume an unknown field silently.
+#
+# Modelled: they decide the ACEs a rule becomes.
+_MODELLED_FIELDS = frozenset({
+    "from", "to", "source", "destination", "application", "service", "action",
+    "disabled", "negate-source", "negate-destination",
 })
+# Consumed but not modelled; failclosed.panos-unmodeled-rule-field blocks the
+# PASS whenever one carries a value other than any.
+_BLOCKED_FIELDS = frozenset({
+    "source-user", "schedule", "category", "source-hip", "destination-hip",
+    "hip-profiles", "source-device", "destination-device", "rule-type", "target",
+})
+# Known harmless: none changes which packets the rule matches or its action.
+_HARMLESS_FIELDS = frozenset({
+    "description",        # free text
+    "tag", "group-tag",   # labels for grouping and display
+    "uuid",               # the rule's identifier
+    "log-start", "log-end", "log-setting",   # logging only
+    "icmp-unreachable",   # what a deny/drop sends back; the match is unchanged
+    "qos",                # marks traffic the rule already allowed
+    # disables inspection of server-to-client traffic: it can only drop less
+    "option", "disable-server-response-inspection",
+    # Security profiles inspect traffic the rule allows and can drop more of
+    # it, never less, so they cannot make an isolation PASS false. They CAN
+    # make a connectivity OK false: failclosed blocks that with
+    # panos-security-profile.
+    "profile-setting",
+})
+_RULE_FIELDS = _MODELLED_FIELDS | _BLOCKED_FIELDS | _HARMLESS_FIELDS
+
+# Container fields whose value is a short path, not one token.
+_PROFILE_TYPES = frozenset({"virus", "spyware", "vulnerability", "url-filtering",
+                            "file-blocking", "wildfire-analysis", "data-filtering"})
+_QOS_MARKING = {"ip-dscp": 1, "ip-precedence": 1, "follow-c2s-flow": 0}
+_TARGET_SUBS = frozenset({"devices", "negate", "tags"})
 
 # Cap the cartesian expansion of one rule so a pathological config can't blow up;
 # beyond it we widen every dimension to ANY (a superset) and mark the entry
@@ -125,24 +152,94 @@ def _tok(line: str) -> List[str]:
         return line.split()
 
 
-def _read_fields(toks: List[str]) -> "Dict[str, List[str]]":
-    """Parse a `key val | key [ v1 v2 ] | key v1 v2 ...` body into key->values."""
+def _one(toks: List[str], i: int) -> "Tuple[List[str], int]":
+    """One value: a single token or a `[ ... ]` list (PAN-OS takes no other
+    form: several values need the brackets)."""
+    n = len(toks)
+    if i >= n:
+        return [], i
+    if toks[i] == "[":
+        vals: List[str] = []
+        i += 1
+        while i < n and toks[i] != "]":
+            vals.append(toks[i])
+            i += 1
+        return vals, i + 1                       # skip the closing ]
+    return [toks[i]], i + 1
+
+
+def _container(key: str, toks: List[str], i: int) -> "Tuple[List[str], int, bool]":
+    """(values, next index, well-formed) for qos / option / profile-setting /
+    target, whose value is a short path such as `marking ip-dscp ef`."""
+    n = len(toks)
+    vals: List[str] = []
+    if key == "qos":
+        if i < n and toks[i] == "marking" and i + 1 < n and toks[i + 1] in _QOS_MARKING:
+            want = _QOS_MARKING[toks[i + 1]]
+            vals, i = toks[i:i + 2], i + 2
+            if want:
+                v, i = _one(toks, i)
+                vals += v
+                return vals, i, bool(v)
+            return vals, i, True
+        return vals, i, False
+    if key == "option":
+        if i < n and toks[i] == "disable-server-response-inspection":
+            v, j = _one(toks, i + 1)
+            return [toks[i]] + v, j, bool(v)
+        return vals, i, False
+    if key == "profile-setting":
+        if i < n and toks[i] == "group":
+            v, j = _one(toks, i + 1)
+            return ["group"] + v, j, bool(v)
+        if i < n and toks[i] == "profiles":
+            i += 1
+            vals = ["profiles"]
+            ok = False
+            while i < n and toks[i] in _PROFILE_TYPES:
+                v, i2 = _one(toks, i + 1)
+                if not v:
+                    return vals, i2, False
+                vals += [toks[i]] + v
+                i, ok = i2, True
+            return vals, i, ok
+        return vals, i, False
+    # target
+    ok = False
+    while i < n and toks[i] in _TARGET_SUBS:
+        v, i2 = _one(toks, i + 1)
+        if not v:
+            return vals, i2, False
+        vals += [toks[i]] + v
+        i, ok = i2, True
+    return vals, i, ok
+
+
+_CONTAINERS = frozenset({"qos", "option", "profile-setting", "target"})
+
+
+def _read_fields(toks: List[str], unknown: Optional[List[str]] = None
+                 ) -> "Dict[str, List[str]]":
+    """Parse a `key val | key [ v1 v2 ] | key a b c` body into key->values.
+
+    Each field takes ONE value or a `[ ]` list, except the container fields,
+    which take their short path. A field name not on the allowlist, or a
+    container whose path RuleHawk does not recognise, is appended to
+    `unknown` (the caller notes it); its value is consumed so it is never
+    misread as the next field."""
     out: Dict[str, List[str]] = {}
     i, n = 0, len(toks)
     while i < n:
         key = toks[i]
         i += 1
-        vals: List[str] = []
-        if i < n and toks[i] == "[":
-            i += 1
-            while i < n and toks[i] != "]":
-                vals.append(toks[i])
-                i += 1
-            i += 1                                   # skip the closing ]
+        if key in _CONTAINERS:
+            vals, i, ok = _container(key, toks, i)
+            if not ok and unknown is not None:
+                unknown.append(f"{key} {' '.join(vals)}".strip())
         else:
-            while i < n and toks[i] not in _RULE_FIELDS and toks[i] != "[":
-                vals.append(toks[i])
-                i += 1
+            vals, i = _one(toks, i)
+            if key not in _RULE_FIELDS and unknown is not None:
+                unknown.append(key)
         out.setdefault(key, []).extend(vals)
     return out
 
@@ -697,7 +794,12 @@ def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
         if key not in rules:
             rules[key] = {}
             order.append(key)
-        fields_here = _read_fields(toks[k + 2:])
+        unknown: List[str] = []
+        fields_here = _read_fields(toks[k + 2:], unknown)
+        for u in unknown:
+            notes.append(f"unmodeled PAN-OS rule field '{u}' in rule {name} "
+                         f"(line {lineno}) — not modeled; RuleHawk cannot tell "
+                         f"which packets the rule matches")
         for fk, vals in fields_here.items():
             rules[key].setdefault(fk, []).extend(vals)
         if "action" in fields_here or key not in rule_lines:
