@@ -330,24 +330,28 @@ def _coverage(gate, base: str, skipped: List[dict]) -> dict:
                                  "reason": f"cannot read: {fr.error}"})
     for na in not_analysed:
         na["path"] = _rel(na["path"], base) if os.path.isabs(na["path"]) else na["path"]
+    # No file is certified in this release (allclear), so every analysed file
+    # is uncertified and coverage is never complete (design v2 section 3.1).
+    uncertified = sum(1 for _ in analysed if not allclear.certified())
     if not_analysed:
-        state = "incomplete"
+        state, why = "incomplete", ("at least one input was NOT analysed (see "
+                                    "not_analysed); no PASS is given")
     elif partial:
-        state = "partial"
+        state, why = "partial", ("every file was parsed, but some lines were not "
+                                 "modelled (see unmodelled_lines); review them")
     else:
-        state = "complete"
+        # complete only when every file is file-certified; partial until then.
+        state = allclear.emit(allclear.COMPLETE)
+        why = ("every file was parsed and every line was modelled, but "
+               f"{uncertified} file(s) are not certified (fail-closed stopgap "
+               "pending soundness review), so coverage is partial")
     return {
         "state": state,
-        "explanation": {
-            "complete": "every file was parsed and every line was modelled",
-            "partial": ("every file was parsed, but some lines were not "
-                        "modelled (see unmodelled_lines); review them"),
-            "incomplete": ("at least one input was NOT analysed (see "
-                           "not_analysed); no PASS is given"),
-        }[state],
+        "explanation": why,
         "files_analysed": len(analysed),
         "files_not_analysed": len(not_analysed),
         "files_with_unmodelled_lines": partial,
+        "files_uncertified": uncertified,
         "rules_analysed": sum(a["rules_analysed"] for a in analysed),
         "analysed": analysed,
         "not_analysed": not_analysed,

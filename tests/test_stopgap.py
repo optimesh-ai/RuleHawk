@@ -205,7 +205,10 @@ def test_gate_main_returns_3_and_writes_unknown_everywhere(tmp_path, capsys):
     assert rec["exit_code"] == 3 and rec["passed"] is False
     assert rec["verdict"] == "UNKNOWN"
     sarif = json.load(open(paths["out.sarif"]))
-    assert sarif["runs"][0]["results"] == []          # nothing failed, no "pass"
+    # Nothing failed and nothing reads as a pass: the only result is the note
+    # that the file is not certified (#42 phase 2 slice 2).
+    assert [(r["ruleId"], r["level"]) for r in sarif["runs"][0]["results"]] == \
+        [("rulehawk/uncertified", "note")]
     ev = json.load(open(paths["ev.json"]))
     assert {a["status"] for a in ev["attestations"]} == {"INDETERMINATE"}
 

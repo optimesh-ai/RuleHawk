@@ -530,12 +530,20 @@ def _fingerprint(uri: str, f: Finding) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()[:32]
 
 
+UNCERTIFIED_RULE = "rulehawk/uncertified"
+_UNCERTIFIED_TEXT = (
+    "This release certifies no file (fail-closed stopgap pending soundness "
+    "review), so a run with nothing flagged is UNKNOWN, not a clean result. "
+    "This note is not a finding in the file; the exit code (3) is what blocks.")
+
+
 def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
     """Render findings as SARIF 2.1.0 for `github/codeql-action/upload-sarif`.
 
     Info findings (segmentation-unknown) are omitted — they are not
     annotations, and SARIF never carries a pass result. Every other finding becomes one result located on its exact
-    source line, so GitHub renders it inline on the PR diff."""
+    source line, so GitHub renders it inline on the PR diff. Every uncertified
+    file (every file, in this release) adds one `rulehawk/uncertified` note."""
     if version is None:
         from . import __version__ as version
     rules: List[dict] = []
@@ -625,6 +633,40 @@ def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
             "partialFingerprints": {
                 "ruleHawk/v2": f"{_sarif_uri(fr.path)}:parse-failure",
             },
+        })
+    # An empty SARIF run reads as an all-clear in code scanning. No file is
+    # certified in this release (allclear), so every file gets one note saying
+    # so (design v2 section 3.1, review v4 delta R4-L2). Level `note`, so a repo
+    # that blocks on warnings is not newly blocked: blocking stays with exit 3.
+    # The fingerprint is the rule id and the file path, never a line, so the
+    # alert does not churn between runs.
+    for fr in gate.files:
+        if allclear.certified():
+            continue
+        if UNCERTIFIED_RULE not in rule_index:
+            rule_index[UNCERTIFIED_RULE] = len(rules)
+            rules.append({
+                "id": UNCERTIFIED_RULE,
+                "name": "Uncertified",
+                "shortDescription": {"text": "RuleHawk did not certify this file."},
+                "fullDescription": {"text": _UNCERTIFIED_TEXT},
+                "helpUri": f"{_REPO_URL}/blob/main/docs/github-action.md#exit-codes--verdict",
+                "defaultConfiguration": {"level": "note"},
+                "properties": {"tags": ["firewall", "certification"]},
+            })
+        uri = _sarif_uri(fr.path)
+        results.append({
+            "ruleId": UNCERTIFIED_RULE,
+            "ruleIndex": rule_index[UNCERTIFIED_RULE],
+            "level": "note",
+            "message": {"text": f"{uri} is not certified. {_UNCERTIFIED_TEXT}"},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": uri},
+                    "region": {"startLine": 1},
+                },
+            }],
+            "partialFingerprints": {"ruleHawk/v2": f"{UNCERTIFIED_RULE}:{uri}"},
         })
     sarif = {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",

@@ -81,11 +81,14 @@ def _assert_contract(r):
 # --------------------------------------------------------------------------- #
 # rulehawk_audit
 # --------------------------------------------------------------------------- #
-def test_audit_clean_file_passes_with_complete_coverage(tmp_path):
+def test_audit_clean_file_is_unknown_with_partial_coverage(tmp_path):
     r = m.audit(_write(tmp_path, "edge.cfg", _CLEAN))
     _assert_contract(r)
     assert r["verdict"] == "UNKNOWN"         # fail-closed stopgap: never PASS
-    assert r["coverage"]["state"] == "complete"
+    # complete means every file is certified; none is in this release.
+    assert r["coverage"]["state"] == "partial"
+    assert r["coverage"]["files_with_unmodelled_lines"] == 0
+    assert r["coverage"]["files_uncertified"] == 1
     assert r["coverage"]["files_analysed"] == 1
     assert r["coverage"]["not_analysed"] == []
     assert r["coverage"]["analysed"][0]["vendor"] == "ios-asa"

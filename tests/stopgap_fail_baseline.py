@@ -38,6 +38,10 @@ GOLDEN = os.path.join(ROOT, "tests", "stopgap_fail_golden.json")
 # What the stopgap changes; everything else must be identical.
 CHANGED_KINDS = frozenset({"segmentation-ok", "connectivity-ok",
                            "segmentation-unknown", "connectivity-unknown"})
+# The one SARIF result #42 phase 2 slice 2 adds to every file: a note that the
+# file is not certified. It is not a FAIL result, so it is left out here and
+# tests/test_uncertified.py pins it (exactly one per file).
+CHANGED_SARIF_RULES = frozenset({"rulehawk/uncertified"})
 
 # A must_reach assertion so connectivity FAILs (connectivity-broken) are pinned
 # too, beside the shipped must_not_reach policies.
@@ -128,7 +132,8 @@ def _one(label, path, pol_label, pol_path):
                 "message": r["message"]["text"],
                 "line": r["locations"][0]["physicalLocation"]["region"]["startLine"],
                 "fp": r["partialFingerprints"]["ruleHawk/v2"]}
-               for r in sarif["runs"][0]["results"]]
+               for r in sarif["runs"][0]["results"]
+               if r["ruleId"] not in CHANGED_SARIF_RULES]
     return {
         "config": label, "policy": pol_label,
         "cli_exit": rc, "gate_exit_high": g.exit_code(),

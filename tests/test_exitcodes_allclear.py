@@ -109,7 +109,7 @@ def test_rulehawk_cert_is_a_compiled_in_zero():
 @pytest.mark.parametrize("verdict,stopgap", [
     ("PASS", "UNKNOWN"), ("NO_NEW_RISK", "UNKNOWN"), ("VERIFIED", "INDETERMINATE"),
     ("segmentation-ok", "segmentation-unknown"),
-    ("connectivity-ok", "connectivity-unknown")])
+    ("connectivity-ok", "connectivity-unknown"), ("complete", "partial")])
 def test_emit_gives_the_stopgap_answer(verdict, stopgap):
     assert allclear.emit(verdict) == stopgap
     # A certificate does not help while RULEHAWK_CERT is 0.
@@ -132,7 +132,7 @@ def test_passed_and_exit_code_are_the_stopgaps():
 # --------------------------------------------------------------------------- #
 _TOKEN = re.compile(r"\bPASS\b|\bVERIFIED\b|NO_NEW_RISK|✅")
 _EXACT = {"complete", "segmentation-ok", "connectivity-ok", "certified"}
-_ALLCLEAR_NAMES = {"PASS", "VERIFIED", "NO_NEW_RISK", "SEG_OK", "REACH_OK"}
+_ALLCLEAR_NAMES = {"PASS", "VERIFIED", "NO_NEW_RISK", "SEG_OK", "REACH_OK", "COMPLETE"}
 
 
 def _docstrings(tree):
@@ -284,9 +284,8 @@ _EXEMPT = collections.Counter({
     "evidence.py::build_evidence::literal::complete": 1,
     "evidence.py::to_evidence_markdown::literal::complete": 1,
     "evidence.py::to_evidence_markdown::literal::**PASS — ": 1,
-    # mcp: the coverage state (slice 2 routes it through allclear) and the
-    # segmentation_passed filter, which no stopgap finding kind matches.
-    "mcp_server.py::_coverage::literal::complete": 2,
+    # mcp: the segmentation_passed filter, which no stopgap finding kind
+    # matches. (coverage.state goes through allclear.emit since slice 2.)
     "mcp_server.py::audit::literal::segmentation-ok": 1,
     "mcp_server.py::audit::literal::connectivity-ok": 1,
     # The MCP server process's own exit status, not a verdict.
