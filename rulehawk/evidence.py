@@ -374,6 +374,8 @@ def _assertion_claim(a: dict, direction: str) -> str:
     claim = f"{a.get('src')} {spec['verb']} {a.get('dst')}"
     if proto not in ("ip", "any"):
         claim += f" on {proto}"
+        if ports is not None and not isinstance(ports, (list, tuple)):
+            ports = [ports]             # a scalar, as segcheck accepts it
         if ports:
             claim += "/" + ",".join(str(p) for p in ports)
     return claim

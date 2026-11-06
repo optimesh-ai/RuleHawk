@@ -143,6 +143,17 @@ REASONS: Dict[str, str] = {
         "an interface or access-group is bound to an ACL with no parsed rule; "
         "on IOS a missing or empty ACL permits all traffic, so that path is "
         "unfiltered",
+    "unfiltered-path":
+        "an interface with no inbound filter and another with no outbound "
+        "filter for this address family let traffic cross the device without "
+        "meeting any audited rule",
+    "iptables-fragments":
+        "an iptables rule matches ports or other L4 fields; a non-initial "
+        "fragment carries no L4 header, never matches it and falls through to "
+        "later rules or the chain policy",
+    "pathground-witness-only":
+        "Hammerhead proved one witness packet unreachable; that does not prove "
+        "the rest of the violated flow space unreachable",
     "vendor-unknown":
         "the config's vendor label is not one RuleHawk has fail-closed checks "
         "for, so none of them ran",
@@ -218,6 +229,7 @@ class FailClosedContext:
     vendor: str
     blockers: List[Reason] = field(default_factory=list)
     v6_blockers: List[Reason] = field(default_factory=list)
+    v4_blockers: List[Reason] = field(default_factory=list)
     fallthrough: List[Reason] = field(default_factory=list)
     v6_icmp_fallthrough: List[Reason] = field(default_factory=list)
     n_rules: int = 0
@@ -232,6 +244,8 @@ class FailClosedContext:
         reached the implicit end-of-context default, and `context_families`
         the IP versions each searched context has a rule for."""
         out: List[Reason] = list(self.blockers)
+        if 4 in families:
+            out += self.v4_blockers
         if 6 in families:
             out += self.v6_blockers
         if fell_through:
@@ -338,6 +352,124 @@ def _role_reasons(acls: Sequence[str], transit: Set[str],
         else:
             out.append(Reason("acl-role-unknown", f"{acl}: no transit binding"))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Unfiltered paths: an interface that admits a family unfiltered, paired with
+# another that emits it unfiltered, is a way across the device that meets no
+# audited rule.
+# --------------------------------------------------------------------------- #
+_CISCO_IF_FAMILY_BIND = re.compile(
+    r"^\s+(ip\s+access-group|ip\s+port\s+access-group|ipv4\s+access-group|"
+    r"ipv6\s+traffic-filter|ipv6\s+access-group|ipv6\s+port\s+traffic-filter)"
+    r"\s+\S+\s+(in|out|ingress|egress)\b", re.IGNORECASE)
+_NO_FORWARD_IF = re.compile(r"(?i)^(?:loopback|null)")
+
+
+def _bypasses(paths: Dict[str, Dict[str, Set[int]]], fam: int) -> List[Reason]:
+    """`paths[name]` = {"fams": families it carries, "in": families filtered
+    inbound, "out": families filtered outbound}."""
+    carry = [n for n, p in paths.items() if fam in p["fams"]]
+    no_in = [n for n in carry if fam not in paths[n]["in"]]
+    no_out = [n for n in carry if fam not in paths[n]["out"]]
+    for i in no_in:
+        for e in no_out:
+            if i != e:
+                return [Reason("unfiltered-path", f"IPv{fam}: in {i}, out {e}")]
+    return []
+
+
+def _cisco_paths(text: str) -> Dict[str, Dict[str, Set[int]]]:
+    paths: Dict[str, Dict[str, Set[int]]] = {}
+    cur: Optional[str] = None
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("!"):
+            continue
+        if raw[:1] not in (" ", "\t"):
+            m = re.match(r"(?i)^interface\s+(\S+)", raw)
+            cur = m.group(1) if m and not _NO_FORWARD_IF.match(m.group(1)) else None
+            if cur is not None:
+                paths.setdefault(cur, {"fams": {4, 6}, "in": set(), "out": set(),
+                                       "shutdown": set()})
+            continue
+        if cur is None:
+            continue
+        if re.match(r"(?i)^\s+shutdown\s*$", raw):
+            paths[cur]["shutdown"].add(1)
+        elif re.match(r"(?i)^\s+no\s+shutdown\s*$", raw):
+            paths[cur]["shutdown"].clear()
+        m = _CISCO_IF_FAMILY_BIND.match(raw)
+        if m:
+            fam = 6 if m.group(1).lower().startswith("ipv6") else 4
+            d = "in" if m.group(2).lower() in ("in", "ingress") else "out"
+            paths[cur][d].add(fam)
+    return {n: p for n, p in paths.items() if not p["shutdown"]}
+
+
+_JUNOS_FAMILY = {"inet": {4}, "inet6": {6}, "ethernet-switching": {4, 6},
+                 "bridge": {4, 6}, "vpls": {4, 6}}
+
+
+def _junos_paths(text: str) -> Dict[str, Dict[str, Set[int]]]:
+    """Interface units, the families they carry and which are filtered. An L2
+    family (ethernet-switching, bridge, vpls) carries every IP family and is
+    never filtered by an inet/inet6 filter."""
+    from .parse_junos import _tokenize
+    paths: Dict[str, Dict[str, Set[int]]] = {}
+
+    def leaf(words: List[str]) -> None:
+        words = [w.strip('"') for w in words]
+        if "interfaces" not in words:
+            return
+        k = words.index("interfaces")
+        if k + 1 >= len(words):
+            return
+        ifname = words[k + 1]
+        if ifname.startswith("lo"):
+            return
+        rest = words[k + 2:]
+        unit = rest[rest.index("unit") + 1] if "unit" in rest and \
+            rest.index("unit") + 1 < len(rest) else "0"
+        if "family" not in rest or rest.index("family") + 1 >= len(rest):
+            return
+        famname = rest[rest.index("family") + 1]
+        fams = _JUNOS_FAMILY.get(famname)
+        if not fams:
+            return
+        key = f"{ifname}.{unit}"
+        p = paths.setdefault(key, {"fams": set(), "in": set(), "out": set()})
+        p["fams"] |= fams
+        if famname in ("inet", "inet6") and "filter" in rest:
+            tail = rest[rest.index("filter") + 1:]
+            if "input" in tail or "input-list" in tail:
+                p["in"] |= fams
+            if "output" in tail or "output-list" in tail:
+                p["out"] |= fams
+
+    for raw in text.splitlines():
+        if re.match(r"^\s*set\s", raw):
+            leaf(raw.split()[1:])
+    stack: List[List[str]] = []
+    stmt: List[str] = []
+    for t in _tokenize(text):
+        if t == "{":
+            stack.append(stmt)
+            stmt = []
+        elif t == "}":
+            if stack:
+                stack.pop()
+            stmt = []
+        elif t == ";":
+            leaf([w for part in stack for w in part] + stmt)
+            stmt = []
+        else:
+            stmt.append(t)
+    return paths
+
+
+def _path_blockers(ctx: "FailClosedContext", paths) -> None:
+    ctx.v4_blockers += _bypasses(paths, 4)
+    ctx.v6_blockers += _bypasses(paths, 6)
 
 
 # --------------------------------------------------------------------------- #
@@ -475,6 +607,12 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
         if re.search(r"(?im)^\s*(?:nameif\s+\S|security-level\s+\d|"
                      r"same-security-traffic\b)", text):
             b.append(Reason("asa-security-levels"))
+        if _ASA_DIALECT.search(text):
+            if not any(r.code == "asa-security-levels" for r in b):
+                b.append(Reason("unfiltered-path",
+                                "ASA interface coverage is not modelled"))
+        else:
+            _path_blockers(ctx, _cisco_paths(text))
         if cisco_dialect_ambiguous(text):
             b.append(Reason("numbered-acl-mask-ambiguous"))
         if _ALL_ONES_NONZERO.search(text) \
@@ -493,6 +631,7 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
         ctx.v6_icmp_fallthrough.append(Reason("ipv6-implicit-nd"))
     elif v == "junos":
         transit, other = _junos_bindings(text)
+        _path_blockers(ctx, _junos_paths(text))
         b += _role_reasons(acls, transit, other)
         if acls and all(acl not in transit for acl in acls):
             b.append(Reason("no-transit-filter",
@@ -529,6 +668,11 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
             b.append(Reason("iptables-chain-policy-unset", "FORWARD"))
         ctx.fallthrough.append(Reason("iptables-chain-policy-unset",
                                       "the search reached the end of a chain"))
+        l4 = [x for x in transit_aces if _is_l4(x)]
+        if l4:
+            b.append(Reason("iptables-fragments",
+                            f"{l4[0].acl} line {l4[0].line}" if l4[0].line
+                            else l4[0].acl))
     elif v == "aws-sg":
         b.append(Reason("aws-sg-binding-unknown"))
     else:
