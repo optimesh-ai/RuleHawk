@@ -569,3 +569,20 @@ def test_an_unrecognised_vendor_label_never_passes():
     assert not any(f.kind in _PASS_KINDS for f in fs)
     assert any("vendor-unknown" in [r["code"] for r in (f.reasons or [])]
                for f in fs)
+
+
+def test_a_binding_to_an_undefined_or_empty_acl_never_passes(tmp_path):
+    """Cisco: "If an access list is referenced by a name, but the access list
+    does not exist, all packets pass. An interface or command with an empty
+    access list applied to it permits all traffic into the network."
+    (IOS XE 17 ACL Configuration Guide, IP Access List Overview.) An
+    interface bound to an ACL with no parsed rule is unfiltered, so a PASS
+    over the other ACLs proves nothing: UNKNOWN, acl-binding-undefined."""
+    cfg = tmp_path / "undef.cfg"
+    cfg.write_text("ip access-list extended A\n"
+                   " deny ip 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255\n"
+                   " permit ip any any\n"
+                   "interface GigabitEthernet0/1\n ip access-group A in\n"
+                   "interface GigabitEthernet0/2\n ip access-group MISSING in\n")
+    _assert_unknown_everywhere(str(cfg), _pol("v4_tcp445.json"),
+                               "acl-binding-undefined")
