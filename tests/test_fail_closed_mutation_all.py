@@ -320,11 +320,16 @@ def _junos(lines: List[str]) -> Iterator[Mutant]:
         t = text[:pos] + " description x#y; " + text[pos:]
         yield ("junos-hash-in-word", f"term{k}", t, "never", None)
     # R6-3: one brace too few or too many; the device does not load the file.
-    closes = [m.start() for m in re.finditer(r"\}", text) if not cmt[m.start()]
-              and text.count('"', text.rfind("\n", 0, m.start()) + 1, m.start()) % 2 == 0]
-    for c in closes[:12] + closes[-3:]:
-        yield ("junos-brace", f"drop:{c}", text[:c] + text[c + 1:], "never", None)
-    yield ("junos-brace", "add", text.rstrip("\n") + " }\n", "never", None)
+    # Only from a balanced seed: on an unbalanced one the edit can restore
+    # the balance.
+    def live(ch: str) -> List[int]:
+        return [m.start() for m in re.finditer(re.escape(ch), text) if not cmt[m.start()]
+                and text.count('"', text.rfind("\n", 0, m.start()) + 1, m.start()) % 2 == 0]
+    closes = live("}")
+    if len(closes) == len(live("{")):
+        for c in closes[:12] + closes[-3:]:
+            yield ("junos-brace", f"drop:{c}", text[:c] + text[c + 1:], "never", None)
+        yield ("junos-brace", "add", text.rstrip("\n") + " }\n", "never", None)
     for i, ln in enumerate(lines):
         if i + 2 < len(lines) and not in_block(i) and not in_block(i + 2):
             m = lines[:i] + ["# a /*"] + lines[i:i + 2] + ["# b */"] + lines[i + 2:]
