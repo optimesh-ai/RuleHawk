@@ -57,7 +57,9 @@ exits 2. `--help` still exits 0.
 - GitHub Action: exit 3 fails the check with an error annotation naming the
   stopgap. New outputs `verdict` and `exit-code`; `passed` is never true.
   Under `fail-on: none` the step succeeds with a warning that names the
-  verdict.
+  verdict. The exit code is now the gate step's own output, not a file shared
+  by every RuleHawk step in the job: a step whose gate was skipped or aborted
+  fails with "gate did not complete" instead of reading an earlier step's.
 - `rulehawk combine` and `optimesh-ai/RuleHawk/comment`: a gate result with
   exit 3 is UNKNOWN; new `--verdict PATH`; `fail-on none` checks are shown but
   not enforced. A result file from a gate before 0.4.1 (`passed: true`) is read

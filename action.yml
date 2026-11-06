@@ -209,7 +209,7 @@ runs:
         # ${arr[@]+...} guards EVERY empty-array expansion: bash 3.2 (macOS
         # runners, still the default `bash` there) treats "${ARR[@]}" on an
         # empty array as an unbound variable under `set -u` and aborts the step
-        # before the verdict file is even written. Bash 4.4 fixed it, so Linux
+        # before the exit code is even recorded. Bash 4.4 fixed it, so Linux
         # runners never see this — which is exactly why it must be guarded here
         # rather than trusted to CI. tests/test_action.py pins the form AND
         # executes the command line under the system bash.
