@@ -54,6 +54,7 @@ import collections
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
@@ -224,11 +225,36 @@ def _quiet(fn, *a):
 # --------------------------------------------------------------------------
 
 # Assertion findings: segmentation (must_not_reach) and connectivity
-# (must_reach). Every other kind of these two families is undecided.
-_SEG = {"segmentation-ok": "PASS", "segmentation-violation": "FAIL",
-        "connectivity-ok": "PASS", "connectivity-broken": "FAIL"}
+# (must_reach). The reader knows every kind of these two families by name
+# (review of #46, M1): a decided kind maps to its verdict, an undecided kind
+# to UNKNOWN, and any other kind reads as UNRECOGNISED:<kind>, which no
+# allowed set holds. test_every_engine_assertion_kind_is_in_the_reader_table
+# keeps the table complete.
+_KIND_VERDICT = {"segmentation-ok": "PASS", "segmentation-violation": "FAIL",
+                 "connectivity-ok": "PASS", "connectivity-broken": "FAIL"}
+_UNDECIDED_KINDS = frozenset({
+    "segmentation-unknown", "segmentation-indeterminate", "segmentation-error",
+    "segmentation-infeasible-path", "connectivity-unknown",
+    "connectivity-indeterminate"})
 _ASSERTION_KINDS = ("segmentation-", "connectivity-")
-_ASSERTION_OK = frozenset(k for k, v in _SEG.items() if v == "PASS")
+_ASSERTION_OK = frozenset(k for k, v in _KIND_VERDICT.items() if v == "PASS")
+
+
+def _finding_verdict(x: dict) -> str:
+    """One assertion finding's verdict. The kind decides it; the engine's own
+    per-finding `verdict`, when set, must agree, or the finding reads as
+    MISMATCH (the engine leaves it unset on a violation)."""
+    k = x.get("kind", "")
+    if k in _KIND_VERDICT:
+        want = _KIND_VERDICT[k]
+    elif k in _UNDECIDED_KINDS:
+        want = "UNKNOWN"
+    else:
+        return f"UNRECOGNISED:{k}"
+    v = x.get("verdict")
+    if v is not None and v != want:
+        return f"MISMATCH:{k}:{v}"
+    return want
 
 
 def _assertion_of(gate_json: dict) -> str:
@@ -237,9 +263,8 @@ def _assertion_of(gate_json: dict) -> str:
     vs = set()
     for f in gate_json.get("files", []):
         for x in f.get("findings", []):
-            k = x.get("kind", "")
-            if k.startswith(_ASSERTION_KINDS):
-                vs.add(_SEG.get(k, "UNKNOWN"))
+            if x.get("kind", "").startswith(_ASSERTION_KINDS):
+                vs.add(_finding_verdict(x))
     return ",".join(sorted(vs)) or "none"
 
 
@@ -303,13 +328,24 @@ def _obs_gate_cli(path, pol, _tmp):
 
 def _obs_sarif(path, pol, _tmp):
     gate = g.run_gate([path], _policy(pol), fail_on="high")
-    ids = sorted({r["ruleId"] for r in json.loads(g.to_sarif(gate))["runs"][0]["results"]})
+    results = json.loads(g.to_sarif(gate))["runs"][0]["results"]
+    ids = sorted({r["ruleId"] for r in results})
     # Only a result about the assertion (or an uncertified file) shows that
     # the assertion is not clean. A hygiene result does not, and neither does
     # a segmentation-ok or connectivity-ok result (review v4 delta, R4-L3).
+    # An -ok result on an attack file is itself a PASS claim, so it is listed
+    # on its own and is bad (review of #46, L1). results= counts results,
+    # not distinct rule ids.
     seg = [i for i in ids if (i.startswith(_ASSERTION_KINDS) and i not in _ASSERTION_OK)
            or i == "rulehawk/uncertified"]
-    return f"results={len(ids)} assertion_results={','.join(seg) or 'none'}"
+    ok = [i for i in ids if i.endswith("-ok")]
+    return (f"results={len(results)} assertion_results={','.join(seg) or 'none'}"
+            f" ok_results={','.join(ok) or 'none'}")
+
+
+def _sarif_bad(obs, _allowed, _rel):
+    _, a, ok = obs.split(" ")
+    return a == "assertion_results=none" or ok != "ok_results=none"
 
 
 def _obs_mcp_audit(path, pol, _tmp):
@@ -381,7 +417,7 @@ _SURFACES = {
                  lambda o, a, r: o.startswith("rc=0 ") or _assert_bad(o.split("assert=")[1], a),
                  lambda o: o == "rc=0 assert=PASS"),
     # A clean PASS may legitimately carry no SARIF results, so no control check.
-    "sarif": (_obs_sarif, lambda o, a, r: o.endswith("assertion_results=none"), None),
+    "sarif": (_obs_sarif, _sarif_bad, None),
     "mcp_audit": (_obs_mcp_audit, _mcp_audit_bad,
                   lambda o: o.startswith("PASS/") and o.endswith("/coverage=complete")
                   and o.split("/")[1] != "seg_passed=0"),
@@ -668,3 +704,109 @@ def test_phase3_gate_no_red_cell_left():
     # Slice 9 removes the stopgap xfails (_STOPGAP_CONTROL, _STOPGAP_MAY_PASS)
     # along with the stopgap.
     assert not _STOPGAP_CONTROL and not _STOPGAP_MAY_PASS
+
+
+# --------------------------------------------------------------------------- #
+# The safety net itself fails closed (review of #46: M1, L1, L2).
+# --------------------------------------------------------------------------- #
+def _one_finding(kind, verdict=None):
+    return {"files": [{"findings": [{"kind": kind, "verdict": verdict}]}]}
+
+
+@pytest.mark.parametrize("kind,verdict", [
+    ("segmentation-certified", None), ("segmentation-certified", "UNKNOWN"),
+    ("segmentation-pass", None), ("segmentation-accepted", "UNKNOWN"),
+    ("connectivity-proven", None),
+])
+def test_assertion_reader_rejects_an_unrecognised_kind(kind, verdict):
+    """M1: a new assertion kind reads as a value no allowed set holds, never
+    as UNKNOWN, whatever verdict it carries."""
+    a = _assertion_of(_one_finding(kind, verdict))
+    assert a.startswith("UNRECOGNISED:"), a
+    for allowed in ({"UNKNOWN"}, {"FAIL", "UNKNOWN"}, {"FAIL"}):
+        assert _assert_bad(a, allowed)
+
+
+@pytest.mark.parametrize("kind,verdict", [
+    ("segmentation-unknown", "PASS"), ("segmentation-violation", "PASS"),
+    ("segmentation-indeterminate", "ACCEPTED"), ("connectivity-broken", "UNKNOWN"),
+    ("segmentation-ok", "UNKNOWN"),
+])
+def test_assertion_reader_rejects_a_verdict_that_disagrees_with_its_kind(kind, verdict):
+    a = _assertion_of(_one_finding(kind, verdict))
+    assert a.startswith("MISMATCH:"), a
+    assert _assert_bad(a, {"FAIL", "UNKNOWN"})
+
+
+@pytest.mark.parametrize("kind,verdict,want", [
+    ("segmentation-unknown", "UNKNOWN", "UNKNOWN"),
+    ("segmentation-indeterminate", None, "UNKNOWN"),
+    ("segmentation-violation", None, "FAIL"),
+    ("segmentation-violation", "FAIL", "FAIL"),
+    ("connectivity-broken", None, "FAIL"),
+    ("segmentation-ok", None, "PASS"),
+    ("segmentation-ok", "PASS", "PASS"),
+])
+def test_assertion_reader_reads_known_kinds(kind, verdict, want):
+    assert _assertion_of(_one_finding(kind, verdict)) == want
+
+
+def test_every_engine_assertion_kind_is_in_the_reader_table():
+    """A kind the engine can emit must be in _KIND_VERDICT or
+    _UNDECIDED_KINDS, so the reader never meets one by surprise."""
+    import ast
+    known = set(_KIND_VERDICT) | _UNDECIDED_KINDS
+    help_kinds = {k for k in g._KIND_HELP if k.startswith(_ASSERTION_KINDS)}
+    assert help_kinds <= known, sorted(help_kinds - known)
+    pkg = os.path.join(_ROOT, "rulehawk")
+    lit = set()
+    for n in sorted(os.listdir(pkg)):
+        if n.endswith(".py"):
+            tree = ast.parse(open(os.path.join(pkg, n), encoding="utf-8").read())
+            lit |= {x.value for x in ast.walk(tree)
+                    if isinstance(x, ast.Constant) and isinstance(x.value, str)
+                    and re.fullmatch(r"(segmentation|connectivity)(-[a-z]+)+", x.value)}
+    assert lit <= known, sorted(lit - known)
+
+
+def test_sarif_ok_result_on_an_attack_file_is_bad(monkeypatch, tmp_path):
+    """L1: an `-ok` result in an attack file's SARIF is a PASS claim on that
+    surface, even next to a violation."""
+    rel = "cfg/a02_ios_seq_reorder_permit_first.cfg"
+    real = g.to_sarif
+
+    def plus_ok(gate, version=None):
+        s = json.loads(real(gate, version))
+        r = dict(s["runs"][0]["results"][0])
+        r["ruleId"] = "segmentation-ok"
+        s["runs"][0]["results"].append(r)
+        return json.dumps(s)
+
+    pol, allowed = _ATTACKS[rel]
+    before = _observe("sarif", rel, pol, tmp_path)
+    assert not _SURFACES["sarif"][1](before, allowed, rel), before
+    monkeypatch.setattr(g, "to_sarif", plus_ok)
+    after = _observe("sarif", rel, pol, tmp_path)
+    assert _SURFACES["sarif"][1](after, allowed, rel), after
+
+
+def test_sarif_observation_counts_results_not_rule_ids(monkeypatch, tmp_path):
+    rel = "cfg/a02_ios_seq_reorder_permit_first.cfg"
+    real = g.to_sarif
+
+    def twice(gate, version=None):
+        s = json.loads(real(gate, version))
+        s["runs"][0]["results"] = s["runs"][0]["results"] * 2
+        return json.dumps(s)
+
+    pol, _ = _ATTACKS[rel]
+    before = _observe("sarif", rel, pol, tmp_path)
+    monkeypatch.setattr(g, "to_sarif", twice)
+    assert _observe("sarif", rel, pol, tmp_path) != before
+
+
+def test_red_sets_stay_within_the_stopgap():
+    """L2: under the stopgap no boundary cell is red, and every red cell is
+    on the two surfaces slice 2 turns green. Widening either is an edit here."""
+    assert not _RED_B, sorted(_RED_B)
+    assert {s for _, s in _RED} <= {"sarif", "mcp_audit"}, sorted({s for _, s in _RED})
