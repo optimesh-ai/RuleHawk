@@ -39,6 +39,23 @@ _CLEAN = """ip access-list extended CLEAN
  deny ip any any
 """
 
+
+# A bound, fully modelled clean config (coordinator 11-06): every interface
+# carries the inbound filter, no parse note and no L4 rule, so a PASS is
+# genuinely supported under fail-closed. RFC 5737 addresses only.
+_BOUND_CLEAN = """interface GigabitEthernet0/0
+ ip address 198.51.100.1 255.255.255.0
+ ip access-group CLEAN in
+!
+interface GigabitEthernet0/1
+ ip address 192.0.2.1 255.255.255.0
+ ip access-group CLEAN in
+!
+ip access-list extended CLEAN
+ permit ip 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255
+ deny ip any any
+"""
+
 # A Cisco ACL with a critical permit-any-any (drives the FAIL+unparseable mix).
 _DIRTY = """ip access-list extended EDGE
  permit ip any any
@@ -125,7 +142,7 @@ def test_chmod_000_file_fails_closed_via_audit_file(tmp_path):
 # 2. PASS — the verdict line every green PR shows (gate.py:497)
 # --------------------------------------------------------------------------- #
 def test_pass_verdict_rendered_in_markdown_and_console(tmp_path):
-    p = _write(str(tmp_path), "clean.acl", _CLEAN)
+    p = _write(str(tmp_path), "clean.acl", _BOUND_CLEAN)
     g = gate.run_gate([p], _POLICY, "high")
     assert g.passed and g.exit_code() == 0
 
@@ -347,3 +364,19 @@ def test_split_rule_id_non_digit_seq_is_none():
     # the happy path still holds (rsplit keeps colons inside the acl name)
     assert gate._split_rule_id("EDGE:4") == ("EDGE", 4)
     assert gate._split_rule_id("a:b:7") == ("a:b", 7)
+
+
+def test_pass_verdict_rendered_in_markdown_and_console__unbound_original_is_unknown(tmp_path):
+    """The original, unbound _CLEAN fixture: UNKNOWN in both renderings,
+    with its exact reason codes, and never the PASS wording."""
+    p = _write(str(tmp_path), "clean.acl", _CLEAN)
+    g = gate.run_gate([p], _POLICY, "high")
+    assert not g.passed and g.exit_code() == 3
+    codes = {r["code"] for _, f in g.undecided for r in (f.reasons or [])}
+    assert codes == {"acl-role-unknown", "no-transit-filter", "l4-fragments"}
+    md = gate.to_markdown(g)
+    assert "**UNKNOWN**" in md and "**PASS**" not in md
+    assert "Segmentation proven (rule layer):" not in md
+    con = gate.to_console(g)
+    assert "VERDICT: UNKNOWN (exit 3, fail-closed)" in con
+    assert "VERDICT: PASS" not in con

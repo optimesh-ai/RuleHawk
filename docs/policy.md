@@ -176,8 +176,10 @@ section above. For `must_not_reach` entries:
   `access-class`, SNMP, route-map, NAT, crypto), `parse-note`,
   `panos-default-security-rules`, `panos-implicit-default`,
   `iptables-chain-policy-unset`, `ipv6-implicit-nd`, `icmpv6-canonicalisation`,
-  `tcp-established`, `l4-fragments`, `numbered-acl-mask-ambiguous` and
-  `ios-wildcard-all-ones`. The full list is `rulehawk.failclosed.REASONS`.
+  `tcp-established`, `l4-fragments`, `numbered-acl-mask-ambiguous`,
+  `ios-wildcard-all-ones`, `unfiltered-path` (an unfiltered interface pair
+  can carry the flow around every audited filter), `iptables-fragments` and
+  `pathground-witness-only`. The full list is `rulehawk.failclosed.REASONS`.
   `*-indeterminate` findings also carry verdict UNKNOWN and their reasons.
 - **`segmentation-error`** (high) — the policy itself is invalid: a
   `src`/`dst` naming a zone that isn't defined, an unparseable CIDR in `zones`,

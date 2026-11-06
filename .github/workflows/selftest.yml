@@ -74,7 +74,7 @@ jobs:
         id: clean
         uses: ./
         with:
-          configs: samples/adv_realistic.txt
+          configs: samples/bound_edge.txt
           policy: samples/policy.json
           fail-on: high
           upload-sarif: false      # no code-scanning dependency in the self-test
@@ -84,7 +84,7 @@ jobs:
         id: nopolicy
         uses: ./
         with:
-          configs: samples/adv_realistic.txt
+          configs: samples/bound_edge.txt
           fail-on: high
           upload-sarif: false
           comment: false
@@ -94,7 +94,7 @@ jobs:
         id: evidence
         uses: ./
         with:
-          configs: samples/adv_realistic.txt
+          configs: samples/bound_edge.txt
           policy: samples/policy.json
           fail-on: high
           evidence: true
@@ -162,6 +162,38 @@ jobs:
           [ "${WORST}" = "critical" ]  || { echo "::error::outputs.worst-severity should be critical, got '${WORST}'"; exit 1; }
           echo "FAIL path verified: outcome=${OUTCOME}, passed=${PASSED}, worst=${WORST}"
 
+  action-selftest-unknown-path:
+    name: Dogfood the Action (UNKNOWN verdict is enforced)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Fail closed: adv_realistic.txt has no interface binding, so its
+      # policy assertions cannot be proven. The gate must exit 3, say UNKNOWN
+      # and fail the Action step; it must never read as a PASS.
+      - name: RuleHawk gate (expect UNKNOWN on an unbound sample)
+        id: unknown
+        continue-on-error: true
+        uses: ./
+        with:
+          configs: samples/adv_realistic.txt
+          policy: samples/policy.json
+          fail-on: high
+          upload-sarif: false
+          comment: false
+      - name: Assert the gate went red with exit 3 and verdict UNKNOWN
+        env:
+          OUTCOME: ${{ steps.unknown.outcome }}
+          PASSED: ${{ steps.unknown.outputs.passed }}
+          VERDICT: ${{ steps.unknown.outputs.verdict }}
+          EXIT_CODE: ${{ steps.unknown.outputs.exit-code }}
+        run: |
+          set -euo pipefail
+          [ "${OUTCOME}" = "failure" ] || { echo "::error::gate did not fail on an UNKNOWN sample"; exit 1; }
+          [ "${PASSED}" = "false" ]    || { echo "::error::outputs.passed should be false, got '${PASSED}'"; exit 1; }
+          [ "${VERDICT}" = "UNKNOWN" ] || { echo "::error::outputs.verdict should be UNKNOWN, got '${VERDICT}'"; exit 1; }
+          [ "${EXIT_CODE}" = "3" ]     || { echo "::error::outputs.exit-code should be 3, got '${EXIT_CODE}'"; exit 1; }
+          echo "UNKNOWN path verified: outcome=${OUTCOME}, verdict=${VERDICT}, exit-code=${EXIT_CODE}"
+
   # One PR comment for several checks: the headline is the WORST verdict, so a
   # passing check can never hide a failing one. Same-job: every gate step's
   # result stays in the job's results dir for the comment to combine.
@@ -182,7 +214,7 @@ jobs:
       - name: Clean check (expect PASS)
         uses: ./
         with:
-          configs: samples/adv_realistic.txt
+          configs: samples/bound_edge.txt
           policy: samples/policy.json
           label: clean
           upload-sarif: false
@@ -226,7 +258,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./
         with:
-          configs: samples/adv_realistic.txt
+          configs: samples/bound_edge.txt
           policy: samples/policy.json
           label: clean
           upload-sarif: false

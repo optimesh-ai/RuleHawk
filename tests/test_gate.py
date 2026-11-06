@@ -39,6 +39,23 @@ _CLEAN = """ip access-list extended CLEAN
  deny ip any any
 """
 
+
+# A bound, fully modelled clean config (coordinator 11-06): every interface
+# carries the inbound filter, no parse note and no L4 rule, so a PASS is
+# genuinely supported under fail-closed. RFC 5737 addresses only.
+_BOUND_CLEAN = """interface GigabitEthernet0/0
+ ip address 198.51.100.1 255.255.255.0
+ ip access-group CLEAN in
+!
+interface GigabitEthernet0/1
+ ip address 192.0.2.1 255.255.255.0
+ ip access-group CLEAN in
+!
+ip access-list extended CLEAN
+ permit ip 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255
+ deny ip any any
+"""
+
 _IPTABLES = """*filter
 :FORWARD DROP [0:0]
 -A FORWARD -s 10.20.0.0/16 -d 10.10.0.0/16 -p tcp --dport 445 -j ACCEPT
@@ -207,7 +224,7 @@ def test_low_only_config_passes_at_high(tmp_path):
 
 
 def test_clean_config_passes(tmp_path):
-    p = _write(str(tmp_path), "clean.acl", _CLEAN)
+    p = _write(str(tmp_path), "clean.acl", _BOUND_CLEAN)
     g = gate.run_gate([p], _POLICY, "high")
     assert g.passed and g.worst == "none"
 
@@ -216,7 +233,7 @@ def test_clean_config_passes(tmp_path):
 # info good-news is excluded from gating and SARIF
 # --------------------------------------------------------------------------- #
 def test_segmentation_ok_is_info_not_a_violation(tmp_path):
-    p = _write(str(tmp_path), "clean.acl", _CLEAN)
+    p = _write(str(tmp_path), "clean.acl", _BOUND_CLEAN)
     g = gate.run_gate([p], _POLICY, "high")
     kinds = {f.kind for fr in g.files for f in fr.findings}
     assert "segmentation-ok" in kinds           # the PASS is recorded...
@@ -410,7 +427,7 @@ def test_main_returns_1_on_fail_and_writes_outputs(tmp_path):
 
 def test_main_returns_0_on_clean(tmp_path):
     d = str(tmp_path)
-    p = _write(d, "clean.acl", _CLEAN)
+    p = _write(d, "clean.acl", _BOUND_CLEAN)
     pol = _write(d, "policy.json", json.dumps(_POLICY))
     rc = gate.main([p, "--policy", pol, "--fail-on", "high", "-q"])
     assert rc == 0
@@ -563,3 +580,38 @@ def test_json_stdout_not_corrupted_by_console_report(tmp_path, capsys):
     gate.main([p, "--json", "-"])
     out = capsys.readouterr().out
     json.loads(out)                             # stdout is pure JSON, no banner
+
+
+# --------------------------------------------------------------------------- #
+# the original, unbound _CLEAN fixture is now UNKNOWN (fail-closed)
+# --------------------------------------------------------------------------- #
+_CLEAN_UNKNOWN_CODES = {"acl-role-unknown", "no-transit-filter", "l4-fragments"}
+
+
+def _undecided_codes(g):
+    return {r["code"] for _, f in g.undecided for r in (f.reasons or [])}
+
+
+def test_clean_config_passes__unbound_original_is_unknown(tmp_path):
+    p = _write(str(tmp_path), "clean.acl", _CLEAN)
+    g = gate.run_gate([p], _POLICY, "high")
+    assert not g.passed and g.verdict == "UNKNOWN" and g.worst == "medium"
+    assert g.exit_code() == 3
+    assert _undecided_codes(g) == _CLEAN_UNKNOWN_CODES
+
+
+def test_segmentation_ok_is_info_not_a_violation__unbound_original_is_unknown(tmp_path):
+    p = _write(str(tmp_path), "clean.acl", _CLEAN)
+    g = gate.run_gate([p], _POLICY, "high")
+    kinds = {f.kind for fr in g.files for f in fr.findings}
+    assert "segmentation-ok" not in kinds and "segmentation-unknown" in kinds
+    assert _undecided_codes(g) == _CLEAN_UNKNOWN_CODES
+
+
+def test_main_returns_0_on_clean__unbound_original_exits_3(tmp_path):
+    d = str(tmp_path)
+    p = _write(d, "clean.acl", _CLEAN)
+    pol = _write(d, "policy.json", json.dumps(_POLICY))
+    assert gate.main([p, "--policy", pol, "--fail-on", "high", "-q"]) == 3
+    g = gate.run_gate([p], _POLICY, "high")
+    assert _undecided_codes(g) == _CLEAN_UNKNOWN_CODES

@@ -72,7 +72,7 @@ def test_documented_inputs_match_the_manifest():
 
 @needs_node_and_bash
 def test_a_failing_job_and_a_passing_job_combine_to_fail(tmp_path):
-    res = _results(tmp_path, ("adv_realistic.txt", "Segmentation"),
+    res = _results(tmp_path, ("bound_edge.txt", "Segmentation"),
                    ("ios_acl.txt", "Egress"))
     run = _run(tmp_path, res, "2")
     combine = run["outputs"]["combine"]
@@ -112,7 +112,7 @@ def test_a_bad_expect_value_is_unknown_not_pass(tmp_path):
 
 @needs_node_and_bash
 def test_every_check_passing_passes(tmp_path):
-    res = _results(tmp_path, ("adv_realistic.txt", "One"), ("adv_realistic.txt", "Two"))
+    res = _results(tmp_path, ("bound_edge.txt", "One"), ("bound_edge.txt", "Two"))
     run = _run(tmp_path, res, "2")
     assert run["outputs"]["combine"]["verdict"] == "PASS"
     enforce = [v for k, v in run["outputs"].items() if k.startswith("_step")]
@@ -179,7 +179,7 @@ def test_a_second_invocation_does_not_overwrite_the_first_comment_file(tmp_path)
     first = _run_invocation(_manifest(), {"expect": "1", "results": fail, "jobs": ""},
                             str(runner), str(tmp_path), action_path=_DIR)
     (tmp_path / "results").rename(tmp_path / "results-first")
-    clean = _results(tmp_path, ("adv_realistic.txt", "Clean"))
+    clean = _results(tmp_path, ("bound_edge.txt", "Clean"))
     second = _run_invocation(_manifest(), {"expect": "1", "results": clean, "jobs": ""},
                              str(runner), str(tmp_path), action_path=_DIR)
     assert first["outputs"]["combine"]["verdict"] == "FAIL"
@@ -203,3 +203,50 @@ def test_results_left_by_an_earlier_invocation_are_not_combined_again(tmp_path):
     run = _run_invocation(_manifest(), {"expect": "1", "results": "", "jobs": ""},
                           str(runner), str(tmp_path), action_path=_DIR)
     assert run["outputs"]["combine"]["verdict"] == "UNKNOWN"
+
+
+# --------------------------------------------------------------------------- #
+# the original fixture (adv_realistic.txt, unbound) is now UNKNOWN
+# (coordinator 11-06: bound_edge.txt is the legitimately-PASS sample)
+# --------------------------------------------------------------------------- #
+_ADV_UNKNOWN_CODES = {"acl-role-unknown", "no-transit-filter", "tcp-established",
+                      "l4-fragments"}
+
+
+def _adv_codes():
+    import json
+    g = gate.run_gate([os.path.join(_S, "adv_realistic.txt")],
+                      json.load(open(os.path.join(_S, "policy.json"))), "high", "auto")
+    return {r["code"] for _, f in g.undecided for r in (f.reasons or [])}
+
+
+@needs_node_and_bash
+def test_a_failing_job_and_a_passing_job__unbound_original_is_unknown(tmp_path):
+    res = _results(tmp_path, ("adv_realistic.txt", "Segmentation"),
+                   ("ios_acl.txt", "Egress"))
+    run = _run(tmp_path, res, "2")
+    assert run["outputs"]["combine"]["verdict"] == "FAIL"
+    body = open(run["outputs"]["combine"]["comment"], encoding="utf-8").read()
+    assert "| Segmentation | ✅ PASS |" not in body
+    assert _adv_codes() == _ADV_UNKNOWN_CODES
+
+
+@needs_node_and_bash
+def test_every_check_passing__unbound_original_is_unknown(tmp_path):
+    res = _results(tmp_path, ("adv_realistic.txt", "One"), ("adv_realistic.txt", "Two"))
+    run = _run(tmp_path, res, "2")
+    assert run["outputs"]["combine"]["verdict"] == "UNKNOWN"
+    enforce = [v for k, v in run["outputs"].items() if k.startswith("_step")]
+    assert enforce[-1]["__rc__"] == 1
+    assert _adv_codes() == _ADV_UNKNOWN_CODES
+
+
+@needs_node_and_bash
+def test_a_second_invocation__unbound_original_is_unknown(tmp_path):
+    runner = tmp_path / "runner"
+    runner.mkdir()
+    clean = _results(tmp_path, ("adv_realistic.txt", "Clean"))
+    run = _run_invocation(_manifest(), {"expect": "1", "results": clean, "jobs": ""},
+                          str(runner), str(tmp_path), action_path=_DIR)
+    assert run["outputs"]["combine"]["verdict"] == "UNKNOWN"
+    assert _adv_codes() == _ADV_UNKNOWN_CODES

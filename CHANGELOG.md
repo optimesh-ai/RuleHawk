@@ -76,11 +76,28 @@ UNKNOWN never shares the PASS code. Precedence: 2, then 1, then 3, then 0.
   (`numbered-acl-mask-ambiguous`). A nonzero address with mask
   `255.255.255.255` -> UNKNOWN (`ios-wildcard-all-ones`). 14.
 - An unrecognised vendor label -> UNKNOWN (`vendor-unknown`).
+- An interface that admits a family unfiltered plus another that emits it
+  unfiltered (a way across the device that meets no audited rule) -> UNKNOWN
+  (`unfiltered-path`; IOS/NX-OS/EOS and Junos, per address family). ASA
+  interface coverage is not modelled and is blocked.
+- iptables rules that match ports or other L4 fields, which a non-initial
+  fragment never matches -> UNKNOWN (`iptables-fragments`).
+- A violation that Hammerhead path-grounding suppresses (one witness proven
+  unreachable) -> UNKNOWN (`pathground-witness-only`), never PASS; it still
+  blocks the run.
 - PAN-OS: an empty address-group no longer widens to ANY exactly; the rule is
   imprecise, so the assertion is indeterminate (UNKNOWN), never a PASS.
 
 ### Fixes
 
+- `--evidence` no longer crashes with a TypeError on a scalar `ports` value
+  (`"ports": 445`); it attests the same claim as `[445]`.
+- server.json: the `uvx --from` pin no longer names a PyPI release
+  (`rulehawk` is not on PyPI); it uses the documented git install, pinned to
+  the `v0.5.0` tag.
+- New sample `samples/bound_edge.txt`: a bound, fully modelled config whose
+  PASS is genuinely supported. `samples/adv_realistic.txt` (unbound) is now
+  UNKNOWN.
 - Vendor detection: classic IOS (for example IOS 15.2) with
   `interface Ethernet0/0` is no longer labelled NX-OS. `interface Ethernet`
   alone is now a weak marker that an IOS marker (`version 15.2`,
