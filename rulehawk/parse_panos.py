@@ -153,6 +153,25 @@ def _tok(line: str) -> List[str]:
         return line.split()
 
 
+_QUOTED = re.compile(r"""(\S+)[ \t]+(?:"((?:[^"\\]|\\.)*)"|'([^']*)')""")
+
+
+def _padded_names(text: str) -> List[str]:
+    """A quoted name with leading or trailing whitespace (`rules "d "`) is
+    read as its own name; whether PAN-OS trims it, and so names the rule or
+    object without the spaces, is not modelled (review of #42, round 7,
+    R6-5). A description or comment is free text and is not flagged."""
+    out: List[str] = []
+    for no, ln in enumerate(split_lines(text), 1):
+        for m in _QUOTED.finditer(ln):
+            val = m.group(2) if m.group(2) is not None else m.group(3)
+            if val != val.strip() and m.group(1).lower() not in ("description", "comment"):
+                out.append(f"PAN-OS line {no}: quoted name `{val}` has leading or "
+                           f"trailing whitespace; whether the device trims it is not "
+                           f"modelled, so it may name another rule or object")
+    return out
+
+
 def _one(toks: List[str], i: int) -> "Tuple[List[str], int]":
     """One value: a single token or a `[ ... ]` list (PAN-OS takes no other
     form: several values need the brackets)."""
@@ -963,6 +982,7 @@ def parse_panos(text: str) -> Tuple[List[ACE], List[str]]:
                 if ln.strip() and not ln.lstrip().startswith("#")]
     notes: List[str] = []
     entries: List[ACE] = []
+    notes.extend(_padded_names(text))
     # Every line is consumed by a modelled handler or gets a note (review of
     # #42, round 3): a line skipped silently (a `delete`, an `edit` followed
     # by relative `set`s, a NAT rule) could change what the rulebase does.

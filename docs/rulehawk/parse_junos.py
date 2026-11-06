@@ -181,16 +181,22 @@ def _quote_hazards(text: str) -> List[str]:
     - `#`, `/*`, `*/`, a brace, `;` or a bracket inside a quoted string;
     - a string that is not closed on its line, or a block never closed;
     - `/*` inside a `#` comment, and a `*/` outside any block.
-    A `#` after other text is a comment, as in the device's own output
+    A `#` after a statement is a comment, as in the device's own output
     (`encrypted-password "..."; ## SECRET-DATA`), and is not flagged.
+    Round 7 (R6-3) adds, outside strings and comments:
+    - a `#` glued to a word (not after the line start, whitespace, `;`, `{`
+      or `}`): whether the device reads a comment or a word is not known;
+    - braces that do not balance: the device does not load the file, and
+      `_read_block` takes the rest of the text as the open block.
     Each one is a note, so the answer is UNKNOWN."""
     notes: List[str] = []
 
-    def note(line: int, what: str) -> None:
+    def note(line: int, what: str, why: str = "the tokenizer ignores quotes") -> None:
         if len(notes) < 5:
-            notes.append(f"Junos line {line}: {what}; the tokenizer ignores "
-                         f"quotes, so the statements around it may be misread")
+            notes.append(f"Junos line {line}: {what}; {why}, so the statements "
+                         f"around it may be misread")
 
+    depth = 0
     state, line, start, i, n = "code", 1, 1, 0, len(text)
     while i < n:
         c, two = text[i], text[i:i + 2]
@@ -207,6 +213,9 @@ def _quote_hazards(text: str) -> List[str]:
             if c == '"':
                 state, start = "string", line
             elif c == "#":
+                prev = text[i - 1] if i else "\n"
+                if not (prev.isspace() or prev in ";{}"):
+                    note(line, "`#` inside a word", "the device may read it as a word")
                 state = "hash"
             elif two == "/*":
                 state, start = "block", line
@@ -214,6 +223,13 @@ def _quote_hazards(text: str) -> List[str]:
             elif two == "*/":
                 note(line, "`*/` outside a comment")
                 i += 1
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == -1:
+                    note(line, "a `}` closes a block that was never opened",
+                         "the device does not load unbalanced braces")
         elif state == "string":
             if c == "\\":
                 i += 1
@@ -235,6 +251,9 @@ def _quote_hazards(text: str) -> List[str]:
         note(start, "a `/*` comment is never closed")
     elif state == "string":
         note(start, "a quoted string is never closed")
+    if depth > 0:
+        note(line, f"{depth} `{{` never closed",
+             "the device does not load unbalanced braces")
     return notes
 
 

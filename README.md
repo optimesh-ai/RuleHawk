@@ -84,10 +84,10 @@ Every PASS prints these next to the verdict (text, the `--json` `scope` field,
 `--evidence`, the gate, MCP and the hosted page):
 
 - On every vendor a line ends at \n only, and a control or separator character on any line is UNKNOWN (a CR before the newline is accepted only in Cisco configs and AWS JSON).
-- Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group mode end at a header, `exit` or a recognised top-level command, indented or not; any other line in interface mode, an unindented line in those modes that is not a recognised top-level command, and any line after `end` are UNKNOWN; other global commands are not read.
-- PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed.
+- Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group mode end at a header, `exit` or a recognised top-level command, indented or not; inside an ACL only ACL-entry lines are read (a sequence number, permit, deny, remark, evaluate, dynamic, `no` or `default` of those, NX-OS `statistics per-entry`) and any other line is UNKNOWN; any other line in interface mode, an unindented line in those modes that is not a recognised top-level command, `ex` or `en` for `exit` or `end`, an `exit` after a line that opens no known sub-mode or after a sub-mode body that is not checked, and any line after `end` are UNKNOWN; other global commands are not read.
+- PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed; a quoted name with leading or trailing whitespace is UNKNOWN.
 - iptables reads the filter table; a chain's policy comes only from a parsed -P or :CHAIN line naming ACCEPT or DROP (exact case).
-- Junos reads firewall filters and their interface bindings; SRX security zones or policies, and a comment marker, brace, bracket or `;` inside a quoted string, make the answer UNKNOWN.
+- Junos reads firewall filters and their interface bindings; SRX security zones or policies, a comment marker, brace, bracket or `;` inside a quoted string, a `#` glued to a word, and braces that do not balance make the answer UNKNOWN.
 
 The Cisco interface allowlist is: `description`, `ip address` (with
 `secondary`), `no ip address` (bare, or with an address and mask and optional
@@ -123,9 +123,21 @@ commands, indented or not, none of which is valid inside those modes: `end`,
 or object-group member counts only in the mode its own header opened; one
 after a mode change is in no named ACL and is a parse note. Any other
 unindented line in one of those modes, and an indented top-level command
-there, is UNKNOWN (`stanza-boundary-ambiguous`). `end`, or `exit` at the
-global level, leaves configuration mode: every later line is a parse note
-and no ACL is read from it. Interface names are case-folded and a separately
+there, is UNKNOWN (`stanza-boundary-ambiguous`). Inside an ACL the check is
+an allowlist, not a list of what ends the mode: IOS runs a command the ACL
+mode lacks in global mode, so only ACL-entry lines stay in the ACL (an
+optional sequence number, or `sequence N`, then `permit`, `deny`, `remark`,
+`evaluate` or `dynamic`; `no` or `default` of one of those or of a sequence
+number; NX-OS `statistics per-entry`). Any other line there (`ntp server`,
+`no ip domain-lookup`, an abbreviation, EOS `counters per-entry`, NX-OS
+`fragments`) is UNKNOWN (`stanza-boundary-ambiguous`). IOS accepts any unique
+abbreviation, so `ex`/`exi` and `en` are read as `exit` and `end`, and are
+UNKNOWN too. `end`, or `exit` at the global level, leaves configuration mode:
+every later line is a parse note and no ACL is read from it. So does an
+`exit` straight after a line that opens no known sub-mode (`hostname R1`,
+`ip route ...`). An `exit` after the body of a mode whose lines RuleHawk
+does not check (a routing process, an object-group) is UNKNOWN: a body line
+may have run in global mode, and then the `exit` left configuration mode. Interface names are case-folded and a separately
 written number is joined (`GigabitEthernet 0/1` is `gigabitethernet0/1`);
 repeated stanzas for one interface are merged in order.
 

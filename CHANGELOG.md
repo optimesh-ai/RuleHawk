@@ -149,6 +149,19 @@ run is one.
   a parse note and no ACL is read from them. Interface names are case-folded
   and a separately written number is joined, so `GigabitEthernet 0/2` is its
   own port and repeated stanzas merge in order.
+- Cisco ACL mode is an allowlist: inside an ACL only ACL-entry lines stay
+  in the ACL (sequence number, `permit`, `deny`, `remark`, `evaluate`,
+  `dynamic`, `no` / `default` of those, NX-OS `statistics per-entry`). Any
+  other line, indented or not (an unlisted global command such as
+  `ntp server`, an abbreviation such as `ex`, `hostn`) -> UNKNOWN
+  (`stanza-boundary-ambiguous`). `ex`/`exi`/`en` are read as `exit`/`end`.
+  An `exit` after a line that opens no known sub-mode (`hostname`, `ip
+  route`) ends configuration mode (later lines are a parse note); an `exit`
+  after an unchecked sub-mode body -> UNKNOWN.
+- Junos: braces that do not balance, and a `#` glued to a word (`x#y`), are
+  parse notes -> UNKNOWN.
+- PAN-OS: a quoted rule or object name with leading or trailing whitespace
+  (`rules "d "`) is a parse note -> UNKNOWN.
 - Junos: `#`, `/*`, `*/`, a brace, a bracket or `;` inside a quoted string,
   an unclosed string or block comment, and `/*` inside a `#` comment are
   parse notes -> UNKNOWN (the tokenizer strips comments and splits on braces
@@ -201,10 +214,10 @@ run is one.
   prints these per-vendor limits next to the verdict (text, `--json`
   `scope`, `--evidence`, gate, MCP, hosted page):
   - On every vendor a line ends at \n only, and a control or separator character on any line is UNKNOWN (a CR before the newline is accepted only in Cisco configs and AWS JSON).
-  - Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group mode end at a header, `exit` or a recognised top-level command, indented or not; any other line in interface mode, an unindented line in those modes that is not a recognised top-level command, and any line after `end` are UNKNOWN; other global commands are not read.
-  - PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed.
+  - Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group mode end at a header, `exit` or a recognised top-level command, indented or not; inside an ACL only ACL-entry lines are read (a sequence number, permit, deny, remark, evaluate, dynamic, `no` or `default` of those, NX-OS `statistics per-entry`) and any other line is UNKNOWN; any other line in interface mode, an unindented line in those modes that is not a recognised top-level command, `ex` or `en` for `exit` or `end`, an `exit` after a line that opens no known sub-mode or after a sub-mode body that is not checked, and any line after `end` are UNKNOWN; other global commands are not read.
+  - PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed; a quoted name with leading or trailing whitespace is UNKNOWN.
   - iptables reads the filter table; a chain's policy comes only from a parsed -P or :CHAIN line naming ACCEPT or DROP (exact case).
-  - Junos reads firewall filters and their interface bindings; SRX security zones or policies, and a comment marker, brace, bracket or `;` inside a quoted string, make the answer UNKNOWN.
+  - Junos reads firewall filters and their interface bindings; SRX security zones or policies, a comment marker, brace, bracket or `;` inside a quoted string, a `#` glued to a word, and braces that do not balance make the answer UNKNOWN.
 - RuleHawk models the L3/L4 packet space.
 - iptables: only the filter table is modelled; other tables are noted.
 - A pasted snippet is audited as if it were the whole config.

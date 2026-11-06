@@ -387,6 +387,45 @@ _TOP_LEVEL = re.compile(
     r"|management \S+"                     # EOS management API / SSH mode
     r"|snmp-server \S+"                    # SNMP agent (`snmp trap` is the interface form)
     r")(?: |$)")
+# ACL mode is an allowlist, not a list of what ends it (review of #42, round
+# 7, R6-1): IOS runs a command that the sub-mode lacks in global mode, so any
+# line inside an ACL that is not an ACL entry may have ended the ACL. Kept to
+# the ACL-mode commands the parser reads:
+# - IOS extended / standard named ACL mode: an entry with an optional
+#   sequence number, `remark`, `evaluate`, `dynamic`, and `no` / `default` of
+#   an entry or a sequence number. Cisco, "Configure IP Access Lists" (Doc ID
+#   23602, https://www.cisco.com/c/en/us/support/docs/security/ios-firewall/23602-confaccesslists.html):
+#   "Router(config-ext-nacl)#5 deny tcp any any eq telnet",
+#   "router(config-ext-nacl)#no permit icmp any any", "evaluate", "remark";
+#   IOS XE 17 "IP Named Access Control Lists"
+#   (https://www.cisco.com/c/en/us/td/docs/routers/ios/config/17-x/sec-vpn/b-security-vpn/m_sec-acl-named.html):
+#   "Device(config-ext-nacl)# remark ...", "deny ...", "permit ...".
+#   IPv6 entries are written `sequence N permit ...` (parse._entry_tokens).
+# - NX-OS IP ACL mode: `[no] statistics per-entry`, which only counts.
+#   Cisco Nexus 7000 NX-OS Security Command Reference, "statistics per-entry"
+#   (https://www.cisco.com/c/en/us/td/docs/switches/datacenter/nexus7000/sw/security/command/reference/n7k_sec_cmd/sec_cmd_r_to_s.html):
+#   "To start recording statistics for how many packets are permitted or
+#   denied by each entry ... Command Modes: IP access-list configuration".
+# Anything else (EOS `counters per-entry`, NX-OS `fragments`, a global
+# command, an abbreviation) is `ambiguous`.
+_ACL_ACTION = r"(?:permit|deny|remark|evaluate|dynamic)"
+_ACL_ENTRY = re.compile(
+    r"(?ai)^(?:(?:(?:sequence )?[0-9]+ )?" + _ACL_ACTION + r"(?: |$)"
+    r"|(?:no|default) (?:(?:sequence )?[0-9]+|" + _ACL_ACTION + r")(?: |$)"
+    r"|(?:no )?statistics per-entry$)")
+# `exit` and `end` as the device reads them: IOS accepts "the number of
+# characters that allow a unique abbreviation" (IOS XE Configuration
+# Fundamentals, "Using the Cisco IOS Command-Line Interface",
+# https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/fundamentals/configuration/xe-16-8/fundamentals-xe-16-8-book/cf-cli-basics.html).
+# Whether two letters are unique depends on the mode, so every prefix of
+# two letters or more is read as the word, and is also `ambiguous`.
+_EXIT_END = {"ex": "exit", "exi": "exit", "exit": "exit", "en": "end", "end": "end"}
+# Openers of the sub-modes `exit` can close without leaving configuration
+# mode. After any other line, or after a body RuleHawk does not check, an
+# `exit` may leave configuration mode (round 7, R6-2).
+_SUBMODE = re.compile(
+    r"(?i)^(?:router|line|route-map|class-map|policy-map|control-plane"
+    r"|vrf (?:definition|context|instance)|management|mac access-list)(?: |$)")
 _IF_HEADER = re.compile(r"(?i)^(in(?:t(?:e(?:r(?:f(?:a(?:ce?)?)?)?)?)?)?)$")
 _ACL_HEADER = re.compile(r"(?i)^(?:ip|ipv4|ipv6) access-list(?: |$)")
 _OBJGROUP_HEADER = re.compile(r"(?i)^object-group(?: |$)")
@@ -483,10 +522,19 @@ def cisco_lex(text: str) -> CiscoLex:
     - Any other unindented line inside interface, ACL or object-group mode,
       and an indented `_TOP_LEVEL` command there, is `ambiguous`: whether the
       author meant it inside the stanza is not something RuleHawk can tell.
+    - Inside an ACL, any line that is not ACL-entry grammar (`_ACL_ENTRY`),
+      indented or not, is `ambiguous`: the device may have run it in global
+      mode and left the ACL.
+    - A prefix of `exit` / `end` of two letters or more is read as that word
+      and is `ambiguous`.
     - `end`, or `exit` at the global level, leaves configuration mode; every
-      later line is recorded in `post_end` and flagged. Modes are still
-      tracked after it, so the interface checks keep adding their blockers;
-      the ACL parser reads no flagged line."""
+      later line is recorded in `post_end` and flagged. So does an `exit`
+      after a line that opens no known sub-mode (`hostname`, `ip route`).
+      An `exit` after the body of a mode whose lines are not checked (an
+      object-group, a routing process) is `ambiguous`: a body line may have
+      run in global mode. Modes are still tracked after `end`, so the
+      interface checks keep adding their blockers; the ACL parser reads no
+      flagged line."""
     from .parse import strip_banners
     text = strip_banners(text)[0]                 # banner text is not config
     if text.startswith(_BOM):
@@ -498,6 +546,7 @@ def cisco_lex(text: str) -> CiscoLex:
     ranges: List[str] = []
     post_end: List[int] = []
     mode, iface, stanza, opener = "global", None, "global", 0
+    opener_norm, body = "", False                 # opener text; indented body seen
     ended = False
     for no, raw in enumerate(split_lines(text), 1):
         for ch in raw:
@@ -517,27 +566,39 @@ def cisco_lex(text: str) -> CiscoLex:
                 amb.append((no, stanza, _keyword(norm)))
             iface, is_range = _if_name(words[1:])
             mode, stanza, opener = "interface", f"interface {iface}", no
+            opener_norm, body = norm, False
             headers.append((no, iface, first))
             if is_range:
                 ranges.append(iface)
             lines.append(CiscoLine(no, norm, indented, mode, iface, True, opener, ended))
             continue
-        if first in ("exit", "end"):
+        word = _EXIT_END.get(first)
+        if word:
             # `exit` stays a line of the mode it leaves (so an interface
             # `exit` is checked by the allowlist, as before); `end` is global.
-            if first == "end":
+            if word != first:
+                amb.append((no, stanza, f"{words[0]} (read as {word})"))
+            if word == "end":
                 if indented and mode in ("interface", "acl", "objgroup"):
                     amb.append((no, stanza, "end"))
                 mode, iface = "global", None
             lines.append(CiscoLine(no, norm, indented, mode, iface, False, opener, ended))
-            if first == "end" or mode == "global":
+            if word == "end" or mode == "global":
                 ended = True
+            elif mode in ("other", "objgroup"):
+                sub = mode == "objgroup" or bool(_SUBMODE.match(opener_norm))
+                if body:
+                    amb.append((no, f"the mode of line {opener}", "exit"))
+                elif not sub:
+                    ended = True                  # `hostname R1` / `exit`
             mode, iface, stanza, opener = "global", None, "global", no
+            opener_norm, body = norm, False
             continue
         if _TOP_LEVEL.match(norm):
             if indented and mode in ("interface", "acl", "objgroup"):
                 amb.append((no, stanza, _keyword(norm)))
             iface, opener = None, no
+            opener_norm, body = norm, False
             mode = ("acl" if _ACL_HEADER.match(norm) else
                     "objgroup" if _OBJGROUP_HEADER.match(norm) else "other")
             stanza = {"acl": "an ACL", "objgroup": "an object-group"}.get(
@@ -549,6 +610,13 @@ def cisco_lex(text: str) -> CiscoLex:
                 amb.append((no, stanza, _keyword(norm)))
             else:
                 mode, iface, stanza, opener = "other", None, "global", no
+                opener_norm, body = norm, False
+        else:
+            body = True
+            if mode == "acl" and not _ACL_ENTRY.match(norm):
+                # Not an ACL entry: the device may have run it in global mode,
+                # which ends the ACL (R6-1).
+                amb.append((no, stanza, _keyword(norm)))
         lines.append(CiscoLine(no, norm, indented, mode, iface, False, opener, ended))
     return CiscoLex(lines, "\n".join(ln.norm for ln in lines), bad, amb,
                     headers, ranges, post_end)
@@ -1337,16 +1405,23 @@ KNOWN_LIMITS = (
     "features (zone firewall, ip inspect, service-policy, policy routing, "
     "MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group "
     "mode end at a header, `exit` or a recognised top-level command, indented "
-    "or not; any other line in interface mode, an unindented line in those "
-    "modes that is not a recognised top-level command, and any line after "
-    "`end` are UNKNOWN; other global commands are not read",
+    "or not; inside an ACL only ACL-entry lines are read (a sequence number, "
+    "permit, deny, remark, evaluate, dynamic, `no` or `default` of those, NX-OS "
+    "`statistics per-entry`) and any other line is UNKNOWN; any other line in "
+    "interface mode, an unindented line in those modes that is not a "
+    "recognised top-level command, `ex` or `en` for `exit` or `end`, an `exit` "
+    "after a line that opens no known sub-mode or after a sub-mode body that "
+    "is not checked, and any line after `end` are UNKNOWN; other global "
+    "commands are not read",
     "PAN-OS resolves an object name only in the rule's own vsys or "
-    "device-group and in shared; device-group inheritance is not followed",
+    "device-group and in shared; device-group inheritance is not followed; a "
+    "quoted name with leading or trailing whitespace is UNKNOWN",
     "iptables reads the filter table; a chain's policy comes only from a "
     "parsed -P or :CHAIN line naming ACCEPT or DROP (exact case)",
     "Junos reads firewall filters and their interface bindings; SRX security "
-    "zones or policies, and a comment marker, brace, bracket or `;` inside a "
-    "quoted string, make the answer UNKNOWN",
+    "zones or policies, a comment marker, brace, bracket or `;` inside a "
+    "quoted string, a `#` glued to a word, and braces that do not balance "
+    "make the answer UNKNOWN",
 )
 LIMITS_STATEMENT = "known limits: " + "; ".join(KNOWN_LIMITS)
 
