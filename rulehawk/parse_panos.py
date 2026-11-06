@@ -64,7 +64,12 @@ from typing import Dict, List, Optional, Tuple
 
 from .model import ACE, ANY_PORTS, _PORTED, PortRange, _IPNet
 from .failclosed import Ledger, split_lines
-from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
+# Port names (round 10, R9-4): none are read. PAN-OS Objects > Services
+# describes the destination port as numbers and ranges ("Multiple ports or
+# ranges must be separated by commas",
+# https://docs.paloaltonetworks.com/ngfw/help/12-2/objects/objects-services);
+# a port name is not cited, so it is noted.
+from .parse import _NO_NAMES, _port_num
 
 _ANY_NET: _IPNet = ipaddress.ip_network("0.0.0.0/0")
 
@@ -279,7 +284,7 @@ def _parse_portspec(spec: str, label: str, key: str,
             continue
         if "-" in part and not part.startswith("-"):
             lo, hi = part.split("-", 1)
-            ln, hn = _port_num(lo), _port_num(hi)
+            ln, hn = _port_num(lo, _NO_NAMES), _port_num(hi, _NO_NAMES)
             if ln < 0 or hn < 0:
                 imprecise = True
                 notes.append(f"unparsed PAN-OS {key} '{part}' in {label} "
@@ -287,7 +292,7 @@ def _parse_portspec(spec: str, label: str, key: str,
                 continue
             ranges.append(PortRange(min(ln, hn), max(ln, hn)))
         else:
-            p = _port_num(part)
+            p = _port_num(part, _NO_NAMES)
             if p < 0:
                 imprecise = True
                 notes.append(f"unparsed PAN-OS {key} '{part}' in {label} "
@@ -349,6 +354,10 @@ def _collect_objects(numbered: "List[Tuple[int, List[str]]]", notes: List[str],
     # it). Accumulate each service's definition tokens across lines and parse the
     # UNION once, mirroring the address-group member accumulation above.
     service_defs: "Dict[str, List[str]]" = {}
+    # Each address object's value(s) (round 10, R9-2): an address holds one
+    # value, so two different ones are a redefinition whose semantics are
+    # not cited.
+    addr_vals: "Dict[str, set]" = {}
     if consumed is None:
         consumed = set()
     # (namespace, name) -> {(kind, scope)}; handed back through `scope_map`
@@ -393,6 +402,7 @@ def _collect_objects(numbered: "List[Tuple[int, List[str]]]", notes: List[str],
                 if kind in ("fqdn", "ip-wildcard") or (
                         kind in ("ip-netmask", "ip-range") and rest):
                     _take(lineno, "address", name, toks[1:k])
+                    addr_vals.setdefault(name, set()).add((kind, rest[0] if rest else ""))
                 if kind == "ip-range" and rest and "-" not in rest[0]:
                     addresses[name] = None
                     notes.append(f"unparsed PAN-OS address '{name}' "
@@ -495,11 +505,51 @@ def _collect_objects(numbered: "List[Tuple[int, List[str]]]", notes: List[str],
             service_defs.pop(name, None)
             services[name] = None
 
-    # Parse each service's accumulated definition once (union of all its port
-    # members across lines). A user redefinition overrides a same-named builtin.
+    for name, vals in sorted(addr_vals.items()):
+        if len(vals) > 1:
+            addresses[name] = None
+            shown = ", ".join(f"{k} {v}" for k, v in sorted(vals))
+            notes.append(f"PAN-OS address '{name}' is set more than once with "
+                         f"different values ({shown[:80]}): an address holds one "
+                         f"value and whether a later `set` replaces it is not "
+                         f"cited — not modelled (referencing rule imprecise)")
+
+    # Parse each service's definition once. A user redefinition overrides a
+    # same-named builtin. `protocol`, `port` and `source-port` each hold ONE
+    # value (several ports are one comma-separated value: "Multiple ports or
+    # ranges must be separated by commas", PAN-OS Objects > Services), so a
+    # second line giving one of them another value is not read as a union
+    # (round 10, R9-2): whether it replaces or merges is not cited.
     for name, deftoks in service_defs.items():
+        dup = _service_leaf_redefined(deftoks)
+        if dup:
+            services[name] = None
+            notes.append(f"PAN-OS service '{name}' {dup[0]} is set more than once "
+                         f"with different values ({', '.join(dup[1])[:80]}): whether "
+                         f"a later `set` replaces or merges it is not cited — not "
+                         f"modelled (referencing rule imprecise)")
+            continue
         services[name] = _parse_service_def(deftoks, name, notes)
     return addresses, addr_groups, services
+
+
+def _service_leaf_redefined(toks: List[str]) -> "Optional[Tuple[str, List[str]]]":
+    """The first of `protocol` / `port` / `source-port` given two different
+    values across a service's lines, or None."""
+    seen: "Dict[str, set]" = {}
+    i, n = 0, len(toks)
+    while i < n:
+        t = toks[i]
+        if t in ("protocol", "port", "source-port") and i + 1 < n:
+            v = toks[i + 1]
+            seen.setdefault(t, set()).add(v.lower() if t == "protocol" else v)
+            i += 2
+        else:
+            i += 1
+    for leaf in ("protocol", "port", "source-port"):
+        if len(seen.get(leaf, ())) > 1:
+            return leaf, sorted(seen[leaf])
+    return None
 
 
 def _parse_service_def(toks: List[str], name: str, notes: List[str]
@@ -664,7 +714,28 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
                 acl: str = "security") -> int:
     label = f"{acl}/{name}"
 
-    # Scalar fields set on several lines follow `set` semantics: last wins.
+    # A field that holds one value, set more than once with different values
+    # (round 10, R9-2): whether a later `set` replaces the value is not cited,
+    # so neither value is taken. Modelled as the superset: enabled, negated dimensions widened to any,
+    # and the rule imprecise so it never decides (whichever action it has,
+    # an imprecise rule neither proves a block nor a leak).
+    redefined = []
+    for leaf in ("action", "disabled", "negate-source", "negate-destination"):
+        vals = sorted({v.lower() for v in fields.get(leaf, [])})
+        if len(vals) > 1:
+            redefined.append(leaf)
+            notes.append(f"PAN-OS rule {label}: `{leaf}` is set more than once with "
+                         f"different values ({', '.join(vals)[:60]}); whether a later "
+                         f"`set` replaces it is not cited — not modelled (marked "
+                         f"imprecise)")
+    if redefined:
+        fields = dict(fields)
+        if "disabled" in redefined:
+            fields["disabled"] = ["no"]
+        for nk in ("negate-source", "negate-destination"):
+            if nk in redefined:
+                fields[nk] = ["yes"]
+
     if fields.get("disabled", []) and fields["disabled"][-1].lower() == "yes":
         notes.append(f"PAN-OS rule {label} is disabled — skipped (not enforced)")
         return seq
@@ -678,7 +749,18 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
         notes.append(f"unmodeled PAN-OS action '{act_vals[-1]}' in {label} — skipped")
         return seq
 
-    imprecise = False
+    imprecise = bool(redefined)
+
+    # `any` and another member in one list (round 10, R9-5): whether the
+    # device keeps `any`, drops it or rejects the list is not cited.
+    for leaf in ("source", "destination", "service", "application"):
+        vals = fields.get(leaf, [])
+        if "any" in vals and any(v != "any" for v in vals):
+            imprecise = True
+            notes.append(f"PAN-OS rule {label}: `{leaf}` holds `any` and other "
+                         f"member(s) ({', '.join(v for v in vals if v != 'any')[:60]}); "
+                         f"what the device makes of the list is not cited — not "
+                         f"modelled (marked imprecise)")
 
     # Zones: a specific from/to constrains the match in a dimension we don't
     # model -> over-approximation -> imprecise (the RH-3 line). `any` is exact.

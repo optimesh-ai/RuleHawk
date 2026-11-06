@@ -39,7 +39,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from test_fail_closed_review8 import (  # noqa: E402
-    _DENY, _IF, _LEAK, _NX, _NXDENY, _NXLEAK, _OTHER, _codes, _ios,
+    _DENY, _IF, _IF6, _LEAK, _NX, _NXDENY, _NXLEAK, _OTHER, _codes, _ios,
     _never_pass, _nx, _report, _stays_pass, _write)
 
 from rulehawk import cli  # noqa: E402
@@ -246,6 +246,16 @@ _EOS_BODY = "ip access-list F\n   10 " + _NXDENY + "\n   20 permit ip 203.0.113.
 ])
 def test_r9_1_dialect_not_positively_identified_never_passes(tmp_path, text):
     _never_pass(_write(tmp_path, "x.cfg", text), "v4_ip.json", hosted=False)
+
+
+def test_r9_1_bannerless_ios_ipv6_sequence_file_never_passes(tmp_path):
+    # The round-8 R7-3 file (test_r7_3_ios_ipv6_sequence_keyword_stays_pass)
+    # without its banner: `ipv6 access-list F6` and `sequence N` are written
+    # by more than one dialect, so nothing names the dialect.
+    text = (_IF6 + "ipv6 access-list F6\n"
+            " sequence 10 deny ipv6 2001:db8:20::/48 2001:db8:10::/48\n"
+            " sequence 20 permit ipv6 2001:db8:30::/48 any\n")
+    _never_pass(_write(tmp_path, "x.cfg", text), "v6_ip.json", hosted=False)
 
 
 @pytest.mark.parametrize("text", [

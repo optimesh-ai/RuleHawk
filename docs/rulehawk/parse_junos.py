@@ -78,7 +78,28 @@ from typing import Dict, List, Optional, Tuple
 from .failclosed import Ledger, split_lines
 
 from .model import ACE, ANY_PORTS, _PORTED, PortRange, _IPNet
-from .parse import _port_num  # reuse the Cisco/IANA service-name -> port map
+from .parse import _port_num
+
+# Junos port names (review of #42, round 10, R9-4): "In place of the numeric
+# value, you can specify one of the following text synonyms (the port numbers
+# are also listed)" (Juniper, "Firewall Filter Match Conditions for IPv4
+# Traffic", destination-port,
+# https://www.juniper.net/documentation/us/en/software/junos/routing-policy/topics/concept/firewall-filter-match-conditions-for-ipv4-traffic.html).
+# Any other name is unresolved (noted).
+_JUNOS_PORTS = {
+    "afs": 1483, "bgp": 179, "biff": 512, "bootpc": 68, "bootps": 67, "cmd": 514,
+    "cvspserver": 2401, "dhcp": 67, "domain": 53, "eklogin": 2105, "ekshell": 2106,
+    "exec": 512, "finger": 79, "ftp": 21, "ftp-data": 20, "http": 80, "https": 443,
+    "ident": 113, "imap": 143, "kerberos-sec": 88, "klogin": 543, "kpasswd": 761,
+    "krb-prop": 754, "krbupdate": 760, "kshell": 544, "ldap": 389, "ldp": 646,
+    "login": 513, "mobileip-agent": 434, "mobilip-mn": 435, "msdp": 639,
+    "netbios-dgm": 138, "netbios-ns": 137, "netbios-ssn": 139, "nfsd": 2049,
+    "nntp": 119, "ntalk": 518, "ntp": 123, "pop3": 110, "pptp": 1723,
+    "printer": 515, "radacct": 1813, "radius": 1812, "rip": 520, "rkinit": 2108,
+    "smtp": 25, "snmp": 161, "snmptrap": 162, "snpp": 444, "socks": 1080, "ssh": 22,
+    "sunrpc": 111, "syslog": 514, "tacacs": 49, "tacacs-ds": 65, "talk": 517,
+    "telnet": 23, "tftp": 69, "timed": 525, "who": 513, "xdmcp": 177,
+}
 
 _ANY_NET: _IPNet = ipaddress.ip_network("0.0.0.0/0")
 _ANY6_NET: _IPNet = ipaddress.ip_network("::/0")
@@ -106,9 +127,15 @@ _TERMINATING = {"accept": "permit", "discard": "deny", "reject": "deny"}
 # `then` modifiers that don't decide the packet's fate — safe to ignore.
 _THEN_MODIFIERS = {
     "count", "log", "syslog", "policer", "forwarding-class", "loss-priority",
-    "dscp", "sample", "port-mirror", "three-color-policer", "service-accounting",
-    "ipsec-sa",
+    "dscp", "sample", "port-mirror", "service-accounting", "ipsec-sa",
 }
+# `three-color-policer` is not one (round 10, R9-7): Juniper's form is the
+# block `three-color-policer { single-rate NAME; }` ("Include the
+# three-color-policer single-rate policer-name action", Three-Color Policer
+# Configuration Overview,
+# https://www.juniper.net/documentation/us/en/software/junos/routing-policy/topics/concept/policer-summary-configuration-three-color.html),
+# not a one-word argument, so either spelling is
+# left to the unmodelled-action note.
 
 # `then` actions that FORWARD the packet somewhere other than the normal
 # lookup (filter-based forwarding). For reachability the packet is let through,
@@ -401,13 +428,13 @@ def _ports(vals: List[str], label: str, key: str,
     ranges: List[PortRange] = []
     widen = False
     for v in vals:
-        p = _port_num(v)
+        p = _port_num(v, _JUNOS_PORTS)
         if p >= 0:
             ranges.append(PortRange(p, p))
             continue
         if "-" in v and not v.startswith("-"):
             lo, hi = v.split("-", 1)
-            ln, hn = _port_num(lo), _port_num(hi)
+            ln, hn = _port_num(lo, _JUNOS_PORTS), _port_num(hi, _JUNOS_PORTS)
             if ln >= 0 and hn >= 0:
                 ranges.append(PortRange(min(ln, hn), max(ln, hn)))
                 continue
@@ -623,7 +650,7 @@ _JUNOS_FF_GUIDE = ("https://www.juniper.net/documentation/us/en/software/junos/"
 _THEN_ARGC = {"accept": 0, "discard": 0, "reject": 0, "count": 1, "policer": 1,
               "log": 0, "syslog": 0, "sample": 0, "port-mirror": 0,
               "forwarding-class": 1, "loss-priority": 1, "dscp": 1,
-              "three-color-policer": 1, "service-accounting": 0, "ipsec-sa": 1}
+              "service-accounting": 0, "ipsec-sa": 1}
 
 
 def _parse_then(then_toks: List[str], label: str,

@@ -795,6 +795,92 @@ def cisco_dialect_ambiguous(text: str) -> bool:
                 or (_NUMBERED_FLAT.search(text) and _ASA_DIALECT.search(text)))
 
 
+# Positive dialect identification (review of #42, round 10, R9-1, R9-3). A
+# Cisco PASS needs a line that only the labelled dialect writes; a label that
+# came from a heuristic or the `ios-asa` default is a guess, and the guess
+# decides which entry grammar reads the ACLs. Each marker, where it is cited:
+_DIALECT_MARKERS = {
+    "ios-asa": [
+        # IOS `show running-config` (Cisco 800 Series ISR Software
+        # Configuration Guide, "Basic Router Configuration"): "Building
+        # configuration...", "Current configuration : 986 bytes",
+        # "version 12.4", "boot-start-marker".
+        # https://www.cisco.com/c/en/us/td/docs/routers/access/800/software/configuration/guide/SCG800Guide/SCG800_Guide_BookMap_chapter_010.html
+        re.compile(r"(?m)^Building configuration\.\.\.[ \t\r]*$"),
+        re.compile(r"(?m)^Current configuration : \d+ bytes[ \t\r]*$"),
+        re.compile(r"(?m)^version \d+\.\d+[ \t\r]*$"),
+        re.compile(r"(?m)^boot-start-marker[ \t\r]*$"),
+        # IOS ACL headers `ip access-list { extended | standard } NAME`
+        # (Catalyst 9400 IOS XE 16.10 command reference,
+        # https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9400/software/release/16-10/command_reference/b_1610_9400_cr/security_commands.html);
+        # NX-OS has no type word (NX-OS 10.5 security guide,
+        # https://www.cisco.com/c/en/us/td/docs/dcn/nx-os/nexus3600/105x/configuration/security/cisco-nexus-3600-switch-nx-os-security-configuration-guide-105x/m-configuring-ip-acls.html). `standard` is left out: whether
+        # EOS has a `standard` header is not cited.
+        re.compile(r"(?m)^ip access-list extended \S+[ \t\r]*$"),
+        # Numbered `access-list N {deny | permit | remark}` (IOS command
+        # reference, `access-list (IP extended)`,
+        # https://www.cisco.com/E-Learning/bulk/public/tac/cim/cib/using_cisco_ios_software/cmdrefs/access-list.htm);
+        # NX-OS and EOS have only
+        # named ACLs.
+        re.compile(r"(?m)^access-list \d+ (?:permit|deny|remark)\s"),
+        # ASA: ": Saved", "ASA Version 9.1(5)4" (Cisco document 72273,
+        # "Configure DNS Doctoring for Three NAT Interfaces on ASA",
+        # https://www.cisco.com/c/en/us/support/docs/security/asa-5500-x-series-next-generation-firewalls/72273-dns-doctoring-3zones.html)
+        # and `access-list NAME extended | standard` (ASA 9.20 firewall
+        # configuration guide,
+        # https://www.cisco.com/c/en/us/td/docs/security/asa/asa920/configuration/firewall/asa-920-firewall-config.pdf).
+        re.compile(r"(?m)^ASA Version \d"),
+        re.compile(r"(?m)^: Saved[ \t\r]*$"),
+        re.compile(r"(?m)^access-list \S+ (?:extended|standard) "),
+    ],
+    "nxos": [
+        # NX-OS `show running-config`: "version 9.3(1) Bios:version 05.39"
+        # (Nexus 9000 NX-OS 9.3(x) System Management Configuration Guide,
+        # "Configuration Replace and Commit-timeout",
+        # https://www.cisco.com/c/en/us/td/docs/switches/datacenter/nexus9000/sw/93x/system-management/b-cisco-nexus-9000-series-nx-os-system-management-configuration-guide-93x/b-cisco-nexus-9000-series-nx-os-system-management-configuration-guide-93x_chapter_011000.html),
+        # and the `feature` command ("switch(config)# feature interface-vlan",
+        # "Enable the VLAN network interface feature using the feature
+        # interface-vlan configuration", Nexus 9000 NX-OS 9.3(x) Interfaces
+        # Configuration Guide, VLAN interfaces,
+        # https://www.cisco.com/c/en/us/td/docs/switches/datacenter/nexus9000/sw/93x/interfaces/configuration/guide/b-cisco-nexus-9000-nx-os-interfaces-configuration-guide-93x/b-cisco-nexus-9000-nx-os-interfaces-configuration-guide-93x_chapter_0101.html). `interface EthernetN/N` is not one: IOS names Ethernet
+        # ports the same way.
+        re.compile(r"(?m)^version \d+\.\d+\(\d+\)"),
+        re.compile(r"(?m)^feature \S+[ \t\r]*$"),
+    ],
+    "eos": [
+        # EOS `show running-config`: "! device: r1 (cEOSLab, EOS-4.33.1F-...)"
+        # (third-party: the annet tutorial,
+        # https://annetutil.github.io/annet/main/usage/tutorial.html; Arista's
+        # manual is behind a bot challenge). `! Command: show running-config`
+        # is not one: NX-OS writes `!Command: show running-config` too.
+        re.compile(r"(?m)^! device: \S+ \(.*\bEOS-\d"),
+    ],
+}
+
+
+def dialect_unidentified(text: str, label: str) -> str:
+    """Why the Cisco `label` is not positively identified, or "" when a line
+    only that dialect writes is in the config (outside banners and after-`end`
+    lines) and no other dialect's marker is."""
+    from .parse import strip_banners
+    body = strip_banners(text)[0]
+    lex = cisco_lex(text)
+    if lex.post_end:
+        body = "\n".join(split_lines(body)[:lex.post_end[0] - 1])
+    found = {d for d, rxs in _DIALECT_MARKERS.items() if any(rx.search(body) for rx in rxs)}
+    if found == {label}:
+        return ""
+    if label not in found:
+        return (f"the config's dialect is not positively identified: no line that "
+                f"only {label} writes (a `show running-config` banner, version line "
+                f"or a header form only {label} has) is in it, so the {label} label "
+                f"is a guess and the entry grammar that reads its ACLs may be the "
+                f"wrong one")
+    others = ", ".join(sorted(found - {label}))
+    return (f"the config's dialect is not positively identified: it holds markers "
+            f"of {label} and of {others}")
+
+
 _SHUTDOWN_ONLY = "bound only on a shutdown interface"
 
 
@@ -919,9 +1005,18 @@ def _junos_paths(text: str) -> Dict[str, Dict[str, Set[int]]]:
             if "output" in tail or "output-list" in tail:
                 p["out"] |= fams
 
+    for words in _junos_leaves(text):
+        leaf(words)
+    return paths
+
+
+def _junos_leaves(text: str) -> Iterator[List[str]]:
+    """Every Junos statement as its full hierarchy path of words: a `set`
+    line without `set`, or the enclosing block words plus the statement."""
+    from .parse_junos import _tokenize
     for raw in split_lines(text):
         if re.match(r"^\s*set\s", raw):
-            leaf(raw.split()[1:])
+            yield raw.split()[1:]
     stack: List[List[str]] = []
     stmt: List[str] = []
     for t in _tokenize(text):
@@ -933,11 +1028,46 @@ def _junos_paths(text: str) -> Dict[str, Dict[str, Set[int]]]:
                 stack.pop()
             stmt = []
         elif t == ";":
-            leaf([w for part in stack for w in part] + stmt)
+            yield [w for part in stack for w in part] + stmt
             stmt = []
         else:
             stmt.append(t)
-    return paths
+
+
+def _junos_filter_redefined(text: str) -> Optional[str]:
+    """An interface unit and family whose `filter input` (or `output`) names
+    two different filters (round 10, R9-2). Juniper, "filter (Applying to a
+    Logical Interface)",
+    https://www.juniper.net/documentation/us/en/software/junos/cli-reference/topics/ref/statement/filter-edit-interfaces-unit-family.html:
+    `input filter-name`, "Name of one filter to evaluate
+    when packets are received on the interface" (and `output` likewise); a
+    second value is not one filter, and which one holds is not cited."""
+    seen: Dict[Tuple[str, str, str, str], Set[str]] = {}
+    for words in _junos_leaves(text):
+        words = [w.strip('"') for w in words]
+        if "interfaces" not in words or "filter" not in words:
+            continue
+        k = words.index("interfaces")
+        if k + 1 >= len(words):
+            continue
+        rest = words[k + 2:]
+        if "filter" not in rest:
+            continue
+        unit = rest[rest.index("unit") + 1] if "unit" in rest and \
+            rest.index("unit") + 1 < len(rest) else "0"
+        fam = rest[rest.index("family") + 1] if "family" in rest and \
+            rest.index("family") + 1 < len(rest) else ""
+        tail = rest[rest.index("filter") + 1:]
+        if len(tail) >= 2 and tail[0] in ("input", "output"):
+            key = (words[k + 1], unit, fam, tail[0])
+            seen.setdefault(key, set()).add(tail[1])
+    for (ifname, unit, fam, d), names in sorted(seen.items()):
+        if len(names) > 1:
+            return (f"interface {ifname} unit {unit} family {fam or '?'}: `filter "
+                    f"{d}` is set more than once ({', '.join(sorted(names))}); it "
+                    f"names one filter, and which one the device keeps is not "
+                    f"cited — not modelled")
+    return None
 
 
 def _path_blockers(ctx: "FailClosedContext", paths) -> None:
@@ -1106,6 +1236,24 @@ def _junos_keyword_case(text: str) -> Optional[str]:
         w = w.rstrip(":")
         if w.lower() in _JUNOS_KW and w != w.lower():
             return w
+    # Round 10: a top-level statement is always a fixed hierarchy keyword (no
+    # user-chosen name sits at the top of the hierarchy), so an upper-case
+    # word there is a statement the device rejects, wherever it is off the
+    # evaluated path (`SNMP { ... }`, `set SNMP ...`).
+    depth = 0
+    for i, tk in enumerate(toks):
+        if tk == "{":
+            depth += 1
+        elif tk == "}":
+            depth = max(depth - 1, 0)
+        elif depth == 0 and (i == 0 or toks[i - 1] in ("{", "}", ";")) \
+                and tk != tk.lower() and tk[:1].isalpha():
+            return tk
+    for ln in split_lines(text):
+        w = ln.split()
+        if len(w) > 1 and w[0] in ("set", "delete", "deactivate", "activate") \
+                and w[1] != w[1].lower():
+            return w[1]
     # Interface names are lower case too (ge-0/0/0, ae0, lo0, irb): one with
     # an upper-case letter does not name the device's interface.
     for name in _junos_interface_names(toks, text):
@@ -1342,6 +1490,9 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
                             f"\\n only); {len(bad)} line(s)"))
 
     if v in _CISCO:
+        why = dialect_unidentified(text, v)
+        if why:
+            b.append(Reason("parse-note", why))
         lex = cisco_lex(text)
         text = lex.text                        # normalised lines, banners blank
         if lex.bad_chars:
@@ -1421,6 +1572,9 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
             b.append(Reason("acl-binding-negated", inactive[0][:120]))
         if _NAT["junos"].search(text):
             b.append(Reason("nat-present"))
+        redef = _junos_filter_redefined(text)
+        if redef:
+            b.append(Reason("parse-note", redef))
         transit, other = _junos_bindings(text)
         _path_blockers(ctx, _junos_paths(text))
         b += _role_reasons(acls, transit, other)
@@ -1507,15 +1661,34 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
 KNOWN_LIMITS = (
     "On every vendor a line ends at \\n only, and a control or separator "
     "character on any line is UNKNOWN (a CR before the newline is accepted "
-    "only in Cisco configs and AWS JSON); every line of an object on the "
-    "evaluated path (a Cisco ACL, ACL header, flat access-list or forwarding "
-    "interface line, any other Cisco line that names an ACL, every iptables "
-    "and PAN-OS line, every statement of a Junos term and any Junos stanza "
-    "that names a filter) is either read by a grammar written from a cited "
-    "vendor document or source (keywords, case, number ranges, operand "
-    "forms, argument counts) or makes the answer UNKNOWN; object-group "
-    "bodies are not in that accounting, and every ACL entry that references "
-    "an object-group is UNKNOWN",
+    "only in Cisco configs and AWS JSON); each line on the evaluated path (a "
+    "Cisco ACL, ACL header, flat access-list or forwarding interface line, "
+    "any other Cisco line that names an ACL, every iptables and PAN-OS line, "
+    "every statement of a Junos term and any Junos stanza that names a "
+    "filter) is consumed by a handler or makes the answer UNKNOWN; a "
+    "handler's forms follow a cited vendor document where one is named in "
+    "the code (EOS has none), so a consumed line is not proven against the "
+    "whole vendor grammar; object-group bodies are not in that accounting, "
+    "and every ACL entry that references an object-group is UNKNOWN",
+    "A Cisco PASS needs the dialect positively identified: a line only that "
+    "dialect writes (IOS `Building configuration...`, `Current "
+    "configuration :`, `version X.Y`, `boot-start-marker`, an `ip "
+    "access-list extended` header or a numbered `access-list N` line; ASA "
+    "`ASA Version`, `: Saved` or `access-list NAME extended|standard`; NX-OS "
+    "`version X.Y(Z)` or `feature`; EOS `! device: ... EOS-`) outside banners "
+    "and before `end`, and no line of another dialect; a label from a "
+    "heuristic, the `ios-asa` default or `--vendor` alone is UNKNOWN, and so "
+    "is an ACL header form the identified dialect does not have (an untyped "
+    "`ip access-list NAME` on IOS, a typed one on NX-OS or EOS)",
+    "A field that holds one value, set more than once with different values, "
+    "is UNKNOWN unless the replace semantics are cited (iptables -P is): a "
+    "PAN-OS service protocol, port or source-port, rule action, disabled or "
+    "negate flag, or address value; a Junos interface `filter input` or "
+    "`output`; an iptables rule option given twice or a chain declared twice "
+    "in one iptables-restore block; a PAN-OS list holding `any` and another "
+    "member is UNKNOWN; a port name is read only from the vendor's cited "
+    "table for that protocol (IOS, ASA, Junos) and is UNKNOWN elsewhere "
+    "(NX-OS, EOS, PAN-OS, iptables)",
     "Cisco reads ACLs, allowlisted interface lines and the listed global "
     "features (zone firewall, ip inspect, service-policy, policy routing, "
     "MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group "

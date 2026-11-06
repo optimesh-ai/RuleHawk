@@ -53,7 +53,9 @@ from typing import Dict, List, Optional, Tuple
 
 from .model import ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet
 from .failclosed import Ledger, split_lines
-from .parse import _canon_icmp_type, _port_num  # reuse IANA maps + icmp canon
+# Port names (round 10, R9-4): none. iptables-save writes numbers, and a name
+# in a script resolves through the host's /etc/services, not the config.
+from .parse import _NO_NAMES, _canon_icmp_type, _port_num
 
 # iptables (`iptables -p icmp -h`) names -> RuleHawk canonical TYPE[/CODE].
 # NB: in iptables `ttl-exceeded` is an alias of time-exceeded (all codes),
@@ -158,8 +160,8 @@ def _ports(spec: str, label: str, key: str,
             continue
         if ":" in part:
             lo, hi = part.split(":", 1)
-            ln = _port_num(lo) if lo else PORT_MIN
-            hn = _port_num(hi) if hi else PORT_MAX
+            ln = _port_num(lo, _NO_NAMES) if lo else PORT_MIN
+            hn = _port_num(hi, _NO_NAMES) if hi else PORT_MAX
             if ln < 0 or hn < 0:
                 imprecise = True
                 notes.append(f"unparsed iptables {key} '{part}' in {label} "
@@ -167,7 +169,7 @@ def _ports(spec: str, label: str, key: str,
                 continue
             ranges.append(PortRange(min(ln, hn), max(ln, hn)))
         else:
-            p = _port_num(part)
+            p = _port_num(part, _NO_NAMES)
             if p < 0:
                 imprecise = True
                 notes.append(f"unparsed iptables {key} '{part}' in {label} "
@@ -290,9 +292,54 @@ def _norm_proto(v: str) -> str:
     return v
 
 
+# Options that hold one value per rule, by the field they set (round 10,
+# R9-2). iptables rejects a rule that gives one twice: xshared.c set_option(),
+# "multiple -%c flags not allowed" (-s -d -p -i -o -j -g,
+# https://android.googlesource.com/platform/external/iptables/+/8902cb0d42754a35febbc79c077bca770c477bf1/iptables/xshared.c),
+# and libxtables xtables_option_parse(), "option \"--%s\" can only be used
+# once" for a match option without XTOPT_MULTI (--dport, --sport of the
+# tcp / udp match,
+# https://android.googlesource.com/platform/external/iptables/+/dda1fee032d9d1d1bae1753249f2e624e85e2b39/libxtables/xtoptions.c).
+_ONCE_OPTS = {"-s": "-s", "--source": "-s", "--src": "-s",
+              "-d": "-d", "--destination": "-d", "--dst": "-d",
+              "-p": "-p", "--protocol": "-p",
+              "-i": "-i", "--in-interface": "-i", "-o": "-o", "--out-interface": "-o",
+              "-j": "-j", "--jump": "-j", "-g": "-g", "--goto": "-g",
+              "--dport": "--dport", "--destination-port": "--dport",
+              "--sport": "--sport", "--source-port": "--sport",
+              "--dports": "--dports", "--destination-ports": "--dports",
+              "--sports": "--sports", "--source-ports": "--sports"}
+
+
+def _repeated_option(toks: List[str]) -> Optional[str]:
+    seen: set = set()
+    i, n = 0, len(toks)
+    while i < n:
+        t = toks[i]
+        key = _ONCE_OPTS.get(t)
+        if key is not None:
+            if key in seen:
+                return key
+            seen.add(key)
+        if t in _VALUE_OPTS:
+            i += 2
+        else:
+            i += 1
+    return None
+
+
 def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
     """Parse the option tokens of one `-A CHAIN <here>` rule into a `_Rule`."""
     r = _Rule()
+    rep = _repeated_option(toks)
+    if rep:
+        # iptables rejects the command; the rule is modelled as one that may
+        # or may not be there (imprecise), and noted.
+        r.imprecise = True
+        notes.append(f"iptables option `{rep}` is given more than once in {label}: "
+                     f"iptables rejects the command (xshared.c: \"multiple -%c flags "
+                     f"not allowed\"; libxtables: \"can only be used once\") — not "
+                     f"modelled (marked imprecise)")
     i, n = 0, len(toks)
     negate = False
     while i < n:
@@ -928,6 +975,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     # say what it does with a block that has no `COMMIT` or with a line
     # outside a block, so both are noted.
     table_open = 0                               # header line of the open block
+    chain_decls: "Dict[Tuple[int, str], List]" = {}   # (block, chain) -> [line, policy]
     # iptables-restore reads each line as it is (round 9, R8-3). The source,
     # iptables/iptables-restore.c (netfilter iptables; e.g.
     # https://github.com/canonical/netfilter-iptables/blob/c509a371/iptables/iptables-restore.c):
@@ -1052,6 +1100,21 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                 if parts:
                     consumed.add(lineno)         # the *table header was noted
                 continue
+            if parts:
+                # A chain declared twice in one table block (round 10, R9-2):
+                # a chain has one policy, and what iptables-restore does with
+                # a second declaration is not cited (iptables-restore(8) does
+                # not say). Noted unless the two lines are the same.
+                key = (table_open, parts[0])
+                prev = chain_decls.get(key)
+                if prev is not None and (prev[1:2] != parts[1:2]
+                                         or parts[0] not in _BASE_CHAINS):
+                    notes.append(f"iptables-restore chain `{parts[0]}` is declared "
+                                 f"more than once in one table block (lines "
+                                 f"{prev[0]} and {lineno}); a chain's policy is set "
+                                 f"more than once and which one holds is not cited "
+                                 f"— not modelled")
+                chain_decls.setdefault(key, [lineno] + parts[1:2])
             if len(parts) >= 2 and parts[0] in _BASE_CHAINS:
                 if pol_ok(parts[1]):
                     consumed.add(lineno)

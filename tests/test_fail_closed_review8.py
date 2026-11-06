@@ -278,7 +278,12 @@ def test_r7_2_a_deletion_or_default_never_passes(tmp_path, line):
 # R7-3: the sequence-number grammar per vendor and family
 # --------------------------------------------------------------------------- #
 def test_r7_3_ios_ipv6_sequence_keyword_stays_pass(tmp_path):
-    text = (_IF6 + "ipv6 access-list F6\n"
+    # Round 10 (R9-1): with the IOS `show running-config` banner, so the
+    # dialect is positively identified; without it the file is UNKNOWN
+    # (test_fail_closed_review10,
+    # test_r9_1_bannerless_ios_ipv6_sequence_file_never_passes).
+    text = ("Building configuration...\n\nCurrent configuration : 900 bytes\n!\n"
+            "version 15.2\n!\n" + _IF6 + "ipv6 access-list F6\n"
             " sequence 10 deny ipv6 2001:db8:20::/48 2001:db8:10::/48\n"
             " sequence 20 permit ipv6 2001:db8:30::/48 any\n")
     _stays_pass(_write(tmp_path, "x.cfg", text), "v6_ip.json")

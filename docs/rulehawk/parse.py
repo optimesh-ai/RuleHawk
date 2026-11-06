@@ -31,7 +31,7 @@ from __future__ import annotations
 import contextvars
 import ipaddress
 import re
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .failclosed import _EXIT_END, cisco_dialect_ambiguous, cisco_lex, split_lines
 from .model import (ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet,
@@ -100,27 +100,92 @@ def _canon_icmp_type(tok: Optional[str], proto: str = "icmp") -> Optional[str]:
     return out
 
 
-_NAMED_PORTS = {
-    "ftp-data": 20, "ftp": 21, "ssh": 22, "telnet": 23, "smtp": 25,
-    "domain": 53, "dns": 53, "tftp": 69, "http": 80, "www": 80, "pop3": 110,
-    "ntp": 123, "netbios-ns": 137, "netbios-dgm": 138, "netbios-ssn": 139,
-    "snmp": 161, "snmptrap": 162, "bgp": 179, "ldap": 389, "https": 443,
-    "microsoft-ds": 445, "isakmp": 500, "syslog": 514, "rip": 520,
-    "ldaps": 636, "mssql": 1433, "sqlnet": 1521, "mysql": 3306, "rdp": 3389,
-    "postgres": 5432, "postgresql": 5432, "redis": 6379, "rtsp": 554,
-    "vnc": 5900, "sip": 5060, "elasticsearch": 9200, "mongodb": 27017,
-    "memcached": 11211, "nfs": 2049, "winrm": 5985,
-    # Arista EOS names (its default control-plane ACL uses them)
-    "bfd": 3784, "bfd-echo": 3785, "multihop-bfd": 4784, "micro-bfd": 6784,
-    "sbfd": 7784, "mlag": 4432, "ldp": 646, "msdp": 639, "lsp-ping": 3503,
-    "netconf-ssh": 830,
-    "bootps": 67, "bootpc": 68, "imap4": 143, "imap": 143, "sunrpc": 111,
-    "nntp": 119, "lpd": 515, "non500-isakmp": 4500, "tacacs": 49, "time": 37,
-    "whois": 43, "finger": 79, "gopher": 70, "echo": 7, "discard": 9,
-    "chargen": 19, "ident": 113, "irc": 194, "klogin": 543, "kshell": 544,
-    "login": 513, "cmd": 514, "talk": 517, "uucp": 540,
-    "pim-auto-rp": 496, "xdmcp": 177, "radius": 1812, "radius-acct": 1813,
+# Port names, per vendor and protocol (review of #42, round 10, R9-4). A name
+# is read only where the vendor defines it for that protocol; any other name
+# leaves the operand unresolved (imprecise, noted). Junos, iptables, PAN-OS,
+# NX-OS and EOS have no cited table here, so a name there is always noted
+# (iptables-save writes numbers; a name in a script resolves through the
+# host's /etc/services, which is not in the config).
+#
+# IOS: the names come from the Cisco IOS command reference, `dynamic`
+# (https://www.cisco.com/E-Learning/bulk/public/tac/cim/cib/using_cisco_ios_software/cmdrefs/dynamic.htm):
+# "TCP port names can only be used when filtering TCP. UDP port names can
+# only be used when filtering UDP", with one list for each; the values come
+# from Cisco-IOS-XE-acl.yang 16.7.1, typedef acl-port-type
+# (https://github.com/YangModels/yang/blob/main/vendor/cisco/xe/1671/Cisco-IOS-XE-acl.yang).
+# A name on one list with no value in the YANG model (tacacs-ds, dns) is left
+# out, and so is a YANG name the list for that protocol does not have.
+_IOS_PORTS = {
+    "tcp": {"bgp": 179, "chargen": 19, "daytime": 13, "discard": 9, "domain": 53,
+            "echo": 7, "finger": 79, "ftp": 21, "ftp-data": 20, "gopher": 70,
+            "hostname": 101, "irc": 194, "klogin": 543, "kshell": 544, "lpd": 515,
+            "nntp": 119, "pop2": 109, "pop3": 110, "smtp": 25, "sunrpc": 111,
+            "syslog": 514, "talk": 517, "telnet": 23, "time": 37, "uucp": 540,
+            "whois": 43, "www": 80},
+    "udp": {"biff": 512, "bootpc": 68, "bootps": 67, "discard": 9, "dnsix": 195,
+            "echo": 7, "mobile-ip": 434, "nameserver": 42, "netbios-dgm": 138,
+            "netbios-ns": 137, "ntp": 123, "rip": 520, "snmp": 161, "snmptrap": 162,
+            "sunrpc": 111, "syslog": 514, "talk": 517, "tftp": 69, "time": 37,
+            "who": 513, "xdmcp": 177},
 }
+# ASA: Table 7, "Port Literal Values", with the protocol of each (ASA 9.19
+# General Operations CLI Configuration Guide, "Addresses, Protocols, and
+# Ports", https://www.cisco.com/c/en/us/td/docs/security/asa/asa919/configuration/general/asa-919-general-config/ref-ports.html).
+# "The ASA listens for RADIUS on ports 1645 and 1646"; "If you use dns, the
+# ASA assumes you meant to use the dnsix literal value" (so `dns` is not
+# read as 53: it is not in the table and is noted).
+_ASA_BOTH = {"cifs": 3020, "discard": 9, "domain": 53, "echo": 7, "http": 80,
+             "kerberos": 750, "nfs": 2049, "pim-auto-rp": 496, "sip": 5060,
+             "sunrpc": 111, "tacacs": 49, "talk": 517, "www": 80}
+_ASA_PORTS = {
+    "tcp": dict(_ASA_BOTH, **{
+        "aol": 5190, "bgp": 179, "chargen": 19, "citrix-ica": 1494, "cmd": 514,
+        "ctiqbe": 2748, "daytime": 13, "exec": 512, "finger": 79, "ftp": 21,
+        "ftp-data": 20, "gopher": 70, "h323": 1720, "hostname": 101, "https": 443,
+        "ident": 113, "imap4": 143, "irc": 194, "klogin": 543, "kshell": 544,
+        "ldap": 389, "ldaps": 636, "login": 513, "lotusnotes": 1352, "lpd": 515,
+        "netbios-ssn": 139, "nntp": 119, "pcanywhere-data": 5631, "pop2": 109,
+        "pop3": 110, "pptp": 1723, "rsh": 514, "rtsp": 554, "smtp": 25,
+        "sqlnet": 1521, "ssh": 22, "telnet": 23, "uucp": 540, "whois": 43}),
+    "udp": dict(_ASA_BOTH, **{
+        "biff": 512, "bootpc": 68, "bootps": 67, "dnsix": 195, "isakmp": 500,
+        "mobile-ip": 434, "nameserver": 42, "netbios-dgm": 138, "netbios-ns": 137,
+        "ntp": 123, "pcanywhere-status": 5632, "radius": 1645, "radius-acct": 1646,
+        "rip": 520, "secureid-udp": 5510, "snmp": 161, "snmptrap": 162,
+        "syslog": 514, "tftp": 69, "time": 37, "vxlan": 4789, "who": 513,
+        "xdmcp": 177}),
+}
+_NO_NAMES: "Dict[str, int]" = {}
+
+
+def _agree(tables: "List[Dict[str, int]]") -> "Dict[str, int]":
+    """The names every table defines, with the same value in each."""
+    if not tables:
+        return _NO_NAMES
+    first = tables[0]
+    return {k: v for k, v in first.items() if all(t.get(k) == v for t in tables[1:])}
+
+
+def _port_names(dialect: str, protos: "Sequence[Optional[str]]") -> "Dict[str, int]":
+    """The port names a `dialect` defines for every one of `protos` (a name
+    that means one port on each of them)."""
+    if dialect in ("ios", "ios6"):
+        srcs = [_IOS_PORTS]
+    elif dialect == "asa":
+        srcs = [_ASA_PORTS]
+    else:
+        return _NO_NAMES
+    tables = []
+    for p in protos:
+        if p not in ("tcp", "udp"):
+            return _NO_NAMES
+        tables += [s[p] for s in srcs]
+    return _agree(tables)
+
+
+# The port names of the operand being read; set by the Cisco entry parser.
+_PORT_NAMES: "contextvars.ContextVar[Dict[str, int]]" = contextvars.ContextVar(
+    "_PORT_NAMES", default=_NO_NAMES)
 _ACTIONS = ("permit", "deny")
 # Match-NARROWING trailing qualifiers: on a real device each of these RESTRICTS
 # the packets the ACE matches (`fragments` -> non-initial fragments only,
@@ -240,16 +305,19 @@ def _scan_trailer(rest: List[str]
     return narrowing, first_type, extra_unknown, stateful, inactive
 
 
-def _port_num(tok: str) -> int:
+def _port_num(tok: str, names: "Optional[Dict[str, int]]" = None) -> int:
+    """A port number, or -1. A name is read only from `names` (default: the
+    names of the operand being read, `_PORT_NAMES`); the other frontends pass
+    none, so a name there is unresolved (R9-4)."""
     if tok.isdigit():
         return max(PORT_MIN, min(PORT_MAX, int(tok)))
-    return _NAMED_PORTS.get(tok.lower(), -1)
+    return (_PORT_NAMES.get() if names is None else names).get(tok.lower(), -1)
 
 
 def _is_port_token(tok: str) -> bool:
     """True if `tok` looks like a port literal (a number or a known service
     name) — used to detect the trailing ports of a multi-port `eq a b c`."""
-    return tok.isdigit() or tok.lower() in _NAMED_PORTS
+    return tok.isdigit() or tok.lower() in _PORT_NAMES.get()
 
 
 def _classify_mask(mask: str) -> Tuple[int, str]:
@@ -332,6 +400,16 @@ def _parse_addr(tokens: List[str], i: int, v6: bool = False) -> Tuple[_IPNet, in
         return _ANY_NET, i + 2, False
     imprecise = kind in ("ambiguous", "noncontiguous")
     return ipaddress.ip_network(f"{addr}/{plen}", strict=False), i + 2, imprecise
+
+
+def _port_op(tokens: List[str], i: int, proto: Optional[str]
+             ) -> Tuple[List[PortRange], int, bool, int]:
+    """`_parse_port_op` with the port names of the line's dialect and `proto`."""
+    tok = _PORT_NAMES.set(_port_names(_DIALECT.get(), [proto]))
+    try:
+        return _parse_port_op(tokens, i)
+    finally:
+        _PORT_NAMES.reset(tok)
 
 
 def _parse_port_op(tokens: List[str], i: int) -> Tuple[List[PortRange], int, bool, int]:
@@ -541,7 +619,8 @@ def _expand_proto(p: Optional[str]) -> Optional[List[str]]:
     return None                              # unknown -> fail closed
 
 
-def _svc_port(rest: List[str], idx: int) -> Optional[PortRange]:
+def _svc_port(rest: List[str], idx: int,
+              protos: "Sequence[str]" = ()) -> Optional[PortRange]:
     """Parse an exact, contiguous service-port operator at rest[idx:] -> one
     PortRange. Handles `eq P` / `range LO HI` / `lt P` -> [MIN, P-1] / `gt P` ->
     [P+1, MAX]. `neq` is non-contiguous (two ranges) and cannot be expressed as a
@@ -549,20 +628,27 @@ def _svc_port(rest: List[str], idx: int) -> Optional[PortRange]:
     INDETERMINATE) — never widened into a (possibly false) PASS."""
     if idx >= len(rest):
         return None
+    # `service-object`, `port-object` and `object service ... service` are
+    # the ASA object grammar (ASA firewall configuration guide, "Objects for
+    # Access Control"; IOS XE's `object-group service` body is bare
+    # `protocol [operator port]` lines, which this reader does not take), so
+    # the ASA names are read, for every protocol of the member (R9-4).
+    names = _port_names("asa" if _DIALECT.get() in ("ios", "ios6", "asa")
+                        else "", list(protos) or [None])
     op = rest[idx].lower()
     if op == "eq":
-        p = _port_num(rest[idx + 1])
+        p = _port_num(rest[idx + 1], names)
         return PortRange(p, p) if p >= 0 else None
     if op == "range":
-        lo, hi = _port_num(rest[idx + 1]), _port_num(rest[idx + 2])
+        lo, hi = _port_num(rest[idx + 1], names), _port_num(rest[idx + 2], names)
         if lo < 0 or hi < 0:
             return None
         return PortRange(min(lo, hi), max(lo, hi))
     if op == "lt":
-        p = _port_num(rest[idx + 1])
+        p = _port_num(rest[idx + 1], names)
         return PortRange(PORT_MIN, p - 1) if p > PORT_MIN else None
     if op == "gt":
-        p = _port_num(rest[idx + 1])
+        p = _port_num(rest[idx + 1], names)
         return PortRange(p + 1, PORT_MAX) if 0 <= p < PORT_MAX else None
     return None
 
@@ -579,7 +665,7 @@ def _svc_members(rest: List[str], header_proto: Optional[str]) -> List[Tuple]:
             return [("so", rest[1])]
         if t0 in _PORT_OPS:                  # port-object: proto from the header
             protos = _expand_proto(header_proto)
-            pr = _svc_port(rest, 0)
+            pr = _svc_port(rest, 0, protos or ())
             if protos is None or pr is None or any(p not in _PORTED for p in protos):
                 return [("bad",)]            # ports on a port-less proto -> fail closed
             return [("svc", p, pr) for p in protos]
@@ -593,7 +679,7 @@ def _svc_members(rest: List[str], header_proto: Optional[str]) -> List[Tuple]:
             idx += 1
         if idx >= len(rest):                 # protocol only -> any port
             return [("svc", p, ANY_PORTS) for p in protos]
-        pr = _svc_port(rest, idx)
+        pr = _svc_port(rest, idx, protos)
         if pr is None or any(p not in _PORTED for p in protos):
             # Unparseable port operator, or a port on a port-less protocol
             # (covers()/segcheck ignore ports there, so the member would claim
@@ -889,7 +975,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
     # rare — leave it unresolved/fail-closed rather than grow the model).
     src_ports: List[PortRange] = [ANY_PORTS]
     if i < n and ported and toks[i].lower() in _PORT_OPS:
-        src_ports, i, imp_sp, _ = _parse_port_op(toks, i)
+        src_ports, i, imp_sp, _ = _port_op(toks, i, proto)
         imprecise = imprecise or imp_sp
         port_imprecise = port_imprecise or imp_sp
     elif i < n and _is_svc_ref(toks, i, defs):
@@ -928,7 +1014,7 @@ def _resolve_entry(toks: List[str], defs: _Defs, seq: int, acl: str, raw: str,
         if not combos:                       # tcp ACE over a udp-only group, etc.
             return None
     elif i < n and ported and toks[i].lower() in _PORT_OPS:
-        dst_ports, i, imp_dp, _ = _parse_port_op(toks, i)
+        dst_ports, i, imp_dp, _ = _port_op(toks, i, proto)
         imprecise = imprecise or imp_dp
         port_imprecise = port_imprecise or imp_dp
         combos = [(proto, dp) for dp in dst_ports]
@@ -1130,6 +1216,50 @@ _NO_ACL_RE = re.compile(r"(?i)^no\s+(?:(?:ip|ipv4|ipv6)\s+)?access-list\b")
 _NO_ENTRY_RE = re.compile(r"(?i)^no\s+(?:\d+|permit|deny)\b")
 
 
+# IOS global commands that share the `ip access-list` prefix and take no
+# argument: `ip access-list persistent` ("Enables persistency and stores the
+# IP access list entry sequence number across reloads", IOS 15SY ACL guide,
+# "IP Access List Entry Sequence Numbering",
+# https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/sec_data_acl/configuration/15-sy/sec-data-acl-15-sy-book/sec-acl-seq-num-persistent.html)
+# and `ip access-list match-local-traffic` (Cisco-IOS-XE-acl.yang 16.7.1,
+# "Enable ACL matching for locally generated traffic",
+# https://github.com/YangModels/yang/blob/main/vendor/cisco/xe/1671/Cisco-IOS-XE-acl.yang). Neither opens an ACL nor filters transit
+# traffic.
+_IOS_ACL_GLOBALS = frozenset({"persistent", "match-local-traffic"})
+
+
+def _header_dialect_note(vendor: str, family: str, typ: Optional[str], name: str,
+                         lineno: int) -> str:
+    """The ACL header form of each dialect (review of #42, round 10, R9-1).
+
+    - IOS / IOS XE: `ip access-list { { extended | resequence | standard }
+      { access-list-number | access-list-name } ...` (Catalyst 9400 IOS XE
+      16.10 security command reference); "Named access lists are specified as
+      standard or extended based on the keyword standard or extended in the ip
+      access-list command syntax" (IOS XE 17, IP Access List Overview). An
+      untyped IPv4 header is not in the grammar, and "if an access list is
+      referenced by a name, but the access list does not exist, all packets
+      pass" (IOS XE 16.11 ACL guide). `ipv6 access-list NAME` has no type.
+    - NX-OS: `ip access-list access-list-name` (Nexus 9000 NX-OS 10.5
+      security configuration guide): no type.
+    - EOS: its header grammar is not cited (Arista's manual is behind a bot
+      challenge), so a typed header there is not read either."""
+    if family != "ip":
+        return ""
+    if vendor == "ios" and not typ and name.lower() in _IOS_ACL_GLOBALS:
+        return ""
+    if vendor == "ios" and not typ:
+        return (f"`ip access-list {name}` (line {lineno}) has no `standard` / "
+                f"`extended`: not in the IOS grammar (an interface bound to a named "
+                f"ACL the device does not have passes every packet); not modelled")
+    if vendor in ("nxos", "eos") and typ:
+        what = ("not in the NX-OS grammar (`ip access-list NAME`)" if vendor == "nxos"
+                else "the EOS header grammar is not cited")
+        return (f"`ip access-list {typ.lower()} {name}` (line {lineno}): {what}; "
+                f"not modelled")
+    return ""
+
+
 def parse_acls(text: str, vendor: str = "ios") -> Tuple[List[ACE], List[str]]:
     """Parse all ACLs in `text`; return (entries, notes).
 
@@ -1175,10 +1305,11 @@ def _seq_form_ok(vendor: str, v6: bool, form: str) -> bool:
 #   maximum sequence number is 2147483647. If the generated sequence number
 #   exceeds this maximum number, the following message is displayed:
 #   Exceeded maximum sequence number."
-# - IOS / IOS XE IPv6: 1-4294967295. Catalyst 9800 IOS XE 17.14 "IPv6 ACL"
-#   (https://www.cisco.com/c/en/us/td/docs/wireless/controller/9800/17-14/config-guide/b_wl_17_14_cg/m_ipv6_acl_ewlc.html):
-#   "Enter a sequence value to assign a sequence number to the access list
-#   statement. Valid values range from 1 to 4,294,967,295."
+# - IOS / IOS XE IPv6: 1-4294967295. Catalyst 9600 IOS XE 17.15 Security
+#   Configuration Guide, "Configuring IPv6 ACLs" (a switch guide, round 10,
+#   R9-6; https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9600/software/release/17-15/configuration_guide/sec/b_1715_sec_9600_cg/configuring_ipv6_acls.html):
+#   "Enter sequence value to specify the sequence number for the access list
+#   statement. The acceptable range is from 1 to 4,294,967,295."
 # - NX-OS: 1-4294967295. Nexus 3600 10.5(x) "Configuring IP ACLs" (URL
 #   above): "The sequence-number argument can be a whole number between 1 and
 #   4294967295."
@@ -1278,7 +1409,6 @@ def _parse_acls(text: str, vendor: str = "ios") -> Tuple[List[ACE], List[str]]:
     current_acl = "(unnamed)"
     acl_opener = -1                          # header line of the current named ACL
     cur_v6 = cur_std = False                 # family/kind of the current named ACL
-    cur_typed = False                        # header says extended / standard
     seq = 0
     # Line accounting (round 8): the scope is every line the lexer puts in ACL
     # mode, every ACL header and every flat `access-list` line, whatever the
@@ -1391,10 +1521,13 @@ def _parse_acls(text: str, vendor: str = "ios") -> Tuple[List[ACE], List[str]]:
             acl_opener = lineno if lx.mode == "acl" and lx.opener == lineno else -2
             cur_v6 = m.group(1).lower() == "ipv6"
             cur_std = (m.group(2) or "").lower() == "standard"
-            cur_typed = bool(m.group(2))
             acl_meta.setdefault(current_acl, (vendor, cur_v6))
             names.add(current_acl)
-            if _ACL_HEADER_FULL.match(lx.norm):
+            hdr_note = _header_dialect_note(vendor, m.group(1).lower(), m.group(2),
+                                            current_acl, lineno)
+            if hdr_note:
+                led.note(lineno, notes, hdr_note)
+            elif _ACL_HEADER_FULL.match(lx.norm):
                 led.consume(lineno)
             else:
                 led.note(lineno, notes,
@@ -1493,12 +1626,6 @@ def _parse_acls(text: str, vendor: str = "ios") -> Tuple[List[ACE], List[str]]:
         if m:
             _DIALECT.set("ios" if vendor == "ios" and _IOS_NUMBERED.match(stripped)
                          and not pix_dialect else "asa" if vendor == "ios" else vendor)
-        elif vendor == "ios" and not line_v6 and not cur_typed:
-            # `ip access-list NAME` with no `extended` / `standard` is the
-            # NX-OS / EOS header form, which writes `A/len` operands: the
-            # file's dialect is not IOS here, so the IOS operand rule does not
-            # apply (its other rules do).
-            _DIALECT.set("ios-untyped")
         else:
             _DIALECT.set(("ios6" if line_v6 else "ios") if vendor == "ios" else vendor)
         toks = _entry_tokens(raw.strip())
@@ -1770,16 +1897,20 @@ def _parse_entry(toks: List[str], seq: int, acl: str, raw: str, line: int = 0,
     ported = proto in ("tcp", "udp")
     i = 2
     extra_sp = extra_dp = 0
-    src, i, imp_s = _parse_addr(toks, i, v6)
-    if ported:
-        src_ports, i, imp_sp, extra_sp = _parse_port_op(toks, i)
-    else:
-        src_ports, imp_sp = [ANY_PORTS], False
-    dst, i, imp_d = _parse_addr(toks, i, v6)
-    if ported:
-        dst_ports, i, imp_dp, extra_dp = _parse_port_op(toks, i)
-    else:
-        dst_ports, imp_dp = [ANY_PORTS], False
+    names = _PORT_NAMES.set(_port_names(_DIALECT.get(), [proto]))
+    try:
+        src, i, imp_s = _parse_addr(toks, i, v6)
+        if ported:
+            src_ports, i, imp_sp, extra_sp = _parse_port_op(toks, i)
+        else:
+            src_ports, imp_sp = [ANY_PORTS], False
+        dst, i, imp_d = _parse_addr(toks, i, v6)
+        if ported:
+            dst_ports, i, imp_dp, extra_dp = _parse_port_op(toks, i)
+        else:
+            dst_ports, imp_dp = [ANY_PORTS], False
+    finally:
+        _PORT_NAMES.reset(names)
     rest = toks[i:]
     cidr = _v4_prefix_operands(toks[2:i]) if not v6 else []
     narrowing, type_tok, extra_unknown, stateful, inactive = _scan_trailer(rest)
