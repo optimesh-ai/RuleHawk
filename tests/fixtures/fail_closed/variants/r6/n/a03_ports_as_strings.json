@@ -1,0 +1,21 @@
+{
+ "SecurityGroups": [
+  {
+   "GroupId": "sg-0aa",
+   "GroupName": "pci",
+   "IpPermissions": [
+    {
+     "IpProtocol": "tcp",
+     "FromPort": "0",
+     "ToPort": "65535",
+     "IpRanges": [
+      {
+       "CidrIp": "192.0.2.0/24"
+      }
+     ]
+    }
+   ],
+   "IpPermissionsEgress": []
+  }
+ ]
+}

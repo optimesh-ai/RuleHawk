@@ -1,0 +1,9 @@
+set groups G firewall family inet filter F term a from source-address 192.0.2.0/24
+set groups G firewall family inet filter F term a then accept
+set interfaces ge-0/0/0 unit 0 family inet filter input F
+set interfaces ge-0/0/0 unit 0 family inet address 192.0.2.1/24
+set interfaces ge-0/0/1 unit 0 family inet filter input F
+set interfaces ge-0/0/1 unit 0 family inet address 198.51.100.1/24
+set firewall family inet filter F apply-groups G
+set firewall family inet filter F term d from source-address 192.0.2.0/24
+set firewall family inet filter F term d then discard
