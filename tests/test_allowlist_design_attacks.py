@@ -912,3 +912,110 @@ def test_phase3_gate_no_red_cell_left():
     # Slice 9 removes the stopgap xfails (_STOPGAP_CONTROL, _STOPGAP_MAY_PASS)
     # along with the stopgap.
     assert not _STOPGAP_CONTROL and not _STOPGAP_MAY_PASS
+
+
+# --------------------------------------------------------------------------- #
+# The safety net itself fails closed (review of #46: M1, L1, L2).
+# --------------------------------------------------------------------------- #
+def _one_finding(kind, verdict=None):
+    return {"files": [{"findings": [{"kind": kind, "verdict": verdict}]}]}
+
+
+@pytest.mark.parametrize("kind,verdict", [
+    ("segmentation-certified", None), ("segmentation-certified", "UNKNOWN"),
+    ("segmentation-pass", None), ("segmentation-accepted", "UNKNOWN"),
+    ("connectivity-proven", None),
+])
+def test_assertion_reader_rejects_an_unrecognised_kind(kind, verdict):
+    """M1: a new assertion kind reads as a value no allowed set holds, never
+    as UNKNOWN, whatever verdict it carries."""
+    a = _assertion_of(_one_finding(kind, verdict))
+    assert a.startswith("UNRECOGNISED:"), a
+    for allowed in ({"UNKNOWN"}, {"FAIL", "UNKNOWN"}, {"FAIL"}):
+        assert _assert_bad(a, allowed)
+
+
+@pytest.mark.parametrize("kind,verdict", [
+    ("segmentation-unknown", "PASS"), ("segmentation-violation", "PASS"),
+    ("segmentation-indeterminate", "ACCEPTED"), ("connectivity-broken", "UNKNOWN"),
+    ("segmentation-ok", "UNKNOWN"),
+])
+def test_assertion_reader_rejects_a_verdict_that_disagrees_with_its_kind(kind, verdict):
+    a = _assertion_of(_one_finding(kind, verdict))
+    assert a.startswith("MISMATCH:"), a
+    assert _assert_bad(a, {"FAIL", "UNKNOWN"})
+
+
+@pytest.mark.parametrize("kind,verdict,want", [
+    ("segmentation-unknown", "UNKNOWN", "UNKNOWN"),
+    ("segmentation-indeterminate", None, "UNKNOWN"),
+    ("segmentation-violation", None, "FAIL"),
+    ("segmentation-violation", "FAIL", "FAIL"),
+    ("connectivity-broken", None, "FAIL"),
+    ("segmentation-ok", None, "PASS"),
+    ("segmentation-ok", "PASS", "PASS"),
+])
+def test_assertion_reader_reads_known_kinds(kind, verdict, want):
+    assert _assertion_of(_one_finding(kind, verdict)) == want
+
+
+def test_every_engine_assertion_kind_is_in_the_reader_table():
+    """A kind the engine can emit must be in _KIND_VERDICT or
+    _UNDECIDED_KINDS, so the reader never meets one by surprise."""
+    import ast
+    known = set(_KIND_VERDICT) | _UNDECIDED_KINDS
+    help_kinds = {k for k in g._KIND_HELP if k.startswith(_ASSERTION_KINDS)}
+    assert help_kinds <= known, sorted(help_kinds - known)
+    pkg = os.path.join(_ROOT, "rulehawk")
+    lit = set()
+    for n in sorted(os.listdir(pkg)):
+        if n.endswith(".py"):
+            tree = ast.parse(open(os.path.join(pkg, n), encoding="utf-8").read())
+            lit |= {x.value for x in ast.walk(tree)
+                    if isinstance(x, ast.Constant) and isinstance(x.value, str)
+                    and x.value.startswith(_ASSERTION_KINDS)
+                    and x.value.replace("-", "").isalpha() and x.value.islower()}
+    assert lit <= known, sorted(lit - known)
+
+
+def test_sarif_ok_result_on_an_attack_file_is_bad(monkeypatch, tmp_path):
+    """L1: an `-ok` result in an attack file's SARIF is a PASS claim on that
+    surface, even next to a violation."""
+    rel = "cfg/a02_ios_seq_reorder_permit_first.cfg"
+    real = g.to_sarif
+
+    def plus_ok(gate, version=None):
+        s = json.loads(real(gate, version))
+        r = dict(s["runs"][0]["results"][0])
+        r["ruleId"] = "segmentation-ok"
+        s["runs"][0]["results"].append(r)
+        return json.dumps(s)
+
+    pol, allowed = _ATTACKS[rel]
+    before = _observe("sarif", rel, pol, tmp_path)
+    assert not _SURFACES["sarif"][1](before, allowed, rel), before
+    monkeypatch.setattr(g, "to_sarif", plus_ok)
+    after = _observe("sarif", rel, pol, tmp_path)
+    assert _SURFACES["sarif"][1](after, allowed, rel), after
+
+
+def test_sarif_observation_counts_results_not_rule_ids(monkeypatch, tmp_path):
+    rel = "cfg/a02_ios_seq_reorder_permit_first.cfg"
+    real = g.to_sarif
+
+    def twice(gate, version=None):
+        s = json.loads(real(gate, version))
+        s["runs"][0]["results"] = s["runs"][0]["results"] * 2
+        return json.dumps(s)
+
+    pol, _ = _ATTACKS[rel]
+    before = _observe("sarif", rel, pol, tmp_path)
+    monkeypatch.setattr(g, "to_sarif", twice)
+    assert _observe("sarif", rel, pol, tmp_path) != before
+
+
+def test_red_sets_stay_within_the_stopgap():
+    """L2: under the stopgap no boundary cell is red, and every red cell is
+    on the two surfaces slice 2 turns green. Widening either is an edit here."""
+    assert not _RED_B, sorted(_RED_B)
+    assert {s for _, s in _RED} <= {"sarif", "mcp_audit"}, sorted({s for _, s in _RED})
