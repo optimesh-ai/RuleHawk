@@ -97,7 +97,7 @@ either. To keep blocking on FAIL while UNKNOWN stays non-blocking, keep
 
 ### Other changes you may notice
 
-- CLI text output now ends with a `VERDICT:` line on every run, FAIL runs
+- CLI text output now carries a `VERDICT:` line on every run, FAIL runs
   included, so the text output is not byte-identical to 0.4.0; the findings
   themselves are unchanged.
 - A run whose only findings are accepted risks (`--accept`) exited 0 in 0.4.0
