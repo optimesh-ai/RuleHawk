@@ -525,3 +525,31 @@ def test_r7_8_junos_mutants_inside_comments_are_back():
     got = [(f, tag, kind) for f, tag, _, kind, _ in mutants(text, "junos")]
     assert ("junos-keyword-case", "4", "preserve") in got, got
     assert ("junos-annotation", "2", "never") in got, got
+
+
+# --------------------------------------------------------------------------- #
+# Object-group bodies: a member line no branch reads is not a member dropped
+# --------------------------------------------------------------------------- #
+# Guards, not red tests: every object-group reference already carries a
+# parse note (even an exact resolution is noted), so none of these PASS at
+# 3d2cbf3 either. They keep it so if that note is ever dropped.
+_OG = ("object-group network G\n description web hosts\n"
+       " network-object host 203.0.113.5\n")
+
+
+@pytest.mark.parametrize("extra", [" host 192.0.2.10", " 192.0.2.0 255.255.255.0",
+                                   " range 192.0.2.1 192.0.2.9", " fqdn corp.example.net",
+                                   " xyzzy 192.0.2.10"])
+def test_r8_an_unread_object_group_member_never_passes(tmp_path, extra):
+    """Read as 203.0.113.5 alone, the group could not reach PCI from CORP;
+    the unread line adds a CORP host."""
+    text = (_IF + _OG + extra + "\nip access-list extended F\n"
+            " permit ip object-group G 198.51.100.0 0.0.0.255\n deny ip any any\n")
+    _never_pass(_write(tmp_path, "x.cfg", text), "v4_ip.json", hosted=False)
+
+
+def test_r8_every_object_group_reference_is_noted():
+    from rulehawk.parse import parse_acls
+    _, notes = parse_acls(_IF + _OG + "ip access-list extended F\n"
+                          " permit ip object-group G 198.51.100.0 0.0.0.255\n")
+    assert any("object-group" in n for n in notes), notes
