@@ -120,24 +120,48 @@ run is one.
 - nftables text next to parsed rules (a `table ... {` block, an `nft`
   command, `flush ruleset`) -> UNKNOWN (`nftables-present`), not only when
   no rule parsed.
-- A removed or deactivated binding -> UNKNOWN (`acl-binding-negated`):
-  `no ip access-group`, `no ipv6 traffic-filter`, `no ip port
-  access-group`, `no access-class`, ASA `no access-group`, Junos `inactive:`
-  on an interface, unit, family, filter binding or filter, and set-form
-  `deactivate` / `delete` of an interface or a filter. The removal is not
-  applied.
-- iptables with no FORWARD policy at all (no `-P FORWARD` / `:FORWARD`)
-  -> UNKNOWN (`iptables-chain-policy-unset`), also when no rule is in
-  FORWARD (a user chain nothing jumps to).
+- A removed, reset or deactivated binding -> UNKNOWN (`acl-binding-negated`):
+  `no` or `default` before `ip access-group`, `ipv6 traffic-filter`,
+  `ip port access-group`, `access-class` or ASA `access-group`, a top-level
+  `no interface` or `default interface`, Junos `inactive:` on an interface,
+  unit, family, filter binding or filter, and set-form `deactivate` /
+  `delete` of an interface or a filter. The removal is not applied.
+- Cisco IOS / ASA / NX-OS / EOS interfaces are an allowlist: every line in
+  an `interface` stanza other than Loopback / Null must be one that cannot
+  change a transit packet's fate (the list is in the README and in
+  `rulehawk/failclosed.py`, each entry with its reason). Any other line, any
+  `default` form and any abbreviated keyword (`no ip access-gr F in`) ->
+  UNKNOWN (`interface-feature-unmodeled`; the detail names the keyword, not
+  the line).
+- Cisco features that drop, inspect, rewrite or bypass traffic outside the
+  ACLs, on any line -> UNKNOWN: zone-based firewall (`zone security`,
+  `zone-member security`, `zone-pair security`; `zone-firewall`), `ip
+  inspect` / CBAC (`stateful-inspection`), any `service-policy`
+  (`qos-policy`), `ip` / `ipv6 policy route-map`, `ip local policy`,
+  `service-policy type pbr` (`policy-routing`), and any `mpls` line,
+  `tag-switching`, `xconnect`, `l2vpn` or `pseudowire` (`mpls-forwarding`).
+- iptables with no FORWARD policy at all -> UNKNOWN
+  (`iptables-chain-policy-unset`), also when no rule is in FORWARD (a user
+  chain nothing jumps to). The policy is the one the parser applied from a
+  `-P FORWARD` / `--policy FORWARD` command or a `:FORWARD` line; text in a
+  comment, a `--comment` or a `--log-prefix` sets nothing.
+- iptables: a line is dispatched on its first verb. A line that carries a
+  second verb or a shell separator (`;`, `&&`, `|`) is a parse note, and a
+  word in a rule that is no option's value (iptables rejects the line)
+  makes the rule imprecise with a parse note.
 - must_reach: connectivity OK now needs every audited rule context to
   permit the whole flow. One permitting and another denying part of it
   (an egress ACL on the destination interface) -> UNKNOWN
   (`reach-not-every-context`).
-- PAN-OS: an address, address-group or service name defined in more than one
+- PAN-OS: a name defined as more than one kind (address and address-group
+  share a namespace, as do service and service-group) or in more than one
   `shared` / vsys / device-group scope is unresolved (imprecise) and noted
-  -> UNKNOWN (`object-scope-ambiguous`).
-- NAT in the config -> UNKNOWN (`nat-present`): Cisco `ip nat inside |
-  outside | source | destination | pool | static`, ASA `nat (...)` /
+  -> UNKNOWN (`object-scope-ambiguous`). A rule's names are looked up in its
+  own vsys or device-group, then `shared` (a firewall rulebase: the firewall
+  objects, then `shared`); a name defined only elsewhere is noted -> UNKNOWN
+  (`object-scope-ambiguous`).
+- NAT in the config -> UNKNOWN (`nat-present`): any Cisco `ip nat` or
+  `ipv6 nat` line, `nat64`, `nat66`, ASA `nat (...)` /
   `static (...)`, the PAN-OS NAT rulebase, Junos security/services NAT, the
   iptables nat table.
 
@@ -146,11 +170,14 @@ run is one.
 - Routing, NAT translation and topology are not evaluated, and every
   interface is assumed to be in the file. NAT is detected (`nat-present`)
   but never applied.
-- Only the PAN-OS and iptables frontends account for every line. The Cisco
-  IOS / NX-OS / EOS / ASA and Junos frontends read ACLs, filters and the
-  constructs listed above, and ignore other configuration.
-- RuleHawk models the L3/L4 packet space. Zones, applications, users and
-  connection state are over-approximated (UNKNOWN), never modelled.
+- Only the PAN-OS and iptables frontends account for every line. Every PASS
+  prints these per-vendor limits next to the verdict (text, `--json`
+  `scope`, `--evidence`, gate, MCP, hosted page):
+  - Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, NAT); any other interface line is UNKNOWN and other global commands are not read.
+  - PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed.
+  - iptables reads the filter table; a chain's policy comes only from its parsed -P or :CHAIN line.
+  - Junos reads firewall filters and their interface bindings; SRX security zones or policies make the answer UNKNOWN.
+- RuleHawk models the L3/L4 packet space.
 - iptables: only the filter table is modelled; other tables are noted.
 - A pasted snippet is audited as if it were the whole config.
 
@@ -205,11 +232,18 @@ run is one.
   prove; only `NO_NEW_RISK` is an all-clear.
 - PASS messages now end with their scope ("no audited ruleset permits this
   flow; assumes every interface is in the file; routing, NAT and topology
-  not evaluated"); match on the `verdict` field, not the message text.
+  not evaluated; known limits: ..." followed by the per-vendor limits under
+  Known limits); match on the `verdict` field, not the message text. The
+  `--json` report adds a `scope` object (`statement`, `must_not_reach`,
+  `must_reach`, `known_limits`).
 - PAN-OS set files and iptables scripts with lines RuleHawk does not
   model (a shell `echo`, an `edit` block, a NAT rule) now carry a parse note
   per line and are UNKNOWN; so is any input with nftables text, NAT, or a
-  `no ip access-group` / Junos `inactive:` binding.
+  binding removed as listed under `acl-binding-negated` above.
+- Cisco configs with interface lines outside the allowlist (an `ip verify`,
+  a `vrf forwarding`, a `standby`, a sub-interface `encapsulation`) or a
+  `service-policy`, PBR, zone, `ip inspect` or MPLS line are UNKNOWN. The
+  PASS scope text now ends with the known limits.
 - must_reach with several rule contexts: connectivity OK used to need one
   context permitting the whole flow; it now needs every one (else
   UNKNOWN). The connectivity scope text reads "every audited ruleset
