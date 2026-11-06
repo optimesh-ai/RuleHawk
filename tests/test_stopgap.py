@@ -270,6 +270,22 @@ def test_action_enforced_exit_0_fails_closed(tmp_path):
     assert p.returncode == 1 and "::error" in p.stdout
 
 
+@pytest.mark.skipif(not _BASH, reason="needs bash")
+@pytest.mark.parametrize("fail_on", ["high", "none"])
+def test_action_missing_rc_file_never_claims_exit_0(tmp_path, fail_on):
+    # The gate step aborted before writing its exit code: there is no verdict,
+    # so the step fails, says so, and never claims RuleHawk exited 0 -- not
+    # even under fail-on none.
+    env = dict(os.environ, RUNNER_TEMP=str(tmp_path), RH_FAIL_ON=fail_on,
+               RH_WORST="", RH_VERDICT="")
+    p = subprocess.run([_BASH, "-c", _enforce_script()], env=env,
+                       capture_output=True, text=True)
+    assert p.returncode == 1
+    assert "exited 0" not in p.stdout
+    assert "::error title=RuleHawk gate did not complete" in p.stdout
+    assert "No verdict was recorded" in p.stdout
+
+
 # --------------------------------------------------------------------------- #
 # hosted entrypoint (docs/worker.js over the docs/rulehawk copy)
 # --------------------------------------------------------------------------- #
