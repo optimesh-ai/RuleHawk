@@ -3,6 +3,16 @@
 **Paste your firewall/ACL config → get a ranked list of dead, shadowed, and
 dangerously-permissive rules in seconds.** No agent, no integration, no account.
 
+> **0.3.2: fail-closed stopgap.** This release never reports PASS. A run with
+> nothing at or above the threshold is **UNKNOWN**, exit **3**, with reason
+> `fail-closed-stopgap` ("fail-closed stopgap pending soundness review"); FAIL
+> (exit 1) and parse failures (exit 2) are unchanged. A GitHub Action check
+> with `fail-on` set fails with exit 3 until PASS returns, where proven, in the
+> next release; for a non-blocking run meanwhile, set `fail-on: none`. Where
+> this README describes a PASS, `segmentation-ok` or exit 0 on a clean config,
+> this release reports UNKNOWN (exit 3) instead. See
+> [CHANGELOG.md](CHANGELOG.md).
+
 ```
 python -m rulehawk samples/ios_acl.txt                         # human report
 python -m rulehawk samples/ios_acl.txt --json                  # machine/CI report

@@ -23,8 +23,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install pytest
-        run: python -m pip install --quiet pytest
+      - name: Install pytest and PyYAML
+        # PyYAML: the stopgap tests run the action's steps one by one.
+        run: python -m pip install --quiet pytest pyyaml
       - name: Run tests
         run: python -m pytest -q
       - name: Verify the web demo vendored engine is in sync
@@ -45,9 +46,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Use the action from this very checkout (local `./`). A clean sample +
-      # the segmentation policy must pass the gate with exit 0 — proving the
-      # zero-install PYTHONPATH wiring works on a real runner.
-      - name: RuleHawk gate (expect PASS on a clean sample)
+      # the segmentation policy runs end to end through the zero-install
+      # PYTHONPATH wiring on a real runner. Fail-closed stopgap (0.3.2): a
+      # clean run is UNKNOWN, exit 3, and fails the step (never a PASS).
+      - name: RuleHawk gate (expect UNKNOWN on a clean sample)
+        id: clean
+        continue-on-error: true
         uses: ./
         with:
           configs: samples/adv_realistic.txt
@@ -56,13 +60,38 @@ jobs:
           upload-sarif: false      # no code-scanning dependency in the self-test
           comment: false
       # No-policy run exercises the empty POLICY_ARGS path (the bash-3.2 trap).
-      - name: RuleHawk gate (expect PASS, no policy input)
+      - name: RuleHawk gate (expect UNKNOWN, no policy input)
+        id: nopolicy
+        continue-on-error: true
         uses: ./
         with:
           configs: samples/adv_realistic.txt
           fail-on: high
           upload-sarif: false
           comment: false
+      - name: Assert the UNKNOWN outputs
+        env:
+          OUTCOME: ${{ steps.clean.outcome }}
+          VERDICT: ${{ steps.clean.outputs.verdict }}
+          EXIT_CODE: ${{ steps.clean.outputs.exit-code }}
+          PASSED: ${{ steps.clean.outputs.passed }}
+          WORST: ${{ steps.clean.outputs.worst-severity }}
+          NOPOLICY_OUTCOME: ${{ steps.nopolicy.outcome }}
+          NOPOLICY_VERDICT: ${{ steps.nopolicy.outputs.verdict }}
+          NOPOLICY_EXIT_CODE: ${{ steps.nopolicy.outputs.exit-code }}
+          NOPOLICY_PASSED: ${{ steps.nopolicy.outputs.passed }}
+        run: |
+          set -euo pipefail
+          [ "${OUTCOME}" = "failure" ]          || { echo "::error::exit 3 should fail the step, got '${OUTCOME}'"; exit 1; }
+          [ "${VERDICT}" = "UNKNOWN" ]          || { echo "::error::outputs.verdict should be UNKNOWN, got '${VERDICT}'"; exit 1; }
+          [ "${EXIT_CODE}" = "3" ]              || { echo "::error::outputs.exit-code should be 3, got '${EXIT_CODE}'"; exit 1; }
+          [ "${PASSED}" = "false" ]             || { echo "::error::outputs.passed should be false, got '${PASSED}'"; exit 1; }
+          [ "${WORST}" = "none" ]               || { echo "::error::outputs.worst-severity should be none, got '${WORST}'"; exit 1; }
+          [ "${NOPOLICY_OUTCOME}" = "failure" ] || { echo "::error::no-policy exit 3 should fail the step, got '${NOPOLICY_OUTCOME}'"; exit 1; }
+          [ "${NOPOLICY_VERDICT}" = "UNKNOWN" ] || { echo "::error::no-policy verdict should be UNKNOWN, got '${NOPOLICY_VERDICT}'"; exit 1; }
+          [ "${NOPOLICY_EXIT_CODE}" = "3" ]     || { echo "::error::no-policy exit-code should be 3, got '${NOPOLICY_EXIT_CODE}'"; exit 1; }
+          [ "${NOPOLICY_PASSED}" = "false" ]    || { echo "::error::no-policy run should not pass, got '${NOPOLICY_PASSED}'"; exit 1; }
+          echo "UNKNOWN path verified: verdict=${VERDICT}, exit-code=${EXIT_CODE}, passed=${PASSED}, worst=${WORST}"
 
   action-selftest-fail-path:
     name: Dogfood the Action (FAIL verdict is enforced)
@@ -87,9 +116,44 @@ jobs:
           OUTCOME: ${{ steps.dirty.outcome }}
           PASSED: ${{ steps.dirty.outputs.passed }}
           WORST: ${{ steps.dirty.outputs.worst-severity }}
+          VERDICT: ${{ steps.dirty.outputs.verdict }}
+          EXIT_CODE: ${{ steps.dirty.outputs.exit-code }}
         run: |
           set -euo pipefail
           [ "${OUTCOME}" = "failure" ] || { echo "::error::gate did not fail on a dirty sample"; exit 1; }
+          [ "${VERDICT}" = "FAIL" ]    || { echo "::error::outputs.verdict should be FAIL, got '${VERDICT}'"; exit 1; }
+          [ "${EXIT_CODE}" = "1" ]     || { echo "::error::outputs.exit-code should be 1, got '${EXIT_CODE}'"; exit 1; }
           [ "${PASSED}" = "false" ]    || { echo "::error::outputs.passed should be false, got '${PASSED}'"; exit 1; }
           [ "${WORST}" = "critical" ]  || { echo "::error::outputs.worst-severity should be critical, got '${WORST}'"; exit 1; }
           echo "FAIL path verified: outcome=${OUTCOME}, passed=${PASSED}, worst=${WORST}"
+
+  action-selftest-advisory-unknown:
+    name: Dogfood the Action (fail-on none never reads as PASS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # fail-on none never blocks, but under the fail-closed stopgap it
+      # reports UNKNOWN: passed=false, verdict=UNKNOWN, and the step still
+      # succeeds (exit 0).
+      - name: RuleHawk gate (expect UNKNOWN, not enforced)
+        id: adv
+        uses: ./
+        with:
+          configs: samples/adv_realistic.txt
+          policy: samples/policy.json
+          fail-on: none
+          upload-sarif: false
+          comment: false
+      - name: Assert the step passed but the verdict is UNKNOWN
+        env:
+          OUTCOME: ${{ steps.adv.outcome }}
+          PASSED: ${{ steps.adv.outputs.passed }}
+          VERDICT: ${{ steps.adv.outputs.verdict }}
+          EXIT_CODE: ${{ steps.adv.outputs.exit-code }}
+        run: |
+          set -euo pipefail
+          [ "${OUTCOME}" = "success" ] || { echo "::error::fail-on none must not fail the step"; exit 1; }
+          [ "${PASSED}" = "false" ]    || { echo "::error::outputs.passed should be false, got '${PASSED}'"; exit 1; }
+          [ "${VERDICT}" = "UNKNOWN" ] || { echo "::error::outputs.verdict should be UNKNOWN, got '${VERDICT}'"; exit 1; }
+          [ "${EXIT_CODE}" = "0" ]     || { echo "::error::outputs.exit-code should be 0, got '${EXIT_CODE}'"; exit 1; }
+          echo "advisory UNKNOWN verified: outcome=${OUTCOME}, verdict=${VERDICT}, passed=${PASSED}"

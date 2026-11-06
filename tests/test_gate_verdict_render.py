@@ -127,20 +127,23 @@ def test_chmod_000_file_fails_closed_via_audit_file(tmp_path):
 def test_pass_verdict_rendered_in_markdown_and_console(tmp_path):
     p = _write(str(tmp_path), "clean.acl", _CLEAN)
     g = gate.run_gate([p], _POLICY, "high")
-    assert g.passed and g.exit_code() == 0
+    # fail-closed stopgap (0.3.2): the would-be PASS is UNKNOWN, exit 3
+    assert not g.passed and g.exit_code() == 3
 
     md = gate.to_markdown(g)
-    # exact PASS wording — the first line a reviewer reads on a green gate
-    assert "**PASS** — no findings at or above `high`." in md
-    assert "✅" in md and "FAIL" not in md
-    # the proven isolation is celebrated, not hidden
-    assert "Segmentation proven:" in md
+    # exact UNKNOWN wording — the first line a reviewer reads on a clean gate
+    assert ("**UNKNOWN** — no finding at or above `high`, but this run is not "
+            "certified (`fail-closed-stopgap`: fail-closed stopgap pending "
+            "soundness review). Exit 3 fails the check.") in md
+    assert "✅" not in md and "FAIL" not in md
+    # the undecided isolation is named, not hidden
+    assert "Segmentation UNKNOWN (`fail-closed-stopgap`:" in md
     # privacy promise footer is always present
     assert "never leaves your infrastructure" in md
 
     con = gate.to_console(g)
-    assert "VERDICT: PASS (threshold --fail-on high)" in con
-    assert "[ok   ]" in con or "[ok" in con
+    assert "VERDICT: UNKNOWN (exit 3) — nothing at or above high" in con
+    assert "[UNKNOWN]" in con
     assert "FAIL" not in con
 
 
@@ -196,7 +199,7 @@ def test_main_forced_vendor_nxos_eos_label(tmp_path, vendor, alias):
     # the forced parser actually ran AND parsed real rules under that grammar
     assert f0["vendor"] == vendor
     assert f0["status"] == "ok" and f0["rules_analyzed"] == 2
-    assert rc == 0                                   # clean, scoped ACL
+    assert rc == 3                                   # clean, scoped ACL: stopgap UNKNOWN
 
 
 def test_forced_vendor_label_in_renderers(tmp_path):
@@ -205,7 +208,7 @@ def test_forced_vendor_label_in_renderers(tmp_path):
     p = _write(str(tmp_path), "numbered.acl", _NUMBERED)
     for v in ("nxos", "eos"):
         g = gate.run_gate([p], None, "high", vendor=v)
-        assert g.files[0].vendor == v and g.passed
+        assert g.files[0].vendor == v and g.exit_code() == 3   # stopgap UNKNOWN
         assert f"({v}, 2 rules" in gate.to_markdown(g)
         assert f"({v}, 2 rules" in gate.to_console(g)
 
@@ -264,7 +267,7 @@ def test_autodetect_nxos_and_eos_in_gate(tmp_path):
     g = gate.run_gate([nxos, eos, junos, panos], None, "high")  # vendor=auto
     assert [fr.vendor for fr in g.files] == ["nxos", "eos", "junos", "panos"]
     assert all(fr.status == "ok" for fr in g.files)
-    assert g.passed
+    assert g.exit_code() == 3                        # fail-closed stopgap: UNKNOWN
 
 
 # --------------------------------------------------------------------------- #
@@ -298,19 +301,19 @@ def test_main_writes_sticky_comment_and_stdout_summary(tmp_path, capsys):
     p = _write(d, "clean.acl", _CLEAN)
     comment = os.path.join(d, "comment.md")
     rc = gate.main([p, "--comment", comment, "--summary", "-", "-q"])
-    assert rc == 0
+    assert rc == 3                                   # fail-closed stopgap
     body = open(comment).read()
     assert body.startswith(gate._COMMENT_MARKER)     # sticky-update anchor first
-    assert "**PASS** — no findings at or above `high`." in body
-    # --summary - streams the same PASS report to stdout (gate.py:761-762)
-    assert "**PASS**" in capsys.readouterr().out
+    assert "**UNKNOWN** — no finding at or above `high`" in body
+    # --summary - streams the same UNKNOWN report to stdout (gate.py:761-762)
+    assert "**UNKNOWN**" in capsys.readouterr().out
 
 
 def test_main_prints_console_report_unless_quiet(tmp_path, capsys):
     p = _write(str(tmp_path), "clean.acl", _CLEAN)
-    assert gate.main([p]) == 0                       # no -q
-    assert "VERDICT: PASS" in capsys.readouterr().out
-    assert gate.main([p, "-q"]) == 0
+    assert gate.main([p]) == 3                       # no -q; stopgap UNKNOWN
+    assert "VERDICT: UNKNOWN" in capsys.readouterr().out
+    assert gate.main([p, "-q"]) == 3
     assert "VERDICT" not in capsys.readouterr().out  # -q suppresses it
 
 

@@ -19,9 +19,11 @@ and computes a single exit code from a `--fail-on` severity threshold, so the
 check goes red exactly when the team decides it should.
 
 DESIGN PRINCIPLES (inherited from the engine):
-  * Sound, never noisy. `segmentation-ok` is good news, not a finding — it never
-    annotates a line and never fails the build. `segmentation-indeterminate`
-    (we could not PROVE isolation) is surfaced honestly at MEDIUM, not hidden.
+  * Sound, never noisy. An assertion the search finds no witness for is
+    `segmentation-unknown` (info): it never annotates a line, but the run's
+    verdict is UNKNOWN (exit 3), never a pass — the 0.3.2 fail-closed stopgap.
+    `segmentation-indeterminate` (we could not PROVE isolation) is surfaced
+    honestly at MEDIUM, not hidden.
   * Never a false bill of health. A file that parses to ZERO rules is reported
     as `no_rules_parsed` (status, not a 100/100 score) — the same guarantee the
     CLI gives, generalized across a whole repo.
@@ -39,7 +41,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from .analyze import Finding, analyze, score
+from .analyze import (STOPGAP_CODE, STOPGAP_MESSAGE, UNKNOWN_KINDS, Finding,
+                      analyze, score, stopgap_reasons)
 from .parse import parse_acls
 from .parse_iptables import detect as detect_iptables, parse_iptables
 from .parse_junos import detect as detect_junos, parse_junos
@@ -48,13 +51,17 @@ from .parse_nxos import detect as detect_nxos, parse_nxos
 from .parse_eos import detect as detect_eos, parse_eos
 from .segcheck import check_segmentation
 
+# Policy-assertion findings that disprove an assertion (a FAIL under
+# `--fail-on none`, which enforces nothing).
+_ASSERTION_FAIL_KINDS = ("segmentation-violation", "connectivity-broken")
+
 # Severity ordering shared by the threshold logic, SARIF level mapping, and the
 # report sort. Higher = worse.
 _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 _SEV_ORDER = ("critical", "high", "medium", "low", "info")
 
 # Severity -> SARIF result level. Code scanning shows `error` as a failing
-# annotation, `warning`/`note` as advisory. `info` findings (segmentation-ok)
+# annotation, `warning`/`note` as advisory. `info` findings (segmentation-unknown)
 # are never emitted to SARIF at all (see _sarif).
 _SARIF_LEVEL = {"critical": "error", "high": "error", "medium": "warning",
                 "low": "note", "info": "note"}
@@ -106,14 +113,17 @@ _KIND_HELP: Dict[str, str] = {
     "segmentation-indeterminate":
         "Isolation could not be PROVEN — a rule uses an unmodeled form "
         "(neq / complex mask / unresolved group). Review manually.",
-    "segmentation-ok":
-        "A declared zone isolation holds: no permitted witness flow exists.",
+    "segmentation-unknown":
+        "No parsed rule permits a witness flow for a declared zone isolation, "
+        "but it is not certified: fail-closed stopgap pending soundness "
+        "review. Verdict UNKNOWN (exit 3).",
     "segmentation-error":
         "The segmentation policy itself is invalid (unknown zone, bad CIDR or "
         "port) — fail-closed: the affected assertion gets no PASS until fixed.",
-    "connectivity-ok":
-        "A declared must_reach deployment flow is provably permitted at the "
-        "filter layer — reported with a concrete witness packet.",
+    "connectivity-unknown":
+        "The parsed rules permit a declared must_reach flow (a witness packet "
+        "is shown), but connectivity is not certified: fail-closed stopgap "
+        "pending soundness review. Verdict UNKNOWN (exit 3).",
     "connectivity-broken":
         "A declared must_reach deployment flow (e.g. hosts -> proxy/vendor "
         "egress ranges) is permitted by NO parsed ruleset — the traffic will "
@@ -149,10 +159,10 @@ class FileResult:
           2. Finding.line             — direct fallback when line_by_id misses or
                                        returns 0 (parser did not record a line) or
                                        the rule_id is a zone-pair label rather than
-                                       an acl:seq (e.g. segmentation-ok).
+                                       an acl:seq (e.g. segmentation-unknown).
           3. 1                        — hard minimum; SARIF requires startLine >= 1.
 
-        Info findings (segmentation-ok) carry zone-pair rule_ids and are excluded
+        Info findings (segmentation-unknown) carry zone-pair rule_ids and are excluded
         from SARIF by real_findings, so their fallback is safe."""
         acl_seq = _split_rule_id(f.rule_id)
         if acl_seq is not None and acl_seq in self.line_by_id:
@@ -243,7 +253,7 @@ class GateResult:
 
     @property
     def real_findings(self) -> List[Tuple[FileResult, Finding]]:
-        """(file, finding) pairs, excluding pure-info good-news (segmentation-ok)."""
+        """(file, finding) pairs, excluding info findings (segmentation-unknown)."""
         out: List[Tuple[FileResult, Finding]] = []
         for fr in self.files:
             for f in fr.findings:
@@ -292,17 +302,51 @@ class GateResult:
                 if fr.status in ("error", "no_rules_parsed")]
 
     def exit_code(self) -> int:
-        """0 clean · 1 finding at/above threshold · 2 a file failed to parse
-        (fail-closed). `--fail-on none` is advisory: it never blocks."""
+        """2 a file failed to parse (fail-closed) · 1 finding at/above
+        threshold · 3 UNKNOWN: nothing at the threshold, but the run is not
+        certified (fail-closed stopgap pending soundness review). Never 0 for
+        an enforced run, which would read as a PASS. `--fail-on none` is
+        advisory: it exits 0, and its verdict still says UNKNOWN or FAIL."""
         if self.fail_on == "none":
             return 0
         if self.parse_failures:
             return 2
-        return 1 if self.violations else 0
+        return 1 if self.violations else 3
+
+    @property
+    def enforced(self) -> bool:
+        """False under `--fail-on none`: the verdict is reported, not enforced."""
+        return self.fail_on != "none"
+
+    @property
+    def verdict(self) -> str:
+        """FAIL | UNKNOWN — never PASS (fail-closed stopgap). Enforced, it follows
+        the exit code (1/2 FAIL, 3 UNKNOWN). Under `--fail-on none` it is the
+        real verdict: FAIL for a file that parsed to zero rules or a policy
+        violation, otherwise UNKNOWN."""
+        if self.enforced:
+            return "UNKNOWN" if self.exit_code() == 3 else "FAIL"
+        if self.parse_failures or any(
+                f.kind in _ASSERTION_FAIL_KINDS for _, f in self.real_findings):
+            return "FAIL"
+        return "UNKNOWN"
+
+    @property
+    def reasons(self) -> List[dict]:
+        """Why the verdict is UNKNOWN ([] on FAIL)."""
+        return stopgap_reasons() if self.verdict == "UNKNOWN" else []
+
+    @property
+    def undecided(self) -> List[Tuple[FileResult, Finding]]:
+        """Policy assertions reported UNKNOWN (the stopgap's would-be passes)."""
+        return [(fr, f) for fr in self.files for f in fr.findings
+                if f.kind in UNKNOWN_KINDS]
 
     @property
     def passed(self) -> bool:
-        return self.exit_code() == 0
+        """Never true in 0.3.2: the fail-closed stopgap emits no PASS, under
+        `--fail-on none` too."""
+        return False
 
     @property
     def score(self) -> Optional[int]:
@@ -389,8 +433,8 @@ def _fingerprint(uri: str, f: Finding) -> str:
 def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
     """Render findings as SARIF 2.1.0 for `github/codeql-action/upload-sarif`.
 
-    Info findings (segmentation-ok) are omitted — they are good news, not
-    annotations. Every other finding becomes one result located on its exact
+    Info findings (segmentation-unknown) are omitted — they are not
+    annotations, and SARIF never carries a pass result. Every other finding becomes one result located on its exact
     source line, so GitHub renders it inline on the PR diff."""
     if version is None:
         from . import __version__ as version
@@ -504,6 +548,11 @@ def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
 def to_json(gate: GateResult) -> str:
     return json.dumps({
         "passed": gate.passed,
+        # FAIL | UNKNOWN, never PASS (fail-closed stopgap). Under fail-on none
+        # the real verdict, with enforced false and exit_code 0.
+        "verdict": gate.verdict,
+        "enforced": gate.enforced,
+        "reasons": gate.reasons,
         "exit_code": gate.exit_code(),
         "fail_on": gate.fail_on,
         "worst_severity": gate.worst,
@@ -512,6 +561,7 @@ def to_json(gate: GateResult) -> str:
         "rules_analyzed": gate.total_rules,
         "findings_by_severity": gate.counts(),
         "violations": len(gate.violations),
+        "undecided_assertions": len(gate.undecided),
         "parse_failures": [fr.path for fr in gate.parse_failures],
         "files": [{
             "path": fr.path,
@@ -524,6 +574,7 @@ def to_json(gate: GateResult) -> str:
                 "rule_id": f.rule_id, "kind": f.kind, "severity": f.severity,
                 "line": fr.line_of(f), "message": f.message, "rule": f.rule,
                 "cited": f.cited, "fix": f.fix, "witness": f.witness,
+                "verdict": f.verdict, "reasons": list(f.reasons or []),
             } for f in _sorted(fr.findings)],
             "parse_notes": fr.notes,
         } for fr in gate.files],
@@ -556,8 +607,16 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
     PR comment body (the comment prepends a hidden marker for sticky updates)."""
     counts = gate.counts()
     pf = gate.parse_failures
-    if gate.passed:
-        verdict = f"**PASS** — no findings at or above `{gate.fail_on}`."
+    if not gate.enforced:
+        verdict = (f"**{gate.verdict} (not enforced)** — `fail-on: none` never "
+                   f"blocks, so this check exits 0, but the verdict is "
+                   f"{gate.verdict}"
+                   + (f" (`{STOPGAP_CODE}`: {STOPGAP_MESSAGE})."
+                      if gate.verdict == "UNKNOWN" else "."))
+    elif gate.exit_code() == 3:
+        verdict = (f"**UNKNOWN** — no finding at or above `{gate.fail_on}`, but "
+                   f"this run is not certified (`{STOPGAP_CODE}`: "
+                   f"{STOPGAP_MESSAGE}). Exit 3 fails the check.")
     elif pf and not gate.violations:
         verdict = (f"**FAIL (fail-closed)** — {len(pf)} file(s) parsed to zero "
                    f"rules. That is not a clean bill of health; the gate blocks "
@@ -566,7 +625,7 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
         extra = (f" plus {len(pf)} unparseable file(s)" if pf else "")
         verdict = (f"**FAIL** — {len(gate.violations)} finding(s) at or above "
                    f"`{gate.fail_on}`{extra} block this change.")
-    icon = "✅" if gate.passed else "❌"
+    icon = "❌"          # fail-closed stopgap: no verdict is a pass
     sc = gate.score
     lines: List[str] = []
     lines.append(f"## {icon} {title}")
@@ -601,8 +660,8 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
     # Per-file breakdown.
     for fr in gate.files:
         real = [f for f in fr.findings if f.severity != "info"]
-        ok = [f for f in fr.findings if f.kind == "segmentation-ok"]
-        conn_ok = [f for f in fr.findings if f.kind == "connectivity-ok"]
+        ok = [f for f in fr.findings if f.kind == "segmentation-unknown"]
+        conn_ok = [f for f in fr.findings if f.kind == "connectivity-unknown"]
         if fr.status == "error":
             lines.append(f"<details><summary>❌ <code>{_sarif_uri(fr.path)}</code> "
                          f"— ERROR, could not read: {fr.error}</summary></details>")
@@ -616,8 +675,7 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
             lines.append("</details>")
             lines.append("")
             continue
-        head_icon = "❌" if any(f.severity in ("critical", "high") for f in real) else (
-            "·" if real else "✅")
+        head_icon = "❌" if any(f.severity in ("critical", "high") for f in real) else "·"
         fscore = f"{fr.score}/100" if fr.score is not None else "—"
         summ = (f"{head_icon} <code>{_sarif_uri(fr.path)}</code> "
                 f"<sub>({fr.vendor}, {fr.n_rules} rules, score {fscore}, "
@@ -625,7 +683,8 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
         lines.append(f"<details><summary>{summ}</summary>")
         lines.append("")
         if not real:
-            lines.append("No hygiene/segmentation findings. ✅")
+            lines.append(f"No hygiene/segmentation findings; verdict UNKNOWN "
+                         f"(`{STOPGAP_CODE}`: {STOPGAP_MESSAGE}).")
         for f in _sorted(real):
             lines.append(f"- {_SEV_BADGE.get(f.severity, f.severity)} "
                          f"**{f.kind}** "
@@ -640,11 +699,13 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
                 lines.append(f"  fix: _{f.fix}_  ")
         if ok:
             lines.append("")
-            lines.append("Segmentation proven: "
+            lines.append(f"Segmentation UNKNOWN (`{STOPGAP_CODE}`: "
+                         f"{STOPGAP_MESSAGE}): "
                          + ", ".join(f"`{f.rule_id.replace('!->', ' → ')}`" for f in ok))
         if conn_ok:
             lines.append("")
-            lines.append("Connectivity proven (must_reach): "
+            lines.append(f"Connectivity UNKNOWN (must_reach; `{STOPGAP_CODE}`: "
+                         f"{STOPGAP_MESSAGE}): "
                          + ", ".join(f"`{f.witness}`" for f in conn_ok))
         if fr.notes:
             lines += _notes_block(fr.notes)
@@ -691,7 +752,7 @@ def to_console(gate: GateResult) -> str:
             continue
         real = [f for f in fr.findings if f.severity != "info"]
         tag = "FAIL" if any(f.severity in ("critical", "high") for f in real) else (
-            "WARN" if real else "ok")
+            "WARN" if real else "UNKNOWN")
         out.append(f"  [{tag:5}] {fr.path}  ({fr.vendor}, {fr.n_rules} rules, "
                    f"score {fr.score}, {len(real)} findings)")
         for f in _sorted(real):
@@ -704,8 +765,14 @@ def to_console(gate: GateResult) -> str:
     out.append(f"  score {score_txt}   "
                + "  ".join(f"{k}:{counts[k]}" for k in ("critical", "high",
                                                         "medium", "low")))
-    if gate.passed:
-        out.append(f"  VERDICT: PASS (threshold --fail-on {gate.fail_on})")
+    if not gate.enforced:
+        out.append(f"  VERDICT: {gate.verdict} (not enforced: --fail-on none, "
+                   f"exit 0)"
+                   + (f" — {STOPGAP_CODE}: {STOPGAP_MESSAGE}"
+                      if gate.verdict == "UNKNOWN" else ""))
+    elif gate.exit_code() == 3:
+        out.append(f"  VERDICT: UNKNOWN (exit 3) — nothing at or above "
+                   f"{gate.fail_on}; {STOPGAP_CODE}: {STOPGAP_MESSAGE}")
     elif gate.exit_code() == 2:
         n = len(gate.parse_failures)
         out.append(f"  VERDICT: FAIL (exit 2, fail-closed) — {n} file(s) parsed "
@@ -739,6 +806,14 @@ options:
   --json PATH          write the machine aggregate ('-' for stdout)
   -q, --quiet          suppress the console report
   -h, --help           show this help
+
+exit codes (0.3.2, fail-closed stopgap: PASS is never reported):
+  1  FAIL: a finding at or above --fail-on
+  2  a file parsed to zero rules, or invalid input / usage
+  3  UNKNOWN: nothing at or above --fail-on, but not certified
+     (fail-closed-stopgap: fail-closed stopgap pending soundness review)
+  0  only with --fail-on none (advisory; the verdict still says UNKNOWN/FAIL)
+  Precedence: 2, then 1, then 3.
 """
 
 

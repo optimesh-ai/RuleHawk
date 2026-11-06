@@ -62,7 +62,7 @@ def test_partial_svc_group_resolved_member_proves_leak_emits_critical():
     assert "segmentation-violation" in kinds, (
         "resolved tcp:445 member proves CORP->PCI:445 leak; expect CRITICAL"
     )
-    assert "segmentation-ok" not in kinds, "must not produce a false PASS"
+    assert "segmentation-unknown" not in kinds, "must not produce a false PASS"
     assert "segmentation-indeterminate" not in kinds, (
         "CRITICAL should be reported (segcheck breaks on first hit per assertion)"
     )
@@ -97,7 +97,7 @@ def test_partial_svc_group_resolved_member_not_covering_forbidden_port_stays_ind
         "no resolved member covers port 445; unresolved remainder must stay INDETERMINATE"
     )
     assert "segmentation-violation" not in kinds, "must not invent a false CRITICAL"
-    assert "segmentation-ok" not in kinds, "must not produce a false PASS"
+    assert "segmentation-unknown" not in kinds, "must not produce a false PASS"
 
     # Structural check: one precise ACE (tcp:80) + one opaque ACE.
     precise = [a for a in aces if not a.imprecise]
@@ -123,7 +123,7 @@ def test_fully_resolved_svc_group_no_forbidden_port_stays_pass():
     kinds = _kinds(cfg)
 
     # Neither port 80 nor 443 is forbidden; all members resolve exactly.
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
     assert "segmentation-violation" not in kinds
     assert "segmentation-indeterminate" not in kinds
 
@@ -150,6 +150,6 @@ def test_all_bad_svc_group_members_still_opaque():
     assert len(aces) == 1 and aces[0].imprecise is True
     assert "segmentation-indeterminate" in kinds
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
     # Note from the fallback path (not partial-resolution path).
     assert any("unmodeled (object-group)" in n for n in notes)

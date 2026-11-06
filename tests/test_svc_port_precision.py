@@ -56,7 +56,7 @@ def test_lt_445_excludes_445_precise_pass():
     acl = f"ip access-list extended T\n permit tcp {_SRC} {_DST} lt 445\n"
     kinds = _kinds(acl)
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
 
 
 # --- (d) neq 80 covers 445 -> CRITICAL; neq 445 excludes 445 -> PASS --------
@@ -72,7 +72,7 @@ def test_neq_445_never_segmentation_ok_when_445_in_complement():
     # violation). This sweeps the boundary cases too (neq 444 / neq 446).
     for p in (1, 80, 444, 446, 3389, 65535):
         kinds = _kinds(f"ip access-list extended T\n permit tcp {_SRC} {_DST} neq {p}\n")
-        assert "segmentation-ok" not in kinds, f"false PASS for neq {p}"
+        assert "segmentation-unknown" not in kinds, f"false PASS for neq {p}"
         assert "segmentation-violation" in kinds
 
 
