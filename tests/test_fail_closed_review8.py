@@ -387,18 +387,23 @@ def test_ledger_a_line_both_consumed_and_noted_is_noted():
     assert led.counts()["noted"] == 1 and led.counts()["consumed"] == 0
 
 
-def test_ledger_the_acl_parser_leaves_nothing_unaccounted():
-    """The R7-2 hole by construction: `default 10` makes no model state, so
-    the central check notes it even though no branch of the parser does."""
+@pytest.mark.parametrize("line,caught", [("default 10", 0), ("30 xyzzy", 1),
+                                         ("statistics per-entry", 0)])
+def test_ledger_the_acl_parser_leaves_nothing_unaccounted(line, caught):
+    """The R7-2 hole by construction: a line in ACL mode that makes no model
+    state is noted, by its own branch or, when no branch reads it (`30
+    xyzzy`), by the central check."""
     from rulehawk.failclosed import collect_ledgers
     from rulehawk.parse import parse_acls
     with collect_ledgers() as leds:
-        _, notes = parse_acls(_ios("10 " + _DENY, "20 " + _OTHER, "default 10"))
+        _, notes = parse_acls(_ios("10 " + _DENY, "20 " + _OTHER, line))
     acl = [led for led in leds if led.frontend == "cisco-acl"]
     assert acl and all(led.closed for led in acl)
     c = acl[0].counts()
-    assert c["scope"] == 3 and c["unaccounted"] == 0 and c["consumed"] == 2, c
-    assert any("default 10" in n for n in notes), notes
+    # the header, two entries and the line
+    assert c["scope"] == 4 and c["consumed"] == 3 and c["unaccounted"] == 0, c
+    assert c["noted"] + c["caught"] == 1 and c["caught"] == caught, c
+    assert any(line in n for n in notes), notes
 
 
 def _config_corpus():
