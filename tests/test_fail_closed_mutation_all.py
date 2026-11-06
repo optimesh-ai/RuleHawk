@@ -268,6 +268,7 @@ def _cisco_grammar(lines: List[str], vendor: str) -> Iterator[Mutant]:
             ln = lines[i]
             mm = _NUM.match(ln)
             body = ln[mm.end():] if mm else ln.lstrip()
+            remark = body.split()[:1] and body.split()[0].lower() == "remark"
             kw = "sequence " if (vendor == "ios-asa" and v6) else ""
             for n in ("0", str(top + 1)):
                 yield ("cisco-acl-seq-range", f"{i + 1}:{n}",
@@ -280,7 +281,7 @@ def _cisco_grammar(lines: List[str], vendor: str) -> Iterator[Mutant]:
                 yield ("cisco-acl-keyword-case", f"{i + 1}",
                        _j(lines[:i] + [up] + lines[i + 1:]),
                        "preserve" if vendor == "ios-asa" else "never", None)
-            if vendor == "ios-asa" and not v6:
+            if vendor == "ios-asa" and not v6 and not remark:   # a remark is free text
                 w = _WC.search(ln)
                 if w:
                     plen = 32 - sum(bin(int(o)).count("1") for o in w.group(2).split("."))
@@ -338,7 +339,10 @@ def _cisco_acl_meaning(lines: List[str]) -> Iterator[Mutant]:
                        "never", None)
                 yield ("cisco-acl-default", f"{i + 1}:default sequence {n}",
                        ins("default sequence " + n), "never", None)
+            remark = bool(re.match(r"(?i)^\s*(?:(?:sequence\s+)?\d+\s+)?remark\b", ln))
             for tok, kind in _TRAILING if "log" not in ln.lower().split() else _TRAILING[:1]:
+                if remark and kind == "never":
+                    kind = "preserve"            # free text: a remark stays a remark
                 yield ("cisco-acl-trailing-token", f"{i + 1}:{tok}",
                        _j(lines[:i] + [ln.rstrip() + " " + tok] + lines[i + 1:]), kind,
                        _j(lines[:i] + lines[i + 1:]) if kind == "ref" else None)

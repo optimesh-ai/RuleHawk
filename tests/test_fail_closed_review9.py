@@ -133,7 +133,7 @@ def test_r8_1_the_latest_terminating_action_wins(cfg):
     last (j08, must_reach) the break is proven. FAIL, with a note."""
     r = _report(_r8(cfg))
     assert r["assertion_verdict"] == "FAIL", (cfg, _codes(r))
-    assert any("more than one terminating action" in n for n in r["notes"]), r["notes"]
+    assert any("more than one terminating action" in n for n in r["parse_notes"]), r["parse_notes"]
 
 
 @pytest.mark.parametrize("terms", [
@@ -261,6 +261,7 @@ def test_r8_5_resequence_naming_the_acl_never_passes(tmp_path, text):
     _ios(_DENY + " log interval 5", _LEAK),
     _ios(_DENY + " log 5", _LEAK),
     _ios(_DENY + " log default", _LEAK),
+    _ios(_DENY + " log CORP-DENY", _OTHER),
     _IF.replace("access-group F", "access-group 101")
     + "access-list 101 deny ip 192.0.2.0/24 198.51.100.0 0.0.0.255\n"
     "access-list 101 permit ip 192.0.2.0 0.0.0.255 any\n",
@@ -272,7 +273,6 @@ def test_r8_6_other_dialect_forms_in_ios_never_pass(tmp_path, text):
 @pytest.mark.parametrize("text", [
     _ios(_DENY + " log", _OTHER),
     _ios(_DENY + " log-input", _OTHER),
-    _ios(_DENY + " log CORP-DENY", _OTHER),
     _nx(_NXDENY, _NXOTHER),
 ])
 def test_r8_6_cited_forms_stay_pass(tmp_path, text):
