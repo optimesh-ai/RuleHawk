@@ -1,0 +1,2 @@
+{"zones": {"CORP6": ["2001:db8:20::/48"], "PCI6": ["2001:db8:10::/48"]},
+ "must_not_reach": [{"src": "CORP6", "dst": "PCI6", "proto": "icmpv6"}]}

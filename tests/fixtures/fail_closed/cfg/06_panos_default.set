@@ -1,0 +1,3 @@
+set rulebase security rules web from any to any source 203.0.113.0/24 destination 198.51.100.0/24 application any service service-https action allow
+set rulebase default-security-rules rules interzone-default action allow
+set rulebase default-security-rules rules intrazone-default action allow
