@@ -62,19 +62,19 @@ def test_f1_an_interface_with_no_filter_in_either_direction_is_a_bypass(tmp_path
     _assert_unknown_everywhere(str(p), "v4_tcp445.json", "unfiltered-path")
 
 
-def test_f1_a_shutdown_filtered_interface_does_not_cover_traffic(tmp_path):
-    """Gi0/1's filter is on a shutdown interface: it filters nothing."""
+def test_f1_a_filter_only_on_shutdown_interfaces_covers_nothing(tmp_path):
+    """F is bound only on a shutdown interface: it filters nothing, so it is
+    not a transit filter and nothing proves the isolation."""
     p = tmp_path / "shut.cfg"
     p.write_text("interface GigabitEthernet0/0\n ip address 192.0.2.1 255.255.255.0\n"
-                 " ip access-group F in\n ip access-group F out\n"
-                 "interface GigabitEthernet0/1\n ip address 198.51.100.1 255.255.255.0\n"
-                 " ip access-group F out\n shutdown\n"
-                 "interface GigabitEthernet0/2\n ip address 203.0.113.1 255.255.255.0\n"
-                 " ip access-group F in\n"
+                 " ip access-group F in\n ip access-group F out\n shutdown\n"
                  "ip access-list extended F\n"
                  " deny ip 192.0.2.0 0.0.0.255 198.51.100.0 0.0.0.255\n"
                  " permit ip 203.0.113.0 0.0.0.255 any\n")
-    _assert_unknown_everywhere(str(p), "v4_ip.json", "unfiltered-path")
+    _assert_unknown_everywhere(str(p), "v4_ip.json", "acl-role-unknown")
+    p.write_text(p.read_text().replace(" shutdown\n", " no shutdown\n"))
+    r = _report(str(p))
+    assert r["assertion_verdict"] == "PASS", _assertion_findings(r)
 
 
 def test_f1_every_interface_filtered_one_way_still_passes(tmp_path):

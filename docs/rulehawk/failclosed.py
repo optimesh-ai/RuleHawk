@@ -144,9 +144,11 @@ REASONS: Dict[str, str] = {
         "on IOS a missing or empty ACL permits all traffic, so that path is "
         "unfiltered",
     "unfiltered-path":
-        "an interface with no inbound filter and another with no outbound "
-        "filter for this address family let traffic cross the device without "
-        "meeting any audited rule",
+        "traffic of this address family can cross the device without meeting "
+        "any audited rule: an interface with no filter in either direction "
+        "(a packet can enter and leave on it, e.g. between a primary and a "
+        "secondary subnet), or one interface with no inbound filter and "
+        "another with no outbound filter",
     "iptables-fragments":
         "an iptables rule matches ports or other L4 fields; a non-initial "
         "fragment carries no L4 header, never matches it and falls through to "
@@ -297,7 +299,7 @@ _CISCO_NON_TRANSIT = [
 ]
 _ASA_DIALECT = re.compile(
     r"(?im)^\s*(?:(?:ASA|PIX|FWSM)\s+Version\b|nameif\s+\S|security-level\s+\d|"
-    r"access-group\s+\S+\s+(?:in|out)\s+interface\b)")
+    r"access-group\s+\S+\s+(?:(?:in|out)\s+interface\b|global\s*$))")
 _NUMBERED_FLAT = re.compile(
     r"(?im)^\s*access-list\s+\d+\s+(?:permit|deny|dynamic)\b")
 
@@ -314,20 +316,41 @@ def cisco_dialect_ambiguous(text: str) -> bool:
                 or (_NUMBERED_FLAT.search(text) and _ASA_DIALECT.search(text)))
 
 
+_SHUTDOWN_ONLY = "bound only on a shutdown interface"
+
+
 def _cisco_bindings(text: str) -> Tuple[Set[str], Dict[str, str]]:
-    """(ACLs with a transit binding, ACL -> first non-transit role)."""
+    """(ACLs with a transit binding, ACL -> first non-transit role). A
+    binding on a `shutdown` interface filters nothing, so an ACL bound only
+    there has no transit binding."""
     transit: Set[str] = set()
     other: Dict[str, str] = {}
+    shut_bound: Set[str] = set()
     in_interface = False
+    here: Set[str] = set()
+    shut = False
+
+    def close() -> None:
+        (shut_bound if shut else transit).update(here)
+
     for raw in text.splitlines():
         if not raw.strip() or raw.lstrip().startswith("!"):
             continue
         if raw[:1] not in (" ", "\t"):
+            if in_interface:
+                close()
             in_interface = bool(re.match(r"(?i)^interface\s", raw))
+            here, shut = set(), False
         if in_interface:
+            if re.match(r"(?i)^\s+shutdown\s*$", raw):
+                shut = True
+                continue
+            if re.match(r"(?i)^\s+no\s+shutdown\s*$", raw):
+                shut = False
+                continue
             m = _CISCO_IF_BIND.match(raw)
             if m:
-                transit.add(m.group(1))
+                here.add(m.group(1))
                 continue
         m = _ASA_BIND.match(raw)
         if m:
@@ -338,6 +361,10 @@ def _cisco_bindings(text: str) -> Tuple[Set[str], Dict[str, str]]:
             if m:
                 other.setdefault(m.group(1), role)
                 break
+    if in_interface:
+        close()
+    for acl in shut_bound - transit:
+        other.setdefault(acl, _SHUTDOWN_ONLY)
     return transit, other
 
 
@@ -347,7 +374,9 @@ def _role_reasons(acls: Sequence[str], transit: Set[str],
     for acl in acls:
         if acl in transit:
             continue
-        if acl in other:
+        if other.get(acl) == _SHUTDOWN_ONLY:
+            out.append(Reason("acl-role-unknown", f"{acl}: {_SHUTDOWN_ONLY}"))
+        elif acl in other:
             out.append(Reason("acl-not-packet-filter", f"{acl}: {other[acl]}"))
         else:
             out.append(Reason("acl-role-unknown", f"{acl}: no transit binding"))
@@ -372,6 +401,13 @@ def _bypasses(paths: Dict[str, Dict[str, Set[int]]], fam: int) -> List[Reason]:
     carry = [n for n, p in paths.items() if fam in p["fams"]]
     no_in = [n for n in carry if fam not in paths[n]["in"]]
     no_out = [n for n in carry if fam not in paths[n]["out"]]
+    # One interface with neither filter is a bypass on its own: a packet can
+    # arrive on it and be routed back out of it (a hairpin between two
+    # subnets on the same interface, primary and secondary).
+    for n in no_in:
+        if n in no_out:
+            return [Reason("unfiltered-path",
+                           f"IPv{fam}: {n} has no filter in either direction")]
     for i in no_in:
         for e in no_out:
             if i != e:
@@ -408,6 +444,11 @@ def _cisco_paths(text: str) -> Dict[str, Dict[str, Set[int]]]:
 
 _JUNOS_FAMILY = {"inet": {4}, "inet6": {6}, "ethernet-switching": {4, 6},
                  "bridge": {4, 6}, "vpls": {4, 6}}
+# Any other family (mpls, iso, ccc, tcc, ...) is not filtered by an inet or
+# inet6 filter, and traffic it carries can leave as IP (an MPLS label popped
+# here and forwarded out an IP interface), so it counts as a path that admits
+# and emits every IP family unfiltered. It gets its own path entry: an inet
+# filter on the same unit does not cover it.
 
 
 def _junos_paths(text: str) -> Dict[str, Dict[str, Set[int]]]:
@@ -434,9 +475,10 @@ def _junos_paths(text: str) -> Dict[str, Dict[str, Set[int]]]:
             return
         famname = rest[rest.index("family") + 1]
         fams = _JUNOS_FAMILY.get(famname)
-        if not fams:
-            return
         key = f"{ifname}.{unit}"
+        if not fams:
+            fams = {4, 6}
+            key = f"{ifname}.{unit} (family {famname})"
         p = paths.setdefault(key, {"fams": set(), "in": set(), "out": set()})
         p["fams"] |= fams
         if famname in ("inet", "inet6") and "filter" in rest:
