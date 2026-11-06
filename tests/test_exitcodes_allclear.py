@@ -415,3 +415,178 @@ def test_literal_scan_catches_a_planted_all_clear(monkeypatch):
                         {"planted": lambda: "\n".join(planted)})
     found = _literal_scan()
     assert set(found) == {f"planted::{p}" for p in planted}, found
+
+
+# --------------------------------------------------------------------------- #
+# Review of #47: F1, F2, F4 and F5 (red first).
+# --------------------------------------------------------------------------- #
+_ALLCLEAR_PLANTS = {
+    "env-in-certified": (
+        "    return RULEHAWK_CERT == 1 and cert is not None and _require_certified(cert)",
+        "    import os\n    if os.environ.get('RH_FORCE') == '1':\n        return True\n"
+        "    return RULEHAWK_CERT == 1 and cert is not None and _require_certified(cert)"),
+    "env-globals": ("RULEHAWK_CERT = 0\n",
+                    "RULEHAWK_CERT = 0\nimport os as _os\n"
+                    "globals()['RULEHAWK_CERT'] = int(_os.environ.get('RH_C', '0'))\n"),
+    "getenv": ("RULEHAWK_CERT = 0\n",
+               "RULEHAWK_CERT = 0\nfrom os import getenv\n_X = getenv('RH_C')\n"),
+    "argv": ("RULEHAWK_CERT = 0\n", "RULEHAWK_CERT = 0\nimport sys\n_X = sys.argv\n"),
+    "file-read": ("RULEHAWK_CERT = 0\n", "RULEHAWK_CERT = 0\n_X = open('cert').read()\n"),
+    "importlib": ("RULEHAWK_CERT = 0\n",
+                  "RULEHAWK_CERT = 0\n_X = __import__('os').environ\n"),
+    "setattr": ("RULEHAWK_CERT = 0\n",
+                "RULEHAWK_CERT = 0\nsetattr(__import__(__name__), 'x', 1)\n"),
+}
+
+
+def test_allclear_module_is_closed():
+    """F1: allclear.py imports only __future__, typing and .exitcodes, and
+    names no environment, argv, file, import or reflection hook."""
+    assert _allclear_violations(_read(os.path.join("rulehawk", "allclear.py"))) == []
+
+
+@pytest.mark.parametrize("plant", sorted(_ALLCLEAR_PLANTS))
+def test_allclear_closure_catches_a_planted_override(plant):
+    old, new = _ALLCLEAR_PLANTS[plant]
+    src = _read(os.path.join("rulehawk", "allclear.py"))
+    assert src.count(old) == 1
+    assert _allclear_violations(src.replace(old, new)), plant
+
+
+def test_allclear_gate_functions_are_pinned():
+    """F1: the bodies of the gate functions are pinned by AST hash, so any
+    change to them is a reviewed edit of this test."""
+    assert _allclear_fn_hashes(_read(os.path.join("rulehawk", "allclear.py"))) == _ALLCLEAR_FN_SHA
+
+
+def test_allclear_pin_catches_an_edit():
+    old, new = _ALLCLEAR_PLANTS["env-in-certified"]
+    src = _read(os.path.join("rulehawk", "allclear.py")).replace(old, new)
+    assert _allclear_fn_hashes(src) != _ALLCLEAR_FN_SHA
+
+
+def test_scan_catches_a_planted_emission(tmp_path, monkeypatch):
+    """F4: the scan sees emissions as well as spellings."""
+    planted = tmp_path / "planted.py"
+    planted.write_text(
+        "import os, sys\n"
+        "from . import exitcodes as ec, allclear as ac\n"
+        "def a():\n    sys.exit(0)\n"
+        "def b():\n    raise SystemExit(ec.ADVISORY)\n"
+        "def c():\n    os._exit(0)\n"
+        "def d():\n    return ec.HELP\n"
+        "def e():\n    return VERIFIED\n"
+        "def f():\n    os.environ.update(RULEHAWK_SHADOW='1')\n"
+        "def g():\n    os.environ.setdefault('RULEHAWK_CERT', '1')\n"
+        "def h():\n    ac.emit = lambda v, cert=None: v\n"
+        "def i():\n    ac._STOPGAP['PASS'] = 'PASS'\n"
+        "def j():\n    raise SystemExit\n",
+        encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "_PKG", str(tmp_path))
+    hits = _scan_module("planted.py")
+    rules = collections.Counter(k.split("::")[2] for k in hits)
+    assert rules["exit-call-0"] == 4, hits
+    assert rules["exit-code"] >= 2, hits          # ec.ADVISORY, ec.HELP through an alias
+    assert rules["allclear-const"] == 1, hits
+    assert rules["env-set"] == 2, hits
+    assert rules["allclear-write"] == 2, hits
+
+
+@pytest.mark.parametrize("command,argv", [("file", ["--help"]),
+                                          ("gate", ["gate", "--help"]),
+                                          ("combine", ["combine", "--help"])])
+def test_help_rows_say_what_their_code_means(command, argv):
+    """F5: each --help row's meaning matches its code."""
+    from rulehawk import cli
+    _, out = _help(cli.main, argv)
+    assert _help_row_problems(command, out) == []
+
+
+def test_help_row_check_catches_a_swap():
+    text = exitcodes.help_section("file").replace("  1  FAIL:", "  1  UNKNOWN:")
+    assert _help_row_problems("file", text)
+
+
+def test_doc_table_rows_say_what_their_code_means():
+    assert _table_row_problems(exitcodes.markdown_table()) == []
+    swapped = exitcodes.markdown_table().replace("| FAIL | 1 |", "| UNKNOWN | 1 |")
+    assert swapped != exitcodes.markdown_table()
+    assert _table_row_problems(swapped)
+
+
+def test_guard_blocks_are_byte_for_byte_from_e04630e():
+    """F2: #44's guard blocks in the Actions, the hosted page and its glue,
+    as they were at e04630e."""
+    assert _guard_block_problems(_read) == []
+
+
+def test_guard_pin_catches_a_deleted_guard():
+    guard = ('        if [ "${RH_FAIL_ON}" != "none" ]; then\n'
+             '          echo "::error title=RuleHawk gate (fail-closed-stopgap)::RuleHawk exited 0 under fail-on \'${RH_FAIL_ON}\', which this release never does; failing closed (fail-closed stopgap pending soundness review)."\n'
+             '          exit 1\n        fi\n')
+    real = _read("action.yml")
+    assert real.count(guard) == 1
+
+    def read(rel):
+        return real.replace(guard, "") if rel == "action.yml" else _read(rel)
+    assert _guard_block_problems(read)
+
+
+def _step_run(rel: str, step: str) -> str:
+    """The `run: |` script of the named step, dedented."""
+    lines = _read(rel).splitlines()
+    i = next(n for n, l in enumerate(lines) if l.strip() == f"- name: {step}")
+    j = next(n for n in range(i + 1, len(lines)) if lines[n].strip() == "run: |")
+    body = []
+    for l in lines[j + 1:]:
+        if l.strip() and not l.startswith(" " * 8):
+            break
+        body.append(l[8:])
+    return "\n".join(body) + "\n"
+
+
+def _bash(script: str, env: dict):
+    import shutil
+    import subprocess
+    if not shutil.which("bash"):
+        pytest.skip("bash not available")
+    e = {"PATH": os.environ.get("PATH", "")}
+    e.update(env)
+    r = subprocess.run(["bash", "-c", script], env=e, capture_output=True, text=True)
+    return r.returncode, r.stdout
+
+
+@pytest.mark.parametrize("rc,fail_on,want", [
+    (None, "high", 1), ("", "high", 1), ("1", "high", 1), ("2", "high", 1),
+    ("3", "high", 1), ("5", "high", 1),
+    ("0", "critical", 1), ("0", "high", 1), ("0", "medium", 1), ("0", "low", 1),
+    ("0", "none", 0),
+])
+def test_action_enforce_step_fails_closed(rc, fail_on, want):
+    """F2: action.yml's Enforce step under bash: every code but an advisory
+    exit 0 fails the step, and an enforced exit 0 fails closed."""
+    env = {"RH_FAIL_ON": fail_on, "RH_WORST": "none", "RH_VERDICT": "UNKNOWN"}
+    if rc is not None:
+        env["RH_RC"] = rc
+    code, out = _bash(_step_run("action.yml", "Enforce gate verdict"), env)
+    assert code == want, (rc, fail_on, out)
+    if want == 0:
+        assert "::warning" in out and "not enforced" in out
+
+
+@pytest.mark.parametrize("enforced,verdict,want", [
+    (None, "FAIL", 1), ("UNKNOWN", "UNKNOWN", 1), ("FAIL", "FAIL", 1),
+    ("PASS", None, 1), ("PASS", "", 1), ("PASS", "PASS", 1),
+    ("PASS", "PASS (not enforced)", 1),
+    ("PASS", "FAIL (not enforced)", 0), ("PASS", "UNKNOWN (not enforced)", 0),
+])
+def test_comment_enforce_step_fails_closed(enforced, verdict, want):
+    """F2: comment/action.yml's Enforce step under bash."""
+    env = {}
+    if enforced is not None:
+        env["RH_ENFORCED"] = enforced
+    if verdict is not None:
+        env["RH_VERDICT"] = verdict
+    code, out = _bash(_step_run(os.path.join("comment", "action.yml"),
+                                "Enforce the combined verdict"), env)
+    assert code == want, (enforced, verdict, out)

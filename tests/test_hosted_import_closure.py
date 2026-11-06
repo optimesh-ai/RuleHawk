@@ -63,3 +63,18 @@ def test_worker_loads_the_full_import_closure():
         f"docs/worker.js ENGINE_MODULES is missing {missing} — the hosted "
         f"tool will crash at `import rulehawk`. Add them to the list."
     )
+
+
+def test_closure_reader_sees_every_top_level_import_form():
+    """Review of #47, F6: a trailing comment, an alias or a parenthesised
+    list must not hide an import from the closure; an indented (lazy) import
+    stays out of it."""
+    text = (
+        "from . import allclear, exitcodes  # noqa: F401\n"
+        "from .report import x  # noqa\n"
+        "from . import (\n    boundary,\n    model as m,  # why\n)\n"
+        "from .gate import (y,\n    z)\n"
+        "def f():\n    from .cli import main\n"
+    )
+    assert _imports_of_text(text) == {"allclear", "exitcodes", "report",
+                                      "boundary", "model", "gate"}
