@@ -129,6 +129,26 @@ REASONS: Dict[str, str] = {
     "nftables-unsupported":
         "the input looks like an nftables ruleset, which RuleHawk does not "
         "read",
+    "nftables-present":
+        "nftables text is present next to the parsed rules; RuleHawk does not "
+        "read nftables, whose chains can accept, drop or forward a packet "
+        "before or after the parsed ones",
+    "acl-binding-negated":
+        "a filter binding is removed or deactivated (`no ip access-group`, "
+        "`no ipv6 traffic-filter`, `no access-class`, Junos `inactive:` / "
+        "`deactivate` / `delete` on an interface filter or a filter); the "
+        "removal is not applied, so which interfaces are filtered is unknown",
+    "nat-present":
+        "NAT is configured (Cisco `ip nat`, ASA `nat`/`static`, PAN-OS NAT "
+        "rulebase, Junos NAT, iptables nat table); addresses are checked "
+        "before translation only, so a translated flow may reach the zone",
+    "object-scope-ambiguous":
+        "a PAN-OS object name is defined in more than one vsys / "
+        "device-group / shared scope; objects are not resolved per scope",
+    "reach-not-every-context":
+        "one audited rule context permits the whole flow but another denies "
+        "part of it; which contexts are on the path is not modelled, so "
+        "connectivity is not proven",
     "acl-family-mismatch":
         "part of the flow space reaches the end of a rule context that has "
         "no rule of the packet's address family; such a context may not "
@@ -609,6 +629,78 @@ def _panos_unmodeled_fields(text: str) -> List[str]:
     return found
 
 
+# A removed or deactivated binding (review of #42, round 3, H1/H2). The
+# removal is not applied; any such line makes which interfaces are filtered
+# unknown.
+_CISCO_NEGATED_BIND = re.compile(
+    r"(?im)^\s*no\s+(?:(?:ip|ipv4|ipv6)\s+(?:port\s+)?"
+    r"(?:access-group|traffic-filter|access-class)|access-group|access-class|"
+    r"ipv6\s+port\s+traffic-filter)\b.*$")
+_JUNOS_SET_NEGATED = re.compile(
+    r"(?m)^\s*(?:deactivate|delete)\s+(?:logical-systems\s+\S+\s+)?"
+    r"(?:interfaces\b|firewall\s+(?:family\s+\S+\s+)?filter\s+\S+\s*$).*$")
+
+# NAT (M1, H8): addresses are checked before translation only.
+_NAT = {
+    "cisco": re.compile(
+        r"(?im)^\s*(?:ip|ipv6)\s+nat\s+(?:inside|outside|source|destination|"
+        r"pool|enable|static)\b|^\s*nat\s*\(|^\s*static\s*\(|^\s*nat64\b"),
+    "panos": re.compile(r"(?m)^\s*set\s.*\b(?:pre-|post-)?rulebase\s+nat\b"),
+    "junos": re.compile(
+        r"(?m)^\s*(?:set\s+(?:\S+\s+)*?(?:security|services)\s+nat\b|"
+        r"nat\s*\{)"),
+    "iptables": re.compile(r"(?m)^\s*\*nat\b|(?:^|\s)(?:-t|--table)\s+nat\b"),
+}
+# nftables text anywhere in the input (H7).
+_NFT_ANY = re.compile(
+    r"(?m)^\s*(?:sudo\s+)?(?:nft\s|table\s+(?:inet|ip6?|arp|bridge|netdev)\s+"
+    r"\S+\s*\{|flush\s+ruleset\b)")
+_PANOS_OBJECT = re.compile(
+    r"(?m)^\s*set\s+(?:(shared)\s+|(vsys|device-group)\s+(\S+)\s+)?"
+    r"(address|address-group|service|service-group)\s+(\S+)")
+
+
+def _panos_scope_collisions(text: str) -> List[str]:
+    where: Dict[Tuple[str, str], Set[str]] = {}
+    for m in _PANOS_OBJECT.finditer(text):
+        scope = m.group(1) or (f"{m.group(2)} {m.group(3)}" if m.group(2) else "")
+        where.setdefault((m.group(4), m.group(5).strip('"')), set()).add(scope)
+    return [f"{k} {n}" for (k, n), sc in sorted(where.items()) if len(sc) > 1]
+
+
+def _junos_inactive(text: str) -> List[str]:
+    """Where an `inactive:` marks an interface, unit, family, filter binding
+    or a whole filter (terms are modelled by the parser and noted)."""
+    from .parse_junos import _tokenize
+    out: List[str] = []
+    stack: List[List[str]] = []
+    stmt: List[str] = []
+    pending = False
+    for t in _tokenize(text):
+        if t == "inactive:":
+            pending = True
+            continue
+        if t in ("{", ";"):
+            if pending:
+                path = [w for part in stack for w in part] + stmt
+                if ("interfaces" in path or "firewall" in path) and \
+                        "term" not in stmt[:1]:
+                    out.append(" ".join(path))
+                pending = False
+            if t == "{":
+                stack.append(stmt)
+            stmt = []
+        elif t == "}":
+            if stack:
+                stack.pop()
+            stmt = []
+        else:
+            stmt.append(t)
+    for m in _JUNOS_SET_NEGATED.finditer(text):
+        out.append(m.group(0).strip())
+    return out
+
+
 _ALL_ONES_NONZERO = re.compile(
     r"(?im)^\s*(?:access-list\s+\S+\s+)?(?:\d+\s+)?(?:permit|deny)\b.*?"
     r"\b(?!0\.0\.0\.0\b)\d{1,3}(?:\.\d{1,3}){3}\s+255\.255\.255\.255\b")
@@ -634,6 +726,9 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
         b.append(Reason("no-rules-parsed"))
         if _NFT.search(text):
             b.append(Reason("nftables-unsupported"))
+    elif _NFT_ANY.search(text):
+        b.append(Reason("nftables-present",
+                        _NFT_ANY.search(text).group(0).strip()[:60]))
     if notes:
         first = str(notes[0])
         if len(first) > 160:
@@ -646,6 +741,12 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
     if v in _CISCO:
         from .parse import strip_banners
         text = strip_banners(text)[0]          # banner text is not config
+        neg = _CISCO_NEGATED_BIND.search(text)
+        if neg:
+            b.append(Reason("acl-binding-negated", neg.group(0).strip()))
+        if _NAT["cisco"].search(text):
+            b.append(Reason("nat-present",
+                            _NAT["cisco"].search(text).group(0).strip()))
         transit, other = _cisco_bindings(text)
         role = _role_reasons(acls, transit, other)
         b += role
@@ -683,6 +784,11 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
             ctx.v6_blockers.append(Reason("icmpv6-canonicalisation"))
         ctx.v6_icmp_fallthrough.append(Reason("ipv6-implicit-nd"))
     elif v == "junos":
+        inactive = _junos_inactive(text)
+        if inactive:
+            b.append(Reason("acl-binding-negated", inactive[0][:120]))
+        if _NAT["junos"].search(text):
+            b.append(Reason("nat-present"))
         transit, other = _junos_bindings(text)
         _path_blockers(ctx, _junos_paths(text))
         b += _role_reasons(acls, transit, other)
@@ -698,6 +804,11 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
         if re.search(r"(?m)^\s*(?:set\s+)?groups\b|\bapply-groups\b", text):
             b.append(Reason("junos-groups"))
     elif v == "panos":
+        if _NAT["panos"].search(text):
+            b.append(Reason("nat-present", "PAN-OS NAT rulebase"))
+        coll = _panos_scope_collisions(text)
+        if coll:
+            b.append(Reason("object-scope-ambiguous", ", ".join(coll)))
         if "default-security-rules" in text:
             b.append(Reason("panos-default-security-rules"))
         fields = _panos_unmodeled_fields(text)
@@ -718,10 +829,18 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
             b.append(Reason("ip6tables-family"))
         if re.search(r"(?m)(?:^|\s)(?:-D|--delete)\s+\S+", text):
             b.append(Reason("iptables-delete"))
-        if any(a.acl == "FORWARD" for a in transit_aces) and not re.search(
-                r"(?m)(?:^|\s)(?:-P|--policy)\s+FORWARD\s|^\s*:FORWARD\s+(?:ACCEPT|DROP)\b",
+        if _NAT["iptables"].search(text):
+            b.append(Reason("nat-present", "iptables nat table"))
+        # Every forwarded packet crosses FORWARD, whatever chain the rules are
+        # in: with no FORWARD policy anywhere, its kernel default ACCEPT
+        # decides whatever the parsed rules do not (H3: a user chain nothing
+        # jumps to, and no FORWARD rule at all).
+        if aces and not re.search(
+                r"(?m)(?:^|\s)(?:-P|--policy)\s+FORWARD\s+(?:ACCEPT|DROP)\b|"
+                r"^\s*:FORWARD\s+(?:ACCEPT|DROP)\b",
                 text):
-            b.append(Reason("iptables-chain-policy-unset", "FORWARD"))
+            b.append(Reason("iptables-chain-policy-unset",
+                            "FORWARD has no policy: the kernel default is ACCEPT"))
         ctx.fallthrough.append(Reason("iptables-chain-policy-unset",
                                       "the search reached the end of a chain"))
         l4 = [x for x in transit_aces if _is_l4(x)]
@@ -748,7 +867,7 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
 # What every positive verdict rests on, stated with it (review of #42, F8).
 PASS_SCOPE = ("no audited ruleset permits this flow; assumes every interface is "
               "in the file; routing, NAT and topology not evaluated")
-REACH_SCOPE = ("an audited ruleset permits the whole flow; assumes every "
+REACH_SCOPE = ("every audited ruleset permits the whole flow; assumes every "
                "interface is in the file; routing, NAT and topology not "
                "evaluated")
 

@@ -504,10 +504,12 @@ def test_two_vsys_are_independent_contexts_deny_not_lost():
 
 
 def test_two_vsys_independent_must_reach_not_merged():
-    # must_reach direction: each vsys is its own first-match context. vsys2 fully
-    # permits CORP->PCI, so the path is OPEN (connectivity-ok) regardless of
-    # vsys1's deny. Merging the two into one ACL would put vsys1's deny in front
-    # of vsys2's permit and falsely report the flow BROKEN.
+    # must_reach direction: each vsys is its own first-match context. Merging
+    # the two into one ACL would put vsys1's deny in front of vsys2's permit
+    # and falsely report the flow BROKEN. vsys2 permits the whole flow but
+    # vsys1 denies it, and which vsys the flow crosses is not modelled, so
+    # connectivity is not proven either: UNKNOWN (review of #42, round 3, H4;
+    # this test asserted connectivity-ok before).
     cfg = """
     set vsys vsys1 rulebase security rules block from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action deny
     set vsys vsys2 rulebase security rules allow from any to any source 10.20.0.0/16 destination 10.10.0.0/16 application any service any action allow
@@ -517,10 +519,13 @@ def test_two_vsys_independent_must_reach_not_merged():
     pol = {"zones": _SEG_POLICY["zones"],
            "must_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp",
                            "ports": [443]}]}
-    kinds = {f.kind for f in check_segmentation(aces, pol)}
-    assert "connectivity-ok" in kinds, (
-        "vsys2 independently permits the whole flow -> path is open")
+    found = check_segmentation(aces, pol)
+    kinds = {f.kind for f in found}
+    assert "connectivity-ok" not in kinds, kinds
     assert "connectivity-broken" not in kinds
+    unk = [f for f in found if f.kind == "connectivity-unknown"]
+    assert unk and unk[0].verdict == "UNKNOWN"
+    assert "reach-not-every-context" in {r["code"] for r in unk[0].reasons}
 
 
 def test_device_group_scope_is_independent_context():

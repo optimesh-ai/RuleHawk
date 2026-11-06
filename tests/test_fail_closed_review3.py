@@ -207,7 +207,7 @@ def test_no_frontend_drops_a_line_without_a_note(kind):
     for line in list(_junk_lines(20261106, 300)) + [
             "delete x", "edit x", "rename a to b", "move x top", "up", "top",
             "exit", "}", "{", ";", "table netdev t {", "chain c {",
-            "COMMITX", ":", "-X", "-Z FORWARD", "set", "set x"]:
+            "COMMITX", ":", "-X", "-E A B", "set", "set x"]:
         _, notes = _parse(kind, base + line + "\n")
         new = [x for x in notes if x not in base_notes]
         if not any(f"line {n}" in x for x in new):

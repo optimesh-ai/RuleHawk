@@ -537,6 +537,31 @@ def check_segmentation(aces: List[ACE], policy: dict, *,
                         witness=wit,
                         line=rule.line,
                         verdict="PASS", reasons=[]))
+                elif kind == "partial":
+                    rule, wit, hole_acl, hole = info
+                    hsrc, hdst, hport, hprobe = hole
+                    psfx = f":{hport}" if hport is not None else ""
+                    blk = reason_dicts(
+                        [Reason("reach-not-every-context",
+                                f"{rule.acl} permits it, {hole_acl} denies "
+                                f"{hsrc} -> {hdst}{psfx}")]
+                        + _blockers(sname, dname, proto, set(), reach=True))
+                    findings.append(Finding(
+                        label, "connectivity-unknown", "medium",
+                        f"UNKNOWN ({sname} must reach {dname}{scope}): "
+                        f"{rule.acl} permits the whole flow (e.g. {wit}), but "
+                        f"{hole_acl} denies {hsrc} -> {hdst}{psfx} ({hprobe}), "
+                        f"and which rule contexts are on the path is not "
+                        f"modelled — {len(blk)} reason(s): "
+                        f"{_reason_summary(blk)}. This is NOT a connectivity OK.",
+                        rule.raw,
+                        fix=f"permit the flow in {hole_acl} too, or verify it "
+                            f"on the device",
+                        line=rule.line,
+                        claim={"direction": direction, "src": sname,
+                               "dst": dname, "proto": proto,
+                               "ports": assertion.get("ports")},
+                        verdict="UNKNOWN", reasons=blk))
                 elif kind == "indeterminate":
                     rule, acl_name = info
                     if rule is not None:
@@ -738,17 +763,21 @@ def _prove_reach(aces: List[ACE], by_acl: Dict[str, List[ACE]],
       ("ok",            (rule, witness-string))
       ("indeterminate", (rule_or_None, acl_name))
       ("broken",        (hole_src, hole_dst, hole_port, probe))
-    Preference order: ok > indeterminate > broken. A single scoped context (the
-    documented usage — one policy per config that owns the path) has no
-    ambiguity; with several transit contexts, ANY fully-permitting one proves an
-    open path (mirrors how must_not_reach treats any permitting context as a
-    leak)."""
+      ("partial",       (rule, witness-string, acl_name, hole))
+    Connectivity is proven only when EVERY audited context permits the whole
+    flow: which contexts sit on the path is not modelled, so one context that
+    denies part of it (an egress ACL on the destination interface, say) may
+    drop the flow (review of #42, round 3, H4). Some contexts permitting and
+    another denying is "partial" (UNKNOWN). Any undecidable context is
+    "indeterminate"; every context with a hole is "broken"."""
     probes = _reach_probes(aces, proto, ports)
     combos = [(sa, db, port, probe) for sa in sa_nets for db in db_nets
               for port in ports for probe in probes]
     best_indet = None       # (rule_or_None, acl_name)
     first_hole = None       # (src, dst, port, probe)
     witness = None          # from any clean combo, for the ok message
+    n_clean = 0             # contexts that permit the whole flow
+    hole_acl = None
     for acl_name, acl_aces in by_acl.items():
         ctx_hole = None
         ctx_indet = None
@@ -776,15 +805,18 @@ def _prove_reach(aces: List[ACE], by_acl: Dict[str, List[ACE]],
                         port, probe)
             break
         if ctx_hole is None and ctx_indet is None:
-            # this context permits the WHOLE flow -> proven reachable
-            if witness is not None:
-                return ("ok", witness)
+            n_clean += 1                 # this context permits the WHOLE flow
         if ctx_indet is not None and best_indet is None:
             best_indet = ctx_indet
         if ctx_hole is not None and first_hole is None:
             first_hole = ctx_hole
+            hole_acl = acl_name
     if best_indet is not None:
         return ("indeterminate", best_indet)
+    if n_clean and first_hole is None and witness is not None:
+        return ("ok", witness)
+    if n_clean and first_hole is not None and witness is not None:
+        return ("partial", (witness[0], witness[1], hole_acl, first_hole))
     if first_hole is not None:
         return ("broken", first_hole)
     # No context had a hole or indeterminate, yet none was recorded clean with a

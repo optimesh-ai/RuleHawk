@@ -715,6 +715,16 @@ def _resolve_transit_jump(
     return result  # empty = chain matched nothing → all traffic falls through
 
 
+# nftables text (a ruleset file, a `nft` command, or the nft list output):
+# not read by this frontend.
+_NFT_LINE = re.compile(
+    r"^(?:sudo\s+)?(?:nft\b|table\s+(?:inet|ip6?|arp|bridge|netdev)\s+\S+"
+    r"\s*\{|flush\s+ruleset\b|chain\s+\S+\s*\{)")
+# Verbs that never change filtering: -Z zeroes counters, -L / -S list rules.
+_READ_ONLY = frozenset({"-Z", "--zero", "-L", "--list", "-S", "--list-rules"})
+_MAX_LINE_NOTES = 20
+
+
 def _strip_command(line: str) -> Optional[str]:
     """For the command form, drop a leading `iptables`/`ip6tables` (and `sudo`).
     Return the remaining args string, or None if the line isn't an ip(6)tables
@@ -876,6 +886,9 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             return _Item(None, line)
         return _Item(r, line)
 
+    def pol_ok(pol: str) -> bool:
+        return pol.upper() in _TERMINATING
+
     def set_policy(ch: str, pol: str, line: int = 0) -> None:
         act = _TERMINATING.get(pol.upper())
         if act is not None:
@@ -883,12 +896,36 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             policy_lines[ch] = line
             ensure_chain(ch)
 
+    # Every line is consumed by a modelled handler or gets a note (review of
+    # #42, round 3). `consumed` holds the handled line numbers; the rest are
+    # noted after the loop. nftables text has no frontend: its blocks are
+    # noted once each (failclosed also blocks them as nftables-present).
+    consumed: set = set()
+    foreign: set = set()
+    nft_depth = 0
     for lineno, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
 
+        if nft_depth > 0:
+            consumed.add(lineno)
+            nft_depth += line.count("{") - line.count("}")
+            continue
+        if _NFT_LINE.match(line):
+            consumed.add(lineno)
+            notes.append(f"nftables text at line {lineno} (`{line[:60]}`) — "
+                         f"RuleHawk does not read nftables; its rules can accept, "
+                         f"drop or forward packets before or after these iptables "
+                         f"chains")
+            nft_depth = max(0, line.count("{") - line.count("}"))
+            continue
+
         if line.startswith("*"):                 # iptables-save table header
+            if len(line.split()) != 1 or len(line) == 1:
+                notes.append(f"malformed iptables-save table header at line "
+                             f"{lineno}: `{line[:60]}` — read as `*filter`")
+            consumed.add(lineno)
             table = line[1:].strip().split()[0] if len(line) > 1 else "filter"
             table_is_filter = (table == "filter")
             if table_is_filter:
@@ -903,19 +940,26 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                                  f"modeled as replacing each other")
             if not table_is_filter and table not in other_tables_noted:
                 other_tables_noted.add(table)
-                notes.append(f"iptables '{table}' table present — not modeled "
-                             f"(filter-space only; review NAT/mangle/raw manually)")
+                notes.append(f"iptables '{table}' table present (line {lineno}) — "
+                             f"not modeled (filter-space only; review "
+                             f"NAT/mangle/raw manually)")
             continue
         if line.upper() == "COMMIT":
+            consumed.add(lineno)
             continue
 
         if line.startswith(":"):                 # save-form chain + default policy
-            if not table_is_filter:
-                continue
             parts = line[1:].split()
+            if not table_is_filter:
+                if parts:
+                    consumed.add(lineno)         # the *table header was noted
+                continue
             if len(parts) >= 2 and parts[0] in _BASE_CHAINS:
+                if pol_ok(parts[1]):
+                    consumed.add(lineno)
                 set_policy(parts[0], parts[1], lineno)
-            elif len(parts) >= 1:
+            elif len(parts) >= 1 and parts[0] not in _BASE_CHAINS:
+                consumed.add(lineno)
                 ensure_chain(parts[0])           # custom chain declaration
             continue
 
@@ -931,6 +975,13 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             unreliable = True                # see parse_one: fail closed
         if not toks:
             continue
+        if cmd is None and not toks[0].startswith("-"):
+            # Not an iptables line (a shell line, `$IPT -A ...`). One that
+            # carries an iptables verb is still parsed (a FAIL it shows is
+            # real), but it is never consumed: what runs it is unknown.
+            foreign.add(lineno)
+            if not _OPS & set(toks):
+                continue
 
         # Honor an explicit `-t TABLE` (command form); default table is filter.
         # Only on a line that is an iptables operation: in a shell script,
@@ -941,21 +992,25 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             tbl = toks[k + 1] if k + 1 < len(toks) else "filter"
             del toks[k:k + 2]
             if tbl != "filter":
+                consumed.add(lineno)
                 if tbl not in other_tables_noted:
                     other_tables_noted.add(tbl)
-                    notes.append(f"iptables '{tbl}' table rule present — not modeled "
-                                 f"(filter-space only; review manually)")
+                    notes.append(f"iptables '{tbl}' table rule present (line "
+                                 f"{lineno}) — not modeled (filter-space only; "
+                                 f"review manually)")
                 continue
         elif not table_is_filter:
             # ANY rule line (save-form `-A ...` or command form) inside a
             # *nat/*mangle/*raw block: the `*table` header already surfaced the
             # block — skip; a nat ACCEPT must never become a filter permit.
+            consumed.add(lineno)
             continue
 
         # Dispatch the action verb.
         if "-A" in toks or "--append" in toks:
             k = toks.index("-A") if "-A" in toks else toks.index("--append")
             if k + 1 < len(toks):
+                consumed.add(lineno)
                 ch = toks[k + 1]
                 ensure_chain(ch)
                 items_by_chain[ch].append(parse_one(ch, toks[k + 2:], lineno,
@@ -969,6 +1024,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             # is treated as 1 (front).
             k = toks.index("-I") if "-I" in toks else toks.index("--insert")
             if k + 1 < len(toks):
+                consumed.add(lineno)
                 ch = toks[k + 1]
                 args = toks[k + 2:]
                 pos = None
@@ -990,6 +1046,8 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
         elif "-P" in toks or "--policy" in toks:
             k = toks.index("-P") if "-P" in toks else toks.index("--policy")
             if k + 2 < len(toks):
+                if pol_ok(toks[k + 2]):
+                    consumed.add(lineno)
                 set_policy(toks[k + 1], toks[k + 2], lineno)
         elif "-R" in toks or "--replace" in toks:
             # Replace the rule currently at 1-based position N in place, so the
@@ -997,6 +1055,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             # missing) index fails safe: append at the end + surface the note.
             k = toks.index("-R") if "-R" in toks else toks.index("--replace")
             if k + 1 < len(toks):
+                consumed.add(lineno)
                 ch = toks[k + 1]
                 args = toks[k + 2:]
                 pos = None
@@ -1021,6 +1080,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             # Delete: removal not modeled — the deleted rule (if parsed earlier)
             # stays in the analysis. Surfaced, never silent.
             k = toks.index("-D") if "-D" in toks else toks.index("--delete")
+            consumed.add(lineno)
             ch = toks[k + 1] if k + 1 < len(toks) else "?"
             notes.append(f"iptables `-D {ch}` delete not modeled — the deleted "
                          f"rule may still appear in the analysis (verify manually)")
@@ -1030,6 +1090,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             # jump placeholders they carried go with them: deferred expansion
             # never sees flushed rules, so no stale pending resolution survives.
             k = toks.index("-F") if "-F" in toks else toks.index("--flush")
+            consumed.add(lineno)
             ch = toks[k + 1] if k + 1 < len(toks) else None
             if ch is not None:
                 if ch in items_by_chain:
@@ -1044,8 +1105,25 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
         elif "-N" in toks or "--new-chain" in toks:
             k = toks.index("-N") if "-N" in toks else toks.index("--new-chain")
             if k + 1 < len(toks):
+                consumed.add(lineno)
                 ensure_chain(toks[k + 1])
-        # -X/-Z and others: no rule contribution; ignored.
+        elif _READ_ONLY & set(toks) and not (_OPS - _READ_ONLY) & set(toks):
+            # -Z zeroes counters, -L / -S list: none changes filtering.
+            consumed.add(lineno)
+        # Anything else (-X, -E, a shell line, an unknown verb) is noted below.
+
+    missed = [(n, ln.strip()) for n, ln in enumerate(text.splitlines(), 1)
+              if ln.strip() and not ln.strip().startswith("#")
+              and (n not in consumed or n in foreign)]
+    for n, ln in missed[:_MAX_LINE_NOTES]:
+        # Only the first word is quoted: the rest of a shell line can look
+        # like an iptables option (`ssh -t "su -"`) and must not read as one.
+        notes.append(f"unmodeled line {n} (`{ln.split()[0][:40]} ...`) — not an "
+                     f"iptables filter rule, policy or chain RuleHawk models, so "
+                     f"it cannot tell what the line changes")
+    if len(missed) > _MAX_LINE_NOTES:
+        notes.append(f"... and {len(missed) - _MAX_LINE_NOTES} more unmodeled "
+                     f"line(s)")
 
     # ── Expansion: materialize each chain's ACEs in device (first-match) order.
     # Deferred until now so the -A/-I/-R splices above have already fixed each
