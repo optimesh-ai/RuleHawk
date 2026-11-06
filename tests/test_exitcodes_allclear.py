@@ -179,6 +179,33 @@ _EXIT_CALLS = {"sys.exit", "exit", "quit", "SystemExit", "os._exit", "_exit"}
 _ENV_WRITES = {"update", "setdefault", "__setitem__", "pop", "putenv", "clear"}
 
 
+def _const_use(node, par):
+    """(rule, text) for one use of an all-clear module constant, by what the
+    use does (review of #47, R2-F2). A plain `==`/`!=` comparison is a read; a
+    definition, a write, a return, a dict key or value each has its own rule
+    and names its target, so an edit that turns one into another, or widens a
+    read (`in (VERIFIED, ...)`), changes the pinned Counter."""
+    c, p = node.id, par.get(node)
+    if isinstance(node.ctx, ast.Store):
+        return "allclear-const-def", c
+    if isinstance(p, ast.Compare) and len(p.ops) == 1 \
+            and isinstance(p.ops[0], (ast.Eq, ast.NotEq)) and node in [p.left] + p.comparators:
+        other = p.comparators[0] if node is p.left else p.left
+        op = "==" if isinstance(p.ops[0], ast.Eq) else "!="
+        return "allclear-const-read", f"{ast.unparse(other)} {op} {c}"[:72]
+    if isinstance(p, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and p.value is node:
+        tg = p.targets if isinstance(p, ast.Assign) else [p.target]
+        return "allclear-const-write", f"{' = '.join(ast.unparse(t) for t in tg)} = {c}"[:72]
+    if isinstance(p, ast.Return):
+        return "allclear-const-return", c
+    if isinstance(p, ast.Dict):
+        if node in p.keys:
+            return "allclear-const-dictkey", c
+        k = p.keys[p.values.index(node)]
+        return "allclear-const-dictval", f"{ast.unparse(k) if k else '**'}: {c}"[:72]
+    return "allclear-const", c
+
+
 def _module_aliases(tree, module: str) -> set:
     """Local names bound to rulehawk.<module> (`from . import x as y`)."""
     names = {module}
@@ -247,7 +274,7 @@ def _scan_module(name: str):
                         and isinstance(v, ast.Constant) and v.value is True:
                     hit(node, "passed-true", '"passed": True')
         elif isinstance(node, ast.Name) and node.id in ("PASS", "VERIFIED", "NO_NEW_RISK"):
-            hit(node, "allclear-const", node.id)          # F4: a module constant
+            hit(node, *_const_use(node, par))             # F4: a module constant
         elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             if node.value.id in ec and node.attr in _EXIT_NAMES:
                 hit(node, "exit-code", f"exitcodes.{node.attr}")
@@ -438,18 +465,23 @@ _EXEMPT = collections.Counter({
     "gate.py::GateResult.exit_code::exit-code::exitcodes.ADVISORY": 1,
     "combine.py::<module>::exit-code::exitcodes.ADVISORY": 1,
     # exitcodes.py's own PASS exit-code constant: its definition, the PASS
-    # row's three cells and the precedence line of the doc table. Text only;
-    # nothing returns it.
-    "exitcodes.py::<module>::allclear-const::PASS": 4,
+    # row's three cells (str(PASS)) and the precedence line of the doc table.
+    # Text only; nothing returns it.
+    "exitcodes.py::<module>::allclear-const-def::PASS": 1,
+    "exitcodes.py::<module>::allclear-const::PASS": 3,
     "exitcodes.py::markdown_table::allclear-const::PASS": 1,
-    # evidence.py's VERIFIED status constant: its definition and
-    # _STATUS_MARK key; comparisons that read a status; and the control
-    # roll-up, which copies VERIFIED only from an attestation that already
-    # holds it, which only allclear.emit can give.
-    "evidence.py::<module>::allclear-const::VERIFIED": 2,
-    "evidence.py::build_attestations::allclear-const::VERIFIED": 2,
-    "evidence.py::_control_rollup::allclear-const::VERIFIED": 2,
-    "evidence.py::build_evidence::allclear-const::VERIFIED": 1,
+    # evidence.py's VERIFIED status constant, by use (review of #47, R2-F2):
+    # its definition and _STATUS_MARK key; four `== VERIFIED` reads of a
+    # status; and one write, the control roll-up, which copies VERIFIED only
+    # under `a['status'] == VERIFIED` (an attestation that already holds it,
+    # which only allclear.emit can give).
+    "evidence.py::<module>::allclear-const-def::VERIFIED": 1,
+    "evidence.py::<module>::allclear-const-dictkey::VERIFIED": 1,
+    "evidence.py::build_attestations::allclear-const-read::p['status'] == VERIFIED": 1,
+    "evidence.py::build_attestations::allclear-const-read::status == VERIFIED": 1,
+    "evidence.py::_control_rollup::allclear-const-read::a['status'] == VERIFIED": 1,
+    "evidence.py::_control_rollup::allclear-const-write::s['status'] = VERIFIED": 1,
+    "evidence.py::build_evidence::allclear-const-read::a['status'] == VERIFIED": 1,
     # allclear.certified(): the two sites that ask whether a file is
     # certified (review of #48, L2). to_sarif skips a file's
     # rulehawk/uncertified note only if it is; _coverage counts the files that
@@ -682,6 +714,90 @@ def test_allclear_pin_catches_an_edit():
     assert _allclear_fn_hashes(src) != _ALLCLEAR_FN_SHA
 
 
+# --------------------------------------------------------------------------- #
+# Review of #47, round 2: R2-F1 (the closure, red first). Each plant leaves the
+# hashed definitions alone and reaches the environment through allowed names.
+# Every part of the closure must catch every plant on its own.
+# --------------------------------------------------------------------------- #
+_ALLCLEAR_ON = ("def _on():\n    return Optional.__repr__.__globals__['sys'].modules['os']"
+                ".environb.get(b'RH_FORCE') == b'1'\n\n\n")
+_ALLCLEAR_LAST = "    return exitcodes.PASS if passed(cert) else exitcodes.UNKNOWN\n"
+_ALLCLEAR_EMIT = "def emit(verdict: str, cert: Optional[object] = None) -> str:\n"
+_ALLCLEAR_R2_PLANTS = {
+    "R4-module-if": (_ALLCLEAR_LAST, _ALLCLEAR_LAST + "\n\n" + _ALLCLEAR_ON
+                     + "if _on():\n    _STOPGAP.update({k: k for k in list(_STOPGAP)})\n"),
+    "R5-decorator": (_ALLCLEAR_EMIT, _ALLCLEAR_ON
+                     + "def _w(f):\n    def g(verdict, cert=None):\n"
+                     "        return verdict if _on() else f(verdict, cert)\n    return g\n\n\n"
+                     "@_w\n" + _ALLCLEAR_EMIT),
+    "R6-code-swap": (_ALLCLEAR_LAST, _ALLCLEAR_LAST + "\n\n" + _ALLCLEAR_ON
+                     + "certified.__code__ = (lambda cert=None: _on()).__code__\n"),
+    "R7-stopgap-write": (_ALLCLEAR_LAST, _ALLCLEAR_LAST + "\n\n_STOPGAP[PASS] = PASS\n"),
+}
+
+
+def _allclear_closure():
+    return {"names": _allclear_violations, "shape": _allclear_shape_problems,
+            "file-pin": _allclear_pin_problems}
+
+
+@pytest.mark.parametrize("copy", ["rulehawk", os.path.join("docs", "rulehawk")])
+def test_allclear_closure_holds_on_both_copies(copy):
+    src = _read(os.path.join(copy, "allclear.py"))
+    assert src == _read(os.path.join("rulehawk", "allclear.py"))
+    for part, check in _allclear_closure().items():
+        assert check(src) == [], part
+
+
+# R7 names no hook, so the names part has nothing to see; shape and file-pin
+# catch it (and the emit tests, behaviourally).
+@pytest.mark.parametrize("plant,part", [
+    (p, c) for p in sorted(_ALLCLEAR_R2_PLANTS) for c in ("names", "shape", "file-pin")
+    if (p, c) != ("R7-stopgap-write", "names")])
+def test_allclear_closure_catches_round_2_plants(plant, part):
+    old, new = _ALLCLEAR_R2_PLANTS[plant]
+    src = _read(os.path.join("rulehawk", "allclear.py"))
+    assert src.count(old) == 1
+    planted = src.replace(old, new)
+    ast.parse(planted)
+    assert _allclear_closure()[part](planted), (plant, part)
+
+
+# R2-F2: a VERIFIED read that widens (== to `in (VERIFIED, INDETERMINATE)`,
+# so INDETERMINATE attestations count as verified controls) must change the
+# pinned scan, not only fail behaviourally.
+_R9 = ('            if a["status"] == VERIFIED:\n                s["verified"] += 1\n',
+       '            if a["status"] in (VERIFIED, INDETERMINATE):\n                s["verified"] += 1\n')
+
+
+def test_scan_catches_a_widened_verified_read(tmp_path, monkeypatch):
+    src = _read(os.path.join("rulehawk", "evidence.py"))
+    assert src.count(_R9[0]) == 1
+    pinned = collections.Counter({k: v for k, v in _EXEMPT.items()
+                                  if k.startswith("evidence.py::")})
+    monkeypatch.setattr(sys.modules[__name__], "_PKG", str(tmp_path))
+    (tmp_path / "evidence.py").write_text(src, encoding="utf-8")
+    assert collections.Counter(_scan_module("evidence.py")) == pinned
+    (tmp_path / "evidence.py").write_text(src.replace(*_R9), encoding="utf-8")
+    assert collections.Counter(_scan_module("evidence.py")) != pinned
+
+
+# Low suggestion: the guard fixture re-derives from git when the commits are
+# there (skipped on a shallow clone).
+def test_guard_fixture_rederives_from_git():
+    import json
+    import subprocess
+    for ref in ("v0.4.0", "e04630e"):
+        r = subprocess.run(["git", "-C", _ROOT, "cat-file", "-e", f"{ref}^{{commit}}"],
+                           capture_output=True)
+        if r.returncode != 0:
+            pytest.skip(f"{ref} is not in this clone")
+    sys.path.insert(0, os.path.join(_ROOT, "scripts"))
+    from gen_stopgap_guards import derive
+    want = json.loads(_read(os.path.join("tests", "fixtures", "stopgap_guards_e04630e.json")))
+    assert derive(_ROOT) == want
+
+
 def test_scan_catches_a_planted_emission(tmp_path, monkeypatch):
     """F4: the scan sees emissions as well as spellings."""
     planted = tmp_path / "planted.py"
@@ -704,7 +820,7 @@ def test_scan_catches_a_planted_emission(tmp_path, monkeypatch):
     rules = collections.Counter(k.split("::")[2] for k in hits)
     assert rules["exit-call-0"] == 4, hits
     assert rules["exit-code"] >= 2, hits          # ec.ADVISORY, ec.HELP through an alias
-    assert rules["allclear-const"] == 1, hits
+    assert rules["allclear-const-return"] == 1, hits   # R2-F2: by use
     assert rules["env-set"] == 2, hits
     assert rules["allclear-write"] == 2, hits
 
@@ -816,10 +932,10 @@ def test_comment_enforce_step_fails_closed(enforced, verdict, want):
 _ALLCLEAR_IMPORTS = {("__future__", 0, "annotations"), ("typing", 0, "Optional"),
                      (None, 1, "exitcodes")}
 _ALLCLEAR_FORBIDDEN = {
-    "os", "sys", "environ", "getenv", "putenv", "argv", "open", "io", "pathlib",
-    "importlib", "__import__", "globals", "locals", "vars", "setattr", "getattr",
-    "delattr", "eval", "exec", "compile", "__dict__", "__builtins__", "builtins",
-    "input", "subprocess", "reload"}
+    "os", "sys", "environ", "environb", "getenv", "getenvb", "putenv", "argv",
+    "modules", "open", "io", "pathlib", "importlib", "__import__", "globals",
+    "locals", "vars", "setattr", "getattr", "delattr", "eval", "exec", "compile",
+    "__dict__", "__builtins__", "builtins", "input", "subprocess", "reload", "type"}
 
 
 def _allclear_violations(src: str) -> list:
@@ -837,6 +953,17 @@ def _allclear_violations(src: str) -> list:
             out.append(f"attribute {node.attr}")
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             out.append(f"global {','.join(node.names)}")
+        # R2-F1 (b): no decorators, and no dunder attribute or name at all
+        # (__globals__, __code__, __repr__, __defaults__, __wrapped__, ...).
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
+                and node.decorator_list:
+            out.append(f"decorator on {node.name}")
+        if isinstance(node, ast.Attribute) and node.attr.startswith("__") \
+                and node.attr not in _ALLCLEAR_FORBIDDEN:
+            out.append(f"dunder attribute {node.attr}")
+        if isinstance(node, ast.Name) and node.id.startswith("__") \
+                and node.id not in _ALLCLEAR_FORBIDDEN:
+            out.append(f"dunder name {node.id}")
     return out
 
 
@@ -872,6 +999,72 @@ def _allclear_fn_hashes(src: str) -> dict:
         text = "\n".join(lines[n - 1] for n in range(node.lineno, node.end_lineno + 1)
                          if n not in drop)
         out[name] = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return out
+
+
+# R2-F1 (a). The top level of allclear.py is exactly this list, in order:
+# the docstring, its three imports, the named constants, the stopgap table and
+# the five gate functions, none decorated. No module-level `if`, `for`,
+# expression or attribute assignment.
+_ALLCLEAR_TOP_LEVEL = (
+    "docstring",
+    "from __future__ import annotations",
+    "from typing import Optional",
+    "from . import exitcodes",
+    "RULEHAWK_CERT = <int>",
+    "PASS = <str>", "VERIFIED = <str>", "NO_NEW_RISK = <str>",
+    "SEG_OK = <str>", "REACH_OK = <str>",
+    "COMPLETE = <str>",                     # slice 2: coverage.state
+    "_STOPGAP = <dict of names to str>",
+    "def _require_certified", "def certified", "def emit", "def passed", "def exit_code",
+)
+
+
+def _top_level_shape(node, first: bool) -> str:
+    if first and isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) \
+            and isinstance(node.value.value, str):
+        return "docstring"
+    if isinstance(node, ast.ImportFrom):
+        return (f"from {'.' * node.level}{node.module or ''} import "
+                + ", ".join(a.name + (f" as {a.asname}" if a.asname else "") for a in node.names))
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+            and isinstance(node.targets[0], ast.Name):
+        v, name = node.value, node.targets[0].id
+        if isinstance(v, ast.Constant) and type(v.value) in (int, str):
+            return f"{name} = <{type(v.value).__name__}>"
+        if isinstance(v, ast.Dict) and all(isinstance(k, ast.Name) for k in v.keys) \
+                and all(isinstance(x, ast.Constant) and type(x.value) is str for x in v.values):
+            return f"{name} = <dict of names to str>"
+    if isinstance(node, ast.FunctionDef) and not node.decorator_list:
+        return f"def {node.name}"
+    return f"line {node.lineno}: {ast.unparse(node).splitlines()[0][:60]}"
+
+
+def _allclear_shape_problems(src: str) -> list:
+    body = ast.parse(src).body
+    got = tuple(_top_level_shape(n, i == 0) for i, n in enumerate(body))
+    if got == _ALLCLEAR_TOP_LEVEL:
+        return []
+    want = list(_ALLCLEAR_TOP_LEVEL)
+    return ([f"not allowed at top level: {g}" for g in got if g not in want]
+            + [f"missing at top level: {w}" for w in want if w not in got]
+            or ["top-level statements out of order"])
+
+
+# R2-F1 (a). The whole of allclear.py, byte for byte (sha256 of its text), on
+# both copies, as well as the per-definition pins above (which name the
+# definition that changed). Any edit, a comment included, is a reviewed change
+# of this line.
+_ALLCLEAR_FILE_SHA = "ff894ef8c6b178caad0d2f6914f8a2aebd230a0338fd2a87691b981f4fff8440"  # slice 2: COMPLETE
+
+
+def _allclear_pin_problems(src: str) -> list:
+    import hashlib
+    got = _allclear_fn_hashes(src)
+    out = [f"definition changed: {n}" for n in _ALLCLEAR_PINNED
+           if got.get(n) != _ALLCLEAR_FN_SHA[n]]
+    if hashlib.sha256(src.encode("utf-8")).hexdigest() != _ALLCLEAR_FILE_SHA:
+        out.append("allclear.py changed (whole-file pin)")
     return out
 
 

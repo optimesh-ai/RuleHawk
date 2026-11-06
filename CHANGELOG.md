@@ -20,11 +20,14 @@ reviewed exemption list: an all-clear literal, an exit-code constant or exit
 call worth 0, a PASS or VERIFIED constant, a write to `allclear`, or an
 environment write naming RULEHAWK_*. (They read spellings and emissions, not data
 flow; an all-clear built at run time is left to the behavioural tests.)
-`allclear.py` itself may import nothing but `typing` and `exitcodes`, and its
-gate functions are pinned. The stopgap's guard blocks in `action.yml`,
+`allclear.py` itself may import nothing but `typing` and `exitcodes`, may
+use no decorator, dunder attribute or environment and module hooks, has a
+fixed list of top-level statements, and is pinned whole, byte for byte, in
+both copies. The stopgap's guard blocks in `action.yml`,
 `comment/action.yml`, `docs/index.html` and `docs/worker.js` are pinned byte
-for byte as the 0.4.1 stopgap wrote them, and both Actions' enforce steps
-are run under bash.
+for byte as the 0.4.1 stopgap wrote them (`scripts/gen_stopgap_guards.py`
+re-derives the pins from git), and both Actions' enforce steps are run under
+bash.
 
 ### No file is certified, so code scanning and MCP coverage say so (#42 phase 2)
 
