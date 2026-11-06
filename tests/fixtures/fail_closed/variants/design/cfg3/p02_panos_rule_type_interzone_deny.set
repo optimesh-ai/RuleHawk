@@ -1,0 +1,6 @@
+set network interface ethernet ethernet1/1 layer3 ip 192.0.2.1/24
+set network interface ethernet ethernet1/2 layer3 ip 198.51.100.1/24
+set zone inside network layer3 [ ethernet1/1 ethernet1/2 ]
+set rulebase security rules d from any to any source 192.0.2.0/24 destination 198.51.100.0/24 application any service any action deny
+set rulebase security rules d rule-type interzone
+set rulebase security rules z from any to any source any destination any application any service any action allow

@@ -1,0 +1,22 @@
+set address 203.0.113.5 ip-netmask 198.51.100.0/24
+set rulebase security rules r1 from any
+set rulebase security rules r1 to any
+set rulebase security rules r1 source 192.0.2.0/24
+set rulebase security rules r1 destination 203.0.113.5
+set rulebase security rules r1 application any
+set rulebase security rules r1 service any
+set rulebase security rules r1 action allow
+set rulebase security rules r2 from any
+set rulebase security rules r2 to any
+set rulebase security rules r2 source 192.0.2.0/24
+set rulebase security rules r2 destination 198.51.100.0/24
+set rulebase security rules r2 application any
+set rulebase security rules r2 service any
+set rulebase security rules r2 action deny
+set rulebase security rules r3 from any
+set rulebase security rules r3 to any
+set rulebase security rules r3 source any
+set rulebase security rules r3 destination any
+set rulebase security rules r3 application any
+set rulebase security rules r3 service any
+set rulebase security rules r3 action deny

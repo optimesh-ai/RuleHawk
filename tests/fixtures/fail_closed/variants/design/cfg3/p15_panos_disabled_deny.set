@@ -1,0 +1,3 @@
+set rulebase security rules d from any to any source 192.0.2.0/24 destination 198.51.100.0/24 application any service any action deny
+set rulebase security rules d disabled yes
+set rulebase security rules z from any to any source any destination any application any service any action allow
