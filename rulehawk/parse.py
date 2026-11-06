@@ -1511,8 +1511,9 @@ def _apply_numbering(entries: List[ACE], notes: List[str], events: "dict") -> Li
         nums, deleted = _device_numbers(evs, True)
         nums_b, deleted_b = _device_numbers(evs, False)
         lines = [ln for k, ln, _ in evs if k == "entry"]
-        rank_a = sorted(lines, key=lambda ln: (nums.get(ln, 0), lines.index(ln)))
-        rank_b = sorted(lines, key=lambda ln: (nums_b.get(ln, 0), lines.index(ln)))
+        pos = {ln: i for i, ln in enumerate(lines)}
+        rank_a = sorted(lines, key=lambda ln: (nums.get(ln, 0), pos[ln]))
+        rank_b = sorted(lines, key=lambda ln: (nums_b.get(ln, 0), pos[ln]))
         if [ln for ln in rank_a if ln not in deleted] != \
                 [ln for ln in rank_b if ln not in deleted_b]:
             notes.append(f"ACL {acl}: the device order depends on whether an "
