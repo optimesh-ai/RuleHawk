@@ -755,6 +755,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     policies: Dict[str, str] = {}                # chain -> permit|deny (from policy)
     policy_lines: Dict[str, int] = {}            # chain -> source line of its `-P`/`:` policy
     table = "filter"                             # iptables-save default before *table
+    n_filter_blocks = 0
     table_is_filter = True
     other_tables_noted: set = set()
     # Chains that contain RETURN or NAT targets — their control flow cannot be
@@ -890,6 +891,16 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
         if line.startswith("*"):                 # iptables-save table header
             table = line[1:].strip().split()[0] if len(line) > 1 else "filter"
             table_is_filter = (table == "filter")
+            if table_is_filter:
+                n_filter_blocks += 1
+                if n_filter_blocks == 2:
+                    # iptables-restore (without --noflush) flushes a table at
+                    # each `*table` header and the last block wins; RuleHawk
+                    # merges the blocks. Not modeled: fail closed.
+                    notes.append(f"more than one `*filter` block (second at line "
+                                 f"{lineno}) — iptables-restore replaces the "
+                                 f"table at each one; the blocks are not "
+                                 f"modeled as replacing each other")
             if not table_is_filter and table not in other_tables_noted:
                 other_tables_noted.add(table)
                 notes.append(f"iptables '{table}' table present — not modeled "
