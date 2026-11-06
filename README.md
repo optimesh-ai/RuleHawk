@@ -99,6 +99,11 @@ jobs:
           fail-on: high
 ```
 
+`@v1` resolves to 0.5.0, which fails closed: an assertion RuleHawk cannot
+prove is UNKNOWN and exits 3, which fails the check, so a run that was green
+on an earlier `@v1` can turn red. To stay on the previous behaviour while you
+read the reason codes, pin `optimesh-ai/RuleHawk@v0.3.1`.
+
 A bad change that opens CORP→PCI on SMB/445 gets blocked with the witness packet
 `10.20.0.1 -> 10.10.0.1:445` annotated on the exact line. A file that parses to
 **zero** rules **fails closed** (exit 2) — RuleHawk never certifies isolation it

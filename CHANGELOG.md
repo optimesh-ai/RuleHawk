@@ -126,6 +126,14 @@ run is one.
 
 ### Compatibility
 
+- **`@v1` now resolves to 0.5.0.** The moving Action tag `v1` pointed at
+  0.3.1; it now points at this release, so `optimesh-ai/RuleHawk@v1` jumps
+  from 0.3.1 to 0.5.0, including everything in 0.4.0 (and
+  `optimesh-ai/RuleHawk/comment@v1`, which 0.3.1 did not have, starts to
+  resolve). UNKNOWN exits 3 and the Action fails the check on it,
+  so some previously green `@v1` runs turn red. Opt-out: pin
+  `optimesh-ai/RuleHawk@v0.3.1` until you have read the reason codes.
+  Workflows pinned to a SHA, `v0.3.1` or `v0.4.0` do not change.
 - A run that exited 0 with PASS in 0.4.0 can now exit 3 with UNKNOWN. This
   hits most often on a config whose ACLs have no `ip access-group` /
   `access-group` binding (a bare ACL snippet), a config with any parse note,
