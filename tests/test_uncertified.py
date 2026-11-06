@@ -83,7 +83,9 @@ def test_no_coverage_block_is_complete_anywhere():
     for cfg in _DIALECTS:
         r = mcp_server.audit(cfg, "")
         assert r["coverage"]["state"] in ("partial", "incomplete"), cfg
-        assert r["coverage"]["files_uncertified"] == r["coverage"]["files_analysed"]
+        cov = r["coverage"]
+        # Review of #48, L5: every input counts, analysed or not.
+        assert cov["files_uncertified"] == cov["files_analysed"] + cov["files_not_analysed"]
         c = mcp_server.compare(cfg, cfg, "")
         for side in ("before", "after"):
             assert c["coverage"][side]["state"] in ("partial", "incomplete"), cfg
@@ -171,3 +173,102 @@ def test_uncertified_message_says_what_it_is():
     msg = _uncertified(_sarif([CLEAN]))[0]["message"]["text"]
     assert "not certified" in msg and "fail-closed stopgap" in msg
     assert "UNKNOWN" in msg
+
+
+# --------------------------------------------------------------------------- #
+# Review of #48: L3 (golden exclusion), L4 (one note per URI), L5 (every input
+# is uncertified), L6 (the explanation follows the state), L1 (CHANGELOG).
+# --------------------------------------------------------------------------- #
+def test_golden_drops_only_the_exact_note(monkeypatch):
+    """L3: the golden comparison leaves out the note and nothing else. Any
+    other result under the rule id stays in sarif_results, so the golden check
+    fails on it; and each row counts its notes."""
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import stopgap_fail_baseline as base
+    cwd = os.getcwd()
+    os.chdir(_ROOT)
+    try:
+        row = base._one("adv_realistic", CLEAN, "none", None)
+        assert row["sarif_results"] == []
+        assert row["sarif_uncertified"] == 1
+        real = gate.to_sarif
+
+        def extra(g, version="x"):
+            doc = json.loads(real(g, version=version))
+            res = doc["runs"][0]["results"]
+            note = _uncertified(doc["runs"][0])[0]
+            for change in ({"level": "warning"},
+                           {"partialFingerprints": {"ruleHawk/v2": f"{RULE}:other.cfg"}},
+                           {"locations": [{"physicalLocation": {
+                               "artifactLocation": note["locations"][0]["physicalLocation"]["artifactLocation"],
+                               "region": {"startLine": 7}}}]},
+                           {"message": {"text": "something else"}}):
+                res.append({**note, **change})
+            res.append(dict(note))                 # a second, identical note
+            return json.dumps(doc)
+
+        monkeypatch.setattr(gate, "to_sarif", extra)
+        row = base._one("adv_realistic", CLEAN, "none", None)
+    finally:
+        os.chdir(cwd)
+    kept = [(r["level"], r["line"], r["fp"], r["message"]) for r in row["sarif_results"]]
+    assert len(kept) == 4, kept
+    assert row["sarif_uncertified"] == 2
+
+
+def test_one_note_per_distinct_uri(tmp_path, monkeypatch):
+    """L4: one file under two spellings gets one note, not two notes with one
+    fingerprint."""
+    shutil.copy(CLEAN, tmp_path / "a.cfg")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GITHUB_WORKSPACE", raising=False)
+    run = _sarif(["a.cfg", "./a.cfg", os.path.join(str(tmp_path), "a.cfg")])
+    fps = [r["partialFingerprints"]["ruleHawk/v2"] for r in _uncertified(run)]
+    assert fps == [f"{RULE}:a.cfg"], fps
+
+
+def test_every_input_is_uncertified(tmp_path):
+    """L5: files_uncertified counts every input, analysed or not."""
+    shutil.copy(CLEAN, tmp_path / "a.cfg")
+    (tmp_path / "b.cfg").write_text("hostname r1\n", encoding="utf-8")
+    cov = mcp_server.audit(str(tmp_path), "")["coverage"]
+    assert cov["state"] == "incomplete"
+    assert (cov["files_analysed"], cov["files_not_analysed"]) == (1, 1), cov
+    assert cov["files_uncertified"] == 2, cov
+    cov = mcp_server.audit(str(tmp_path / "b.cfg"), "")["coverage"]
+    assert cov["files_analysed"] == 0 and cov["files_uncertified"] == 1, cov
+
+
+def test_explanation_follows_the_state(monkeypatch):
+    """L6: the fully-modelled explanation names the state emit() gave, so it
+    cannot say partial next to another state."""
+    cov = mcp_server.audit(CLEAN, "")["coverage"]
+    assert cov["state"] == "partial"
+    assert cov["explanation"].endswith("so coverage is partial"), cov
+    monkeypatch.setattr(allclear, "emit", lambda v, cert=None: "state-from-emit")
+    cov = mcp_server.audit(CLEAN, "")["coverage"]
+    assert cov["state"] == "state-from-emit"
+    assert cov["explanation"].endswith("so coverage is state-from-emit"), cov
+    assert "partial" not in cov["explanation"], cov
+
+
+def _changelog_section():
+    text = open(os.path.join(_ROOT, "CHANGELOG.md"), encoding="utf-8").read()
+    head = "### No file is certified, so code scanning and MCP coverage say so"
+    start = text.index(head)
+    end = text.index("\n## ", start)
+    return " ".join(text[start:end].split())
+
+
+def test_changelog_says_what_the_note_is():
+    """L1: a note (not a warning); the explanation gives a count (it names no
+    file); no internal design label; the Cisco-family rule is a plan."""
+    sec = _changelog_section()
+    assert "warning in code scanning" not in sec
+    assert "keeps that warning" not in sec
+    assert "standing `rulehawk/uncertified` note (SARIF level `note`)" in sec
+    assert "names the uncertified files" not in sec
+    assert "option B" not in sec and "under B" not in sec
+    assert "`dialect-not-exclusive`" not in sec
+    assert "planned to keep this note permanently" in sec

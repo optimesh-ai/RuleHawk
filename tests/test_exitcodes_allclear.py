@@ -374,6 +374,21 @@ _EXEMPT = collections.Counter({
     "evidence.py::build_attestations::allclear-const::VERIFIED": 2,
     "evidence.py::_control_rollup::allclear-const::VERIFIED": 2,
     "evidence.py::build_evidence::allclear-const::VERIFIED": 1,
+    # allclear.certified(): the two sites that ask whether a file is
+    # certified (review of #48, L2). to_sarif skips a file's
+    # rulehawk/uncertified note only if it is; _coverage counts the files that
+    # are not. Both pass no certificate, so neither is ever true in 0.4.1.
+    "gate.py::to_sarif::allclear-name::allclear.certified": 1,
+    "mcp_server.py::_coverage::allclear-name::allclear.certified": 1,
+    # `passed` set to something other than an allclear.passed() call (review
+    # of #47, optional rule). The gate's JSON and result records copy
+    # GateResult.passed, a property that returns allclear.passed(); the
+    # failed-run record is a constant False; combine reads `passed` from a
+    # record and turns a true one into UNKNOWN (_load, "pre-stopgap record").
+    "gate.py::to_json::passed-set::\"passed\": gate.passed": 1,
+    "gate.py::to_result::passed-set::\"passed\": gate.passed": 1,
+    "gate.py::_failed_result::passed-set::\"passed\": False": 1,
+    "combine.py::_load::passed-set::passed": 1,
 })
 
 
@@ -397,15 +412,58 @@ def test_scan_catches_a_planted_all_clear(tmp_path, monkeypatch):
         "    z = {'passed': True, 'shadow': {'certified': 1}}\n"
         "    f(passed=True)\n"
         "    allclear.RULEHAWK_CERT = 1\n"
+        "    if allclear.certified(x):\n"
+        "        pass\n"
+        "    ok = allclear.certified\n"
         "    return exitcodes.PASS\n"
         "def w():\n"
         "    return 0\n"
         "def a():\n"
         "    return 4\n", encoding="utf-8")
     monkeypatch.setattr(sys.modules[__name__], "_PKG", str(tmp_path))
-    rules = {k.split("::")[2] for k in _scan_module("planted.py")}
+    hits = _scan_module("planted.py")
+    rules = {k.split("::")[2] for k in hits}
     assert rules >= {"literal", "allclear-name", "passed-true", "cert-override",
                      "exit-code", "return-0", "return-4"}, rules
+    # Review of #48, L2: a certified() call, and certified held as a value.
+    assert hits.count("planted.py::v::allclear-name::allclear.certified") == 2, hits
+
+
+def test_scan_catches_a_planted_passed(tmp_path, monkeypatch):
+    """Review of #47 (optional rule): `passed` set to anything but an
+    allclear.passed() call is a hit, as attribute, name, keyword or dict key."""
+    planted = tmp_path / "planted.py"
+    planted.write_text(
+        "from . import allclear\n"
+        "class G:\n"
+        "    passed = not self.violations\n"
+        "    def passed(self):\n"
+        "        return not self.violations\n"
+        "    def a(self):\n"
+        "        self.passed = not self.violations\n"
+        "        R(passed=not self.violations)\n"
+        "        d = {'passed': len(self.violations) == 0}\n"
+        "        d['passed'] = ok\n"
+        "        setattr(d, 'passed', ok)\n"
+        "        passed, code = rec\n"
+        "        for passed in xs:\n"
+        "            pass\n"
+        "    def ok(self):\n"
+        "        passed = allclear.passed()\n"
+        "        self.passed = allclear.passed()\n"
+        "        R(passed=allclear.passed())\n"
+        "        return {'passed': allclear.passed()}\n"
+        "class H:\n"
+        "    @property\n"
+        "    def passed(self):\n"
+        "        return allclear.passed()\n",
+        encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "_PKG", str(tmp_path))
+    hits = [k for k in _scan_module("planted.py") if k.split("::")[2] == "passed-set"]
+    where = collections.Counter(k.split("::")[1] for k in hits)
+    # Nothing in G.ok or H.passed: those are allclear.passed() calls.
+    assert where == {"G": 1, "G.passed": 1, "G.a": 7}, hits
+    assert "planted.py::G::passed-set::passed = not self.violations" in hits, hits
 
 
 # --------------------------------------------------------------------------- #

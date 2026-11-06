@@ -992,6 +992,9 @@ def test_fail_is_unchanged_on_every_sample_and_fixture():
         for field in ("findings", "failed_claims", "sarif_results",
                       "gate_violations"):
             assert got[field] == was[field], (key, field)
+        # The one result left out of sarif_results: exactly one exact-shape
+        # rulehawk/uncertified note per run (review of #48, L3).
+        assert got["sarif_uncertified"] == 1, key
         for field in ("cli_exit", "gate_exit_high"):
             # 1 and 2 stay as they were; the only change is 0 -> 3.
             want = 3 if was[field] == 0 else was[field]
