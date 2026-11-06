@@ -22,6 +22,8 @@ PKG = ROOT / "rulehawk"
 WORKER = ROOT / "docs" / "worker.js"
 
 _REL_IMPORT = re.compile(r"^from \.(\w+) import", re.MULTILINE)
+# `from . import a, b` (e.g. `from . import allclear, exitcodes`).
+_PKG_IMPORT = re.compile(r"^from \. import ([\w, ]+)$", re.MULTILINE)
 
 
 def _top_level_relative_imports(module: str) -> set[str]:
@@ -29,7 +31,10 @@ def _top_level_relative_imports(module: str) -> set[str]:
     # Only TOP-LEVEL imports matter for module load: strip indented lines so
     # lazy in-function imports don't inflate the closure.
     top = "\n".join(l for l in text.splitlines() if l and not l[0].isspace())
-    return set(_REL_IMPORT.findall(top))
+    mods = set(_REL_IMPORT.findall(top))
+    for names in _PKG_IMPORT.findall(top):
+        mods |= {n.split(" as ")[0].strip() for n in names.split(",")}
+    return mods
 
 
 def _import_closure(root: str = "__init__") -> set[str]:

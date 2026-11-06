@@ -192,12 +192,27 @@ assessor reads the output:
 
 ## Exit codes / verdict
 
-| Code | Meaning |
-|---|---|
-| `0` | Only under `fail-on: none` (advisory). Fail-closed stopgap (0.4.1): an enforced run never exits 0, and no run reports PASS. |
-| `1` | FAIL: one or more findings at/above `fail-on`. |
-| `2` | **Fail-closed** — a file parsed to *zero* rules or could not be read (suppressed only by `fail-on: none`), a `configs` pattern matched **no files** (a typo'd path must not mean "never audited, green check"), an unknown `vendor`/flag, or an unwritable output path. RuleHawk will not certify isolation it could not verify. |
-| `3` | UNKNOWN (new): no finding at/above `fail-on`, but the run is not certified — reason `fail-closed-stopgap`, "fail-closed stopgap pending soundness review". Precedence: `2`, then `1`, then `3`. |
+<!-- rulehawk:exit-codes:begin (generated from rulehawk/exitcodes.py) -->
+| outcome | `rulehawk FILE` | `rulehawk gate` | `rulehawk combine` | Actions (`action.yml`, `comment/action.yml`) |
+|---|---|---|---|---|
+| PASS (certified). Not emitted by this release (fail-closed stopgap) | 0 | 0 | 0 | not emitted; an enforced exit 0 fails the step closed |
+| FAIL | 1 | 1 | 1 | `verdict=FAIL`; the step fails |
+| config parsed to zero rules, unreadable or invalid input, usage | 2 | 2 | 2 (usage only) | the step fails (fail-closed) |
+| UNKNOWN (reason `fail-closed-stopgap`: fail-closed stopgap pending soundness review) | 3 | 3 | 2 | `verdict=UNKNOWN`; the step fails |
+| ACCEPTED (reserved: not emitted until ACCEPTED ships) | 4 | 4 | 4 | not emitted; any code but 0 fails the step |
+| advisory: `gate --fail-on none`, or combine with no enforced check | n/a | 0, with the verdict (UNKNOWN or FAIL) reported | 0 | the step succeeds with a warning naming the verdict |
+| `--help` | 0 | 0 | 0 | n/a |
+
+Precedence on `rulehawk FILE` and `rulehawk gate`: 2, then 1, then 3, then 4, then 0. The Actions never report an exit code as a PASS, and `comment/action.yml` fails its step only with `fail: true`.
+<!-- rulehawk:exit-codes:end -->
+
+What each code means for the gate:
+
+* `0` only under `fail-on: none` (advisory). Fail-closed stopgap (0.4.1): an enforced run never exits 0, and no run reports PASS.
+* `1` FAIL: one or more findings at/above `fail-on`.
+* `2` **Fail-closed** — a file parsed to *zero* rules or could not be read (suppressed only by `fail-on: none`), a `configs` pattern matched **no files** (a typo'd path must not mean "never audited, green check"), an unknown `vendor`/flag, or an unwritable output path. RuleHawk will not certify isolation it could not verify.
+* `3` UNKNOWN (new): no finding at/above `fail-on`, but the run is not certified — reason `fail-closed-stopgap`, "fail-closed stopgap pending soundness review". Precedence: `2`, then `1`, then `3`.
+* `4` reserved for ACCEPTED: not emitted until ACCEPTED ships.
 
 The Action maps `1`, `2` and `3` to a red check (exit 3 with an error annotation that names the stopgap). Even on failure it still uploads
 SARIF and posts the comment first, so the gate always reports its value.

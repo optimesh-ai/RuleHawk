@@ -51,6 +51,22 @@ One of the three findings it prints:
 Then `rulehawk edge-fw.txt` for one config, `rulehawk gate configs/` for a
 directory, `--json` for machines. Exit code is non-zero on a critical/high
 finding (1) or when nothing could be audited (2), so it drops into CI.
+Every command uses one exit-code table:
+
+<!-- rulehawk:exit-codes:begin (generated from rulehawk/exitcodes.py) -->
+| outcome | `rulehawk FILE` | `rulehawk gate` | `rulehawk combine` | Actions (`action.yml`, `comment/action.yml`) |
+|---|---|---|---|---|
+| PASS (certified). Not emitted by this release (fail-closed stopgap) | 0 | 0 | 0 | not emitted; an enforced exit 0 fails the step closed |
+| FAIL | 1 | 1 | 1 | `verdict=FAIL`; the step fails |
+| config parsed to zero rules, unreadable or invalid input, usage | 2 | 2 | 2 (usage only) | the step fails (fail-closed) |
+| UNKNOWN (reason `fail-closed-stopgap`: fail-closed stopgap pending soundness review) | 3 | 3 | 2 | `verdict=UNKNOWN`; the step fails |
+| ACCEPTED (reserved: not emitted until ACCEPTED ships) | 4 | 4 | 4 | not emitted; any code but 0 fails the step |
+| advisory: `gate --fail-on none`, or combine with no enforced check | n/a | 0, with the verdict (UNKNOWN or FAIL) reported | 0 | the step succeeds with a warning naming the verdict |
+| `--help` | 0 | 0 | 0 | n/a |
+
+Precedence on `rulehawk FILE` and `rulehawk gate`: 2, then 1, then 3, then 4, then 0. The Actions never report an exit code as a PASS, and `comment/action.yml` fails its step only with `fail: true`.
+<!-- rulehawk:exit-codes:end -->
+
 **[Quickstart](docs/quickstart.md)**: install, first audit, agents (Claude, Cursor,
 NetClaw) and what to do when something goes wrong.
 

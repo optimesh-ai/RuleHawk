@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Dict, List, Optional
 
+from . import allclear, exitcodes
 from .analyze import STOPGAP_CODE, STOPGAP_MESSAGE, Finding, score, stopgap_reasons
 from .boundary import text_lines as boundary_text, to_dict as boundary_dict
 
@@ -39,13 +40,14 @@ def exit_code(findings: List[Finding], n_rules: int) -> int:
     unaccepted critical/high finding), else 3 UNKNOWN. Fail-closed stopgap: an
     audited run never exits 0, because 0 would read as a PASS."""
     if not n_rules:
-        return 2
+        return exitcodes.INVALID
     # An ACCEPTED finding is reported but does not fail the run — that is what
     # a time-boxed, attributed risk acceptance is for.
     if any(f.severity in ("critical", "high") and f.accepted is None
            for f in findings):
-        return 1
-    return 3
+        return exitcodes.FAIL
+    # The would-be PASS: exit 3 (UNKNOWN) until allclear certifies it.
+    return allclear.exit_code()
 
 
 def verdict(findings: List[Finding], n_rules: int) -> str:

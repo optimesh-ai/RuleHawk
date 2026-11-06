@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### One exit-code table (#42 phase 2)
+
+Every command now takes its exit codes from one table, `rulehawk/exitcodes.py`.
+README, `docs/github-action.md` and the `--help` of `rulehawk`, `rulehawk gate`
+and `rulehawk combine` are generated from it. No exit code changes in this
+release: 1 FAIL, 2 parse failure, invalid input or usage, 3 UNKNOWN (combine:
+2), 0 only for the advisory `--fail-on none`, a combine with no enforced
+check, or `--help`. PASS is still never reported.
+
+Every would-be all-clear (PASS, VERIFIED, NO_NEW_RISK, `passed: true`, an
+enforced exit 0) now goes through one function, `rulehawk.allclear.emit`. It
+gives the stopgap's answer (UNKNOWN, exit 3) because its compiled-in switch is
+off; it is not read from the environment, and nothing overrides it at run
+time. A test fails on any all-clear literal outside that module, and on any
+change to the Actions' existing stopgap guard lines.
+
+### Compatibility
+
+- **Exit code 4 is reserved for ACCEPTED** (a run whose only violations are
+  covered by a risk acceptance). It is not emitted by this release, and no
+  command uses 4 for anything else. When ACCEPTED ships, such a run exits 4 on
+  `rulehawk FILE`, `rulehawk gate` and `rulehawk combine`.
+- **Upgrading from 0.4.0 or earlier straight to the release that ships
+  ACCEPTED:** a run whose only violations are accepted risks exited `0` there
+  (reported PASS). It will exit `4`, never `0`, so a wrapper that treats any
+  non-zero code as a failure will stop on it. In 0.4.1 the same run already
+  exits `3`. To let such runs through once ACCEPTED ships, treat `4` as
+  success in the wrapper, or use the opt-in `--accepted-exit 0`, which makes
+  ACCEPTED and PASS indistinguishable to the exit code. `--accepted-exit 1`
+  will not exist, because 1 is FAIL's.
+
 ## 0.4.1: Fail-closed stopgap
 
 RuleHawk no longer emits PASS or VERIFIED, on any surface. Wherever it used to

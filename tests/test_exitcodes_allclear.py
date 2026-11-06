@@ -246,22 +246,24 @@ def _scan():
 # Pinned: every all-clear literal outside allclear.py, with the reason it is
 # not an all-clear. Keys are module::function::rule::text (strings cut at 72).
 _EXEMPT = collections.Counter({
-    # --help texts: they name PASS only to say it is not reported.
-    "cli.py::<module>::literal::rulehawk — firewall/ACL hygiene auditor (single-file report)\n\nusage:\n  ru": 1,
-    "gate.py::<module>::literal::rulehawk — audit firewall/ACL configs and gate a pull request\n\nusage:\n ": 1,
+    # Help and the exit-code table: they name PASS only to say it is not
+    # emitted.
     "exitcodes.py::<module>::literal::PASS (certified). Not emitted by this release (fail-closed stopgap)": 1,
-    "exitcodes.py::<module>::literal::ACCEPTED (": 0,
-    "exitcodes.py::help_section::literal::exit codes (0.4.1, fail-closed stopgap: PASS is never reported; from r": 1,
+    "exitcodes.py::<module>::literal::only for --help; an audited run never exits 0 (PASS is not\n     emitted ": 1,
+    "exitcodes.py::<module>::literal::only with --fail-on none (advisory; the verdict still says\n     UNKNOWN/": 1,
+    "exitcodes.py::help_section::literal:: (0.4.1, fail-closed stopgap: PASS is never reported):": 1,
+    "exitcodes.py::markdown_table::literal::. The Actions never report an exit code as a PASS, and `comment/action.y": 1,
     # Negated messages: they name PASS only to deny it (test_stopgap NEGATIONS).
-    "gate.py::<module>::literal::The segmentation policy itself is invalid (unknown zone, bad CIDR or port": 1,
-    "segcheck.py::check_segmentation::literal::SEGMENTATION POLICY ERROR: 'zones' must be an object of name -> [CIDR,": 1,
-    "segcheck.py::check_segmentation::literal::' — fail-closed: assertions over this zone get no PASS until the policy i": 1,
-    "mcp_server.py::_verdict::literal::fail_on=none: nothing blocks, so no PASS is given; read findings_by_severi": 1,
-    "mcp_server.py::<module>::literal::fail-closed: unrecognised or unreadable input makes the result INCOMPLETE": 1,
+    "gate.py::<module>::literal::The segmentation policy itself is invalid (unknown zone, bad CIDR or por": 1,
+    "segcheck.py::check_segmentation::literal::SEGMENTATION POLICY ERROR: 'zones' must be an object of name -> [CIDR, .": 1,
+    "segcheck.py::check_segmentation::literal::' — fail-closed: assertions over this zone get no PASS until the policy ": 1,
+    "mcp_server.py::_verdict::literal::fail_on=none: nothing blocks, so no PASS is given; read findings_by_seve": 1,
+    "mcp_server.py::supported_inputs::literal::fail-closed: unrecognised or unreadable input makes the result INCOMPLET": 1,
     "mcp_server.py::_coverage::literal::at least one input was NOT analysed (see not_analysed); no PASS is given": 1,
-    # combine reads records; it never builds a PASS check. "PASS" is only
-    # enforced_verdict's default when no check is enforced (advisory exit 0),
-    # and the legacy-record reader that turns an old PASS into UNKNOWN.
+    # combine reads records and never builds a PASS check. "PASS" is only
+    # enforced_verdict's default when no check is enforced (the advisory exit
+    # 0, via _EXIT), the renderer's names for it, and the legacy-record reader
+    # that turns an older gate's PASS into UNKNOWN.
     "combine.py::<module>::literal::PASS": 3,
     "combine.py::<module>::literal::✅": 1,
     "combine.py::_report_verdict::literal::## ✅ ": 1,
@@ -272,8 +274,9 @@ _EXEMPT = collections.Counter({
     "combine.py::_render_many::literal::PASS": 3,
     "combine.py::_headline::literal::PASS": 1,
     "combine.py::enforced_verdict::literal::PASS": 1,
-    # evidence: the claim-status vocabulary and its renderers. A VERIFIED
-    # status only exists if allclear.emit lets one through.
+    # evidence: the claim-status vocabulary, its finding-kind tables and its
+    # renderers. A VERIFIED claim exists only if allclear.emit lets one
+    # through (_fleet_status asks it).
     "evidence.py::<module>::literal::VERIFIED": 1,
     "evidence.py::<module>::literal::segmentation-ok": 2,
     "evidence.py::<module>::literal::connectivity-ok": 2,
@@ -286,11 +289,9 @@ _EXEMPT = collections.Counter({
     "mcp_server.py::_coverage::literal::complete": 2,
     "mcp_server.py::audit::literal::segmentation-ok": 1,
     "mcp_server.py::audit::literal::connectivity-ok": 1,
-    # Not verdicts: --help, and the MCP server process's own exit.
-    "cli.py::main::return-0::0": 0,
+    # The MCP server process's own exit status, not a verdict.
     "mcp_server.py::main::return-0::0": 3,
 })
-_EXEMPT = +_EXEMPT     # drop the zero-count placeholders
 
 
 def test_no_all_clear_literal_outside_allclear():
@@ -329,7 +330,7 @@ def test_scan_catches_a_planted_all_clear(tmp_path, monkeypatch):
 # guard lines are pinned exactly, so they stay byte-for-byte until slice 9.
 # --------------------------------------------------------------------------- #
 _LIT = re.compile(r"\bPASS\b|\bVERIFIED\b|NO_NEW_RISK|✅|passed=true|\"passed\":\s*true"
-                  r"|allPass|no issues found|all[- ]clear|all_clear", re.I)
+                  r"|allPass|[Nn]o issues found|all[- ]clear|all_clear")
 
 
 def _analyze_py():
@@ -380,8 +381,11 @@ _LIT_EXEMPT = collections.Counter({
     "comment/action.yml::\"\"|PASS*)": 1,
     "comment/action.yml::# 0.4.1 never reports PASS (fail-closed stopgap): fail closed.": 1,
     "comment/action.yml::echo \"::error title=RuleHawk combined verdict (fail-closed-stopgap)::Unexpected combined verdict '${RH_VERDICT:-}': this release never reports PASS (fail-closed stopgap pending soundness review); failing closed.\"": 1,
-    # docs/index.html: a CSS comment, not a banner.
+    # docs/index.html: CSS and comments, not banners. The banners render from
+    # report_json and are swept by tests/test_stopgap.py.
     "docs/index.html::/* all-clear: no issues found */": 1,
+    "docs/index.html::.all-clear{display:flex;gap:10px;align-items:center;": 1,
+    "docs/index.html::// Fail-closed stopgap: nothing flagged is UNKNOWN, never an all-clear.": 1,
 })
 
 
