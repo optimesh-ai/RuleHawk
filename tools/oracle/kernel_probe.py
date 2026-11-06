@@ -187,6 +187,11 @@ def find_tag(frame: bytes, l2: bool):
 EXPECT = {}
 
 
+def expect(idx: int, frame: bytes):
+    """Register what probe `idx` looked like when sent, for find_tag."""
+    EXPECT[idx] = (frame[9], frame[12:16], frame[16:20])
+
+
 SENDER = r"""
 import socket, sys, json, time
 d = json.load(sys.stdin)
@@ -267,7 +272,7 @@ def main():
     built = [build(p, i) for i, p in enumerate(pk)]
     frames = [b for b, _ in built]
     for i, (b, pn) in enumerate(built):
-        EXPECT[i] = (b[9], b[12:16], b[16:20])
+        expect(i, b)
     socks = open_capture(mode, [pn for _, pn in built])
     if req.get("attribute"):
         for i, f in enumerate(frames):
