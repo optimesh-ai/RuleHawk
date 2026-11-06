@@ -307,3 +307,10 @@ def test_r1_c03_comment_value_that_looks_like_a_verb():
     path = os.path.join(_ROOT, "tests", "fixtures", "fail_closed", "rev42r3",
                         "c03_comment_dash_A_hides_insert.sh")
     _unknown_on_every_surface(path, "parse-note")
+
+
+@pytest.mark.parametrize("line", ["no interface GigabitEthernet0/1",
+                                  "default interface GigabitEthernet0/1"])
+def test_r9_top_level_interface_removal_is_a_removed_binding(tmp_path, line):
+    _unknown_on_every_surface(_write(tmp_path, "x.cfg", _BOUND_IOS + line + "\n"),
+                              "acl-binding-negated")
