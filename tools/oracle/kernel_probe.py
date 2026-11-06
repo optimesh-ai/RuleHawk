@@ -101,9 +101,43 @@ def flush():
     sh("conntrack", "-F", check=False)
 
 
+def _table_option(tok: str) -> bool:
+    """`-t`, `-tNAME`, `--table`, `--table=NAME` or an abbreviation of it."""
+    if tok.startswith("--"):
+        return len(tok) >= 4 and "--table".startswith(tok.split("=", 1)[0])
+    return tok.startswith("-t")
+
+
+def non_filter_table(ruleset: str):
+    """Why the ruleset touches a table other than filter, or None.
+
+    Only the filter table may be loaded: NAT and mangle rewrite bytes that
+    find_tag compares (addresses, ports, TOS, checksums), so a probe the
+    kernel accepted would read as dropped. Any `-t` option is refused, even
+    `-t filter`, so no spelling slips through."""
+    for m in re.finditer(r"(?m)^\s*\*(\S+)", ruleset):
+        if m.group(1) != "filter":
+            return f"table *{m.group(1)} refused: only *filter is supported"
+    for ln in ruleset.splitlines():
+        s = ln.strip()
+        if not (s.startswith("iptables ") or s.startswith("iptables\t")):
+            continue
+        try:
+            toks = shlex.split(s, comments=True)
+        except ValueError:
+            toks = s.split()
+        if any(_table_option(t) for t in toks[1:]):
+            return f"table option refused (only the filter table is supported): {s}"
+    return None
+
+
 def load(ruleset: str):
     """iptables-save text -> iptables-restore; command form -> one argv per
-    `iptables ...` line (no shell, so a corpus file can't run anything else)."""
+    `iptables ...` line (no shell, so a corpus file can't run anything else).
+    A ruleset that touches any table but filter is refused as a load error."""
+    bad = non_filter_table(ruleset)
+    if bad:
+        return bad
     if re.search(r"(?m)^\s*\*(filter|nat|mangle|raw|security)\b", ruleset):
         r = subprocess.run(["iptables-restore"], input=ruleset, capture_output=True,
                            text=True)
@@ -164,27 +198,50 @@ def build(p, idx):
     return ip + l4, pn
 
 
+def _hdr_masked(b: bytes) -> bytes:
+    """IPv4 bytes with the fields forwarding rewrites zeroed: TTL (byte 8)
+    and the header checksum (bytes 10-11)."""
+    return b[:8] + b"\0" + b[9:10] + b"\0\0" + b[12:]
+
+
 def find_tag(frame: bytes, l2: bool):
-    """The probe index carried by a captured packet, or None. The OUTER IPv4
-    header must be the probe itself: a REJECT reply (ICMP unreachable / RST)
-    quotes the probe's header and tag inside its own payload, so a tag found
-    under a different outer (src, dst, proto) is a reply, not the probe."""
+    """The probe index carried by a captured packet, or None.
+
+    The captured packet must BE the probe: its bytes from the IPv4 header up
+    to the end of the tag equal what was sent, except TTL and the header
+    checksum (which forwarding rewrites). Matching on the outer
+    (proto, src, dst) alone is not enough: a REJECT reply quotes the probe,
+    tag included, and a self-addressed probe's ICMP error has exactly the
+    probe's outer (proto, src, dst). The quoted tag sits deeper (after the
+    error's own ICMP header and the quoted IPv4 header), and the ICMP header
+    in front of it is the error's, not the probe's, so it fails here."""
     ip = frame[14:] if l2 else frame
     if l2 and frame[12:14] != b"\x08\x00":
         return None
     if len(ip) < 20 or ip[0] >> 4 != 4:
         return None
+    # Try every MAGIC in the packet, not just the first: an address or port
+    # can spell b"RHOR". A candidate counts only when MAGIC + idx sits at
+    # that probe's own tag offset, len(sent) - 8.
     k = ip.find(MAGIC)
-    if k < 0 or k + 8 > len(ip):
-        return None
-    idx = struct.unpack("!I", ip[k + 4:k + 8])[0]
-    want = EXPECT.get(idx)
-    if want is None or (ip[9], ip[12:16], ip[16:20]) != want:
-        return None
-    return idx
+    while 0 <= k and k + 8 <= len(ip):
+        idx = struct.unpack("!I", ip[k + 4:k + 8])[0]
+        sent = EXPECT.get(idx)
+        if sent is not None and k == len(sent) - 8 \
+                and _hdr_masked(ip[:k + 8]) == sent:
+            return idx
+        k = ip.find(MAGIC, k + 1)
+    return None
 
 
 EXPECT = {}
+
+
+def expect(idx: int, frame: bytes):
+    """Register probe `idx` as sent (header through tag, TTL/checksum
+    masked), for find_tag."""
+    k = frame.find(MAGIC + struct.pack("!I", idx))
+    EXPECT[idx] = _hdr_masked(frame[:k + 8])
 
 
 SENDER = r"""
@@ -267,7 +324,7 @@ def main():
     built = [build(p, i) for i, p in enumerate(pk)]
     frames = [b for b, _ in built]
     for i, (b, pn) in enumerate(built):
-        EXPECT[i] = (b[9], b[12:16], b[16:20])
+        expect(i, b)
     socks = open_capture(mode, [pn for _, pn in built])
     if req.get("attribute"):
         for i, f in enumerate(frames):
