@@ -314,3 +314,15 @@ def test_r1_c03_comment_value_that_looks_like_a_verb():
 def test_r9_top_level_interface_removal_is_a_removed_binding(tmp_path, line):
     _unknown_on_every_surface(_write(tmp_path, "x.cfg", _BOUND_IOS + line + "\n"),
                               "acl-binding-negated")
+
+
+@pytest.mark.parametrize("extra,code", [
+    # an abbreviated `interface` header reopening a stanza: its lines are
+    # still checked, and the header itself is not modeled
+    ("int GigabitEthernet0/1\n default ip access-gr EDGE in\n", "interface-feature-unmodeled"),
+    ("inter GigabitEthernet0/1\n description x\n", "interface-feature-unmodeled"),
+    ("no int GigabitEthernet0/1\n", "acl-binding-negated"),
+    ("default inte GigabitEthernet0/1\n", "acl-binding-negated"),
+])
+def test_abbreviated_interface_command_is_unknown(tmp_path, extra, code):
+    _unknown_on_every_surface(_write(tmp_path, "x.cfg", _BOUND_IOS + extra), code)
