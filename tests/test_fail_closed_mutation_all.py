@@ -74,7 +74,8 @@ def _corpus() -> List[Tuple[str, str]]:
             if os.path.isfile(path):
                 base = os.path.basename(path)
                 pol = "v4_reach_ip.json" if "reach" in base else "v4_ip.json"
-                if os.sep + "r7" + os.sep in path:      # the reviewer's round-8 driver
+                if os.sep + "r7" + os.sep in path or os.sep + "r8" + os.sep in path:
+                    # the reviewer's round-8 and round-9 drivers
                     pol = ("v6_ip.json" if base.startswith("v6") else
                            "v4_tcp445.json" if "tcp445" in base else pol)
                 out.append((path, os.path.join(_POL, pol)))
@@ -148,7 +149,7 @@ def _bodies(lines: List[str], hdr) -> List[Tuple[int, int]]:
     return out
 
 
-def _cisco(lines: List[str]) -> Iterator[Mutant]:
+def _cisco(lines: List[str], vendor: str = "ios-asa") -> Iterator[Mutant]:
     for i, ln in enumerate(lines):
         if ln[:1] in (" ", "\t"):
             yield ("cisco-dedent", f"{i + 1}", _j(lines[:i] + [ln.lstrip(" \t")] + lines[i + 1:]),
@@ -207,6 +208,7 @@ def _cisco(lines: List[str]) -> Iterator[Mutant]:
                             kind, ref = "ref", _j(lines[:i] + lines[e:])
                         yield (fam + sfx, f"{i + 1}:{b.strip()}", mutant, kind, ref)
     yield from _cisco_acl_meaning(lines)
+    yield from _cisco_grammar(lines, vendor)
     # R6-2: `exit` after a one-line global command leaves configuration mode;
     # after the body of a mode RuleHawk does not model, it may.
     for i in range(1, len(lines)):
@@ -224,6 +226,79 @@ def _cisco(lines: List[str]) -> Iterator[Mutant]:
 
 _NUM = re.compile(r"^\s*(sequence\s+)?(\d+)\s")
 _PD = re.compile(r"(?i)\b(?:permit|deny)\b")
+
+
+# Trailing tokens (round 9, R8-8): real keywords from other vendors and
+# contexts, not only a word no grammar accepts. A word the entry grammar does
+# not have is rejected (`% Invalid input`): ref = the line dropped. A cited
+# qualifier that narrows the match (`fragments`, `established` on a non-TCP
+# entry is rejected, on TCP narrows) has no reference config: never.
+_TRAILING = [("xyzzy", "ref"), ("accept", "ref"), ("count", "ref"), ("interval", "ref"),
+             ("then", "ref"), ("-j", "ref"), ("any4", "ref"), ("fragments", "never"),
+             ("established", "never")]
+# The largest sequence number the device takes, per dialect (round 9, R8-2):
+# IOS XE 17 IPv4 2147483647; IOS IPv6 and NX-OS 4294967295. EOS is not cited.
+_SEQ_MAX = {("ios-asa", False): 2147483647, ("ios-asa", True): 4294967295,
+            ("nxos", False): 4294967295, ("nxos", True): 4294967295,
+            ("eos", False): 4294967295, ("eos", True): 4294967295}
+_WC = re.compile(r"\b(\d+\.\d+\.\d+\.\d+) (0\.\d+\.\d+\.\d+)\b")
+
+
+def _cisco_grammar(lines: List[str], vendor: str) -> Iterator[Mutant]:
+    """Forms the ACL grammar of another dialect, or of no dialect, accepts
+    with a meaning the seed does not have (round 9, R8-8). Each one is
+    `never`: the device rejects the line or reads it differently, and the
+    answer must not rest on it.
+
+    - an entry numbered 0 or one past the dialect's maximum;
+    - a `resequence` line naming the ACL;
+    - on IOS IPv4: a prefix operand (`A/len`) for a wildcard pair, and ASA
+      `log` arguments (`log 5`, `log interval 5`, `log disable`);
+    - on NX-OS and EOS: an upper-case keyword (IOS: preserve, cited)."""
+    for s, e in _bodies(lines, _ACL_HDR):
+        hdr = lines[s - 1]
+        v6 = "ipv6" in hdr.lower()
+        name = hdr.split()[-1]
+        ents = [i for i in range(s, e) if _ENTRY.match(lines[i]) and _PD.search(lines[i])]
+        if not ents:
+            continue
+        ind = re.match(r"^[ \t]*", lines[ents[0]]).group(0) or " "
+        top = _SEQ_MAX[(vendor, v6)]
+        for i in ents:
+            ln = lines[i]
+            mm = _NUM.match(ln)
+            body = ln[mm.end():] if mm else ln.lstrip()
+            kw = "sequence " if (vendor == "ios-asa" and v6) else ""
+            for n in ("0", str(top + 1)):
+                yield ("cisco-acl-seq-range", f"{i + 1}:{n}",
+                       _j(lines[:i] + [ind + kw + n + " " + body] + lines[i + 1:]),
+                       "never", None)
+            low = body.split()
+            if low and low[0].lower() in ("permit", "deny"):
+                up = ind + (mm.group(0).strip() + " " if mm else "") + low[0].upper() + \
+                    body[len(low[0]):]
+                yield ("cisco-acl-keyword-case", f"{i + 1}",
+                       _j(lines[:i] + [up] + lines[i + 1:]),
+                       "preserve" if vendor == "ios-asa" else "never", None)
+            if vendor == "ios-asa" and not v6:
+                w = _WC.search(ln)
+                if w:
+                    plen = 32 - sum(bin(int(o)).count("1") for o in w.group(2).split("."))
+                    yield ("cisco-acl-cidr-operand", f"{i + 1}",
+                           _j(lines[:i] + [ln[:w.start()] + f"{w.group(1)}/{plen}"
+                                           + ln[w.end():]] + lines[i + 1:]), "never", None)
+                if "log" not in ln.lower().split():
+                    for a in ("log 5", "log interval 5", "log disable"):
+                        yield ("cisco-acl-log-args", f"{i + 1}:{a}",
+                               _j(lines[:i] + [ln.rstrip() + " " + a] + lines[i + 1:]),
+                               "never", None)
+        fam = "ipv6" if v6 else "ip"
+        for rs in (f"resequence {fam} access-list {name} 100 10",
+                   f"{fam} access-list resequence {name} 100 10"):
+            yield ("cisco-acl-resequence", rs.split()[0],
+                   _j(lines[:e] + ["hostname R1", rs] + lines[e:]), "never", None)
+        yield ("cisco-acl-resequence", "in-acl",
+               _j(lines[:e] + [ind + "resequence 100 10"] + lines[e:]), "never", None)
 
 
 def _cisco_acl_meaning(lines: List[str]) -> Iterator[Mutant]:
@@ -263,9 +338,10 @@ def _cisco_acl_meaning(lines: List[str]) -> Iterator[Mutant]:
                        "never", None)
                 yield ("cisco-acl-default", f"{i + 1}:default sequence {n}",
                        ins("default sequence " + n), "never", None)
-            yield ("cisco-acl-trailing-token", f"{i + 1}",
-                   _j(lines[:i] + [ln.rstrip() + " xyzzy"] + lines[i + 1:]), "ref",
-                   _j(lines[:i] + lines[i + 1:]))
+            for tok, kind in _TRAILING if "log" not in ln.lower().split() else _TRAILING[:1]:
+                yield ("cisco-acl-trailing-token", f"{i + 1}:{tok}",
+                       _j(lines[:i] + [ln.rstrip() + " " + tok] + lines[i + 1:]), kind,
+                       _j(lines[:i] + lines[i + 1:]) if kind == "ref" else None)
         yield ("cisco-acl-default", f"{s + 1}:default remark", ins("default remark"),
                "never", None)
         if not any(nums):
@@ -300,6 +376,19 @@ def _iptables(lines: List[str]) -> Iterator[Mutant]:
             up = re.sub(r"^(\s*)(ip6?tables)", lambda m: m.group(1) + m.group(2).upper(), ln)
             yield ("ipt-command-case", f"{i + 1}", _j(lines[:i] + [up] + lines[i + 1:]),
                    "ref", dropped)
+    # Round 9 (R8-3, R8-4, R8-8): iptables-restore commits only on the exact
+    # line `COMMIT` (iptables-restore.c: `strcmp(buffer, "COMMIT\n")`), and
+    # iptables rejects a command with arguments left over (xtables.c:
+    # "unknown arguments found on commandline"). Both: never.
+    for i, ln in enumerate(lines):
+        if ln == "COMMIT":
+            for c in ("commit", "COMMIT ", "Commit", " COMMIT"):
+                yield ("ipt-commit-spelling", f"{i + 1}:{c!r}",
+                       _j(lines[:i] + [c] + lines[i + 1:]), "never", None)
+        if re.match(r"^\s*(?:ip6?tables\s+)?-(?:P|N|F|X)\s+\S+", ln):
+            for extra in (" extra", " INPUT", " -w"):
+                yield ("ipt-policy-extra-arg", f"{i + 1}:{extra.strip()}",
+                       _j(lines[:i] + [ln.rstrip() + extra] + lines[i + 1:]), "never", None)
     yield ("crlf", "", "\r\n".join(lines), "never", None)
     yield ("tabs", "", _j(ln.replace(" ", "\t") for ln in lines),
            "never" if save else "preserve", None)
@@ -319,6 +408,11 @@ def _panos(lines: List[str]) -> Iterator[Mutant]:
                 yield ("panos-quoted-name-space", f"{i + 1}:{q}",
                        _j(lines[:i] + [m.group(1) + q + (m.group(3) or "")] + lines[i + 1:]),
                        "never", None)
+        # Round 9 (R8-9): an address object with a token past its value is
+        # rejected by PAN-OS: never.
+        if re.match(r"^set (?:.* )?address \S+ (?:ip-netmask|ip-range) \S+$", ln):
+            yield ("panos-object-extra-token", f"{i + 1}",
+                   _j(lines[:i] + [ln + " extra"] + lines[i + 1:]), "never", None)
     yield ("crlf", "", "\r\n".join(lines), "never", None)
 
 
@@ -414,6 +508,24 @@ def _junos(lines: List[str]) -> Iterator[Mutant]:
             at = heads[i] + len(" ".join(words[:lead])) + (1 if lead else 0)
             yield ("junos-keyword-case", f"{i + 1}", _j(lines[:i] + [" ".join(up)] + lines[i + 1:]),
                    "preserve" if cmt[min(at, len(text))] else "never", None)
+    # Round 9 (R8-1, R8-10, R8-8): a second terminating action after the
+    # first (Juniper: "the latest terminating action will replace the
+    # existing terminating action"), a term name used twice in one filter
+    # (Juniper: "You must specify a unique name for each term"), and a
+    # statement the term grammar does not have. All never.
+    opp = {"accept": "discard", "discard": "accept", "reject": "accept"}
+    for k, m in enumerate(re.finditer(r"\bthen\s+(accept|discard|reject)\s*;", text)):
+        if cmt[m.start()]:
+            continue
+        t = text[:m.end()] + f" then {opp[m.group(1)]};" + text[m.end():]
+        yield ("junos-two-terminating", f"{k}", t, "never", None)
+    for k, m in enumerate(re.finditer(r"\bterm\s+(\S+)\s*\{", text)):
+        if cmt[m.start()]:
+            continue
+        t = text[:m.end()] + " bogus-stmt;" + text[m.end():]
+        yield ("junos-term-unknown-stmt", f"{k}", t, "never", None)
+        t = text[:m.start()] + f"term {m.group(1)} {{ then accept; }} " + text[m.start():]
+        yield ("junos-duplicate-term", f"{k}", t, "never", None)
     yield ("crlf", "", "\r\n".join(lines), "never", None)
     yield ("tabs", "", _j(re.sub(r"^ +", "\t", ln) for ln in lines), "preserve", None)
 
@@ -444,7 +556,9 @@ def _separators(lines: List[str]) -> Iterator[Mutant]:
 
 def mutants(text: str, vendor: str) -> Iterator[Mutant]:
     lines = text.split("\n")
-    fam = (_cisco if vendor in _CISCO else _iptables if vendor == "iptables" else
+    if vendor in _CISCO:
+        yield from _cisco(lines, vendor)
+    fam = (_iptables if vendor == "iptables" else
            _panos if vendor == "panos" else _junos if vendor == "junos" else
            _aws if vendor == "aws-sg" else None)
     if fam:
@@ -588,7 +702,12 @@ def test_no_mutant_passes_where_the_device_would_not(tmp_path_factory):
                 "junos-hash-in-word", "panos-quoted-name-space",
                 "cisco-post-end", "ipt-comment-out",
                 "ipt-continuation", "panos-command-case", "junos-quoted-markers",
-                "junos-hash-block", "aws-char-in-string", "sep-joins-lines"):
+                "junos-hash-block", "aws-char-in-string", "sep-joins-lines",
+                # round 9 (R8-8)
+                "junos-two-terminating", "junos-duplicate-term",
+                "junos-term-unknown-stmt", "cisco-acl-seq-range", "cisco-acl-resequence",
+                "cisco-acl-cidr-operand", "cisco-acl-log-args", "cisco-acl-keyword-case",
+                "ipt-policy-extra-arg", "ipt-commit-spelling", "panos-object-extra-token"):
         assert stats[fam]["mutants"] > 0, fam
     assert not bad, f"{len(bad)} mutant(s) PASS where the device would not:\n" + \
         "\n".join(bad[:80]) + "\n" + table
