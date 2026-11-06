@@ -361,7 +361,7 @@ class FailClosedContext:
 #   as IOS applies them. An abbreviated type (`Gi0/1`) stays a separate name:
 #   that can only add an interface to the path model, never hide one.
 # --------------------------------------------------------------------------- #
-_BOM = "﻿"
+_BOM = "\ufeff"
 
 # Top-level commands that end an interface / ACL / object-group mode. Each is
 # not a command of those modes on IOS, NX-OS or EOS, so the device leaves the
