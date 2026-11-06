@@ -23,8 +23,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install pytest
-        run: python -m pip install --quiet pytest
+      - name: Install pytest and PyYAML
+        # PyYAML: the stopgap tests run the action's steps one by one.
+        run: python -m pip install --quiet pytest pyyaml
       - name: Run tests
         run: python -m pytest -q
       - name: Verify the web demo vendored engine is in sync

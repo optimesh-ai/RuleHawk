@@ -22,6 +22,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -284,6 +285,212 @@ def test_action_missing_rc_file_never_claims_exit_0(tmp_path, fail_on):
     assert "exited 0" not in p.stdout
     assert "::error title=RuleHawk gate did not complete" in p.stdout
     assert "No verdict was recorded" in p.stdout
+
+
+try:
+    import yaml
+except ImportError:          # the step-by-step Action checks need PyYAML
+    yaml = None
+needs_yaml = pytest.mark.skipif(yaml is None, reason="PyYAML not installed")
+
+
+def _action() -> dict:
+    with open(_ACTION, encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+# --------------------------------------------------------------------------- #
+# One use of the action, run step by step (reserve, gate, enforce): the
+# per-invocation verdict and the documented FAIL-only recipe.
+# --------------------------------------------------------------------------- #
+_GH_EXPR = re.compile(r"\$\{\{\s*(.*?)\s*\}\}")
+_SIM_STEPS = ("Reserve this check's result", "Run RuleHawk gate",
+              "Enforce gate verdict")
+
+
+def _gh_ctx(expr: str, inputs: dict, outs: dict) -> str:
+    m = re.fullmatch(r"inputs\.([\w-]+)", expr)
+    if m:
+        return str(inputs.get(m.group(1), ""))
+    m = re.fullmatch(r"steps\.([\w-]+)\.outputs\.([\w-]+)", expr)
+    if m:
+        return str(outs.get(m.group(1), {}).get(m.group(2), ""))
+    return _ROOT if expr == "github.action_path" else ""
+
+
+def _gh_resolve(value, inputs: dict, outs: dict) -> str:
+    return _GH_EXPR.sub(lambda m: _gh_ctx(m.group(1), inputs, outs), str(value))
+
+
+def _gh_outputs(path: str) -> dict:
+    out, lines = {}, open(path, encoding="utf-8").read().splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if "<<" in line and "=" not in line.split("<<", 1)[0]:
+            key, delim = line.split("<<", 1)
+            j = lines.index(delim, i + 1)
+            out[key] = "\n".join(lines[i + 1:j])
+            i = j
+        elif "=" in line:
+            key, val = line.split("=", 1)
+            out[key] = val
+        i += 1
+    return out
+
+
+def _stub_bin(tmp_path) -> str:
+    """A `python3` that is the real interpreter, except that with STUB_CRASH
+    set `python3 -m rulehawk gate` dies like a traceback: exit 1, no JSON."""
+    d = tmp_path / "stub-bin"
+    if not d.exists():
+        d.mkdir()
+        py = d / "python3"
+        py.write_text(
+            "#!/bin/bash\n"
+            'if [ -n "${STUB_CRASH:-}" ] && [ "$1" = "-m" ] && [ "$3" = "gate" ]; then\n'
+            '  echo "Traceback (most recent call last): stub crash" >&2; exit 1\n'
+            "fi\n"
+            f'exec {shlex.quote(sys.executable)} "$@"\n')
+        py.chmod(0o755)
+    return str(d)
+
+
+def _invoke(tmp_path, configs: str, fail_on: str, gate_mode: str = "run"):
+    """Run one use of the action in a job whose RUNNER_TEMP is tmp_path/runner
+    (shared by every use in the job, as on a real runner). gate_mode: `run`;
+    `skip` (an earlier step such as setup-python failed, so the gate step never
+    ran but the always() enforce step does); `abort` (the gate step dies before
+    RuleHawk runs); `crash` (RuleHawk exits 1 with no JSON). Returns (step
+    outputs by id, {step name: CompletedProcess})."""
+    action = _action()
+    runner = tmp_path / "runner"
+    runner.mkdir(exist_ok=True)
+    inputs = {k: str(v.get("default", "")) for k, v in action["inputs"].items()}
+    inputs.update({"configs": configs, "fail-on": fail_on})
+    outs: dict = {}
+    procs: dict = {}
+    for i, step in enumerate(action["runs"]["steps"]):
+        name = step.get("name")
+        if name not in _SIM_STEPS or "run" not in step:
+            continue
+        if name == "Run RuleHawk gate" and gate_mode == "skip":
+            continue
+        sid = step.get("id") or f"_step{i}"
+        out_file = tmp_path / f"out-{len(list(tmp_path.glob('out-*')))}"
+        out_file.write_text("")
+        env = dict(os.environ)
+        env.pop("GITHUB_STEP_SUMMARY", None)
+        env.update({k: _gh_resolve(v, inputs, outs)
+                    for k, v in (step.get("env") or {}).items()})
+        env.update(RUNNER_TEMP=str(runner), GITHUB_OUTPUT=str(out_file),
+                   GITHUB_JOB="gate-job",
+                   PATH=_stub_bin(tmp_path) + os.pathsep + env.get("PATH", ""))
+        if name == "Run RuleHawk gate" and gate_mode == "abort":
+            env.pop("RH_CONFIGS", None)        # unbound under `set -u`
+        if name == "Run RuleHawk gate" and gate_mode == "crash":
+            env["STUB_CRASH"] = "1"
+        procs[name] = subprocess.run([_BASH, "-c", step["run"]], cwd=str(tmp_path),
+                                     env=env, capture_output=True, text=True)
+        outs[sid] = _gh_outputs(str(out_file))
+    return outs, procs
+
+
+@pytest.mark.skipif(not _BASH, reason="needs bash")
+@needs_yaml
+@pytest.mark.parametrize("gate_mode", ["skip", "abort"])
+@pytest.mark.parametrize("fail_on", ["high", "medium", "none"])
+def test_action_second_use_never_reads_the_first_ones_verdict(tmp_path, gate_mode,
+                                                              fail_on):
+    # Two RuleHawk steps in one job share RUNNER_TEMP. The first one runs
+    # (advisory, so it records exit 0); the second one's gate step is skipped
+    # or aborts. Its enforce step must not pick up the first one's verdict.
+    _, first = _invoke(tmp_path, CLEAN, "none")
+    assert first["Enforce gate verdict"].returncode == 0
+    _, second = _invoke(tmp_path, CLEAN, fail_on, gate_mode)
+    p = second["Enforce gate verdict"]
+    assert p.returncode == 1, p.stdout
+    assert "::error title=RuleHawk gate did not complete" in p.stdout
+    assert "exited 0" not in p.stdout
+
+
+def _gh_if(expr: str, ctx: dict) -> bool:
+    """Evaluate a GitHub `if:` expression built from ==, !=, &&, ||, !, (),
+    'string' literals and context names (the subset the docs use)."""
+    m = _GH_EXPR.fullmatch(expr.strip())
+    expr = m.group(1) if m else expr
+    toks = re.findall(r"'[^']*'|==|!=|&&|\|\||!|\(|\)|[A-Za-z_][\w.-]*", expr)
+    assert "".join(toks) == re.sub(r"\s+", "", expr), expr   # all tokenised
+    py = []
+    for t in toks:
+        if t in ("&&", "||", "!"):
+            py.append({"&&": " and ", "||": " or ", "!": " not "}[t])
+        elif t in ("==", "!=", "(", ")"):
+            py.append(t)
+        elif t.startswith("'"):
+            py.append(repr(t[1:-1]))
+        elif t in ("true", "false"):
+            py.append(t.title())
+        else:
+            assert t in ctx, f"recipe reads {t}, which the action does not set"
+            py.append(repr(ctx[t]))
+    return bool(eval("".join(py), {"__builtins__": {}}))   # noqa: S307
+
+
+def _doc_recipes():
+    """Every workflow snippet in the changelog and docs that gates on a
+    RuleHawk step's outputs (`steps.rh.`)."""
+    found = []
+    for rel in ["CHANGELOG.md"] + sorted(
+            os.path.join("docs", f) for f in os.listdir(os.path.join(_ROOT, "docs"))
+            if f.endswith(".md")):
+        text = open(os.path.join(_ROOT, rel), encoding="utf-8").read()
+        for block in re.findall(r"```ya?ml\n(.*?)```", text, re.S):
+            if "steps.rh." in block:
+                found.append((rel, block))
+    return found
+
+
+_RECIPE_CASES = {
+    # case: (config, gate_mode, should the job fail?)
+    "setup failure": ("CLEAN", "skip", True),
+    "gate did not complete": ("CLEAN", "abort", True),
+    "exit 1 with JSON": ("DIRTY", "run", True),
+    "exit 1, no JSON (crash)": ("CLEAN", "crash", True),
+    "exit 2 (zero rules parsed)": ("JUNK", "run", True),
+    "exit 3 (UNKNOWN)": ("CLEAN", "run", False),
+}
+
+
+@pytest.mark.skipif(not _BASH, reason="needs bash")
+@needs_yaml
+@pytest.mark.parametrize("case", sorted(_RECIPE_CASES))
+def test_documented_fail_only_recipe_blocks_everything_but_unknown(tmp_path, case):
+    recipes = _doc_recipes()
+    assert recipes, "the FAIL-only recipe is documented in CHANGELOG.md"
+    junk = tmp_path / "junk.txt"
+    junk.write_text("this is not a firewall config\n")
+    cfg_name, gate_mode, should_fail = _RECIPE_CASES[case]
+    cfg = {"CLEAN": CLEAN, "DIRTY": DIRTY, "JUNK": str(junk)}[cfg_name]
+    action_outputs = _action()["outputs"]
+    for rel, block in recipes:
+        steps = yaml.safe_load(block)
+        rh = next(s for s in steps if s.get("id") == "rh")
+        assert rh.get("continue-on-error") is True, rel
+        job = tmp_path / f"job-{len(list(tmp_path.glob('job-*')))}"
+        job.mkdir()
+        outs, procs = _invoke(job, cfg, str(rh["with"].get("fail-on", "high")),
+                              gate_mode)
+        if case.startswith("exit "):
+            assert outs["gate"]["exit_code"] == case.split()[1].rstrip(","), outs
+        outcome = ("failure" if any(p.returncode for p in procs.values())
+                   else "success")
+        ctx = {"steps.rh.outcome": outcome, "steps.rh.conclusion": "success"}
+        for name, spec in action_outputs.items():
+            ctx[f"steps.rh.outputs.{name}"] = _gh_resolve(spec["value"], {}, outs)
+        job_fails = any(_gh_if(s["if"], ctx) and "exit 1" in str(s.get("run", ""))
+                        for s in steps if s.get("id") != "rh" and "if" in s)
+        assert job_fails == should_fail, (rel, case, outcome, ctx)
 
 
 # --------------------------------------------------------------------------- #
