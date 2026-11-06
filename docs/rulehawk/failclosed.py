@@ -139,6 +139,10 @@ REASONS: Dict[str, str] = {
         "an IOS ACL entry pairs a nonzero address with 255.255.255.255; as an "
         "IOS wildcard that matches any address, as a netmask it is one host, "
         "and RuleHawk will not pick a reading to prove a PASS",
+    "acl-binding-undefined":
+        "an interface or access-group is bound to an ACL with no parsed rule; "
+        "on IOS a missing or empty ACL permits all traffic, so that path is "
+        "unfiltered",
     "vendor-unknown":
         "the config's vendor label is not one RuleHawk has fail-closed checks "
         "for, so none of them ran",
@@ -463,6 +467,11 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
         if acls and all(acl not in transit for acl in acls):
             b.append(Reason("no-transit-filter",
                             "no ACL has an interface or access-group binding"))
+        defined = {a.acl for a in aces}
+        for name in sorted(transit - defined):
+            # Cisco: "If an access list is referenced by a name, but the access
+            # list does not exist, all packets pass." (IOS XE 17 ACL guide)
+            b.append(Reason("acl-binding-undefined", name))
         if re.search(r"(?im)^\s*(?:nameif\s+\S|security-level\s+\d|"
                      r"same-security-traffic\b)", text):
             b.append(Reason("asa-security-levels"))

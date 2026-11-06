@@ -47,6 +47,9 @@ UNKNOWN never shares the PASS code. Precedence: 2, then 1, then 3, then 0.
 - ACL role is not a transit packet filter (`line vty` `access-class`, SNMP,
   route-map / PBR / class-map `match`, NAT, crypto, distribute-list) or is
   unknown -> UNKNOWN (`acl-not-packet-filter`, `acl-role-unknown`). 10.
+- An interface or `access-group` bound to an ACL with no parsed rule (Cisco:
+  "If an access list is referenced by a name, but the access list does not
+  exist, all packets pass.") -> UNKNOWN (`acl-binding-undefined`).
 - ASA `nameif` / `security-level` semantics -> UNKNOWN (`asa-security-levels`). 11.
 - Junos SRX security policies and logical systems -> UNKNOWN
   (`junos-srx-policies`, `junos-logical-systems`; also `junos-groups`). 08, 09.
