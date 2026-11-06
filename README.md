@@ -83,10 +83,10 @@ default, and the verdict becomes a real PASS or FAIL.
 Every PASS prints these next to the verdict (text, the `--json` `scope` field,
 `--evidence`, the gate, MCP and the hosted page):
 
-- On every vendor a line ends at \n only, and a control or separator character on any line is UNKNOWN (a CR before the newline is accepted only in Cisco configs and AWS JSON).
-- Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group mode end at a header, `exit` or a recognised top-level command, indented or not; inside an ACL only ACL-entry lines are read (a sequence number, permit, deny, remark, evaluate, dynamic, `no` or `default` of those, NX-OS `statistics per-entry`) and any other line is UNKNOWN; any other line in interface mode, an unindented line in those modes that is not a recognised top-level command, `ex` or `en` for `exit` or `end`, an `exit` after a line that opens no known sub-mode or after a sub-mode body that is not checked, and any line after `end` are UNKNOWN; other global commands are not read.
+- On every vendor a line ends at \n only, and a control or separator character on any line is UNKNOWN (a CR before the newline is accepted only in Cisco configs and AWS JSON); every line of an object on the evaluated path (a Cisco ACL, ACL header, flat access-list or forwarding interface line, every iptables and PAN-OS line, every Junos term) is either read into the model, every word of it, or makes the answer UNKNOWN.
+- Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group mode end at a header, `exit` or a recognised top-level command, indented or not; inside an ACL a line is read only if it is a `permit` or `deny` entry, a `remark` or `exit`, with the sequence-number form of its vendor and family (`N` on IOS IPv4, NX-OS and EOS, `sequence N` on IOS IPv6); an unnumbered entry is numbered the last number + 10 and the ACL is evaluated in number order; `no N` (IOS IPv4, NX-OS, EOS) and `no sequence N` (IOS IPv6) delete that entry; NX-OS `statistics per-entry` is read on NX-OS only; an ACL whose number order differs from its text or that has a deletion, and every other line in an ACL (`default`, `evaluate`, `dynamic`, another `no` or sequence form, any other command), are UNKNOWN; any other line in interface mode, an unindented line in those modes that is not a recognised top-level command, `ex` or `en` for `exit` or `end`, an `exit` after a line that opens no known sub-mode, after an opener that is not complete (`router`, `line vty`) or after a sub-mode body that is not checked, and any line after `end` are UNKNOWN; other global commands are not read.
 - PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed; a quoted name with leading or trailing whitespace is UNKNOWN.
-- iptables reads the filter table; a chain's policy comes only from a parsed -P or :CHAIN line naming ACCEPT or DROP (exact case).
+- iptables reads the filter table; a chain's policy comes only from a parsed -P or :CHAIN line naming ACCEPT or DROP (exact case); an iptables-restore table block without `COMMIT`, and a line outside a table block, are UNKNOWN.
 - Junos reads firewall filters and their interface bindings; SRX security zones or policies, a comment marker, brace, bracket or `;` inside a quoted string, a `#` glued to a word, and braces that do not balance make the answer UNKNOWN.
 
 The Cisco interface allowlist is: `description`, `ip address` (with
@@ -130,12 +130,29 @@ optional sequence number, or `sequence N`, then `permit`, `deny`, `remark`,
 `evaluate` or `dynamic`; `no` or `default` of one of those or of a sequence
 number; NX-OS `statistics per-entry`). Any other line there (`ntp server`,
 `no ip domain-lookup`, an abbreviation, EOS `counters per-entry`, NX-OS
-`fragments`) is UNKNOWN (`stanza-boundary-ambiguous`). IOS accepts any unique
+`fragments`) is UNKNOWN (`stanza-boundary-ambiguous`). Of the lines that stay
+in the ACL, the parser reads `permit` / `deny` entries (every word), `remark`
+and `exit`, each with its vendor's sequence-number form (`N` on IOS IPv4,
+NX-OS and EOS; `sequence N` on IOS IPv6). An unnumbered entry is numbered the
+last number + 10 and the ACL is evaluated in number order; `no N` (IOS IPv4,
+NX-OS, EOS) and `no sequence N` (IOS IPv6) delete entry N. A reordered ACL, a
+deletion, `default ...`, any other `no` or sequence form, `evaluate`,
+`dynamic` and NX-OS `statistics per-entry` outside NX-OS are parse notes, so
+the answer is UNKNOWN (or FAIL when a leak is proven). Every line of an ACL,
+an ACL header, a flat `access-list` line or a forwarding interface is
+accounted for: read, or a note. IOS accepts any unique
 abbreviation, so `ex`/`exi` and `en` are read as `exit` and `end`, and are
 UNKNOWN too. `end`, or `exit` at the global level, leaves configuration mode:
 every later line is a parse note and no ACL is read from it. So does an
 `exit` straight after a line that opens no known sub-mode (`hostname R1`,
-`ip route ...`). An `exit` after the body of a mode whose lines RuleHawk
+`ip route ...`). An `exit` after an opener that starts like a sub-mode but is
+not complete (`router`, `router ospf`, `line vty`, `route-map`, `vrf
+definition`, `control-plane xyzzy`) is UNKNOWN; the complete forms are
+`router ospf|ospfv3|eigrp N`, `router bgp N`, `router rip`, `router isis
+[TAG]`, `line vty|con|aux N [M]`, `route-map NAME [permit|deny] [N]`,
+`class-map [match-any|match-all] NAME`, `policy-map NAME`, `control-plane
+[host|transit|cef-exception]`, `vrf definition|context|instance NAME` and
+`mac access-list [extended] NAME`. An `exit` after the body of a mode whose lines RuleHawk
 does not check (a routing process, an object-group) is UNKNOWN: a body line
 may have run in global mode, and then the `exit` left configuration mode. Interface names are case-folded and a separately
 written number is joined (`GigabitEthernet 0/1` is `gigabitethernet0/1`);

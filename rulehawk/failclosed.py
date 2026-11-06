@@ -1507,24 +1507,36 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
 KNOWN_LIMITS = (
     "On every vendor a line ends at \\n only, and a control or separator "
     "character on any line is UNKNOWN (a CR before the newline is accepted "
-    "only in Cisco configs and AWS JSON)",
+    "only in Cisco configs and AWS JSON); every line of an object on the "
+    "evaluated path (a Cisco ACL, ACL header, flat access-list or forwarding "
+    "interface line, every iptables and PAN-OS line, every Junos term) is "
+    "either read into the model, every word of it, or makes the answer UNKNOWN",
     "Cisco reads ACLs, allowlisted interface lines and the listed global "
     "features (zone firewall, ip inspect, service-policy, policy routing, "
     "MPLS / xconnect, VLAN filters, NAT); interface, ACL and object-group "
     "mode end at a header, `exit` or a recognised top-level command, indented "
-    "or not; inside an ACL only ACL-entry lines are read (a sequence number, "
-    "permit, deny, remark, evaluate, dynamic, `no` or `default` of those, NX-OS "
-    "`statistics per-entry`) and any other line is UNKNOWN; any other line in "
-    "interface mode, an unindented line in those modes that is not a "
-    "recognised top-level command, `ex` or `en` for `exit` or `end`, an `exit` "
-    "after a line that opens no known sub-mode or after a sub-mode body that "
-    "is not checked, and any line after `end` are UNKNOWN; other global "
-    "commands are not read",
+    "or not; inside an ACL a line is read only if it is a `permit` or `deny` "
+    "entry, a `remark` or `exit`, with the sequence-number form of its vendor "
+    "and family (`N` on IOS IPv4, NX-OS and EOS, `sequence N` on IOS IPv6); an "
+    "unnumbered entry is numbered the last number + 10 and the ACL is "
+    "evaluated in number order; `no N` (IOS IPv4, NX-OS, EOS) and `no "
+    "sequence N` (IOS IPv6) delete that entry; NX-OS `statistics per-entry` "
+    "is read on NX-OS only; an ACL whose number order differs from its text "
+    "or that has a deletion, and every other line in an ACL (`default`, "
+    "`evaluate`, `dynamic`, another `no` or sequence form, any other "
+    "command), are UNKNOWN; any other line in interface mode, an unindented "
+    "line in those modes that is not a recognised top-level command, `ex` or "
+    "`en` for `exit` or `end`, an `exit` after a line that opens no known "
+    "sub-mode, after an opener that is not complete (`router`, `line vty`) or "
+    "after a sub-mode body that is not checked, and any line after `end` are "
+    "UNKNOWN; other global commands are not read",
     "PAN-OS resolves an object name only in the rule's own vsys or "
     "device-group and in shared; device-group inheritance is not followed; a "
     "quoted name with leading or trailing whitespace is UNKNOWN",
     "iptables reads the filter table; a chain's policy comes only from a "
-    "parsed -P or :CHAIN line naming ACCEPT or DROP (exact case)",
+    "parsed -P or :CHAIN line naming ACCEPT or DROP (exact case); an "
+    "iptables-restore table block without `COMMIT`, and a line outside a "
+    "table block, are UNKNOWN",
     "Junos reads firewall filters and their interface bindings; SRX security "
     "zones or policies, a comment marker, brace, bracket or `;` inside a "
     "quoted string, a `#` glued to a word, and braces that do not balance "
