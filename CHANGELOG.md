@@ -113,5 +113,6 @@ UNKNOWN never shares the PASS code. Precedence: 2, then 1, then 3, then 0.
   failure will go red; read the reason codes, then bind the ACL, fix the
   note, or keep the job advisory with `fail-on: none`.
 - An indeterminate assertion used to exit 0 below the threshold; it now exits 3.
+- A violation suppressed by Hammerhead path-grounding used to exit 0; it is now UNKNOWN (`pathground-witness-only`) and exits 3.
 - The evidence schema stays `rulehawk.evidence/v1`; `reasons` is additive.
 - New JSON fields are additive; no field was removed or renamed.
