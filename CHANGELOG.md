@@ -81,8 +81,9 @@ it.
 
 `fail-on: none` turns off **all** blocking, not just UNKNOWN: a FAIL (exit 1)
 and a config that parses to zero rules (exit 2) no longer fail the step
-either. To keep blocking on FAIL while UNKNOWN stays non-blocking, keep
-`fail-on` at your threshold and gate on the verdict yourself:
+either. To keep blocking on everything except UNKNOWN, keep `fail-on` at
+your threshold, let the RuleHawk step continue on error, and fail the job
+unless the step failed with exit code 3:
 
 ```yaml
 - id: rh
@@ -91,9 +92,15 @@ either. To keep blocking on FAIL while UNKNOWN stays non-blocking, keep
   with:
     configs: 'firewall/**/*.txt'
     fail-on: high
-- if: steps.rh.outputs.verdict == 'FAIL' || steps.rh.outputs.exit-code == '2'
+- if: steps.rh.outcome == 'failure' && steps.rh.outputs.exit-code != '3'
   run: exit 1
 ```
+
+This blocks on FAIL (exit 1), on exit 2, on a crash, and when the step failed
+before RuleHawk recorded an exit code (a setup failure, or "gate did not
+complete"). Only an explicit UNKNOWN (exit 3) passes. Do not use it on a
+step with `share-results: true`: on an UNKNOWN run it would also hide a failed
+result upload (see docs/github-action.md).
 
 ### Other changes you may notice
 

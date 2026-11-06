@@ -250,9 +250,8 @@ def test_action_declares_verdict_and_exit_code_outputs():
 
 def _enforce(tmp_path, rc: str, fail_on: str, verdict: str):
     step = _step(_action(), "Enforce gate verdict")
-    (tmp_path / "rulehawk.rc").write_text(rc + "\n")
     env = dict(os.environ, RUNNER_TEMP=str(tmp_path), RH_FAIL_ON=fail_on,
-               RH_WORST="none", RH_VERDICT=verdict)
+               RH_WORST="none", RH_VERDICT=verdict, RH_RC=rc)
     return subprocess.run([_BASH, "-c", step["run"]], env=env,
                           capture_output=True, text=True)
 
