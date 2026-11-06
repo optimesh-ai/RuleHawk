@@ -344,3 +344,17 @@ def test_nat_present_is_unknown(cfg):
 def test_cisco_nat_forms_are_unknown(tmp_path, extra):
     text = _BOUND_IOS + extra
     _unknown_on_every_surface(_write(tmp_path, "x.cfg", text), "nat-present")
+
+
+# --------------------------------------------------------------------------- #
+# L5: the hosted report_json carries the real vendor label
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("cfg,want", [
+    ("s01_junos_inactive_binding.conf", "junos"),
+    ("t01_userchain_unref_nopolicy.sh", "iptables"),
+    ("u04_nat_dnat.set", "panos"),
+    ("r01_no_access_group.cfg", "ios-asa"),
+])
+def test_hosted_report_json_vendor_is_the_parsed_vendor(cfg, want):
+    env = _hosted(_rev(cfg), "v4_ip.json")
+    assert env["report_json"]["vendor"] == want, env["report_json"]["vendor"]
