@@ -418,7 +418,7 @@ from rulehawk.parse_awssg import detect as detect_awssg, parse_awssg
 from rulehawk.analyze import analyze
 from rulehawk.report import to_json, to_text
 from rulehawk.segcheck import check_segmentation
-from rulehawk.failclosed import build_context
+from rulehawk.failclosed import build_context, normalise_vendor
 from rulehawk.evidence import Subject, build_evidence, to_evidence_markdown
 from rulehawk.model import strip_pager
 _pasted = cfg
@@ -457,7 +457,7 @@ _art = build_evidence([_subject], policy=_policy_obj,
                       policy_source=("pasted-policy" if _policy_obj else ""),
                       policy_raw=(_pol.encode("utf-8") if _policy_obj else None),
                       generator="hosted")
-json.dumps({"report_json": json.loads(to_json(findings, notes, len(aces))),
+json.dumps({"report_json": json.loads(to_json(findings, notes, len(aces), normalise_vendor(vendor))),
             "report_text": to_text(findings, notes, len(aces)),
             "rule_lines": _rl, "vendor": vendor,
             "evidence": _art, "evidence_md": to_evidence_markdown(_art)})
