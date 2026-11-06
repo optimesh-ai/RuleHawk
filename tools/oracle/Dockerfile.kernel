@@ -1,0 +1,8 @@
+# The iptables oracle: a stock Debian userspace (iptables, nf_tables backend)
+# driving the host kernel's netfilter. Run privileged (netns + sysctls).
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        iptables iproute2 conntrack python3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY kernel_probe.py /oracle/kernel_probe.py
+ENTRYPOINT ["python3", "/oracle/kernel_probe.py"]
