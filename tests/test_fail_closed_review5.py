@@ -87,8 +87,8 @@ def test_s2_unindented_line_in_interface_mode_is_unknown(cfg):
 
 
 @pytest.mark.parametrize("line", ["no ip access-gr EDGE in", "xyzzy",
-                                  "ip forward-protocol nd", " description x",
-                                  " no ip access-gr EDGE in"])
+                                  "ip forward-protocol nd", "\u00a0description x",
+                                  "\u2003no ip access-gr EDGE in"])
 def test_s2_any_unrecognised_unindented_line_after_an_interface(tmp_path, line):
     text = _BOUND_IOS.replace("!\ninterface GigabitEthernet0/1",
                               f"!\n{line}\ninterface GigabitEthernet0/1", 1)
@@ -128,12 +128,32 @@ def test_s3_separator_in_description_is_unknown(cfg):
 
 
 @pytest.mark.parametrize("ch", ["\v", "\x0c", "\x1c", "\x1d", "\x1e", "\x85",
-                                " ", " ", "\x00", "\x1b", "\r"])
+                                "\u2028", "\u2029", "\x00", "\x1b"])
 def test_s3_any_control_character_blocks(tmp_path, ch):
     text = _BOUND_IOS.replace(" ip access-group EDGE in\n!\ninterface GigabitEthernet0/1",
                               f" ip access-group EDGE in\n description a{ch}b\n!\n"
                               "interface GigabitEthernet0/1", 1)
     _unknown_on_every_surface(_write(tmp_path, "x.cfg", text), "parse-note")
+
+
+def test_s3_a_lone_cr_inside_a_line_blocks(tmp_path):
+    """The CLI, gate and MCP read bytes and see one line with a CR inside
+    (parse-note); a browser textarea turns the CR into a line break, so the
+    hosted page sees an unindented line in interface mode. UNKNOWN on both."""
+    from test_fail_closed_review3 import _hosted
+    from test_fail_closed import _load_policy
+    from rulehawk import gate as g
+    from rulehawk import mcp_server as m
+    p = tmp_path / "x.cfg"
+    p.write_bytes(_BOUND_IOS.replace(" ip access-group EDGE in\n!\ninterface GigabitEthernet0/1",
+                                     " ip access-group EDGE in\n description a\rb\n!\n"
+                                     "interface GigabitEthernet0/1", 1).encode())
+    r = _report(str(p))
+    assert r["assertion_verdict"] == "UNKNOWN" and "parse-note" in _codes(r)
+    assert g.run_gate([str(p)], _load_policy("v4_ip.json")).exit_code() == 3
+    assert m.audit(str(p), _pol("v4_ip.json"))["verdict"] == "UNKNOWN"
+    env = _hosted(str(p), "v4_ip.json")
+    assert env["report_json"]["assertion_verdict"] == "UNKNOWN"
 
 
 def test_s3_crlf_alone_is_fine(tmp_path):
@@ -153,14 +173,15 @@ def test_s4_spaced_names_do_not_merge():
 
 def test_s4_spaced_and_joined_name_are_one_interface(tmp_path):
     """IOS reads `GigabitEthernet 0/1` and `gigabitethernet0/1` as one port,
-    so a later stanza for either spelling merges with the first."""
-    text = _BOUND_IOS.replace("!\nend\n",
-                              "!\ninterface gigabitethernet 0/1\n shutdown\n!\nend\n")
-    assert text != _BOUND_IOS
-    r = _report(_write(tmp_path, "x.cfg", text))
-    # Gi0/1 is now shut, so CORP's ingress port no longer counts: the result
-    # must not be a PASS built on Gi0/1's binding.
-    assert r["assertion_verdict"] != "PASS", _codes(r)
+    so a later stanza for either spelling merges with the first: still two
+    filtered ports, a PASS. A spaced name for a third port is unfiltered."""
+    same = _BOUND_IOS.replace("!\nend\n",
+                              "!\ninterface gigabitethernet 0/1\n description x\n!\nend\n")
+    assert same != _BOUND_IOS
+    r = _report(_write(tmp_path, "same.cfg", same))
+    assert r["assertion_verdict"] == "PASS", _codes(r)
+    third = same.replace("gigabitethernet 0/1", "GigabitEthernet 0/2")
+    _unknown_on_every_surface(_write(tmp_path, "third.cfg", third), "unfiltered-path")
 
 
 # --------------------------------------------------------------------------- #
@@ -219,8 +240,8 @@ def test_one_cisco_lexer():
     import inspect
     from rulehawk import failclosed as fc
     src = inspect.getsource(fc)
-    lexer = inspect.getsource(fc.cisco_lex)
-    rest = src.replace(lexer, "")
+    rest = src.replace(inspect.getsource(fc.cisco_lex), "").replace(
+        inspect.getsource(fc.split_lines), "")
     assert "splitlines(" not in rest
     assert 'split("\\n")' not in rest
-    assert "interface\\s" not in rest
+    assert "^interface" not in rest and "^\\s+shutdown" not in rest

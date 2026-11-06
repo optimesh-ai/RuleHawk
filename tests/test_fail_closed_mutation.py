@@ -98,7 +98,7 @@ def mutants(text: str) -> Iterator[Tuple[str, str]]:
     for i, ln in enumerate(lines):
         if ln[:1] in (" ", "\t"):
             yield f"dedent:{i + 1}", "\n".join(lines[:i] + [ln.lstrip(" \t")] + lines[i + 1:])
-        for tag, junk in (("junk", "xyzzy"), ("nbsp", " ")):
+        for tag, junk in (("junk", "xyzzy"), ("nbsp", "\u00a0")):
             yield f"{tag}-before:{i + 1}", "\n".join(lines[:i] + [junk] + lines[i:])
         if "description" in ln:
             k = ln.index("description") + len("description ")
