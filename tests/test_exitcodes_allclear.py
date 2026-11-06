@@ -549,6 +549,90 @@ def test_allclear_pin_catches_an_edit():
     assert _allclear_fn_hashes(src) != _ALLCLEAR_FN_SHA
 
 
+# --------------------------------------------------------------------------- #
+# Review of #47, round 2: R2-F1 (the closure, red first). Each plant leaves the
+# hashed definitions alone and reaches the environment through allowed names.
+# Every part of the closure must catch every plant on its own.
+# --------------------------------------------------------------------------- #
+_ALLCLEAR_ON = ("def _on():\n    return Optional.__repr__.__globals__['sys'].modules['os']"
+                ".environb.get(b'RH_FORCE') == b'1'\n\n\n")
+_ALLCLEAR_LAST = "    return exitcodes.PASS if passed(cert) else exitcodes.UNKNOWN\n"
+_ALLCLEAR_EMIT = "def emit(verdict: str, cert: Optional[object] = None) -> str:\n"
+_ALLCLEAR_R2_PLANTS = {
+    "R4-module-if": (_ALLCLEAR_LAST, _ALLCLEAR_LAST + "\n\n" + _ALLCLEAR_ON
+                     + "if _on():\n    _STOPGAP.update({k: k for k in list(_STOPGAP)})\n"),
+    "R5-decorator": (_ALLCLEAR_EMIT, _ALLCLEAR_ON
+                     + "def _w(f):\n    def g(verdict, cert=None):\n"
+                     "        return verdict if _on() else f(verdict, cert)\n    return g\n\n\n"
+                     "@_w\n" + _ALLCLEAR_EMIT),
+    "R6-code-swap": (_ALLCLEAR_LAST, _ALLCLEAR_LAST + "\n\n" + _ALLCLEAR_ON
+                     + "certified.__code__ = (lambda cert=None: _on()).__code__\n"),
+    "R7-stopgap-write": (_ALLCLEAR_LAST, _ALLCLEAR_LAST + "\n\n_STOPGAP[PASS] = PASS\n"),
+}
+
+
+def _allclear_closure():
+    return {"names": _allclear_violations, "shape": _allclear_shape_problems,
+            "file-pin": _allclear_pin_problems}
+
+
+@pytest.mark.parametrize("copy", ["rulehawk", os.path.join("docs", "rulehawk")])
+def test_allclear_closure_holds_on_both_copies(copy):
+    src = _read(os.path.join(copy, "allclear.py"))
+    assert src == _read(os.path.join("rulehawk", "allclear.py"))
+    for part, check in _allclear_closure().items():
+        assert check(src) == [], part
+
+
+# R7 names no hook, so the names part has nothing to see; shape and file-pin
+# catch it (and the emit tests, behaviourally).
+@pytest.mark.parametrize("plant,part", [
+    (p, c) for p in sorted(_ALLCLEAR_R2_PLANTS) for c in ("names", "shape", "file-pin")
+    if (p, c) != ("R7-stopgap-write", "names")])
+def test_allclear_closure_catches_round_2_plants(plant, part):
+    old, new = _ALLCLEAR_R2_PLANTS[plant]
+    src = _read(os.path.join("rulehawk", "allclear.py"))
+    assert src.count(old) == 1
+    planted = src.replace(old, new)
+    ast.parse(planted)
+    assert _allclear_closure()[part](planted), (plant, part)
+
+
+# R2-F2: a VERIFIED read that widens (== to `in (VERIFIED, INDETERMINATE)`,
+# so INDETERMINATE attestations count as verified controls) must change the
+# pinned scan, not only fail behaviourally.
+_R9 = ('            if a["status"] == VERIFIED:\n                s["verified"] += 1\n',
+       '            if a["status"] in (VERIFIED, INDETERMINATE):\n                s["verified"] += 1\n')
+
+
+def test_scan_catches_a_widened_verified_read(tmp_path, monkeypatch):
+    src = _read(os.path.join("rulehawk", "evidence.py"))
+    assert src.count(_R9[0]) == 1
+    pinned = collections.Counter({k: v for k, v in _EXEMPT.items()
+                                  if k.startswith("evidence.py::")})
+    monkeypatch.setattr(sys.modules[__name__], "_PKG", str(tmp_path))
+    (tmp_path / "evidence.py").write_text(src, encoding="utf-8")
+    assert collections.Counter(_scan_module("evidence.py")) == pinned
+    (tmp_path / "evidence.py").write_text(src.replace(*_R9), encoding="utf-8")
+    assert collections.Counter(_scan_module("evidence.py")) != pinned
+
+
+# Low suggestion: the guard fixture re-derives from git when the commits are
+# there (skipped on a shallow clone).
+def test_guard_fixture_rederives_from_git():
+    import json
+    import subprocess
+    for ref in ("v0.4.0", "e04630e"):
+        r = subprocess.run(["git", "-C", _ROOT, "cat-file", "-e", f"{ref}^{{commit}}"],
+                           capture_output=True)
+        if r.returncode != 0:
+            pytest.skip(f"{ref} is not in this clone")
+    sys.path.insert(0, os.path.join(_ROOT, "scripts"))
+    from gen_stopgap_guards import derive
+    want = json.loads(_read(os.path.join("tests", "fixtures", "stopgap_guards_e04630e.json")))
+    assert derive(_ROOT) == want
+
+
 def test_scan_catches_a_planted_emission(tmp_path, monkeypatch):
     """F4: the scan sees emissions as well as spellings."""
     planted = tmp_path / "planted.py"
@@ -740,6 +824,17 @@ def _allclear_fn_hashes(src: str) -> dict:
                          if n not in drop)
         out[name] = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
     return out
+
+
+# R2-F1, red: the closure as it stands at c1c5a8a. It has no top-level shape
+# check, and its pin covers only the six definitions. The fix replaces both.
+def _allclear_shape_problems(src: str) -> list:
+    return []
+
+
+def _allclear_pin_problems(src: str) -> list:
+    got = _allclear_fn_hashes(src)
+    return [n for n in _ALLCLEAR_PINNED if got.get(n) != _ALLCLEAR_FN_SHA[n]]
 
 
 # F5. What each --help row and doc table row means, keyed by how its text
