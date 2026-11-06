@@ -788,7 +788,7 @@ _IF_ALLOW_RX = re.compile("(?i)(?:" + "|".join(_IF_ALLOW) + ")")
 _KW_PREFIX = frozenset({"no", "default", "ip", "ipv4", "ipv6", "mpls",
                         "switchport", "crypto", "tunnel", "service-policy",
                         "zone-member"})
-_KW_TOKEN = re.compile(r"^[A-Za-z][A-Za-z-]*$")
+_KW_TOKEN = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
 
 
 def _keyword(line: str) -> str:
