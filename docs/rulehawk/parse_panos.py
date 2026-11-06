@@ -379,6 +379,17 @@ def _collect_objects(numbered: "List[Tuple[int, List[str]]]", notes: List[str],
                 if kind in _OBJECT_HARMLESS:
                     _take(lineno, "address", name, toks[1:k])
                     continue
+                if kind in ("ip-netmask", "ip-range", "fqdn", "ip-wildcard") \
+                        and len(rest) > 1:
+                    # `set address NAME ip-netmask VALUE` takes ONE value
+                    # (round 9, R8-9): a word after it is not this grammar
+                    # (PAN-OS rejects the line). The object is unresolved,
+                    # and the line is left unconsumed, so it is noted.
+                    addresses[name] = None
+                    notes.append(f"PAN-OS address '{name}' {kind} has word(s) after "
+                                 f"its value ({' '.join(rest[1:])[:30]}); not "
+                                 f"modelled (referencing rule imprecise)")
+                    continue
                 if kind in ("fqdn", "ip-wildcard") or (
                         kind in ("ip-netmask", "ip-range") and rest):
                     _take(lineno, "address", name, toks[1:k])
@@ -428,6 +439,13 @@ def _collect_objects(numbered: "List[Tuple[int, List[str]]]", notes: List[str],
                     # (exports commonly emit one member per line); overwriting
                     # would model a subset of the group. A group already marked
                     # unresolvable (None) stays unresolvable (superset).
+                    # Cited (round 9): Palo Alto Networks, "Modify Configuration
+                    # - set and edit", panos-xml-api-rtd 1.4
+                    # (http://api-lab.paloaltonetworks.com/set-edit-object.html):
+                    # `set address-group group1 static addr4` is the API
+                    # request `cmd="set"` on .../static, and "set | merge at
+                    # node specified by XPath"; the group then holds addr1,
+                    # addr2, addr3 and addr4.
                     members = [t for t in toks[k + 3:] if t not in ("[", "]")]
                     prev = addr_groups.get(name)
                     if isinstance(prev, list):

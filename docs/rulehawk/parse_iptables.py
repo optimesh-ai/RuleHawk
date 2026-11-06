@@ -928,11 +928,48 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
     # say what it does with a block that has no `COMMIT` or with a line
     # outside a block, so both are noted.
     table_open = 0                               # header line of the open block
+    # iptables-restore reads each line as it is (round 9, R8-3). The source,
+    # iptables/iptables-restore.c (netfilter iptables; e.g.
+    # https://github.com/canonical/netfilter-iptables/blob/c509a371/iptables/iptables-restore.c):
+    #   if (buffer[0] == '\n') continue;
+    #   else if (buffer[0] == '#') { ... continue; }
+    #   else if ((strcmp(buffer, "COMMIT\n") == 0) && (in_table)) { ... }
+    #   else if ((buffer[0] == '*') && (!in_table)) { /* New table */ ... }
+    #   else if (in_table) { ... ret = cb->do_command(...); }
+    #   if (!ret) { fprintf(stderr, "%s: line %u failed\n", ...); exit(1); }
+    # So only the exact line `COMMIT` commits, only a line that starts with
+    # `#` is a comment and only an empty line is skipped. Anything else (a
+    # `commit`, `COMMIT ` with a trailing space or CR, an indented `#`, a
+    # line of spaces) is handed to the rule parser: noted, never read as the
+    # thing it looks like.
+    raws = split_lines(text, keep_cr=True)
     for lineno, raw in enumerate(split_lines(text), 1):
         line = raw.strip()
-        if not line or line.startswith("#"):
+        exact = raws[lineno - 1]
+        if is_save and nft_depth == 0 and exact and not line:
+            led.add(lineno, "(spaces)")
+            led.note(lineno, notes,
+                     f"iptables-restore line {lineno} holds only spaces: "
+                     f"iptables-restore skips only an empty line")
+            continue
+        if not line or (line.startswith("#") and (not is_save or exact.startswith("#"))):
             continue
         led.add(lineno, line)
+        if is_save and nft_depth == 0 and line != exact and (
+                line[:1] in "#*:" or line.upper() == "COMMIT"):
+            led.note(lineno, notes,
+                     f"iptables-restore line {lineno} (`{line[:30]}`) has "
+                     f"white space or a CR around it: iptables-restore reads "
+                     f"the line as it is, so it is not the "
+                     f"{'comment' if line[:1] == '#' else 'table header' if line[:1] == '*' else 'chain line' if line[:1] == ':' else 'COMMIT'} "
+                     f"it looks like; not modelled")
+            continue
+        if is_save and nft_depth == 0 and line.upper() == "COMMIT" and line != "COMMIT":
+            led.note(lineno, notes,
+                     f"`{line}` at line {lineno} is not `COMMIT`: iptables-restore "
+                     f"commits only on the exact line `COMMIT`, so the table "
+                     f"block is not committed here")
+            continue
         if is_save and nft_depth == 0 and not _NFT_LINE.match(line):
             if line.startswith("*"):
                 if table_open:
@@ -942,7 +979,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                              f"{lineno}); what iptables-restore loads is not "
                              f"modelled")
                 table_open = lineno
-            elif line.upper() == "COMMIT":
+            elif line == "COMMIT":
                 if not table_open:
                     led.note(lineno, notes,
                              f"`COMMIT` at line {lineno} is outside a table block")
@@ -1005,7 +1042,7 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                              f"not modeled (filter-space only; review "
                              f"NAT/mangle/raw manually)")
             continue
-        if line.upper() == "COMMIT":
+        if line == "COMMIT" and is_save:
             consumed.add(lineno)
             continue
 
@@ -1107,10 +1144,28 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                              f"(first-match order honored; it evaluates before "
                              f"whatever held that slot)")
         elif op in ("-P", "--policy"):
+            # `-P CHAIN TARGET` and nothing after it (round 9, R8-4):
+            # iptables/xtables.c (same source tree) ends option parsing with
+            #   if (optind < argc) xtables_error(PARAMETER_PROBLEM,
+            #       "unknown arguments found on commandline");
+            # so a word left over makes iptables reject the command, and the
+            # policy stays what it was. Noted, not applied. A policy on a
+            # chain that is not built in is not modelled either.
             if k + 2 < len(toks):
-                if pol_ok(toks[k + 2]):
-                    consumed.add(lineno)
-                set_policy(toks[k + 1], toks[k + 2], lineno)
+                extra = toks[k + 3:]
+                if extra or toks[k + 1] not in _BASE_CHAINS:
+                    led.note(
+                        lineno, notes,
+                        f"iptables `{' '.join(toks[k:])[:60]}` (line {lineno}): "
+                        + (f"word(s) after the policy ({' '.join(extra)[:30]}) — "
+                           f"iptables rejects the command (\"unknown arguments "
+                           f"found on commandline\"), so the policy is not set"
+                           if extra else
+                           f"{toks[k + 1]} is not a built-in chain; not modelled"))
+                else:
+                    if pol_ok(toks[k + 2]):
+                        consumed.add(lineno)
+                    set_policy(toks[k + 1], toks[k + 2], lineno)
         elif op in ("-R", "--replace"):
             # Replace the rule currently at 1-based position N in place, so the
             # replacement inherits N's first-match slot. An out-of-range (or
@@ -1149,8 +1204,18 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             # falsely prove a later rule dead — clear the accumulated items. Any
             # jump placeholders they carried go with them: deferred expansion
             # never sees flushed rules, so no stale pending resolution survives.
-            consumed.add(lineno)
             ch = toks[k + 1] if k + 1 < len(toks) else None
+            if len(toks) > k + 2:
+                # `-F [CHAIN]` takes one chain at most (round 9, R8-4): with
+                # more, iptables rejects the command (xtables.c, above). The
+                # flush is still applied here (fewer rules can only add FAILs
+                # the note keeps from being a PASS) and the line is noted.
+                led.note(lineno, notes,
+                         f"iptables `{' '.join(toks[k:])[:60]}` (line "
+                         f"{lineno}): word(s) after the chain; iptables "
+                         f"rejects the command")
+            else:
+                consumed.add(lineno)
             if ch is not None:
                 if ch in items_by_chain:
                     items_by_chain[ch] = []
@@ -1163,7 +1228,13 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
                              "this point cleared from the analysis")
         elif op in ("-N", "--new-chain"):
             if k + 1 < len(toks):
-                consumed.add(lineno)
+                if len(toks) == k + 2:
+                    consumed.add(lineno)
+                else:
+                    led.note(lineno, notes,
+                             f"iptables `{' '.join(toks[k:])[:60]}` (line "
+                             f"{lineno}): word(s) after the chain name; "
+                             f"iptables rejects the command")
                 ensure_chain(toks[k + 1])
         elif op in _READ_ONLY and not (_OPS - _READ_ONLY) & set(toks):
             # -Z zeroes counters, -L / -S list: none changes filtering.
