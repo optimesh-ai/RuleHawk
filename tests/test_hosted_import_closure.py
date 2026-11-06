@@ -14,6 +14,7 @@ in it is listed in ENGINE_MODULES. Lazy in-function imports (e.g. cli.py's
 the browser.
 """
 
+import ast
 import pathlib
 import re
 
@@ -21,20 +22,23 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 PKG = ROOT / "rulehawk"
 WORKER = ROOT / "docs" / "worker.js"
 
-_REL_IMPORT = re.compile(r"^from \.(\w+) import", re.MULTILINE)
-# `from . import a, b` (e.g. `from . import allclear, exitcodes`).
-_PKG_IMPORT = re.compile(r"^from \. import ([\w, ]+)$", re.MULTILINE)
+def _imports_of_text(text: str) -> set[str]:
+    """Package modules named by the TOP-LEVEL relative imports of `text`:
+    `from .X import ...` and `from . import a, b as c`, in any layout
+    (trailing comments, parentheses, aliases). Only top-level statements
+    matter for module load, so lazy in-function imports stay out."""
+    mods: set[str] = set()
+    for node in ast.parse(text).body:
+        if isinstance(node, ast.ImportFrom) and node.level == 1:
+            if node.module:
+                mods.add(node.module.split(".")[0])
+            else:
+                mods |= {a.name for a in node.names}
+    return mods
 
 
 def _top_level_relative_imports(module: str) -> set[str]:
-    text = (PKG / f"{module}.py").read_text(encoding="utf-8")
-    # Only TOP-LEVEL imports matter for module load: strip indented lines so
-    # lazy in-function imports don't inflate the closure.
-    top = "\n".join(l for l in text.splitlines() if l and not l[0].isspace())
-    mods = set(_REL_IMPORT.findall(top))
-    for names in _PKG_IMPORT.findall(top):
-        mods |= {n.split(" as ")[0].strip() for n in names.split(",")}
-    return mods
+    return _imports_of_text((PKG / f"{module}.py").read_text(encoding="utf-8"))
 
 
 def _import_closure(root: str = "__init__") -> set[str]:

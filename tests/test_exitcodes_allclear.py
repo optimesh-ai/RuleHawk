@@ -78,6 +78,13 @@ def test_exit_table_matches_docs(command, argv):
     assert listed == exitcodes.codes(command)
     assert exitcodes.ACCEPTED in listed
     assert "reserved: not emitted until ACCEPTED ships" in out
+    # Each row's meaning matches its code, in --help and in both docs
+    # (review of #47, F5): a row that says UNKNOWN must carry UNKNOWN's code.
+    assert _help_row_problems(command, out) == []
+    for doc in ("README.md", os.path.join("docs", "github-action.md")):
+        text = _read(doc)
+        block = text[text.index(exitcodes.MARK_BEGIN):text.index(exitcodes.MARK_END)]
+        assert _table_row_problems("\n".join(block.splitlines()[1:])) == [], doc
 
 
 def test_exit_table_cells_are_constants():
@@ -166,15 +173,51 @@ def _is_code(v, code):
     return isinstance(v, ast.Constant) and type(v.value) is int and v.value == code
 
 
+_ZERO_CODES = {"PASS", "ADVISORY", "HELP"}          # exitcodes names whose value is 0
+_EXIT_NAMES = _ZERO_CODES | {"ACCEPTED"}
+_EXIT_CALLS = {"sys.exit", "exit", "quit", "SystemExit", "os._exit", "_exit"}
+_ENV_WRITES = {"update", "setdefault", "__setitem__", "pop", "putenv", "clear"}
+
+
+def _module_aliases(tree, module: str) -> set:
+    """Local names bound to rulehawk.<module> (`from . import x as y`)."""
+    names = {module}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module is None:
+            names |= {a.asname or a.name for a in node.names if a.name == module}
+        elif isinstance(node, ast.Import):
+            names |= {a.asname for a in node.names
+                      if a.name == f"rulehawk.{module}" and a.asname}
+    return names
+
+
 def _scan_module(name: str):
-    """(qualname, rule, text) for every all-clear literal in one module."""
+    """(qualname, rule, text) for every all-clear literal or emission in one
+    module. It reads spellings and emissions, not data flow: an all-clear
+    built at run time ("PA" + "SS", "pass".upper(), an f-string) or an exit
+    code held in a variable is out of its reach. #44's behavioural tests
+    (tests/test_stopgap.py and the attack file) catch those on every fixture
+    they run."""
     src = open(os.path.join(_PKG, name), encoding="utf-8").read()
     tree = ast.parse(src)
     doc, par = _docstrings(tree), _parents(tree)
+    ec, ac = _module_aliases(tree, "exitcodes"), _module_aliases(tree, "allclear")
     out = []
 
     def hit(node, rule, text):
         out.append(f"{name}::{_qualname(node, par)}::{rule}::{text}")
+
+    def zero(v):
+        return (v is None or _is_code(v, 0)
+                or (isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name)
+                    and v.value.id in ec and v.attr in _ZERO_CODES))
+
+    def on_allclear(t):
+        while isinstance(t, (ast.Attribute, ast.Subscript)):
+            t = t.value
+            if isinstance(t, ast.Name) and t.id in ac:
+                return True
+        return False
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in doc:
@@ -192,6 +235,9 @@ def _scan_module(name: str):
                 hit(node, "return-0", ast.unparse(node.value))
             if any(_is_code(v, 4) for v in vals):
                 hit(node, "return-4", ast.unparse(node.value))
+        elif isinstance(node, ast.Raise) and isinstance(node.exc, ast.Name) \
+                and node.exc.id == "SystemExit":
+            hit(node, "exit-call-0", "raise SystemExit")  # a bare SystemExit exits 0
         elif isinstance(node, ast.keyword) and node.arg == "passed" \
                 and isinstance(node.value, ast.Constant) and node.value.value is True:
             hit(node, "passed-true", "passed=True")
@@ -200,38 +246,55 @@ def _scan_module(name: str):
                 if isinstance(k, ast.Constant) and k.value == "passed" \
                         and isinstance(v, ast.Constant) and v.value is True:
                     hit(node, "passed-true", '"passed": True')
+        elif isinstance(node, ast.Name) and node.id in ("PASS", "VERIFIED", "NO_NEW_RISK"):
+            hit(node, "allclear-const", node.id)          # F4: a module constant
         elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            if node.value.id == "exitcodes" and node.attr in ("PASS", "ACCEPTED"):
+            if node.value.id in ec and node.attr in _EXIT_NAMES:
                 hit(node, "exit-code", f"exitcodes.{node.attr}")
-            if node.value.id == "allclear" and node.attr in _ALLCLEAR_NAMES:
+            if node.value.id in ac and node.attr in _ALLCLEAR_NAMES:
                 p = par.get(node)
                 first_arg_of_emit = (
                     isinstance(p, ast.Call) and p.args and p.args[0] is node
                     and isinstance(p.func, ast.Attribute) and p.func.attr == "emit"
-                    and isinstance(p.func.value, ast.Name) and p.func.value.id == "allclear")
+                    and isinstance(p.func.value, ast.Name) and p.func.value.id in ac)
                 if not first_arg_of_emit:
                     hit(node, "allclear-name", f"allclear.{node.attr}")
             if node.attr == "RULEHAWK_CERT":
                 hit(node, "cert-override", ast.unparse(node))
         elif isinstance(node, ast.ImportFrom) and node.module in ("exitcodes", "allclear"):
             for a in node.names:
-                if a.name in ("PASS", "ACCEPTED", "RULEHAWK_CERT") | _ALLCLEAR_NAMES:
+                if a.name in (_EXIT_NAMES | {"RULEHAWK_CERT"}) | _ALLCLEAR_NAMES:
                     hit(node, "import-name", f"{node.module}.{a.name}")
         elif isinstance(node, ast.Global) and "RULEHAWK_CERT" in node.names:
             hit(node, "cert-override", "global RULEHAWK_CERT")
-        elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
+            targets = (node.targets if isinstance(node, (ast.Assign, ast.Delete))
+                       else [node.target])
             for t in targets:
                 if isinstance(t, ast.Name) and t.id == "RULEHAWK_CERT" and name != "allclear.py":
                     hit(node, "cert-override", t.id)
                 if isinstance(t, ast.Subscript) and "RULEHAWK_SHADOW" in ast.unparse(t):
                     hit(node, "shadow-set", ast.unparse(t))
+                if isinstance(t, (ast.Subscript, ast.Attribute)) and "environ" in ast.unparse(t) \
+                        and "RULEHAWK_" in ast.unparse(node):
+                    hit(node, "env-set", ast.unparse(t))
+                if on_allclear(t):
+                    hit(node, "allclear-write", ast.unparse(t))
         if isinstance(node, ast.Call):
             f = ast.unparse(node.func)
             args = " ".join(ast.unparse(a) for a in node.args)
             if f.endswith(("putenv", "setdefault", "setattr")) and (
                     "RULEHAWK_SHADOW" in args or "RULEHAWK_CERT" in args):
                 hit(node, "env-set", f"{f}({args})")
+            elif isinstance(node.func, ast.Attribute) and node.func.attr in _ENV_WRITES \
+                    and "environ" in ast.unparse(node.func.value) \
+                    and "RULEHAWK_" in ast.unparse(node):
+                hit(node, "env-set", f)                   # F4: any environ write
+            if f in _EXIT_CALLS and zero(node.args[0] if node.args else None):
+                hit(node, "exit-call-0", ast.unparse(node))
+            if f in ("setattr", "delattr", "vars") and node.args \
+                    and isinstance(node.args[0], ast.Name) and node.args[0].id in ac:
+                hit(node, "allclear-write", ast.unparse(node))
     return out
 
 
@@ -291,6 +354,27 @@ _EXEMPT = collections.Counter({
     "mcp_server.py::audit::literal::connectivity-ok": 1,
     # The MCP server process's own exit status, not a verdict.
     "mcp_server.py::main::return-0::0": 3,
+    # Emissions (review of #47, F4). The zero exit codes at their sites: the
+    # --help returns, the advisory `gate --fail-on none` return, and
+    # combine's advisory code for a run with no enforced check (departure 1).
+    "cli.py::main::exit-code::exitcodes.HELP": 1,
+    "gate.py::main::exit-code::exitcodes.HELP": 1,
+    "combine.py::main::exit-code::exitcodes.HELP": 1,
+    "gate.py::GateResult.exit_code::exit-code::exitcodes.ADVISORY": 1,
+    "combine.py::<module>::exit-code::exitcodes.ADVISORY": 1,
+    # exitcodes.py's own PASS exit-code constant: its definition, the PASS
+    # row's three cells and the precedence line of the doc table. Text only;
+    # nothing returns it.
+    "exitcodes.py::<module>::allclear-const::PASS": 4,
+    "exitcodes.py::markdown_table::allclear-const::PASS": 1,
+    # evidence.py's VERIFIED status constant: its definition and
+    # _STATUS_MARK key; comparisons that read a status; and the control
+    # roll-up, which copies VERIFIED only from an attestation that already
+    # holds it, which only allclear.emit can give.
+    "evidence.py::<module>::allclear-const::VERIFIED": 2,
+    "evidence.py::build_attestations::allclear-const::VERIFIED": 2,
+    "evidence.py::_control_rollup::allclear-const::VERIFIED": 2,
+    "evidence.py::build_evidence::allclear-const::VERIFIED": 1,
 })
 
 
@@ -590,3 +674,164 @@ def test_comment_enforce_step_fails_closed(enforced, verdict, want):
     code, out = _bash(_step_run(os.path.join("comment", "action.yml"),
                                 "Enforce the combined verdict"), env)
     assert code == want, (enforced, verdict, out)
+
+
+# --------------------------------------------------------------------------- #
+# Helpers for the review-of-#47 tests above.
+# --------------------------------------------------------------------------- #
+# F1. allclear.py may import only these, and may name none of the hooks below.
+_ALLCLEAR_IMPORTS = {("__future__", 0, "annotations"), ("typing", 0, "Optional"),
+                     (None, 1, "exitcodes")}
+_ALLCLEAR_FORBIDDEN = {
+    "os", "sys", "environ", "getenv", "putenv", "argv", "open", "io", "pathlib",
+    "importlib", "__import__", "globals", "locals", "vars", "setattr", "getattr",
+    "delattr", "eval", "exec", "compile", "__dict__", "__builtins__", "builtins",
+    "input", "subprocess", "reload"}
+
+
+def _allclear_violations(src: str) -> list:
+    out = []
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Import):
+            out += [f"import {a.name}" for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            out += [f"from {'.' * node.level}{node.module or ''} import {a.name}"
+                    for a in node.names
+                    if (node.module, node.level, a.name) not in _ALLCLEAR_IMPORTS]
+        elif isinstance(node, ast.Name) and node.id in _ALLCLEAR_FORBIDDEN:
+            out.append(f"name {node.id}")
+        elif isinstance(node, ast.Attribute) and node.attr in _ALLCLEAR_FORBIDDEN:
+            out.append(f"attribute {node.attr}")
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            out.append(f"global {','.join(node.names)}")
+    return out
+
+
+# The gate functions and the stopgap table, pinned by the sha256 of their
+# exact source lines (docstrings dropped). Exact text, not ast.dump, so the
+# pin is the same on every Python version CI runs. Slice 7 (the checker) and
+# slice 9 (the flip) edit these on purpose, with this table.
+_ALLCLEAR_PINNED = ("_STOPGAP", "_require_certified", "certified", "emit", "passed", "exit_code")
+_ALLCLEAR_FN_SHA = {
+    "_STOPGAP": "991eae3d066022f8",
+    "_require_certified": "61774ed83da806bc",
+    "certified": "ecf1fd02af0c4336",
+    "emit": "ba0d1324b1ef76a3",
+    "passed": "05424137aeb8e4d9",
+    "exit_code": "d45c448c6a711141",
+}
+
+
+def _allclear_fn_hashes(src: str) -> dict:
+    import hashlib
+    lines = src.splitlines()
+    out = {}
+    for node in ast.parse(src).body:
+        name = (node.name if isinstance(node, ast.FunctionDef) else
+                node.targets[0].id if isinstance(node, ast.Assign)
+                and isinstance(node.targets[0], ast.Name) else None)
+        if name not in _ALLCLEAR_PINNED:
+            continue
+        drop = set()
+        if isinstance(node, ast.FunctionDef) and node.body and isinstance(node.body[0], ast.Expr) \
+                and isinstance(node.body[0].value, ast.Constant):
+            drop = set(range(node.body[0].lineno, node.body[0].end_lineno + 1))
+        text = "\n".join(lines[n - 1] for n in range(node.lineno, node.end_lineno + 1)
+                         if n not in drop)
+        out[name] = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return out
+
+
+# F5. What each --help row and doc table row means, keyed by how its text
+# starts.
+def _help_meanings(command):
+    unknown = exitcodes.COMBINE_UNKNOWN if command == "combine" else exitcodes.UNKNOWN
+    rows = {"file": [("FAIL:", exitcodes.FAIL), ("parse failure", exitcodes.INVALID),
+                     ("UNKNOWN:", unknown),
+                     ("reserved: not emitted until ACCEPTED ships", exitcodes.ACCEPTED),
+                     ("only for --help", exitcodes.HELP)],
+            "gate": [("FAIL:", exitcodes.FAIL),
+                     ("a file parsed to zero rules", exitcodes.INVALID),
+                     ("UNKNOWN:", unknown),
+                     ("reserved: not emitted until ACCEPTED ships", exitcodes.ACCEPTED),
+                     ("only with --fail-on none", exitcodes.ADVISORY)],
+            "combine": [("FAIL:", exitcodes.FAIL), ("UNKNOWN", unknown),
+                        ("reserved: not emitted until ACCEPTED ships", exitcodes.ACCEPTED),
+                        ("only when no enforced check exists", exitcodes.ADVISORY)]}
+    return rows[command]
+
+
+def _help_row_problems(command: str, text: str) -> list:
+    rows = re.findall(r"^  (\d)  (.+)$", text, re.M)
+    want = _help_meanings(command)
+    problems, seen = [], []
+    for code, meaning in rows:
+        m = [(k, c) for k, c in want if meaning.startswith(k)]
+        if len(m) != 1:
+            problems.append(f"unrecognised row: {code}  {meaning}")
+        elif int(code) != m[0][1]:
+            problems.append(f"row {code} says {m[0][0]!r}, which is code {m[0][1]}")
+        else:
+            seen.append(m[0][0])
+    if sorted(seen) != sorted(k for k, _ in want):
+        problems.append(f"rows {seen} are not exactly {[k for k, _ in want]}")
+    return problems
+
+
+# outcome prefix -> codes for (rulehawk FILE, rulehawk gate, rulehawk combine);
+# None is "n/a".
+_TABLE_MEANINGS = [
+    ("PASS (certified)", (exitcodes.PASS,) * 3),
+    ("FAIL", (exitcodes.FAIL,) * 3),
+    ("config parsed to zero rules", (exitcodes.INVALID,) * 3),
+    ("UNKNOWN", (exitcodes.UNKNOWN, exitcodes.UNKNOWN, exitcodes.COMBINE_UNKNOWN)),
+    ("ACCEPTED", (exitcodes.ACCEPTED,) * 3),
+    ("advisory", (None, exitcodes.ADVISORY, exitcodes.ADVISORY)),
+    ("`--help`", (exitcodes.HELP,) * 3),
+]
+
+
+def _table_row_problems(table: str) -> list:
+    problems, seen = [], []
+    for row in table.splitlines()[2:]:
+        if not row.startswith("| "):
+            continue
+        cells = [c.strip() for c in row.strip().strip("|").split("|")]
+        m = [(k, want) for k, want in _TABLE_MEANINGS if cells[0].startswith(k)]
+        if len(m) != 1:
+            problems.append(f"unrecognised row: {row}")
+            continue
+        got = tuple(None if c.startswith("n/a") else int(re.match(r"(\d+)", c).group(1))
+                    for c in cells[1:4])
+        if got != m[0][1]:
+            problems.append(f"{m[0][0]!r} row has codes {got}, not {m[0][1]}")
+        seen.append(m[0][0])
+    if sorted(seen) != sorted(k for k, _ in _TABLE_MEANINGS):
+        problems.append(f"rows {seen} are not exactly {[k for k, _ in _TABLE_MEANINGS]}")
+    return problems
+
+
+# F2. #44's guard blocks, as they were at e04630e, in tests/fixtures/
+# stopgap_guards_e04630e.json: every contiguous run of lines #44 added
+# (`git diff -U0 v0.4.0 e04630e`), which must appear in order, and the whole
+# Enforce/Combine steps, which must each appear exactly once. Byte for byte,
+# indentation included, until slice 9.
+def _guard_block_problems(read) -> list:
+    import json
+    pins = json.loads(_read(os.path.join("tests", "fixtures", "stopgap_guards_e04630e.json")))
+    problems = []
+    for rel, p in sorted(pins.items()):
+        if rel.startswith("_"):
+            continue
+        text = read(rel)
+        at = 0
+        for i, run in enumerate(p["runs"]):
+            k = text.find(run, at)
+            if k < 0:
+                problems.append(f"{rel}: guard run {i} changed or out of order: {run[:70]!r}")
+            else:
+                at = k + len(run)
+        for step in p["steps"]:
+            if text.count(step) != 1:
+                problems.append(f"{rel}: step changed: {step.splitlines()[0].strip()}")
+    return problems

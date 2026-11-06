@@ -15,8 +15,16 @@ Every would-be all-clear (PASS, VERIFIED, NO_NEW_RISK, `passed: true`, an
 enforced exit 0) now goes through one function, `rulehawk.allclear.emit`. It
 gives the stopgap's answer (UNKNOWN, exit 3) because its compiled-in switch is
 off; it is not read from the environment, and nothing overrides it at run
-time. A test fails on any all-clear literal outside that module, and on any
-change to the Actions' existing stopgap guard lines.
+time. Tests fail on an all-clear outside that module that is not on a pinned,
+reviewed exemption list: an all-clear literal, an exit-code constant or exit
+call worth 0, a PASS or VERIFIED constant, a write to `allclear`, or an
+environment write naming RULEHAWK_*. (They read spellings and emissions, not data
+flow; an all-clear built at run time is left to the behavioural tests.)
+`allclear.py` itself may import nothing but `typing` and `exitcodes`, and its
+gate functions are pinned. The stopgap's guard blocks in `action.yml`,
+`comment/action.yml`, `docs/index.html` and `docs/worker.js` are pinned byte
+for byte as the 0.4.1 stopgap wrote them, and both Actions' enforce steps
+are run under bash.
 
 ### Compatibility
 
