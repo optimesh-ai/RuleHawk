@@ -136,7 +136,8 @@ REASONS: Dict[str, str] = {
     "acl-binding-negated":
         "a filter binding is removed, reset or deactivated (`no` or "
         "`default` before `ip access-group`, `ipv6 traffic-filter` or "
-        "`access-class`, a top-level `default interface`, Junos `inactive:` / "
+        "`access-class`, a top-level `no interface` or `default interface`, "
+        "Junos `inactive:` / "
         "`deactivate` / `delete` on an interface filter or a filter); the "
         "removal is not applied, so which interfaces are filtered is unknown",
     "nat-present":
@@ -664,7 +665,7 @@ def _panos_unmodeled_fields(text: str) -> List[str]:
 _CISCO_NEGATED_BIND = re.compile(
     r"(?im)^\s*(?:no|default)\s+(?:(?:ip|ipv4|ipv6)\s+(?:port\s+)?"
     r"(?:access-group|traffic-filter|access-class)|access-group|access-class|"
-    r"ipv6\s+port\s+traffic-filter)\b.*$|^default\s+interface\b.*$")
+    r"ipv6\s+port\s+traffic-filter)\b.*$|^(?:no|default)\s+interface\b.*$")
 _JUNOS_SET_NEGATED = re.compile(
     r"(?m)^\s*(?:deactivate|delete)\s+(?:logical-systems\s+\S+\s+)?"
     r"(?:interfaces\b|firewall\s+(?:family\s+\S+\s+)?filter\s+\S+\s*$).*$")
