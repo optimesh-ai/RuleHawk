@@ -1,0 +1,2 @@
+set address CORP ip-range 192.0.2.0-192.0.2.255
+set rulebase security rules d from any to any source CORP destination 198.51.100.0/24 application any service any action deny
