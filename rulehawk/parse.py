@@ -33,7 +33,7 @@ import ipaddress
 import re
 from typing import List, Optional, Tuple
 
-from .failclosed import cisco_dialect_ambiguous
+from .failclosed import cisco_dialect_ambiguous, split_lines
 from .model import (ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet,
                     _PORTED)
 
@@ -586,7 +586,7 @@ def _collect_defs(text: str) -> _Defs:
     defs = _Defs()
     cur = None          # ("ng"|"no"|"sg"|"so"|"other", name)
     header_proto = None
-    for raw in text.splitlines():
+    for raw in split_lines(text):
         s = raw.strip()
         if not s or s.startswith("!"):
             continue
@@ -987,7 +987,7 @@ def _apply_asa_names(text: str) -> Tuple[str, int]:
     if not names:
         return text, 0
     out = []
-    for ln in text.splitlines():
+    for ln in split_lines(text):
         st = ln.lstrip().lower()
         if st.startswith(("access-list ", "permit ", "deny ", "host ", "subnet ",
                           "range ", "network-object ")):
@@ -1104,7 +1104,7 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
     cur_v6 = cur_std = False                 # family/kind of the current named ACL
     seq = 0
     in_other = False                         # inside a non-filter block (see below)
-    for lineno, raw in enumerate(text.splitlines(), 1):
+    for lineno, raw in enumerate(split_lines(text), 1):
         stripped = raw.strip()
         if not stripped or stripped.startswith("!"):
             continue

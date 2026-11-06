@@ -60,10 +60,12 @@ does not model gets one), when an ACL's role is unknown or is not a transit
 packet filter (`line vty` `access-class`, SNMP, route-map, NAT, crypto, QoS),
 when a binding is removed, reset or deactivated (`no` / `default ip
 access-group`, `default interface`, Junos `inactive:`), when a Cisco interface
-carries a line outside the allowlist below, when a feature that drops, inspects,
+carries a line outside the allowlist below, an unindented line sits where
+RuleHawk cannot tell which mode it belongs to, a line holds a control
+character, a VLAN filter is configured, when a feature that drops, inspects,
 rewrites or bypasses traffic is configured (zone firewall, `ip inspect`,
 `service-policy`, policy routing, `mpls ip` / `xconnect`), when a vendor default it does not model applies (PAN-OS
-`default-security-rules`, the iptables chain policy when no `-P` is given, IPv6
+`default-security-rules`, the iptables chain policy when no `-P` naming `ACCEPT` or `DROP` is given, IPv6
 implicit ND permits, ...), when NAT or nftables text is present, or when an IOS
 ACL mask is ambiguous. The full list is in the CHANGELOG. A PASS still assumes
 every interface is in the file and does not evaluate routing, NAT translation or
@@ -81,22 +83,40 @@ default, and the verdict becomes a real PASS or FAIL.
 Every PASS prints these next to the verdict (text, the `--json` `scope` field,
 `--evidence`, the gate, MCP and the hosted page):
 
-- Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, NAT); any other interface line is UNKNOWN and other global commands are not read.
+- Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); any other line in interface mode, an unindented line in interface, ACL or object-group mode that is not a recognised top-level command, and a control or separator character are UNKNOWN; other global commands are not read.
 - PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed.
-- iptables reads the filter table; a chain's policy comes only from its parsed -P or :CHAIN line.
+- iptables reads the filter table; a chain's policy comes only from a parsed -P or :CHAIN line naming ACCEPT or DROP (exact case).
 - Junos reads firewall filters and their interface bindings; SRX security zones or policies make the answer UNKNOWN.
 
 The Cisco interface allowlist is: `description`, `ip address` (with
+`secondary`), `no ip address` (bare, or with an address and mask and optional
 `secondary`), `ipv6 address`, `ipv6 enable`, the filter bindings
 (`ip access-group`, `ipv6 traffic-filter`, `ipv6 access-group`,
 `ip port access-group`, `ipv6 port traffic-filter`, `ipv4 access-group` with
 `in`/`out`/`ingress`/`egress`), `shutdown`, `no shutdown`, `no switchport`,
-`speed`, `duplex`, `negotiation auto`, `load-interval`, `no ip redirects`,
-`no ip unreachables`, `no ip proxy-arp`, `no ipv6 redirects`,
-`no ipv6 unreachables`, `cdp enable` and `no cdp enable`, each spelled in full.
-Loopback and Null interfaces carry no transit traffic and are not checked. Any
-other line on an interface, and an abbreviated `int X` header, is UNKNOWN with
+`speed`, `duplex`, `negotiation auto`, `media-type` (one word),
+`load-interval`, `no ip redirects`, `no ip unreachables`, `no ip proxy-arp`,
+`no ipv6 redirects`, `no ipv6 unreachables`, `cdp enable` and
+`no cdp enable`, each spelled in full. Loopback and Null interfaces carry no
+transit traffic and are not checked. Any other line in interface mode, and an
+abbreviated `int X` header or `interface range`, is UNKNOWN with
 `interface-feature-unmodeled`, which names the line's keyword, not the line.
+
+How RuleHawk reads a Cisco config (one lexer for every Cisco check): a line
+ends at a newline only (a trailing CR is dropped); any other control, format
+or separator character, or a space character other than an ASCII space, is a
+parse note. The device ignores indentation and `!` is a comment, so interface,
+ACL and object-group mode lasts until another `interface` header, `exit`, or
+one of these top-level commands, none of which is valid inside those modes:
+`end`, `hostname`, `version`, `boot`, `router`, `line`, `ip`/`ipv6`/`mac
+access-list`, `access-list`, `object-group`, `route-map`, `ip`/`ipv6
+prefix-list`, `ip`/`ipv6 route`, `ip routing`, `ipv6 unicast-routing`,
+`class-map`, `policy-map`, `control-plane`, `vrf definition|context|instance`,
+`management`, `snmp-server`. Any other unindented line in one of those modes is
+UNKNOWN (`stanza-boundary-ambiguous`). Interface names are case-folded and a
+separately written number is joined (`GigabitEthernet 0/1` is
+`gigabitethernet0/1`); repeated stanzas for one interface are merged in order.
+
 **[Quickstart](docs/quickstart.md)**: install, first audit, agents (Claude, Cursor,
 NetClaw) and what to do when something goes wrong.
 

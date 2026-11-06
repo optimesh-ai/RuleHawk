@@ -38,8 +38,9 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import unicodedata
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 # --------------------------------------------------------------------------- #
 # reason codes
@@ -156,6 +157,19 @@ REASONS: Dict[str, str] = {
         "allowlist of lines that cannot change a transit packet's fate (any "
         "other feature, any `default` form, any abbreviated keyword); what the "
         "line does to the packet is not modeled",
+    "stanza-boundary-ambiguous":
+        "an unindented line in Cisco / Arista interface, ACL or object-group "
+        "mode is not a command RuleHawk knows ends that mode; the device "
+        "ignores indentation, so the line may apply to the interface, ACL or "
+        "group above it",
+    "vlan-filter":
+        "a VLAN ACL is configured (`vlan access-map`, `vlan filter`); it can "
+        "drop or forward traffic inside a VLAN independently of the interface "
+        "ACLs and is not modeled",
+    "junos-keyword-case":
+        "a Junos statement keyword is written with upper-case letters; Junos "
+        "keywords are lower-case only, so the device rejects the statement "
+        "and RuleHawk will not guess what was meant",
     "zone-firewall":
         "a zone-based firewall is configured (`zone security`, "
         "`zone-member security`, `zone-pair security`); zone policy drops or "
@@ -322,15 +336,198 @@ class FailClosedContext:
 
 
 # --------------------------------------------------------------------------- #
+# Cisco IOS / ASA / NX-OS / EOS: the one lexer (review of #42, round 5).
+# Every Cisco check (bindings, paths, the interface allowlist, the global
+# features, NAT and negation regexes) reads the config through `cisco_lex`,
+# so none of them can split lines or assign stanzas differently.
+#
+# - A line ends at "\n" only (one trailing "\r" is dropped): `str.splitlines`
+#   also breaks at \v, \f, \x1c-\x1e, \x85, U+2028/U+2029, which the device
+#   keeps inside a line. Any other control, format or line/paragraph
+#   separator character, and any space character other than " ", is a
+#   parse note: RuleHawk will not guess how the device reads it.
+# - Words are split on " " and "\t" only.
+# - Mode, not indentation, decides which stanza a line belongs to. The CLI
+#   ignores leading whitespace: a line valid in interface mode applies to the
+#   current interface wherever it starts, and `!` is a comment that does not
+#   leave the mode. So after an `interface` (or ACL / object-group) header the
+#   mode lasts until another header or a command from `_TOP_LEVEL`, each of
+#   which is invalid in interface, ACL and object-group mode, so the device
+#   leaves the sub-mode to run it. Any other unindented line in one of those
+#   modes is `stanza-boundary-ambiguous`.
+# - Interface names are normalised: the type is case-folded and a number
+#   written as a separate word is joined (`GigabitEthernet 0/1` ==
+#   `gigabitethernet0/1`). Repeated stanzas for one name are merged in order,
+#   as IOS applies them. An abbreviated type (`Gi0/1`) stays a separate name:
+#   that can only add an interface to the path model, never hide one.
+# --------------------------------------------------------------------------- #
+_BOM = "﻿"
+
+# Top-level commands that end an interface / ACL / object-group mode. Each is
+# not a command of those modes on IOS, NX-OS or EOS, so the device leaves the
+# sub-mode to run it. Kept small; anything else unindented in those modes is
+# ambiguous.
+_TOP_LEVEL = re.compile(
+    r"(?i)^(?:end"
+    r"|hostname \S+"                       # device identity
+    r"|version \S+|boot \S+"               # image / boot
+    r"|router \S+"                         # routing-process mode
+    r"|line \S+"                           # console / vty mode
+    r"|(?:ip|ipv6|mac) access-list \S+"    # ACL mode (`ip access-group` binds)
+    r"|access-list \S+"                    # numbered ACL entry
+    r"|object-group \S+"                   # object-group mode
+    r"|route-map \S+"                      # route-map mode (`ip policy` binds)
+    r"|(?:ip|ipv6) prefix-list \S+"        # prefix list
+    r"|(?:ip|ipv6) route \S+"              # static route (`ip route-cache` differs)
+    r"|ip routing|ipv6 unicast-routing"    # global forwarding switch
+    r"|class-map \S+|policy-map \S+"       # QoS definitions (`service-policy` binds)
+    r"|control-plane"                      # CoPP mode
+    r"|vrf (?:definition|context|instance) \S+"   # VRF definition (`vrf forwarding|member` binds)
+    r"|management \S+"                     # EOS management API / SSH mode
+    r"|snmp-server \S+"                    # SNMP agent (`snmp trap` is the interface form)
+    r")(?: |$)")
+_IF_HEADER = re.compile(r"(?i)^(in(?:t(?:e(?:r(?:f(?:a(?:ce?)?)?)?)?)?)?)$")
+_ACL_HEADER = re.compile(r"(?i)^(?:ip|ipv6) access-list(?: |$)")
+_OBJGROUP_HEADER = re.compile(r"(?i)^object-group(?: |$)")
+_NO_FORWARD_IF = re.compile(r"(?i)^(?:loopback|null)")
+
+
+def _bad_char(ch: str) -> bool:
+    cat = unicodedata.category(ch)
+    if ch in (" ", "\t"):
+        return False
+    return cat in ("Cc", "Cf", "Zl", "Zp", "Zs")
+
+
+def _if_name(words: List[str]) -> Tuple[str, bool]:
+    """(normalised name, is a range) from the words after `interface`."""
+    if not words:
+        return "?", False
+    if words[0].lower() == "range":
+        return "range " + "".join(words[1:]).lower(), True
+    name = words[0]
+    if len(words) > 1 and words[1][:1].isdigit() and not name[-1:].isdigit():
+        name += words[1]
+    return name.lower(), False
+
+
+@dataclass
+class CiscoLine:
+    no: int                        # 1-based line number
+    norm: str                      # words joined by one space
+    indented: bool
+    mode: str                      # global | interface | acl | objgroup | other
+    iface: Optional[str] = None    # normalised name, interface mode only
+    header: bool = False
+
+
+@dataclass
+class CiscoLex:
+    lines: List[CiscoLine]
+    text: str                                  # one normalised line per line
+    bad_chars: List[Tuple[int, int]]           # (line, code point)
+    ambiguous: List[Tuple[int, str, str]]      # (line, stanza, keyword)
+    headers: List[Tuple[int, str, str]]        # (line, name, header word)
+    ranges: List[str]
+
+    def iface_lines(self, forwarding: bool = False) -> Iterator[CiscoLine]:
+        for ln in self.lines:
+            if ln.mode == "interface" and not ln.header and (
+                    not forwarding or not _NO_FORWARD_IF.match(ln.iface or "")):
+                yield ln
+
+
+def split_lines(text: str) -> List[str]:
+    """Config lines: split at "\n" only, one trailing "\r" dropped."""
+    return [ln[:-1] if ln.endswith("\r") else ln for ln in text.split("\n")]
+
+
+def cisco_lex(text: str) -> CiscoLex:
+    from .parse import strip_banners
+    text = strip_banners(text)[0]                 # banner text is not config
+    if text.startswith(_BOM):
+        text = text[1:]
+    lines: List[CiscoLine] = []
+    bad: List[Tuple[int, int]] = []
+    amb: List[Tuple[int, str, str]] = []
+    headers: List[Tuple[int, str, str]] = []
+    ranges: List[str] = []
+    mode, iface, stanza = "global", None, "global"
+    for no, raw in enumerate(split_lines(text), 1):
+        for ch in raw:
+            if _bad_char(ch):
+                bad.append((no, ord(ch)))
+                break
+        words = [w for w in re.split(r"[ \t]+", raw) if w]
+        norm = " ".join(words)
+        if not words or words[0].startswith("!"):
+            continue
+        indented = raw[:1] in (" ", "\t")
+        if _IF_HEADER.match(words[0]):
+            iface, is_range = _if_name(words[1:])
+            mode, stanza = "interface", f"interface {iface}"
+            headers.append((no, iface, words[0].lower()))
+            if is_range:
+                ranges.append(iface)
+            lines.append(CiscoLine(no, norm, indented, mode, iface, True))
+            continue
+        if words[0].lower() == "exit":
+            lines.append(CiscoLine(no, norm, indented, mode, iface))
+            mode, iface = "global", None
+            continue
+        if not indented:
+            if _TOP_LEVEL.match(norm):
+                iface = None
+                mode = ("acl" if _ACL_HEADER.match(norm) else
+                        "objgroup" if _OBJGROUP_HEADER.match(norm) else
+                        "global" if words[0].lower() == "end" else "other")
+                stanza = {"acl": "an ACL", "objgroup": "an object-group"}.get(
+                    mode, "global")
+            elif mode in ("interface", "acl", "objgroup"):
+                # Valid in the sub-mode or not, RuleHawk cannot tell which
+                # mode the device runs it in.
+                amb.append((no, stanza, _keyword(norm)))
+            else:
+                mode, iface, stanza = "other", None, "global"
+        lines.append(CiscoLine(no, norm, indented, mode, iface))
+    return CiscoLex(lines, "\n".join(ln.norm for ln in lines), bad, amb,
+                    headers, ranges)
+
+
+# Transit packet-filter bindings, read from interface-mode lines (full
+# keyword only; anything else on an interface is caught by the allowlist).
+_CISCO_IF_BIND = re.compile(
+    r"(?i)^(ip access-group|ipv6 traffic-filter|ipv6 access-group|"
+    r"ip port access-group|ipv6 port traffic-filter|ipv4 access-group) "
+    r"(\S+) (in|out|ingress|egress)(?: |$)")
+
+
+def _cisco_if_state(lex: CiscoLex) -> Dict[str, Dict]:
+    """Per interface, merged over every stanza in order: the ACLs bound,
+    the families filtered in / out, and whether it ends up shut down."""
+    st: Dict[str, Dict] = {}
+    for _, name, _w in lex.headers:
+        st.setdefault(name, {"bound": set(), "in": set(), "out": set(),
+                             "shut": False})
+    for ln in lex.iface_lines():
+        s = st[ln.iface]
+        low = ln.norm.lower()
+        if low == "shutdown":
+            s["shut"] = True
+        elif low == "no shutdown":
+            s["shut"] = False
+        m = _CISCO_IF_BIND.match(ln.norm)
+        if m:
+            s["bound"].add(m.group(2))
+            fam = 6 if m.group(1).lower().startswith("ipv6") else 4
+            s["in" if m.group(3).lower() in ("in", "ingress") else "out"].add(fam)
+    return st
+
+
+# --------------------------------------------------------------------------- #
 # Cisco IOS / ASA / NX-OS / EOS: bindings and roles
 # --------------------------------------------------------------------------- #
-# Transit packet-filter bindings. Interface-level forms are honoured only
-# inside an `interface` stanza; the ASA forms are global commands.
-_CISCO_IF_BIND = re.compile(
-    r"^\s+(?:ip\s+access-group|ipv6\s+traffic-filter|ipv6\s+access-group|"
-    r"ip\s+port\s+access-group|ipv6\s+port\s+traffic-filter|"
-    r"ipv4\s+access-group)\s+(\S+)\s+(?:in|out|ingress|egress)\b",
-    re.IGNORECASE)
+# The ASA forms are global commands.
 _ASA_BIND = re.compile(
     r"^\s*access-group\s+(\S+)\s+(?:(?:in|out)\s+interface\s+\S+|global)\b",
     re.IGNORECASE)
@@ -378,50 +575,27 @@ def cisco_dialect_ambiguous(text: str) -> bool:
 _SHUTDOWN_ONLY = "bound only on a shutdown interface"
 
 
-def _cisco_bindings(text: str) -> Tuple[Set[str], Dict[str, str]]:
+def _cisco_bindings(lex: CiscoLex) -> Tuple[Set[str], Dict[str, str]]:
     """(ACLs with a transit binding, ACL -> first non-transit role). A
-    binding on a `shutdown` interface filters nothing, so an ACL bound only
-    there has no transit binding."""
+    binding on an interface that ends up `shutdown` filters nothing, so an
+    ACL bound only there has no transit binding."""
     transit: Set[str] = set()
     other: Dict[str, str] = {}
     shut_bound: Set[str] = set()
-    in_interface = False
-    here: Set[str] = set()
-    shut = False
-
-    def close() -> None:
-        (shut_bound if shut else transit).update(here)
-
-    for raw in text.splitlines():
-        if not raw.strip() or raw.lstrip().startswith("!"):
+    for s in _cisco_if_state(lex).values():
+        (shut_bound if s["shut"] else transit).update(s["bound"])
+    for ln in lex.lines:
+        if ln.mode == "interface" and _CISCO_IF_BIND.match(ln.norm):
             continue
-        if raw[:1] not in (" ", "\t"):
-            if in_interface:
-                close()
-            in_interface = bool(re.match(r"(?i)^interface\s", raw))
-            here, shut = set(), False
-        if in_interface:
-            if re.match(r"(?i)^\s+shutdown\s*$", raw):
-                shut = True
-                continue
-            if re.match(r"(?i)^\s+no\s+shutdown\s*$", raw):
-                shut = False
-                continue
-            m = _CISCO_IF_BIND.match(raw)
-            if m:
-                here.add(m.group(1))
-                continue
-        m = _ASA_BIND.match(raw)
+        m = _ASA_BIND.match(ln.norm)
         if m:
             transit.add(m.group(1))
             continue
         for role, rx in _CISCO_NON_TRANSIT:
-            m = rx.match(raw)
+            m = rx.match(ln.norm)
             if m:
                 other.setdefault(m.group(1), role)
                 break
-    if in_interface:
-        close()
     for acl in shut_bound - transit:
         other.setdefault(acl, _SHUTDOWN_ONLY)
     return transit, other
@@ -447,13 +621,6 @@ def _role_reasons(acls: Sequence[str], transit: Set[str],
 # another that emits it unfiltered, is a way across the device that meets no
 # audited rule.
 # --------------------------------------------------------------------------- #
-_CISCO_IF_FAMILY_BIND = re.compile(
-    r"^\s+(ip\s+access-group|ip\s+port\s+access-group|ipv4\s+access-group|"
-    r"ipv6\s+traffic-filter|ipv6\s+access-group|ipv6\s+port\s+traffic-filter)"
-    r"\s+\S+\s+(in|out|ingress|egress)\b", re.IGNORECASE)
-_NO_FORWARD_IF = re.compile(r"(?i)^(?:loopback|null)")
-
-
 def _bypasses(paths: Dict[str, Dict[str, Set[int]]], fam: int) -> List[Reason]:
     """`paths[name]` = {"fams": families it carries, "in": families filtered
     inbound, "out": families filtered outbound}."""
@@ -474,31 +641,13 @@ def _bypasses(paths: Dict[str, Dict[str, Set[int]]], fam: int) -> List[Reason]:
     return []
 
 
-def _cisco_paths(text: str) -> Dict[str, Dict[str, Set[int]]]:
-    paths: Dict[str, Dict[str, Set[int]]] = {}
-    cur: Optional[str] = None
-    for raw in text.splitlines():
-        if not raw.strip() or raw.lstrip().startswith("!"):
-            continue
-        if raw[:1] not in (" ", "\t"):
-            m = re.match(r"(?i)^interface\s+(\S+)", raw)
-            cur = m.group(1) if m and not _NO_FORWARD_IF.match(m.group(1)) else None
-            if cur is not None:
-                paths.setdefault(cur, {"fams": {4, 6}, "in": set(), "out": set(),
-                                       "shutdown": set()})
-            continue
-        if cur is None:
-            continue
-        if re.match(r"(?i)^\s+shutdown\s*$", raw):
-            paths[cur]["shutdown"].add(1)
-        elif re.match(r"(?i)^\s+no\s+shutdown\s*$", raw):
-            paths[cur]["shutdown"].clear()
-        m = _CISCO_IF_FAMILY_BIND.match(raw)
-        if m:
-            fam = 6 if m.group(1).lower().startswith("ipv6") else 4
-            d = "in" if m.group(2).lower() in ("in", "ingress") else "out"
-            paths[cur][d].add(fam)
-    return {n: p for n, p in paths.items() if not p["shutdown"]}
+def _cisco_paths(lex: CiscoLex) -> Dict[str, Dict[str, Set[int]]]:
+    """Every forwarding interface that is not shut down carries both
+    families (the model never reads addresses: if it ever does, a
+    `no ip address` must be applied there, not skipped)."""
+    return {n: {"fams": {4, 6}, "in": s["in"], "out": s["out"]}
+            for n, s in _cisco_if_state(lex).items()
+            if not s["shut"] and not _NO_FORWARD_IF.match(n)}
 
 
 _JUNOS_FAMILY = {"inet": {4}, "inet6": {6}, "ethernet-switching": {4, 6},
@@ -547,7 +696,7 @@ def _junos_paths(text: str) -> Dict[str, Dict[str, Set[int]]]:
             if "output" in tail or "output-list" in tail:
                 p["out"] |= fams
 
-    for raw in text.splitlines():
+    for raw in split_lines(text):
         if re.match(r"^\s*set\s", raw):
             leaf(raw.split()[1:])
     stack: List[List[str]] = []
@@ -597,7 +746,7 @@ def _junos_bindings(text: str) -> Tuple[Set[str], Dict[str, str]]:
             else:
                 transit.add(nm)
 
-    for raw in text.splitlines():
+    for raw in split_lines(text):
         m = _JUNOS_SET_BIND.match(raw)
         if m:
             bind(m.group(1), m.group(2).replace("[", " ").replace("]", " ").split())
@@ -706,6 +855,37 @@ def _panos_scope_collisions(text: str) -> List[str]:
     return [f"{k} {n}" for (k, n), sc in sorted(where.items()) if len(sc) > 1]
 
 
+# Junos statement keywords RuleHawk's Junos frontend reads or relies on.
+# Junos keywords are lower-case only; an upper-case spelling is a syntax error
+# on the device, and the frontend would skip the statement, so it is blocked
+# (junos-keyword-case). Only the first word of a statement is checked: names
+# (interfaces, filters, terms) may be any case.
+_JUNOS_KW = frozenset("""
+interfaces unit family inet inet6 filter input output input-list output-list
+firewall term from then accept discard reject next count log inactive
+security policies zones nat services groups apply-groups logical-systems
+routing-instances system protocols policy-options address source-address
+destination-address protocol destination-port source-port port vlan-id
+vlan-tagging set delete deactivate activate insert replace edit prefix-list
+source-prefix-list destination-prefix-list ethernet-switching bridge vpls
+mpls iso ccc encapsulation description disable tcp-established
+icmp-type icmp-code fragment-flags is-fragment first-fragment tcp-flags
+""".split())
+
+
+def _junos_keyword_case(text: str) -> Optional[str]:
+    from .parse_junos import _tokenize
+    toks = _tokenize(text)
+    starts = [0] + [i + 1 for i, t in enumerate(toks) if t in ("{", "}", ";")]
+    words = [toks[i] for i in starts if i < len(toks)]
+    words += [ln.split()[0] for ln in split_lines(text) if ln.split()]
+    for w in words:
+        w = w.rstrip(":")
+        if w.lower() in _JUNOS_KW and w != w.lower():
+            return w
+    return None
+
+
 def _junos_inactive(text: str) -> List[str]:
     """Where an `inactive:` marks an interface, unit, family, filter binding
     or a whole filter (terms are modelled by the parser and noted)."""
@@ -768,8 +948,15 @@ _IF_ALLOW = [
     r"shutdown", r"no shutdown",
     # A routed port (NX-OS / EOS): the interface then routes, as modeled.
     r"no switchport",
-    # Physical layer: link speed and duplex do not select packets.
+    # Physical layer: link speed, duplex and the connector (rj45, sfp,
+    # auto-select) do not select packets. One word, so nothing hides after it.
     r"speed (?:auto|\d+)", r"duplex (?:auto|full|half)", r"negotiation auto",
+    r"media-type [A-Za-z0-9-]+",
+    # Removing an address. The path model never reads addresses (every
+    # forwarding interface carries both families), so a removal can only take
+    # away a path the model already counts. If the model ever reads
+    # addresses, this must be applied there, not skipped.
+    r"no ip address", r"no ip address [0-9.]+ [0-9.]+(?: secondary)?",
     # Counter sampling interval only.
     r"load-interval \d+",
     # Turning off messages the router itself originates: ICMP unreachables
@@ -802,33 +989,22 @@ def _keyword(line: str) -> str:
     return " ".join(out) or "(not a keyword)"
 
 
-_IF_ABBREV = re.compile(r"(?i)^(in(?:t(?:e(?:r(?:f(?:a(?:ce?)?)?)?)?)?)?)\s+(\S+)")
-
-
-def _cisco_unallowed(text: str) -> List[str]:
-    """`interface: keyword` for each interface line not on the allowlist."""
+def _cisco_unallowed(lex: CiscoLex) -> List[str]:
+    """`interface: keyword` for each interface line not on the allowlist,
+    each abbreviated `int X` header and each `interface range`."""
     out: List[str] = []
-    cur: Optional[str] = None
-    for raw in text.splitlines():
-        if not raw.strip() or raw.lstrip().startswith("!"):
-            continue
-        if raw[:1] not in (" ", "\t"):
-            m = re.match(r"(?i)^interface\s+(\S+)", raw)
-            cur = m.group(1) if m and not _NO_FORWARD_IF.match(m.group(1)) else None
-            ab = _IF_ABBREV.match(raw)
-            if ab and not m:
-                # `int X`: the CLI accepts it, but the binding and path
-                # passes only read `interface X`, so the stanza is unmodeled.
-                cur = ab.group(2)
-                out.append(f"{cur}: {ab.group(1).lower()} (abbreviated interface)")
-            continue
-        if cur is None:
-            continue
-        line = " ".join(raw.split())
-        if not _IF_ALLOW_RX.fullmatch(line):
-            item = f"{cur}: {_keyword(line)}"
-            if item not in out:
-                out.append(item)
+
+    def add(item: str) -> None:
+        if item not in out:
+            out.append(item)
+    for _, name, word in lex.headers:
+        if word != "interface":
+            add(f"{name}: {word} (abbreviated interface)")
+    for name in lex.ranges:
+        add(f"{name}: interface range")
+    for ln in lex.iface_lines(forwarding=True):
+        if not _IF_ALLOW_RX.fullmatch(ln.norm):
+            add(f"{ln.iface}: {_keyword(ln.norm)}")
     return out
 
 
@@ -844,6 +1020,7 @@ _CISCO_FEATURES = [
     ("policy-routing", re.compile(
         r"(?im)^\s*((?:ip|ipv6)\s+(?:local\s+)?policy\s+route-map|"
         r"service-policy\s+type\s+pbr)\b")),
+    ("vlan-filter", re.compile(r"(?im)^\s*(vlan\s+(?:filter|access-map))\b")),
     ("mpls-forwarding", re.compile(
         r"(?im)^\s*(mpls\s+[a-z-]+|tag-switching\s+[a-z-]+|xconnect|l2vpn|"
         r"pseudowire)\b")),
@@ -888,8 +1065,20 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
     acls = sorted({a.acl for a in transit_aces})
 
     if v in _CISCO:
-        from .parse import strip_banners
-        text = strip_banners(text)[0]          # banner text is not config
+        lex = cisco_lex(text)
+        text = lex.text                        # normalised lines, banners blank
+        if lex.bad_chars:
+            no, cp = lex.bad_chars[0]
+            b.append(Reason("parse-note",
+                            f"line {no}: character U+{cp:04X} is not part of a "
+                            f"config line RuleHawk can read (a line ends at "
+                            f"\\n only); {len(lex.bad_chars)} line(s)"))
+        if lex.ambiguous:
+            no, where, kw = lex.ambiguous[0]
+            more = (f" (+{len(lex.ambiguous) - 1} more)" if len(lex.ambiguous) > 1
+                    else "")
+            b.append(Reason("stanza-boundary-ambiguous",
+                            f"line {no}: `{kw}` unindented in {where}" + more))
         neg = _CISCO_NEGATED_BIND.search(text)
         if neg:
             b.append(Reason("acl-binding-negated", neg.group(0).strip()))
@@ -900,12 +1089,12 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
             m = rx.search(text)
             if m:
                 b.append(Reason(code, " ".join(m.group(1).lower().split())))
-        unallowed = _cisco_unallowed(text)
+        unallowed = _cisco_unallowed(lex)
         if unallowed:
             more = (f" (+{len(unallowed) - 3} more)" if len(unallowed) > 3 else "")
             b.append(Reason("interface-feature-unmodeled",
                             "; ".join(unallowed[:3]) + more))
-        transit, other = _cisco_bindings(text)
+        transit, other = _cisco_bindings(lex)
         role = _role_reasons(acls, transit, other)
         b += role
         if acls and all(acl not in transit for acl in acls):
@@ -924,7 +1113,7 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
                 b.append(Reason("unfiltered-path",
                                 "ASA interface coverage is not modelled"))
         else:
-            _path_blockers(ctx, _cisco_paths(text))
+            _path_blockers(ctx, _cisco_paths(lex))
         if cisco_dialect_ambiguous(text):
             b.append(Reason("numbered-acl-mask-ambiguous"))
         if _ALL_ONES_NONZERO.search(text) \
@@ -942,6 +1131,9 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
             ctx.v6_blockers.append(Reason("icmpv6-canonicalisation"))
         ctx.v6_icmp_fallthrough.append(Reason("ipv6-implicit-nd"))
     elif v == "junos":
+        kw = _junos_keyword_case(text)
+        if kw:
+            b.append(Reason("junos-keyword-case", kw.lower()))
         inactive = _junos_inactive(text)
         if inactive:
             b.append(Reason("acl-binding-negated", inactive[0][:120]))
@@ -1033,12 +1225,14 @@ def build_context(text: str, aces: Sequence, notes: Sequence[str],
 KNOWN_LIMITS = (
     "Cisco reads ACLs, allowlisted interface lines and the listed global "
     "features (zone firewall, ip inspect, service-policy, policy routing, "
-    "MPLS / xconnect, NAT); any other interface line is UNKNOWN and other "
-    "global commands are not read",
+    "MPLS / xconnect, VLAN filters, NAT); any other line in interface mode, "
+    "an unindented line in interface, ACL or object-group mode that is not a "
+    "recognised top-level command, and a control or separator character are "
+    "UNKNOWN; other global commands are not read",
     "PAN-OS resolves an object name only in the rule's own vsys or "
     "device-group and in shared; device-group inheritance is not followed",
-    "iptables reads the filter table; a chain's policy comes only from its "
-    "parsed -P or :CHAIN line",
+    "iptables reads the filter table; a chain's policy comes only from a "
+    "parsed -P or :CHAIN line naming ACCEPT or DROP (exact case)",
     "Junos reads firewall filters and their interface bindings; SRX security "
     "zones or policies make the answer UNKNOWN",
 )

@@ -894,11 +894,17 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             return _Item(None, line)
         return _Item(r, line)
 
+    # iptables(8): "The policy target must be either ACCEPT or DROP", and
+    # libiptc compares the name case-sensitively. `-P FORWARD REJECT` or
+    # `drop` fails on the host (iptables-restore aborts), so it sets nothing
+    # and the line is noted (review of #42, round 5, S1).
+    _POLICIES = {"ACCEPT": "permit", "DROP": "deny"}
+
     def pol_ok(pol: str) -> bool:
-        return pol.upper() in _TERMINATING
+        return pol in _POLICIES
 
     def set_policy(ch: str, pol: str, line: int = 0) -> None:
-        act = _TERMINATING.get(pol.upper())
+        act = _POLICIES.get(pol)
         if act is not None:
             policies[ch] = act
             policy_lines[ch] = line

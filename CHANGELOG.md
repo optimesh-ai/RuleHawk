@@ -133,7 +133,22 @@ run is one.
   `rulehawk/failclosed.py`, each entry with its reason). Any other line, any
   `default` form, any abbreviated keyword (`no ip access-gr F in`) and an
   abbreviated `int X` header -> UNKNOWN (`interface-feature-unmodeled`; the
-  detail names the keyword, not the line).
+  detail names the keyword, not the line). `no ip address` (exact forms) and
+  `media-type WORD` are on the list.
+- Cisco configs are read by one lexer that every Cisco check uses. A line
+  ends at a newline only; any other control, format or separator character,
+  or a space other than ASCII space, is a parse note -> UNKNOWN. Mode, not
+  indentation, decides which stanza a line belongs to: an unindented line in
+  interface, ACL or object-group mode that is not one of a short list of
+  top-level commands (listed in the README) -> UNKNOWN
+  (`stanza-boundary-ambiguous`). Interface names are case-folded and a
+  separately written number is joined, so `GigabitEthernet 0/2` is its own
+  port and repeated stanzas merge in order. The Cisco ACL parser splits
+  lines the same way.
+- Cisco VLAN ACLs (`vlan access-map`, `vlan filter`) -> UNKNOWN
+  (`vlan-filter`).
+- Junos: a statement keyword written in upper case (Junos keywords are
+  lower-case only) -> UNKNOWN (`junos-keyword-case`).
 - Cisco features that drop, inspect, rewrite or bypass traffic outside the
   ACLs, on any line -> UNKNOWN: zone-based firewall (`zone security`,
   `zone-member security`, `zone-pair security`; `zone-firewall`), `ip
@@ -149,7 +164,10 @@ run is one.
 - iptables: a line is dispatched on its first verb. A line that carries a
   second verb or a shell separator (`;`, `&&`, `|`) is a parse note, and a
   word in a rule that is no option's value (iptables rejects the line)
-  makes the rule imprecise with a parse note.
+  makes the rule imprecise with a parse note. A chain policy is only
+  `ACCEPT` or `DROP`, exact case (iptables(8): "The policy target must be
+  either ACCEPT or DROP"); `-P FORWARD REJECT`, `drop` or `:FORWARD REJECT`
+  sets nothing and is a parse note.
 - must_reach: connectivity OK now needs every audited rule context to
   permit the whole flow. One permitting and another denying part of it
   (an egress ACL on the destination interface) -> UNKNOWN
@@ -174,9 +192,9 @@ run is one.
 - Only the PAN-OS and iptables frontends account for every line. Every PASS
   prints these per-vendor limits next to the verdict (text, `--json`
   `scope`, `--evidence`, gate, MCP, hosted page):
-  - Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, NAT); any other interface line is UNKNOWN and other global commands are not read.
+  - Cisco reads ACLs, allowlisted interface lines and the listed global features (zone firewall, ip inspect, service-policy, policy routing, MPLS / xconnect, VLAN filters, NAT); any other line in interface mode, an unindented line in interface, ACL or object-group mode that is not a recognised top-level command, and a control or separator character are UNKNOWN; other global commands are not read.
   - PAN-OS resolves an object name only in the rule's own vsys or device-group and in shared; device-group inheritance is not followed.
-  - iptables reads the filter table; a chain's policy comes only from its parsed -P or :CHAIN line.
+  - iptables reads the filter table; a chain's policy comes only from a parsed -P or :CHAIN line naming ACCEPT or DROP (exact case).
   - Junos reads firewall filters and their interface bindings; SRX security zones or policies make the answer UNKNOWN.
 - RuleHawk models the L3/L4 packet space.
 - iptables: only the filter table is modelled; other tables are noted.
