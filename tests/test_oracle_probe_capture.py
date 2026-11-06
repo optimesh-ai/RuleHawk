@@ -187,6 +187,26 @@ def test_unregistered_tag_reads_drop():
     assert kp.find_tag(b, False) is None
 
 
+# --- L2: the tag is read at the probe's own offset ---------------------------
+
+@pytest.mark.parametrize("proto", sorted(PROBES))
+def test_magic_bytes_in_the_header_do_not_hide_a_real_accept(proto):
+    """82.72.79.82 is b"RHOR": the first MAGIC in the packet is then the
+    source address, not the tag. The probe must still read accept."""
+    p = dict(PROBES[proto], src="82.72.79.82")
+    [b] = _arm([p])
+    assert b[12:16] == kp.MAGIC
+    assert kp.find_tag(b, False) == 0
+    assert kp.find_tag(_forwarded(b), True) == 0
+
+
+def test_magic_bytes_in_both_addresses_do_not_hide_a_real_accept():
+    p = dict(PROBES["icmp"], src="82.72.79.82", dst="82.72.79.82")
+    [b] = _arm([p])
+    assert _verdicts([b], 1, False) == ["accept"]
+    assert _verdicts([_icmp_error(b, p["dst"], p["src"])], 1, False) == ["drop"]
+
+
 # --- L1: only the filter table may be loaded ---------------------------------
 # NAT and mangle rewrite the bytes find_tag compares, so a real accept would
 # read as drop. load() refuses them before touching iptables.
