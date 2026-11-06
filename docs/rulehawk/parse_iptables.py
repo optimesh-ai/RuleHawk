@@ -528,7 +528,7 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
             notes.append(f"iptables fragment match (`-f`) in {label} — applies only to "
                          f"non-first fragments (marked imprecise — verify manually)")
             i += 1
-        elif t.startswith("-") and t not in ("-A", "--append"):
+        elif t.startswith("-"):
             # Unknown narrowing option (e.g. --tcp-flags, --syn, -m limit options):
             # over-approximate and surface, never silently drop the constraint.
             r.imprecise = True
@@ -538,6 +538,14 @@ def _parse_rule(toks: List[str], label: str, notes: List[str]) -> _Rule:
                          + f" in {label} (marked imprecise — verify manually)")
             i += consumed
         else:
+            # A word that is no option's value: iptables rejects the line
+            # (`Bad argument`), so the rule may not exist on the device.
+            # Keep it, imprecise, and say so (round 4: skipping the word
+            # silently let a refused DROP prove a PASS).
+            r.imprecise = True
+            notes.append(f"stray word `{t[:40]}` in iptables rule {label} — "
+                         f"iptables rejects such a line, so the rule may not "
+                         f"be applied (marked imprecise — verify manually)")
             i += 1
         negate = False
     return r
@@ -1108,6 +1116,14 @@ def parse_iptables(text: str) -> Tuple[List[ACE], List[str]]:
             # -Z zeroes counters, -L / -S list: none changes filtering.
             consumed.add(lineno)
         # Anything else (-X, -E, a shell line, an unknown verb) is noted below.
+        # A line that carries a second verb or a shell separator holds more
+        # than the one operation dispatched above (`-N X ; iptables -P FORWARD
+        # ACCEPT`): what was dispatched stays, but the line is not consumed,
+        # so it is noted (round 4, R1).
+        if lineno in consumed and (
+                any(t in _OPS or t in _READ_ONLY for t in toks[k + 1:])
+                or any(c in t for t in toks for c in (";", "|", "&", "`", "$("))):
+            consumed.discard(lineno)
 
     missed = [(n, ln.strip()) for n, ln in enumerate(text.splitlines(), 1)
               if ln.strip() and not ln.strip().startswith("#")
