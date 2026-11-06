@@ -7,8 +7,9 @@ command reads them all and renders ONE sticky comment whose headline is the
 worst verdict:
 
     FAIL     any check failed
-    UNKNOWN  a check that was expected left no readable result (it crashed, was
-             cancelled or skipped) — never read as a pass
+    UNKNOWN  a check reported UNKNOWN (exit 3: a policy assertion could not
+             be proven), or a check that was expected left no readable result
+             (it crashed, was cancelled or skipped) — never read as a pass
     PASS     every expected check reported and passed
 
 usage:
@@ -60,6 +61,8 @@ def _report_verdict(md: str) -> Optional[str]:
         return "PASS"
     if title.startswith("## ❌ ") and line.startswith("**FAIL"):
         return "FAIL"
+    if title.startswith("## ❌ ") and line.startswith("**UNKNOWN**"):
+        return "UNKNOWN"
     return None
 
 
@@ -155,6 +158,12 @@ def _load(path: str) -> Check:
         ok = (code == 0 and n == 0 and (pf == 0 or fail_on == "none")
               and _report_verdict(md) == "PASS")
         verdict, detail = "PASS", f"no findings at or above `{fail_on}`"
+    elif code == 3:
+        # The gate's own UNKNOWN (exit 3, fail-closed): nothing at the
+        # threshold, but a policy assertion could not be proven. Never a PASS.
+        ok = (n == 0 and pf == 0 and _report_verdict(md) == "UNKNOWN")
+        verdict, detail = "UNKNOWN", ("fail-closed: a policy assertion could "
+                                      "not be proven (see its reason codes)")
     else:
         ok = code in (1, 2) and _report_verdict(md) == "FAIL"
         verdict = "FAIL"

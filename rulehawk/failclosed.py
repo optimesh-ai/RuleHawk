@@ -1,0 +1,568 @@
+"""Fail-closed verdicts: the UNKNOWN outcome and the reasons behind it.
+
+The segmentation search (segcheck._search) answers one narrow question: does
+any parsed rule context permit a packet in the asserted flow space? "No" is a
+SEARCH RESULT. It is a verdict (PASS / connectivity OK) only when every
+assumption it rests on holds for the config: the rules really are transit
+packet filters on the path, nothing on the evaluated context was left
+unmodeled, and no vendor default RuleHawk does not model decides the packets
+the search let fall through.
+
+This module states those assumptions, checks them against the config, and
+names each one that fails with a machine-readable reason code. Any reason
+turns a would-be PASS into UNKNOWN. A violation (a concrete permitted witness)
+or a broken required flow stays a FAIL: over-blocking is the safe direction,
+and a FAIL never certifies anything.
+
+Vedu (2026-11-06): "RuleHawk never returns PASS/VERIFIED when: the search is
+empty; any parse note exists on an object on the evaluated path; the ACL's
+binding or role is unknown or is not a packet filter (vty, SNMP, route-map);
+a vendor default it doesn't model applies (PAN-OS default-security-rules,
+iptables chain policy); or an IOS numbered-ACL wildcard is ambiguous. Those
+return UNKNOWN with the reason."
+
+Conservative by construction:
+  * a parse note ANYWHERE in the file counts as on the evaluated path (no
+    attempt is made to prove a note off-path);
+  * every ACL context the search consults must have a known transit role;
+    one unknown or non-transit context is enough;
+  * a vendor default is reported whenever the construct is present, except
+    for the implicit end-of-list defaults, which are reported exactly when the
+    search let part of the flow space fall through to them.
+
+Reason codes are stable identifiers (kebab-case). The message is for humans
+and may change.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import re
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+# --------------------------------------------------------------------------- #
+# reason codes
+# --------------------------------------------------------------------------- #
+REASONS: Dict[str, str] = {
+    # (a) empty search
+    "no-rules-parsed":
+        "no rules were parsed from the config, so nothing was searched",
+    "no-transit-filter":
+        "no rule context on the evaluated path is a known transit packet "
+        "filter, so the search proved nothing about forwarded packets",
+    "search-not-run":
+        "the search did not run over any rule context for this assertion",
+    # (b) parse notes
+    "parse-note":
+        "the parser left a note (a line it did not fully model, or a "
+        "resolution it had to make) and RuleHawk cannot prove the note is off "
+        "the evaluated path",
+    # (c) binding and role
+    "acl-role-unknown":
+        "an ACL in the search has no recognised transit binding "
+        "(no interface ip access-group / ipv6 traffic-filter / ASA "
+        "access-group / Junos interface filter), so its role is unknown",
+    "acl-not-packet-filter":
+        "an ACL in the search is used only in a role that is not a transit "
+        "packet filter (line vty access-class, SNMP, route-map, NAT, crypto, "
+        "PBR, QoS, or a Junos lo0 control-plane filter)",
+    "asa-security-levels":
+        "the ASA nameif / security-level semantics (implicit permit from a "
+        "higher to a lower security level on an interface with no ACL) are "
+        "not modeled",
+    "junos-srx-policies":
+        "Junos SRX zone-based security policies are present and not modeled",
+    "junos-logical-systems":
+        "Junos logical systems are present; their filters are not kept as "
+        "separate contexts",
+    "junos-groups":
+        "Junos configuration groups are present; inherited statements are "
+        "not replayed",
+    "iptables-host-chain-only":
+        "only the iptables INPUT / OUTPUT host chains carry rules; they never "
+        "see a forwarded (transit) packet",
+    "aws-sg-binding-unknown":
+        "an AWS security group's attachment (which network interfaces it "
+        "filters, and with which other groups) is not in the input",
+    # (d) vendor defaults RuleHawk does not model
+    "panos-default-security-rules":
+        "PAN-OS default-security-rules overrides are present and not modeled",
+    "panos-implicit-default":
+        "part of the flow space reaches the end of the PAN-OS rulebase, where "
+        "the predefined intrazone-default (allow) / interzone-default (deny) "
+        "rules decide it; zones are not modeled",
+    "panos-unmodeled-rule-field":
+        "a PAN-OS rule uses a match field RuleHawk consumes but does not "
+        "model (source-user, schedule, category, HIP, device, rule-type, "
+        "target)",
+    "iptables-chain-policy-unset":
+        "part of the flow space reaches the end of an iptables chain with no "
+        "explicit policy; a base chain's kernel default is ACCEPT and a user "
+        "chain returns to its caller",
+    "iptables-proto-zero":
+        "an iptables rule uses `-p 0`, which RuleHawk does not model",
+    "ip6tables-family":
+        "ip6tables rules are present; the address family of `any` and of the "
+        "chain policies is not modeled reliably",
+    "iptables-delete":
+        "an iptables `-D` delete is present and not applied to the rule set",
+    "ipv6-implicit-nd":
+        "part of an IPv6 flow space reaches the end of a Cisco/Arista IPv6 "
+        "ACL, where implicit neighbor-discovery permits apply before the "
+        "implicit deny; they are not modeled",
+    "icmpv6-canonicalisation":
+        "an ICMP rule in an IPv6 context (`icmp` in an `ipv6 access-list`, "
+        "ASA `icmp6`) is not canonicalised to ICMPv6",
+    "tcp-established":
+        "an `established` / `tcp-established` match is present; on the device "
+        "it is a stateless ACK/RST bit test, not connection state",
+    "l4-fragments":
+        "a rule matches on layer-4 fields (ports, ICMP type, TCP flags); "
+        "non-initial fragments carry no layer-4 header and their handling is "
+        "not modeled",
+    "ios-dynamic-entry":
+        "an IOS lock-and-key `dynamic` entry is present and not modeled",
+    "nftables-unsupported":
+        "the input looks like an nftables ruleset, which RuleHawk does not "
+        "read",
+    "acl-family-mismatch":
+        "part of the flow space reaches the end of a rule context that has "
+        "no rule of the packet's address family; such a context may not "
+        "filter that family at all",
+    # (e) IOS numbered-ACL masks
+    "numbered-acl-mask-ambiguous":
+        "a numbered `access-list N permit|deny` line without `extended` "
+        "appears in a config with a PIX/ASA dialect marker, so its mask "
+        "could be a netmask or an IOS wildcard",
+    "ios-wildcard-all-ones":
+        "an IOS ACL entry pairs a nonzero address with 255.255.255.255; as an "
+        "IOS wildcard that matches any address, as a netmask it is one host, "
+        "and RuleHawk will not pick a reading to prove a PASS",
+    "vendor-unknown":
+        "the config's vendor label is not one RuleHawk has fail-closed checks "
+        "for, so none of them ran",
+    # the search itself
+    "imprecise-rule":
+        "a rule on the path uses a form RuleHawk over-approximates "
+        "(neq / complex mask / unresolved group / unknown qualifier)",
+    "search-budget":
+        "the rule context is too complex to search exhaustively",
+    "policy-error":
+        "the assertion could not be evaluated because the policy is invalid",
+}
+
+
+@dataclass(frozen=True)
+class Reason:
+    code: str
+    detail: str = ""
+
+    def to_dict(self) -> dict:
+        msg = REASONS.get(self.code, self.code)
+        if self.detail:
+            msg = f"{msg} ({self.detail})"
+        return {"code": self.code, "message": msg}
+
+
+def reason_dicts(reasons: Iterable[Reason]) -> List[dict]:
+    """Deduplicated, order-preserving list of reason dicts."""
+    out: List[dict] = []
+    seen: Set[Tuple[str, str]] = set()
+    for r in reasons:
+        key = (r.code, r.detail)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r.to_dict())
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# vendor normalisation
+# --------------------------------------------------------------------------- #
+_VENDOR_ALIASES = {
+    "ios-asa": "ios-asa", "nxos": "nxos", "eos": "eos", "junos": "junos",
+    "panos": "panos", "iptables": "iptables", "aws-sg": "aws-sg",
+    # the hosted page's display labels
+    "Cisco IOS / ASA": "ios-asa", "Cisco NX-OS": "nxos", "Arista EOS": "eos",
+    "Juniper Junos": "junos", "Palo Alto PAN-OS": "panos",
+    "Linux iptables": "iptables", "AWS Security Groups": "aws-sg",
+}
+_CISCO = frozenset({"ios-asa", "nxos", "eos"})
+
+
+def normalise_vendor(vendor: str) -> str:
+    """The canonical vendor key; an unknown label is kept as given, and
+    build_context then blocks every PASS with `vendor-unknown` (no
+    vendor-specific checks ran, so nothing a PASS rests on was checked)."""
+    return _VENDOR_ALIASES.get(vendor, vendor or "ios-asa")
+
+
+# --------------------------------------------------------------------------- #
+# the context
+# --------------------------------------------------------------------------- #
+@dataclass
+class FailClosedContext:
+    """Everything about one config that a PASS rests on.
+
+    `blockers` apply to every positive verdict. `transit_acls` is the set of
+    ACL contexts with a recognised transit binding (None when the vendor's
+    rule contexts are transit by construction, e.g. a PAN-OS rulebase or the
+    iptables FORWARD chain). The `*_fallthrough` lists decide a PASS only when
+    the search let part of the flow space reach the end of a context."""
+    vendor: str
+    blockers: List[Reason] = field(default_factory=list)
+    v6_blockers: List[Reason] = field(default_factory=list)
+    fallthrough: List[Reason] = field(default_factory=list)
+    v6_icmp_fallthrough: List[Reason] = field(default_factory=list)
+    n_rules: int = 0
+
+    def pass_blockers(self, *, families: Set[int], proto: str,
+                      fell_through: Set[Tuple[str, int]],
+                      context_families: Dict[str, Set[int]]) -> List[Reason]:
+        """Every reason a would-be PASS for this assertion is unsupported.
+
+        `families` are the IP versions of the assertion's zones, `proto` its
+        protocol, `fell_through` the (ACL, IP version) pairs whose search
+        reached the implicit end-of-context default, and `context_families`
+        the IP versions each searched context has a rule for."""
+        out: List[Reason] = list(self.blockers)
+        if 6 in families:
+            out += self.v6_blockers
+        if fell_through:
+            out += self.fallthrough
+            v6_icmp = proto in ("icmpv6", "ip", "any", "ipv6")
+            if v6_icmp and any(fam == 6 for _, fam in fell_through):
+                out += self.v6_icmp_fallthrough
+            for acl, fam in sorted(fell_through):
+                if fam not in context_families.get(acl, set()):
+                    out.append(Reason("acl-family-mismatch",
+                                      f"{acl}: no IPv{fam} rule"))
+        return out
+
+
+# --------------------------------------------------------------------------- #
+# Cisco IOS / ASA / NX-OS / EOS: bindings and roles
+# --------------------------------------------------------------------------- #
+# Transit packet-filter bindings. Interface-level forms are honoured only
+# inside an `interface` stanza; the ASA forms are global commands.
+_CISCO_IF_BIND = re.compile(
+    r"^\s+(?:ip\s+access-group|ipv6\s+traffic-filter|ipv6\s+access-group|"
+    r"ip\s+port\s+access-group|ipv6\s+port\s+traffic-filter|"
+    r"ipv4\s+access-group)\s+(\S+)\s+(?:in|out|ingress|egress)\b",
+    re.IGNORECASE)
+_ASA_BIND = re.compile(
+    r"^\s*access-group\s+(\S+)\s+(?:(?:in|out)\s+interface\s+\S+|global)\b",
+    re.IGNORECASE)
+# Roles that are not transit packet filters, for the message only: anything
+# without a transit binding is UNKNOWN whatever references it.
+_CISCO_NON_TRANSIT = [
+    ("line vty/con access-class",
+     re.compile(r"^\s*(?:ipv6\s+)?access-class\s+(\S+)", re.IGNORECASE)),
+    ("SNMP", re.compile(r"^\s*snmp-server\s+.*?\b(?:RO|RW|access|ipv6)\s+(\S+)\s*$",
+                        re.IGNORECASE)),
+    ("route-map / class-map / PBR match",
+     re.compile(r"^\s*match\s+(?:ip(?:v6)?\s+)?(?:address|access-group)\s+"
+                r"(?:name\s+|prefix-list\s+)?(\S+)", re.IGNORECASE)),
+    ("NAT", re.compile(r"^\s*ip\s+nat\s+.*?\blist\s+(\S+)", re.IGNORECASE)),
+    ("crypto map", re.compile(r"^\s*(?:crypto\s+map\s+.*\s)?match\s+address\s+(\S+)",
+                              re.IGNORECASE)),
+    ("distribute-list", re.compile(r"^\s*distribute-list\s+(\S+)", re.IGNORECASE)),
+    ("NTP", re.compile(r"^\s*ntp\s+access-group\s+\S+\s+(\S+)", re.IGNORECASE)),
+    ("HTTP server", re.compile(r"^\s*ip\s+http\s+access-class\s+(?:ipv4\s+)?(\S+)",
+                               re.IGNORECASE)),
+    ("ASA class-map / VPN / capture",
+     re.compile(r"^\s*(?:match\s+access-list|vpn-filter\s+value|"
+                r"split-tunnel-network-list\s+value|capture\s+\S+\s+access-list)\s+(\S+)",
+                re.IGNORECASE)),
+]
+_ASA_DIALECT = re.compile(
+    r"(?im)^\s*(?:(?:ASA|PIX|FWSM)\s+Version\b|nameif\s+\S|security-level\s+\d|"
+    r"access-group\s+\S+\s+(?:in|out)\s+interface\b)")
+_NUMBERED_FLAT = re.compile(
+    r"(?im)^\s*access-list\s+\d+\s+(?:permit|deny|dynamic)\b")
+
+
+_NUMBERED_LINE_KW = re.compile(
+    r"(?im)^\s*access-list\s+\d+\s+line\s+\d+\s+(?:permit|deny)\b")
+
+
+def cisco_dialect_ambiguous(text: str) -> bool:
+    """A numbered flat ACL line with no `extended` keyword in a config with a
+    PIX/ASA marker (or written with the ASA-only `line N` keyword): its mask
+    is a PIX netmask or an IOS wildcard."""
+    return bool(_NUMBERED_LINE_KW.search(text)
+                or (_NUMBERED_FLAT.search(text) and _ASA_DIALECT.search(text)))
+
+
+def _cisco_bindings(text: str) -> Tuple[Set[str], Dict[str, str]]:
+    """(ACLs with a transit binding, ACL -> first non-transit role)."""
+    transit: Set[str] = set()
+    other: Dict[str, str] = {}
+    in_interface = False
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("!"):
+            continue
+        if raw[:1] not in (" ", "\t"):
+            in_interface = bool(re.match(r"(?i)^interface\s", raw))
+        if in_interface:
+            m = _CISCO_IF_BIND.match(raw)
+            if m:
+                transit.add(m.group(1))
+                continue
+        m = _ASA_BIND.match(raw)
+        if m:
+            transit.add(m.group(1))
+            continue
+        for role, rx in _CISCO_NON_TRANSIT:
+            m = rx.match(raw)
+            if m:
+                other.setdefault(m.group(1), role)
+                break
+    return transit, other
+
+
+def _role_reasons(acls: Sequence[str], transit: Set[str],
+                  other: Dict[str, str]) -> List[Reason]:
+    out: List[Reason] = []
+    for acl in acls:
+        if acl in transit:
+            continue
+        if acl in other:
+            out.append(Reason("acl-not-packet-filter", f"{acl}: {other[acl]}"))
+        else:
+            out.append(Reason("acl-role-unknown", f"{acl}: no transit binding"))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Junos: interface filter bindings
+# --------------------------------------------------------------------------- #
+_JUNOS_SET_BIND = re.compile(
+    r"^\s*set\s+(?:logical-systems\s+\S+\s+)?interfaces\s+(\S+)\s+.*?\bfilter\s+"
+    r"(?:input|output|input-list|output-list)\s+(.+?)\s*$")
+
+
+def _junos_bindings(text: str) -> Tuple[Set[str], Dict[str, str]]:
+    """(filters bound on a non-loopback interface, filter -> lo0 role)."""
+    from .parse_junos import _tokenize
+    transit: Set[str] = set()
+    other: Dict[str, str] = {}
+
+    def bind(ifname: str, names: Iterable[str]) -> None:
+        for nm in names:
+            nm = nm.strip('"')
+            if nm in ("[", "]", ";") or not nm:
+                continue
+            if ifname.startswith("lo"):
+                other.setdefault(nm, f"{ifname} control-plane filter")
+            else:
+                transit.add(nm)
+
+    for raw in text.splitlines():
+        m = _JUNOS_SET_BIND.match(raw)
+        if m:
+            bind(m.group(1), m.group(2).replace("[", " ").replace("]", " ").split())
+
+    toks = _tokenize(text)
+    stack: List[str] = []
+    stmt: List[str] = []
+    for t in toks:
+        if t == "{":
+            stack.append(stmt[-1] if stmt else "")
+            stmt = []
+        elif t == "}":
+            if stack:
+                stack.pop()
+            stmt = []
+        elif t == ";":
+            _junos_stmt(stack, stmt, bind)
+            stmt = []
+        else:
+            stmt.append(t)
+    return transit, other
+
+
+def _junos_stmt(stack: List[str], stmt: List[str], bind) -> None:
+    if not stmt or "interfaces" not in stack:
+        return
+    k = stack.index("interfaces")
+    if k + 1 >= len(stack):
+        return
+    ifname = stack[k + 1]
+    words = list(stmt)
+    if words and words[0] == "filter":          # `filter input NAME;`
+        words = words[1:]
+    elif "filter" not in stack[k + 1:]:
+        return
+    if words and words[0] in ("input", "output", "input-list", "output-list"):
+        bind(ifname, words[1:])
+
+
+# --------------------------------------------------------------------------- #
+# per-vendor scans
+# --------------------------------------------------------------------------- #
+_PANOS_RULE_LINE = re.compile(r"(?m)^\s*set\s+.*?\b(?:pre-|post-)?rulebase\s+security\s+rules\s.*$")
+_PANOS_UNMODELED_FIELDS = ("source-user", "schedule", "category", "source-hip",
+                           "destination-hip", "hip-profiles", "source-device",
+                           "destination-device", "rule-type", "target")
+_PANOS_FIELD_EXACT = {"any", "universal"}
+
+
+def _panos_unmodeled_fields(text: str) -> List[str]:
+    found: List[str] = []
+    for m in _PANOS_RULE_LINE.finditer(text):
+        toks = m.group(0).split()
+        for k, t in enumerate(toks[:-1]):
+            if t in _PANOS_UNMODELED_FIELDS:
+                val = toks[k + 1].strip('"[').lower()
+                if val not in _PANOS_FIELD_EXACT and t not in found:
+                    found.append(t)
+    return found
+
+
+_ALL_ONES_NONZERO = re.compile(
+    r"(?im)^\s*(?:access-list\s+\S+\s+)?(?:\d+\s+)?(?:permit|deny)\b.*?"
+    r"\b(?!0\.0\.0\.0\b)\d{1,3}(?:\.\d{1,3}){3}\s+255\.255\.255\.255\b")
+_NFT = re.compile(r"(?m)^\s*table\s+(?:inet|ip6?|arp|bridge|netdev)\s+\S+\s*\{")
+
+
+def _is_l4(a) -> bool:
+    from .model import _PORTED
+    if a.stateful:
+        return True
+    if a.proto in _PORTED and not (a.src_port.is_any() and a.dst_port.is_any()):
+        return True
+    return a.icmp_type is not None
+
+
+def build_context(text: str, aces: Sequence, notes: Sequence[str],
+                  vendor: str) -> FailClosedContext:
+    """Check every assumption a PASS on this config rests on."""
+    v = normalise_vendor(vendor)
+    ctx = FailClosedContext(vendor=v, n_rules=len(aces))
+    b = ctx.blockers
+    if not aces:
+        b.append(Reason("no-rules-parsed"))
+        if _NFT.search(text):
+            b.append(Reason("nftables-unsupported"))
+    if notes:
+        first = str(notes[0])
+        if len(first) > 160:
+            first = first[:157] + "..."
+        b.append(Reason("parse-note", f"{len(notes)} note(s); first: {first}"))
+
+    transit_aces = [a for a in aces if a.transit]
+    acls = sorted({a.acl for a in transit_aces})
+
+    if v in _CISCO:
+        transit, other = _cisco_bindings(text)
+        role = _role_reasons(acls, transit, other)
+        b += role
+        if acls and all(acl not in transit for acl in acls):
+            b.append(Reason("no-transit-filter",
+                            "no ACL has an interface or access-group binding"))
+        if re.search(r"(?im)^\s*(?:nameif\s+\S|security-level\s+\d|"
+                     r"same-security-traffic\b)", text):
+            b.append(Reason("asa-security-levels"))
+        if cisco_dialect_ambiguous(text):
+            b.append(Reason("numbered-acl-mask-ambiguous"))
+        if _ALL_ONES_NONZERO.search(text) \
+                and not _ASA_DIALECT.search(text):
+            # `A 255.255.255.255` in an IOS ACL is an all-ones WILDCARD (any
+            # address); the parser keeps the netmask reading (host A). The two
+            # readings differ, so no PASS rests on either.
+            b.append(Reason("ios-wildcard-all-ones"))
+        if re.search(r"(?im)^\s*(?:access-list\s+\S+\s+)?(?:\d+\s+)?dynamic\s+\S+", text):
+            b.append(Reason("ios-dynamic-entry"))
+        v6_icmp = [a for a in transit_aces
+                   if a.proto in ("icmp", "icmp6", "icmpv6")
+                   and (a.src.version == 6 or a.dst.version == 6)]
+        if v6_icmp or re.search(r"(?i)\bicmp6\b", text):
+            ctx.v6_blockers.append(Reason("icmpv6-canonicalisation"))
+        ctx.v6_icmp_fallthrough.append(Reason("ipv6-implicit-nd"))
+    elif v == "junos":
+        transit, other = _junos_bindings(text)
+        b += _role_reasons(acls, transit, other)
+        if acls and all(acl not in transit for acl in acls):
+            b.append(Reason("no-transit-filter",
+                            "no filter is applied on a transit interface"))
+        if re.search(r"\blogical-systems\b", text):
+            b.append(Reason("junos-logical-systems"))
+        if re.search(r"(?m)^\s*(?:set\s+)?security\s+(?:\{|policies\b)", text) or \
+                re.search(r"\bfrom-zone\s+\S+\s+to-zone\s+\S+", text) or \
+                re.search(r"(?m)^\s*policies\s*\{", text):
+            b.append(Reason("junos-srx-policies"))
+        if re.search(r"(?m)^\s*(?:set\s+)?groups\b|\bapply-groups\b", text):
+            b.append(Reason("junos-groups"))
+    elif v == "panos":
+        if "default-security-rules" in text:
+            b.append(Reason("panos-default-security-rules"))
+        fields = _panos_unmodeled_fields(text)
+        if fields:
+            b.append(Reason("panos-unmodeled-rule-field", ", ".join(fields)))
+        ctx.fallthrough.append(Reason("panos-implicit-default"))
+    elif v == "iptables":
+        if not transit_aces and any(not a.transit for a in aces):
+            b.append(Reason("iptables-host-chain-only"))
+            b.append(Reason("no-transit-filter",
+                            "only INPUT/OUTPUT host chains carry rules"))
+        if re.search(r"(?m)(?:^|\s)(?:-p|--protocol)\s+0(?:\s|$)", text):
+            b.append(Reason("iptables-proto-zero"))
+        if re.search(r"(?m)\bip6tables\b", text):
+            b.append(Reason("ip6tables-family"))
+        if re.search(r"(?m)(?:^|\s)(?:-D|--delete)\s+\S+", text):
+            b.append(Reason("iptables-delete"))
+        if any(a.acl == "FORWARD" for a in transit_aces) and not re.search(
+                r"(?m)(?:^|\s)(?:-P|--policy)\s+FORWARD\s|^\s*:FORWARD\s+(?:ACCEPT|DROP)\b",
+                text):
+            b.append(Reason("iptables-chain-policy-unset", "FORWARD"))
+        ctx.fallthrough.append(Reason("iptables-chain-policy-unset",
+                                      "the search reached the end of a chain"))
+    elif v == "aws-sg":
+        b.append(Reason("aws-sg-binding-unknown"))
+    else:
+        b.append(Reason("vendor-unknown", repr(vendor)))
+
+    if v in _CISCO or v == "junos":
+        if any(a.stateful for a in transit_aces):
+            b.append(Reason("tcp-established"))
+        l4 = [a for a in transit_aces if _is_l4(a)]
+        if l4:
+            b.append(Reason("l4-fragments",
+                            f"{l4[0].acl} line {l4[0].line}" if l4[0].line
+                            else l4[0].acl))
+    return ctx
+
+
+def families_of(nets: Iterable) -> Set[int]:
+    out: Set[int] = set()
+    for n in nets:
+        try:
+            out.add(ipaddress.ip_network(str(n), strict=False).version)
+        except ValueError:
+            continue
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# verdict helpers for the output surfaces
+# --------------------------------------------------------------------------- #
+def undecided(findings) -> list:
+    """The policy-assertion findings whose verdict is UNKNOWN (fail-closed:
+    an UNKNOWN, an indeterminate search or a policy error). Any one of them
+    means the run is not a PASS."""
+    return [f for f in findings
+            if getattr(f, "verdict", None) == "UNKNOWN"
+            and getattr(f, "accepted", None) is None]
+
+
+def assertion_verdict(findings) -> Optional[str]:
+    """The worst assertion verdict: FAIL > UNKNOWN > PASS; None when no
+    policy assertion was checked."""
+    vs = {getattr(f, "verdict", None) for f in findings}
+    for v in ("FAIL", "UNKNOWN", "PASS"):
+        if v in vs:
+            return v
+    return None

@@ -512,6 +512,17 @@ def _build_rule(name: str, fields: "Dict[str, List[str]]", seq: int,
     imprecise = imprecise or imp_s or imp_d or imp_v
 
     has_resolved_src, has_resolved_dst = bool(srcs), bool(dsts)
+    for nets, dim in ((srcs, "source"), (dsts, "destination")):
+        if not nets and not (imp_s if dim == "source" else imp_d):
+            # Nothing unresolved, yet no address: an EMPTY static address-group.
+            # It was widened to an EXACT any, so a deny on it shadowed every
+            # later rule (false PASS, false "permit never takes effect"). What
+            # an empty group matches on the device is not modeled: widen to any
+            # (a superset) and mark the rule imprecise so it never decides.
+            imprecise = True
+            notes.append(f"PAN-OS rule {label}: {dim} resolves to no address "
+                         f"(empty address-group) — not modeled, widened to any "
+                         f"and marked imprecise")
     if not srcs:                                   # all unresolved -> widen to ANY
         srcs = [_ANY_NET]
     if not dsts:

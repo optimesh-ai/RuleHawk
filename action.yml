@@ -19,7 +19,14 @@ inputs:
     required: false
     default: ''
   fail-on:
-    description: 'Fail the check at this severity or worse: critical | high | medium | low | none'
+    description: >-
+      Fail the check at this severity or worse: critical | high | medium | low
+      | none. The gate exits 0 PASS, 1 FAIL (a finding at or above this
+      threshold), 2 a config parsed to zero rules or an input was invalid, or
+      3 UNKNOWN: nothing reached the threshold but a policy assertion could
+      not be proven (unbound ACL, parse note, unmodelled vendor default...).
+      Exits 1, 2 and 3 all fail the check; UNKNOWN is never a PASS. `none` is
+      advisory and always exits 0.
     required: false
     default: 'high'
   vendor:
@@ -77,8 +84,21 @@ inputs:
 
 outputs:
   passed:
-    description: 'true when no finding met the fail-on threshold'
+    description: >-
+      true only on PASS (exit 0): no finding met the fail-on threshold and
+      every policy assertion was proven. false on FAIL, parse failure and
+      UNKNOWN.
     value: ${{ steps.gate.outputs.passed }}
+  verdict:
+    description: >-
+      PASS | FAIL | UNKNOWN | ADVISORY (fail-on none). UNKNOWN means a policy
+      assertion could not be proven; the finding's reason codes say why.
+    value: ${{ steps.gate.outputs.verdict }}
+  exit-code:
+    description: >-
+      The gate's exit code: 0 PASS, 1 FAIL, 2 parse failure or invalid input,
+      3 UNKNOWN.
+    value: ${{ steps.gate.outputs.exit_code }}
   score:
     description: 'Lowest hygiene score (0-100) across the audited files'
     value: ${{ steps.gate.outputs.score }}
@@ -227,6 +247,7 @@ runs:
         print("passed=" + ("true" if d["passed"] else "false"))
         print("score=" + ("" if d["score"] is None else str(d["score"])))
         print("worst=" + str(d["worst_severity"]))
+        print("verdict=" + str(d.get("verdict", "")))
         PY
         exit 0
 
@@ -314,6 +335,9 @@ runs:
           exit 1
         elif [ "${RC}" = "2" ]; then
           echo "::error title=RuleHawk gate failed (fail-closed)::RuleHawk exited 2: a config parsed to zero rules, a 'configs' pattern matched no files, or an input was invalid — it will not certify isolation it could not verify. See the step log; check the vendor/format or set the 'vendor' input."
+          exit 1
+        elif [ "${RC}" = "3" ]; then
+          echo "::error title=RuleHawk gate UNKNOWN (fail-closed)::RuleHawk exited 3: no finding reached '${RH_FAIL_ON}', but a policy assertion could not be proven (for example an ACL with no interface binding, a parse note, or a vendor default RuleHawk does not model). UNKNOWN is never a PASS; the PR comment and job summary list each reason code."
           exit 1
         elif [ "${RC}" != "0" ]; then
           echo "::error title=RuleHawk gate failed::Findings at or above '${RH_FAIL_ON}' block this change — see the job summary and PR comment."

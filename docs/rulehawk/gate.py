@@ -21,7 +21,8 @@ check goes red exactly when the team decides it should.
 DESIGN PRINCIPLES (inherited from the engine):
   * Sound, never noisy. `segmentation-ok` is good news, not a finding — it never
     annotates a line and never fails the build. `segmentation-indeterminate`
-    (we could not PROVE isolation) is surfaced honestly at MEDIUM, not hidden.
+    and `segmentation-unknown` (we could not PROVE the assertion) are surfaced
+    at MEDIUM, and the gate's verdict is then UNKNOWN (exit 3), never PASS.
   * Never a false bill of health. A file that parses to ZERO rules is reported
     as `no_rules_parsed` (status, not a 100/100 score) — the same guarantee the
     CLI gives, generalized across a whole repo.
@@ -43,6 +44,7 @@ from typing import Dict, List, Optional, Tuple
 from .analyze import Finding, analyze, score
 from .boundary import markdown_lines as boundary_markdown, triggers
 from .evidence import Subject, build_evidence, to_evidence_markdown
+from .failclosed import build_context, undecided
 from .model import strip_pager
 from .parse import parse_acls
 from .parse_iptables import detect as detect_iptables, parse_iptables
@@ -114,6 +116,16 @@ _KIND_HELP: Dict[str, str] = {
         "(neq / complex mask / unresolved group). Review manually.",
     "segmentation-ok":
         "A declared zone isolation holds: no permitted witness flow exists.",
+    "segmentation-unknown":
+        "No parsed rule permits the forbidden flow, but that does not prove "
+        "isolation for this config (fail-closed): an ACL binding or role is "
+        "unknown, a line was not fully modeled, or a vendor default RuleHawk "
+        "does not model decides the flow. Each finding lists its reason "
+        "codes. This is NOT a PASS.",
+    "connectivity-unknown":
+        "A parsed rule permits the required flow, but that does not prove "
+        "connectivity for this config (fail-closed); see the reason codes. "
+        "This is NOT a connectivity OK.",
     "segmentation-error":
         "The segmentation policy itself is invalid (unknown zone, bad CIDR or "
         "port) — fail-closed: the affected assertion gets no PASS until fixed.",
@@ -303,7 +315,8 @@ def audit_file(path: str, policy: Optional[dict], vendor: str = "auto",
     aces, notes = parse_fn(text)
     findings = analyze(aces)
     if policy:
-        seg = check_segmentation(aces, policy)
+        ctx = build_context(text, aces, notes, vlabel)
+        seg = check_segmentation(aces, policy, context=ctx)
         if ledger is not None:
             # Risk acceptance is scoped per config, so an exception written for
             # one device cannot silently cover the whole estate.
@@ -375,14 +388,31 @@ class GateResult:
         return [fr for fr in self.files
                 if fr.status in ("error", "no_rules_parsed")]
 
+    @property
+    def undecided(self) -> List[Tuple[FileResult, Finding]]:
+        """Policy assertions that could not be proven (verdict UNKNOWN). Any
+        one makes the run UNKNOWN, never PASS — whatever the threshold."""
+        return [(fr, f) for fr in self.files for f in undecided(fr.findings)]
+
     def exit_code(self) -> int:
-        """0 clean · 1 finding at/above threshold · 2 a file failed to parse
-        (fail-closed). `--fail-on none` is advisory: it never blocks."""
+        """0 PASS · 1 finding at/above threshold · 2 a file failed to parse
+        (fail-closed) · 3 UNKNOWN: nothing at the threshold, but a policy
+        assertion could not be proven. `--fail-on none` is advisory: it never
+        blocks."""
         if self.fail_on == "none":
             return 0
         if self.parse_failures:
             return 2
-        return 1 if self.violations else 0
+        if self.violations:
+            return 1
+        return 3 if self.undecided else 0
+
+    @property
+    def verdict(self) -> str:
+        """PASS | FAIL | UNKNOWN | ADVISORY (fail-on none)."""
+        if self.fail_on == "none":
+            return "ADVISORY"
+        return {0: "PASS", 3: "UNKNOWN"}.get(self.exit_code(), "FAIL")
 
     @property
     def passed(self) -> bool:
@@ -600,6 +630,8 @@ def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
 def to_json(gate: GateResult) -> str:
     return json.dumps({
         "passed": gate.passed,
+        # PASS | FAIL | UNKNOWN | ADVISORY. UNKNOWN (exit 3) is never a pass.
+        "verdict": gate.verdict,
         "exit_code": gate.exit_code(),
         "fail_on": gate.fail_on,
         "worst_severity": gate.worst,
@@ -608,6 +640,7 @@ def to_json(gate: GateResult) -> str:
         "rules_analyzed": gate.total_rules,
         "findings_by_severity": gate.counts(),
         "violations": len(gate.violations),
+        "undecided_assertions": len(gate.undecided),
         "parse_failures": [fr.path for fr in gate.parse_failures],
         "files": [{
             "path": fr.path,
@@ -620,6 +653,7 @@ def to_json(gate: GateResult) -> str:
                 "rule_id": f.rule_id, "kind": f.kind, "severity": f.severity,
                 "line": fr.line_of(f), "message": f.message, "rule": f.rule,
                 "cited": f.cited, "fix": f.fix, "witness": f.witness,
+                "verdict": f.verdict, "reasons": list(f.reasons or []),
             } for f in _sorted(fr.findings)],
             "parse_notes": fr.notes,
         } for fr in gate.files],
@@ -654,8 +688,14 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
     PR comment body (the comment prepends a hidden marker for sticky updates)."""
     counts = gate.counts()
     pf = gate.parse_failures
+    und = gate.undecided
     if gate.passed:
         verdict = f"**PASS** — no findings at or above `{gate.fail_on}`."
+    elif gate.exit_code() == 3:
+        verdict = (f"**UNKNOWN** — no finding at or above `{gate.fail_on}`, "
+                   f"but {len(und)} policy assertion(s) could not be proven "
+                   f"(fail-closed). This is not a PASS: see the reason codes "
+                   f"below.")
     elif pf and not gate.violations:
         verdict = (f"**FAIL (fail-closed)** — {len(pf)} file(s) parsed to zero "
                    f"rules. That is not a clean bill of health; the gate blocks "
@@ -697,6 +737,20 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
         for fr, f in seg:
             loc = f"`{_sarif_uri(fr.path)}:{fr.line_of(f)}`"
             lines.append(f"| `{f.witness}` | {loc} | {f.fix} |")
+        lines.append("")
+    if und:
+        lines.append("### Not proven (UNKNOWN)")
+        lines.append("")
+        lines.append("RuleHawk found no permitted witness (or could not "
+                     "search), but the answer rests on something this config "
+                     "breaks, so it is **not** a PASS:")
+        lines.append("")
+        lines.append("| Assertion | Where | Reason codes |")
+        lines.append("|---|---|---|")
+        for fr, f in und:
+            codes = ", ".join(f"`{r['code']}`" for r in (f.reasons or []))
+            lines.append(f"| `{f.rule_id}` | `{_sarif_uri(fr.path)}` | "
+                         f"{codes or '—'} |")
         lines.append("")
     # A finding only a forwarding model can answer gets one "next step" line;
     # everything else stays quiet (see boundary.py for what triggers it).
@@ -745,6 +799,9 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
                 lines.append(f"  cause: {f.cited}  ")
             if f.fix:
                 lines.append(f"  fix: _{f.fix}_  ")
+            if f.verdict == "UNKNOWN":
+                for r in (f.reasons or []):
+                    lines.append(f"  reason `{r['code']}`: {r['message']}  ")
         if ok:
             lines.append("")
             lines.append("Segmentation proven (rule layer): "
@@ -809,6 +866,7 @@ def to_result(gate: GateResult, label: str) -> str:
         "worst": gate.worst,
         "violations": len(gate.violations),
         "parse_failures": len(gate.parse_failures),
+        "verdict": gate.verdict,
         "markdown": to_markdown(gate),
     }, indent=2)
 
@@ -871,6 +929,14 @@ def to_console(gate: GateResult) -> str:
                                                         "medium", "low")))
     if gate.passed:
         out.append(f"  VERDICT: PASS (threshold --fail-on {gate.fail_on})")
+    elif gate.exit_code() == 3:
+        out.append(f"  VERDICT: UNKNOWN (exit 3, fail-closed) — "
+                   f"{len(gate.undecided)} policy assertion(s) could not be "
+                   f"proven; nothing at or above {gate.fail_on}. Not a PASS.")
+        for fr, f in gate.undecided:
+            codes = ", ".join(r["code"] for r in (f.reasons or []))
+            out.append(f"           {os.path.basename(fr.path)}: {f.rule_id} "
+                       f"[{codes}]")
     elif gate.exit_code() == 2:
         n = len(gate.parse_failures)
         out.append(f"  VERDICT: FAIL (exit 2, fail-closed) — {n} file(s) parsed "

@@ -332,6 +332,21 @@ def test_ios_wildcard_all_ones_is_never_a_host(tmp_path):
         cfg = tmp_path / "ones.cfg"
         cfg.write_text(body)
         _assert_unknown_everywhere(str(cfg), pol, "ios-wildcard-all-ones")
+    # NX-OS and EOS route dotted masks through the same parser.
+    from rulehawk.failclosed import build_context
+    from rulehawk.parse_eos import parse_eos
+    from rulehawk.parse_nxos import parse_nxos
+    from rulehawk.segcheck import check_segmentation
+    text = ("ip access-list A\n"
+            " 10 permit ip 203.0.113.5 255.255.255.255 198.51.100.0 0.0.0.255\n"
+            "interface Ethernet1/1\n ip access-group A in\n")
+    for fn, vendor in ((parse_nxos, "nxos"), (parse_eos, "eos")):
+        aces, notes = fn(text)
+        fs = check_segmentation(aces, json.load(open(pol)),
+                                context=build_context(text, aces, notes, vendor))
+        assert not any(f.kind in _PASS_KINDS for f in fs), vendor
+        assert any("ios-wildcard-all-ones" in [r["code"] for r in (f.reasons or [])]
+                   for f in fs), vendor
 
 
 def test_numbered_acl_mask_with_pix_dialect_is_ambiguous_unknown(tmp_path):

@@ -40,7 +40,34 @@ One of the three findings it prints:
 
 Then `rulehawk edge-fw.txt` for one config, `rulehawk gate configs/` for a
 directory, `--json` for machines. Exit code is non-zero on a critical/high
-finding (1) or when nothing could be audited (2), so it drops into CI.
+finding (1), when nothing could be audited (2), or when a policy assertion
+could not be proven (3, UNKNOWN), so it drops into CI.
+
+### Exit codes and the UNKNOWN verdict
+
+| Code | Verdict | Meaning |
+|---|---|---|
+| `0` | PASS | No finding at or above the threshold, and every policy assertion was proven. |
+| `1` | FAIL | A finding at or above the threshold (a violation, a broken required flow, ...). |
+| `2` | fail-closed | A config parsed to zero rules, a path matched nothing, or an input was invalid. |
+| `3` | UNKNOWN | Nothing reached the threshold, but a policy assertion could not be proven. |
+
+RuleHawk fails closed: it never prints PASS or `VERIFIED` on an answer it cannot
+support. An assertion is UNKNOWN, with a machine-readable reason code and a
+message, when the search is empty (no rules, or no ACL bound to an interface or
+`access-group`), when any parse note exists in the evaluated config, when an
+ACL's role is unknown or is not a transit packet filter (`line vty`
+`access-class`, SNMP, route-map, NAT, crypto, QoS), when a vendor default it does
+not model applies (PAN-OS `default-security-rules`, the iptables chain policy
+when no `-P` is given, IPv6 implicit ND permits, ...), or when an IOS ACL mask is
+ambiguous. The `--json` report carries `assertion_verdict` and, per finding,
+`verdict` and `reasons` (`[{"code": ..., "message": ...}]`); `--evidence` marks
+such a claim `INDETERMINATE` with the same reasons, never `VERIFIED`.
+`--fail-on none` stays advisory and exits 0.
+
+Before 0.5.0 these cases printed PASS and exited 0. A CI job that relied on that
+exit 0 now goes red with exit 3: bind the ACL, fix the parse note, or model the
+default, and the verdict becomes a real PASS or FAIL.
 **[Quickstart](docs/quickstart.md)**: install, first audit, agents (Claude, Cursor,
 NetClaw) and what to do when something goes wrong.
 

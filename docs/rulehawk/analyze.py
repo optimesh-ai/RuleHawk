@@ -75,6 +75,12 @@ class Finding:
     # finding is NOT removed and NOT downgraded; the gate simply stops counting
     # it as a violation, and every report shows who accepted it and until when.
     accepted: Optional[dict] = None
+    # Policy-assertion findings only (segcheck): the assertion's verdict, one of
+    # PASS | FAIL | UNKNOWN, and for UNKNOWN the machine-readable reasons it
+    # could not be proven ([{"code", "message"}], see rulehawk/failclosed.py).
+    # None on hygiene findings, which are not verdicts on an assertion.
+    verdict: Optional[str] = None
+    reasons: Optional[List[dict]] = None
 
 
 def _id(a: ACE) -> str:

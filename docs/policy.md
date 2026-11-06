@@ -166,7 +166,19 @@ section above. For `must_not_reach` entries:
   a `neq` operator). RuleHawk **fails closed** and asks you to review, rather than
   guess "isolated."
 - **`segmentation-ok`** (info) — proven isolated: no permitted witness flow exists.
-  This is a positive attestation, not just the absence of a finding.
+  This is a positive attestation, not just the absence of a finding. It is only
+  given when nothing the proof rests on is in doubt.
+- **`segmentation-unknown`** / **`connectivity-unknown`** (medium, verdict
+  UNKNOWN, exit 3) — the search found no witness, but the answer rests on
+  something RuleHawk does not model, so it is not a PASS. Each carries
+  `reasons`: codes such as `no-transit-filter` (no ACL is bound to an interface
+  or `access-group`), `acl-role-unknown`, `acl-not-packet-filter` (vty
+  `access-class`, SNMP, route-map, NAT, crypto), `parse-note`,
+  `panos-default-security-rules`, `panos-implicit-default`,
+  `iptables-chain-policy-unset`, `ipv6-implicit-nd`, `icmpv6-canonicalisation`,
+  `tcp-established`, `l4-fragments`, `numbered-acl-mask-ambiguous` and
+  `ios-wildcard-all-ones`. The full list is `rulehawk.failclosed.REASONS`.
+  `*-indeterminate` findings also carry verdict UNKNOWN and their reasons.
 - **`segmentation-error`** (high) — the policy itself is invalid: a
   `src`/`dst` naming a zone that isn't defined, an unparseable CIDR in `zones`,
   or an unusable `ports` value. RuleHawk **fails closed**: the affected

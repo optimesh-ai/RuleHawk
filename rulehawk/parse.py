@@ -33,6 +33,7 @@ import ipaddress
 import re
 from typing import List, Optional, Tuple
 
+from .failclosed import cisco_dialect_ambiguous
 from .model import (ACE, ANY_PORTS, PORT_MAX, PORT_MIN, PortRange, _IPNet,
                     _PORTED)
 
@@ -1026,6 +1027,7 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
         notes.append(f"ASA `name` aliases resolved: {n_alias} name(s) substituted "
                      f"with their address")
     defs = _collect_defs(text)               # pass 1: object-group / object defs
+    pix_dialect = cisco_dialect_ambiguous(text)
     current_acl = "(unnamed)"
     cur_v6 = cur_std = False                 # family/kind of the current named ACL
     seq = 0
@@ -1062,7 +1064,15 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
         m = re.match(r"(?i)^access-list\s+(\S+)\s+(?:line\s+\d+\s+)?(standard\s+)?",
                      stripped)
         if m and re.search(r"(?i)\b(permit|deny)\b", stripped):
-            _WILDCARD_ONLY.set(False)        # flat access-list: auto-detect
+            # Flat access-list. An IOS NUMBERED ACL (`access-list 101 permit
+            # ...`, no `extended`/`standard` keyword) always carries WILDCARD
+            # masks; only an ASA line (`access-list NAME extended|standard ...`)
+            # carries netmasks. A numbered line in a config with a PIX/ASA
+            # dialect marker is ambiguous (PIX 6 wrote numbered lines with
+            # netmasks): keep the auto-detect there, and the fail-closed layer
+            # reports `numbered-acl-mask-ambiguous` so no PASS rests on it.
+            _WILDCARD_ONLY.set(bool(
+                _IOS_NUMBERED.match(stripped) and not pix_dialect))
             current_acl = m.group(1)
             # Flat `access-list` lines (ASA / IOS numbered) carry their own IPv4
             # context; standard = the explicit keyword, or an IOS standard number.
@@ -1159,6 +1169,17 @@ def _parse_acls(text: str) -> Tuple[List[ACE], List[str]]:
 
 
 _SEQ_PREFIX = re.compile(r"(?i)^\s*(?:sequence\s+)?(\d+)\s")
+# An IOS numbered ACL line: a numeric name followed directly by the action (no
+# ASA `extended` / `standard` / `webtype` / `ethertype` keyword).
+# Its mask is always a wildcard. Cisco, "Configure IP Access Lists" (Document
+# ID 23602, updated 2025-10-15, fetched 2026-11-05):
+#   "In contrast, ACLs use a wildcard mask (also called an inverse mask)"
+#   https://www.cisco.com/c/en/us/support/docs/security/ios-firewall/23602-confaccesslists.html
+# and the IOS `access-list` command reference names the field so:
+#   "source-wildcard (Optional) Wildcard bits to be applied to the source."
+#   https://www.cisco.com/E-Learning/bulk/public/tac/cim/cib/using_cisco_ios_software/cmdrefs/access-list.htm
+_IOS_NUMBERED = re.compile(
+    r"(?i)^access-list\s+\d+\s+(?:permit|deny|dynamic)\b")
 
 
 def _reorder_by_sequence(entries: List[ACE], notes: List[str]) -> List[ACE]:

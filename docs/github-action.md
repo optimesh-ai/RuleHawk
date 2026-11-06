@@ -192,8 +192,11 @@ assessor reads the output:
 | `0` | Clean — no finding at/above `fail-on`, every file parsed. |
 | `1` | One or more findings at/above `fail-on`. |
 | `2` | **Fail-closed** — a file parsed to *zero* rules or could not be read (suppressed only by `fail-on: none`), a `configs` pattern matched **no files** (a typo'd path must not mean "never audited, green check"), an unknown `vendor`/flag, or an unwritable output path. RuleHawk will not certify isolation it could not verify. |
+| `3` | **UNKNOWN** — no finding reached `fail-on`, but a policy assertion could not be proven: an ACL with no interface or `access-group` binding, an ACL used as something other than a transit filter (vty `access-class`, SNMP, route-map, NAT, crypto, QoS), a parse note, an unmodelled vendor default (PAN-OS `default-security-rules`, iptables chain policy without `-P`, IPv6 implicit ND), or an ambiguous IOS mask. Each such assertion lists its reason codes in the comment, the job summary and the JSON. UNKNOWN is never a PASS. |
 
-The Action maps both `1` and `2` to a red check. Even on failure it still uploads
+The Action maps `1`, `2` and `3` to a red check. The `verdict` output is
+`PASS`, `FAIL`, `UNKNOWN` or `ADVISORY` (`fail-on: none`), and `exit-code` is
+the raw code. Before 0.5.0 the UNKNOWN cases exited 0 and printed PASS. Even on failure it still uploads
 SARIF and posts the comment first, so the gate always reports its value.
 
 ## What you get

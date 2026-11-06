@@ -15,7 +15,10 @@ identifies the platform without changing any analysis logic.
 NX-OS distinguishing markers (all absent from plain IOS/ASA dumps):
   * ``version X.Y(Z)``          — NXOS version line (parens in version string)
   * ``feature ...``             — NX-OS feature enable commands
-  * ``interface Ethernet``      — NX-OS Ethernet port naming convention
+  * ``interface Ethernet``      — NX-OS Ethernet port naming convention, a
+    weak marker: it counts only when no classic-IOS marker (``version 15.2``,
+    ``boot-start-marker``, ``ip access-list extended``) is present, because
+    IOS IOL/IOSv images name ports ``Ethernet0/0`` too
   * ``statistics per-entry``    — NX-OS ACL statistics keyword
   * ``vlan configuration``      — NX-OS VLAN config block keyword
   * ``IP access list NAME``     — the NX-OS ``show ip access-lists`` header
@@ -41,13 +44,31 @@ from .model import ACE
 from .parse import parse_acls
 
 # NX-OS-specific pattern: version with parens (7.0(3)I7(9)), feature lines,
-# NX-OS Ethernet naming, per-entry statistics, or vlan configuration block.
+# per-entry statistics, or vlan configuration block.
 _NXOS_MARKERS = re.compile(
     r"(?:^version\s+\d+\.\d+\(\d+\))"           # version 9.3(10)
     r"|(?:^feature\s+\S)"                         # feature interface-vlan
-    r"|(?:^interface\s+Ethernet\d+/\d)"           # interface Ethernet1/1
     r"|(?:\bstatistics\s+per-entry\b)"            # statistics per-entry
     r"|(?:^vlan\s+configuration\b)",              # vlan configuration 10
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# NX-OS Ethernet naming (interface Ethernet1/1). A WEAK marker: classic IOS
+# (IOL / IOSv images, e.g. IOS 15.2) also names ports `Ethernet0/0`, so it
+# counts only when the config carries no classic-IOS marker. It used to be a
+# marker on its own, which labelled IOS 15.2 configs `nxos`.
+_NXOS_ETHERNET = re.compile(r"^interface\s+Ethernet\d+/\d", re.MULTILINE | re.IGNORECASE)
+
+# Classic IOS markers NX-OS never writes: a bare `version 15.2` (NX-OS always
+# writes `version 9.3(10)`), the IOS boot markers, the `extended`/`standard`
+# keyword on a named ACL (NX-OS has neither), and the IOS `show running-config`
+# banner lines.
+_IOS_MARKERS = re.compile(
+    r"(?:^version\s+\d+\.\d+\s*$)"
+    r"|(?:^boot-(?:start|end)-marker\b)"
+    r"|(?:^ip\s+access-list\s+(?:extended|standard)\s+\S)"
+    r"|(?:^Building\s+configuration\.\.\.)"
+    r"|(?:^Current\s+configuration\s*:)",
     re.MULTILINE | re.IGNORECASE,
 )
 
@@ -84,10 +105,9 @@ def detect(text: str) -> bool:
     ``show ip access-lists`` paste has no config-mode markers, and that
     header appears in no other vendor's output.
     """
-    return bool(
-        (_NXOS_MARKERS.search(text) or _NXOS_SHOW_HDR.search(text))
-        and _ACL_HEADER.search(text)
-    )
+    marker = (_NXOS_MARKERS.search(text) or _NXOS_SHOW_HDR.search(text)
+              or (_NXOS_ETHERNET.search(text) and not _IOS_MARKERS.search(text)))
+    return bool(marker and _ACL_HEADER.search(text))
 
 
 def parse_nxos(text: str) -> Tuple[List[ACE], List[str]]:
