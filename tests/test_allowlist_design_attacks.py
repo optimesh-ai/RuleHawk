@@ -54,6 +54,7 @@ import collections
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
@@ -224,11 +225,36 @@ def _quiet(fn, *a):
 # --------------------------------------------------------------------------
 
 # Assertion findings: segmentation (must_not_reach) and connectivity
-# (must_reach). Every other kind of these two families is undecided.
-_SEG = {"segmentation-ok": "PASS", "segmentation-violation": "FAIL",
-        "connectivity-ok": "PASS", "connectivity-broken": "FAIL"}
+# (must_reach). The reader knows every kind of these two families by name
+# (review of #46, M1): a decided kind maps to its verdict, an undecided kind
+# to UNKNOWN, and any other kind reads as UNRECOGNISED:<kind>, which no
+# allowed set holds. test_every_engine_assertion_kind_is_in_the_reader_table
+# keeps the table complete.
+_KIND_VERDICT = {"segmentation-ok": "PASS", "segmentation-violation": "FAIL",
+                 "connectivity-ok": "PASS", "connectivity-broken": "FAIL"}
+_UNDECIDED_KINDS = frozenset({
+    "segmentation-unknown", "segmentation-indeterminate", "segmentation-error",
+    "segmentation-infeasible-path", "connectivity-unknown",
+    "connectivity-indeterminate"})
 _ASSERTION_KINDS = ("segmentation-", "connectivity-")
-_ASSERTION_OK = frozenset(k for k, v in _SEG.items() if v == "PASS")
+_ASSERTION_OK = frozenset(k for k, v in _KIND_VERDICT.items() if v == "PASS")
+
+
+def _finding_verdict(x: dict) -> str:
+    """One assertion finding's verdict. The kind decides it; the engine's own
+    per-finding `verdict`, when set, must agree, or the finding reads as
+    MISMATCH (the engine leaves it unset on a violation)."""
+    k = x.get("kind", "")
+    if k in _KIND_VERDICT:
+        want = _KIND_VERDICT[k]
+    elif k in _UNDECIDED_KINDS:
+        want = "UNKNOWN"
+    else:
+        return f"UNRECOGNISED:{k}"
+    v = x.get("verdict")
+    if v is not None and v != want:
+        return f"MISMATCH:{k}:{v}"
+    return want
 
 
 def _assertion_of(gate_json: dict) -> str:
@@ -237,9 +263,8 @@ def _assertion_of(gate_json: dict) -> str:
     vs = set()
     for f in gate_json.get("files", []):
         for x in f.get("findings", []):
-            k = x.get("kind", "")
-            if k.startswith(_ASSERTION_KINDS):
-                vs.add(_SEG.get(k, "UNKNOWN"))
+            if x.get("kind", "").startswith(_ASSERTION_KINDS):
+                vs.add(_finding_verdict(x))
     return ",".join(sorted(vs)) or "none"
 
 
@@ -303,13 +328,24 @@ def _obs_gate_cli(path, pol, _tmp):
 
 def _obs_sarif(path, pol, _tmp):
     gate = g.run_gate([path], _policy(pol), fail_on="high")
-    ids = sorted({r["ruleId"] for r in json.loads(g.to_sarif(gate))["runs"][0]["results"]})
+    results = json.loads(g.to_sarif(gate))["runs"][0]["results"]
+    ids = sorted({r["ruleId"] for r in results})
     # Only a result about the assertion (or an uncertified file) shows that
     # the assertion is not clean. A hygiene result does not, and neither does
     # a segmentation-ok or connectivity-ok result (review v4 delta, R4-L3).
+    # An -ok result on an attack file is itself a PASS claim, so it is listed
+    # on its own and is bad (review of #46, L1). results= counts results,
+    # not distinct rule ids.
     seg = [i for i in ids if (i.startswith(_ASSERTION_KINDS) and i not in _ASSERTION_OK)
            or i == "rulehawk/uncertified"]
-    return f"results={len(ids)} assertion_results={','.join(seg) or 'none'}"
+    ok = [i for i in ids if i.endswith("-ok")]
+    return (f"results={len(results)} assertion_results={','.join(seg) or 'none'}"
+            f" ok_results={','.join(ok) or 'none'}")
+
+
+def _sarif_bad(obs, _allowed, _rel):
+    _, a, ok = obs.split(" ")
+    return a == "assertion_results=none" or ok != "ok_results=none"
 
 
 def _obs_mcp_audit(path, pol, _tmp):
@@ -381,7 +417,7 @@ _SURFACES = {
                  lambda o, a, r: o.startswith("rc=0 ") or _assert_bad(o.split("assert=")[1], a),
                  lambda o: o == "rc=0 assert=PASS"),
     # A clean PASS may legitimately carry no SARIF results, so no control check.
-    "sarif": (_obs_sarif, lambda o, a, r: o.endswith("assertion_results=none"), None),
+    "sarif": (_obs_sarif, _sarif_bad, None),
     "mcp_audit": (_obs_mcp_audit, _mcp_audit_bad,
                   lambda o: o.startswith("PASS/") and o.endswith("/coverage=complete")
                   and o.split("/")[1] != "seg_passed=0"),
@@ -410,57 +446,57 @@ def _observe(surface, rel, pol, tmp_path):
 _RED = {
     # cfg/a01_ios_no_ip_access_list_after_bind.cfg
     ('cfg/a01_ios_no_ip_access_list_after_bind.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg/a01_ios_no_ip_access_list_after_bind.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a03_ios_remark_only_acl.cfg
     ('cfg/a03_ios_remark_only_acl.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg/a03_ios_remark_only_acl.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a04_ios_description_holds_binding_text.cfg
     ('cfg/a04_ios_description_holds_binding_text.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg/a04_ios_description_holds_binding_text.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a05_ios_banner_delim_midline.cfg
     ('cfg/a05_ios_banner_delim_midline.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg/a05_ios_banner_delim_midline.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a06_ios_portchannel_member_binding.cfg
     ('cfg/a06_ios_portchannel_member_binding.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg/a06_ios_portchannel_member_binding.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a07_ios_subinterface_parent_binding.cfg
     ('cfg/a07_ios_subinterface_parent_binding.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg/a07_ios_subinterface_parent_binding.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a08_ios_alias_shutdown_reenable.cfg
     ('cfg/a08_ios_alias_shutdown_reenable.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg/a08_ios_alias_shutdown_reenable.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a09_ios_out_only_bindings_platform.cfg
     ('cfg/a09_ios_out_only_bindings_platform.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg/a09_ios_out_only_bindings_platform.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a10_ios_crlf_tab_in_deny.cfg
     ('cfg/a10_ios_crlf_tab_in_deny.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg/a10_ios_crlf_tab_in_deny.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a11_ios_excerpt_bytecount_mismatch.cfg
     ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg/a11_ios_excerpt_bytecount_mismatch.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/a12_ios_reach_urpf_inert_ruling.cfg
     ('cfg/a12_ios_reach_urpf_inert_ruling.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg/a12_ios_reach_urpf_inert_ruling.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/g01_ios_accepted_violation_gate.cfg
@@ -468,12 +504,12 @@ _RED = {
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/i01_iptables_exit_before_drop.sh
     ('cfg/i01_iptables_exit_before_drop.sh',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg/i01_iptables_exit_before_drop.sh',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/n01_nxos_unlisted_admin_state.cfg
     ('cfg/n01_nxos_unlisted_admin_state.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg/n01_nxos_unlisted_admin_state.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg/p01_panos_object_named_like_literal.set
@@ -481,52 +517,52 @@ _RED = {
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg/s01_asa_control_plane_binding.cfg
     ('cfg/s01_asa_control_plane_binding.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg/s01_asa_control_plane_binding.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_01_ios_version_contradicts_declared_release.cfg
     ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg2/r2_01_ios_version_contradicts_declared_release.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_02_ios_svi_only_dialect_declared.cfg
     ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg2/r2_02_ios_svi_only_dialect_declared.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_03_ios_svi_secondary_same_vlan.cfg
     ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg2/r2_03_ios_svi_secondary_same_vlan.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_04_ios_pacl_then_no_switchport.cfg
     ('cfg2/r2_04_ios_pacl_then_no_switchport.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg2/r2_04_ios_pacl_then_no_switchport.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg
     ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg2/r2_05_ios_dynamic_default_port_both_modes.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_06_ios_banner_single_line_close.cfg
     ('cfg2/r2_06_ios_banner_single_line_close.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg2/r2_06_ios_banner_single_line_close.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_07_ios_banner_caret_literal.cfg
     ('cfg2/r2_07_ios_banner_caret_literal.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg2/r2_07_ios_banner_caret_literal.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_08_ios_binding_name_case_folded.cfg
     ('cfg2/r2_08_ios_binding_name_case_folded.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg2/r2_08_ios_binding_name_case_folded.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg
     ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg2/r2_09_ios_bytecount_within_tolerance_missing_iface.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg2/r2_10_ios_accepted_plus_unallowlisted_line.cfg
@@ -534,123 +570,123 @@ _RED = {
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/i07_iptables_heredoc_not_executed.sh
     ('cfg3/i07_iptables_heredoc_not_executed.sh',
-     'sarif'): 'results=1 assertion_results=none',
+     'sarif'): 'results=1 assertion_results=none ok_results=none',
     ('cfg3/i07_iptables_heredoc_not_executed.sh',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/i11_iptables_function_never_called.sh
     ('cfg3/i11_iptables_function_never_called.sh',
-     'sarif'): 'results=1 assertion_results=none',
+     'sarif'): 'results=1 assertion_results=none ok_results=none',
     ('cfg3/i11_iptables_function_never_called.sh',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/i16_iptables_conditional_drop.sh
     ('cfg3/i16_iptables_conditional_drop.sh',
-     'sarif'): 'results=1 assertion_results=none',
+     'sarif'): 'results=1 assertion_results=none ok_results=none',
     ('cfg3/i16_iptables_conditional_drop.sh',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/i17_iptables_save_two_filter_blocks.rules
     ('cfg3/i17_iptables_save_two_filter_blocks.rules',
-     'sarif'): 'results=1 assertion_results=none',
+     'sarif'): 'results=3 assertion_results=none ok_results=none',
     ('cfg3/i17_iptables_save_two_filter_blocks.rules',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/i18_iptables_save_invalid_line_aborts.rules
     ('cfg3/i18_iptables_save_invalid_line_aborts.rules',
-     'sarif'): 'results=1 assertion_results=none',
+     'sarif'): 'results=2 assertion_results=none ok_results=none',
     # cfg3/k04_junos_interface_range_unfiltered.conf
     ('cfg3/k04_junos_interface_range_unfiltered.conf',
-     'sarif'): 'results=1 assertion_results=none',
+     'sarif'): 'results=1 assertion_results=none ok_results=none',
     ('cfg3/k04_junos_interface_range_unfiltered.conf',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/k05_junos_delete_annotation_binding.conf
     ('cfg3/k05_junos_delete_annotation_binding.conf',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg3/k05_junos_delete_annotation_binding.conf',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/k10_junos_comment_holds_cisco_lines.conf
     ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg3/k10_junos_comment_holds_cisco_lines.conf',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/k11_polyglot_ios_in_junos_comment.conf
     ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg3/k11_polyglot_ios_in_junos_comment.conf',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/k12_polyglot_veto_dodging_forms.conf
     ('cfg3/k12_polyglot_veto_dodging_forms.conf',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg3/k12_polyglot_veto_dodging_forms.conf',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/k13_junos_irb_both_zones_one_unit.conf
     ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg3/k13_junos_irb_both_zones_one_unit.conf',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/k14_ios_banner_holds_junos.cfg
     ('cfg3/k14_ios_banner_holds_junos.cfg',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg3/k14_ios_banner_holds_junos.cfg',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/k15_junos_pci_nexthop_on_corp_segment.conf
     ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg3/k15_junos_pci_nexthop_on_corp_segment.conf',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/k16_junos_coloc_masked_by_other_finding.conf
     ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
-     'sarif'): 'results=1 assertion_results=none',
+     'sarif'): 'results=1 assertion_results=none ok_results=none',
     ('cfg3/k16_junos_coloc_masked_by_other_finding.conf',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/k17_junos_apply_groups_wildcard_unit.conf
     ('cfg3/k17_junos_apply_groups_wildcard_unit.conf',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     # cfg3/k18_junos_replace_tag_subtree_save.conf
     ('cfg3/k18_junos_replace_tag_subtree_save.conf',
-     'sarif'): 'results=2 assertion_results=none',
+     'sarif'): 'results=2 assertion_results=none ok_results=none',
     ('cfg3/k18_junos_replace_tag_subtree_save.conf',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/k19_junos_inactive_binding.conf
     ('cfg3/k19_junos_inactive_binding.conf',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg3/k19_junos_inactive_binding.conf',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg3/p02_panos_rule_type_interzone_deny.set
     ('cfg3/p02_panos_rule_type_interzone_deny.set',
-     'sarif'): 'results=1 assertion_results=none',
+     'sarif'): 'results=1 assertion_results=none ok_results=none',
     ('cfg3/p02_panos_rule_type_interzone_deny.set',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/p04_panos_move_rule_top.set
     ('cfg3/p04_panos_move_rule_top.set',
-     'sarif'): 'results=1 assertion_results=none',
+     'sarif'): 'results=1 assertion_results=none ok_results=none',
     ('cfg3/p04_panos_move_rule_top.set',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/p06_panos_shared_object_shadowed.set
     ('cfg3/p06_panos_shared_object_shadowed.set',
-     'sarif'): 'results=1 assertion_results=none',
+     'sarif'): 'results=1 assertion_results=none ok_results=none',
     ('cfg3/p06_panos_shared_object_shadowed.set',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/p08_panos_dnat_prenat_destination.set
     ('cfg3/p08_panos_dnat_prenat_destination.set',
-     'sarif'): 'results=1 assertion_results=none',
+     'sarif'): 'results=1 assertion_results=none ok_results=none',
     ('cfg3/p08_panos_dnat_prenat_destination.set',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/p11_panos_list_attr_set_twice.set
     ('cfg3/p11_panos_list_attr_set_twice.set',
-     'sarif'): 'results=1 assertion_results=none',
+     'sarif'): 'results=1 assertion_results=none ok_results=none',
     ('cfg3/p11_panos_list_attr_set_twice.set',
      'mcp_audit'): 'FAIL/seg_passed=0/coverage=complete',
     # cfg3/p14_panos_pci_nexthop_on_corp_segment.set
     ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg3/p14_panos_pci_nexthop_on_corp_segment.set',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg4/p17_panos_default_route_via_corp_segment.set
     ('cfg4/p17_panos_default_route_via_corp_segment.set',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg4/p17_panos_default_route_via_corp_segment.set',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
     # cfg4/p18_panos_recursive_nexthop_via_corp_segment.set
     ('cfg4/p18_panos_recursive_nexthop_via_corp_segment.set',
-     'sarif'): 'results=0 assertion_results=none',
+     'sarif'): 'results=0 assertion_results=none ok_results=none',
     ('cfg4/p18_panos_recursive_nexthop_via_corp_segment.set',
      'mcp_audit'): 'UNKNOWN/seg_passed=0/coverage=complete',
 }
@@ -912,3 +948,109 @@ def test_phase3_gate_no_red_cell_left():
     # Slice 9 removes the stopgap xfails (_STOPGAP_CONTROL, _STOPGAP_MAY_PASS)
     # along with the stopgap.
     assert not _STOPGAP_CONTROL and not _STOPGAP_MAY_PASS
+
+
+# --------------------------------------------------------------------------- #
+# The safety net itself fails closed (review of #46: M1, L1, L2).
+# --------------------------------------------------------------------------- #
+def _one_finding(kind, verdict=None):
+    return {"files": [{"findings": [{"kind": kind, "verdict": verdict}]}]}
+
+
+@pytest.mark.parametrize("kind,verdict", [
+    ("segmentation-certified", None), ("segmentation-certified", "UNKNOWN"),
+    ("segmentation-pass", None), ("segmentation-accepted", "UNKNOWN"),
+    ("connectivity-proven", None),
+])
+def test_assertion_reader_rejects_an_unrecognised_kind(kind, verdict):
+    """M1: a new assertion kind reads as a value no allowed set holds, never
+    as UNKNOWN, whatever verdict it carries."""
+    a = _assertion_of(_one_finding(kind, verdict))
+    assert a.startswith("UNRECOGNISED:"), a
+    for allowed in ({"UNKNOWN"}, {"FAIL", "UNKNOWN"}, {"FAIL"}):
+        assert _assert_bad(a, allowed)
+
+
+@pytest.mark.parametrize("kind,verdict", [
+    ("segmentation-unknown", "PASS"), ("segmentation-violation", "PASS"),
+    ("segmentation-indeterminate", "ACCEPTED"), ("connectivity-broken", "UNKNOWN"),
+    ("segmentation-ok", "UNKNOWN"),
+])
+def test_assertion_reader_rejects_a_verdict_that_disagrees_with_its_kind(kind, verdict):
+    a = _assertion_of(_one_finding(kind, verdict))
+    assert a.startswith("MISMATCH:"), a
+    assert _assert_bad(a, {"FAIL", "UNKNOWN"})
+
+
+@pytest.mark.parametrize("kind,verdict,want", [
+    ("segmentation-unknown", "UNKNOWN", "UNKNOWN"),
+    ("segmentation-indeterminate", None, "UNKNOWN"),
+    ("segmentation-violation", None, "FAIL"),
+    ("segmentation-violation", "FAIL", "FAIL"),
+    ("connectivity-broken", None, "FAIL"),
+    ("segmentation-ok", None, "PASS"),
+    ("segmentation-ok", "PASS", "PASS"),
+])
+def test_assertion_reader_reads_known_kinds(kind, verdict, want):
+    assert _assertion_of(_one_finding(kind, verdict)) == want
+
+
+def test_every_engine_assertion_kind_is_in_the_reader_table():
+    """A kind the engine can emit must be in _KIND_VERDICT or
+    _UNDECIDED_KINDS, so the reader never meets one by surprise."""
+    import ast
+    known = set(_KIND_VERDICT) | _UNDECIDED_KINDS
+    help_kinds = {k for k in g._KIND_HELP if k.startswith(_ASSERTION_KINDS)}
+    assert help_kinds <= known, sorted(help_kinds - known)
+    pkg = os.path.join(_ROOT, "rulehawk")
+    lit = set()
+    for n in sorted(os.listdir(pkg)):
+        if n.endswith(".py"):
+            tree = ast.parse(open(os.path.join(pkg, n), encoding="utf-8").read())
+            lit |= {x.value for x in ast.walk(tree)
+                    if isinstance(x, ast.Constant) and isinstance(x.value, str)
+                    and re.fullmatch(r"(segmentation|connectivity)(-[a-z]+)+", x.value)}
+    assert lit <= known, sorted(lit - known)
+
+
+def test_sarif_ok_result_on_an_attack_file_is_bad(monkeypatch, tmp_path):
+    """L1: an `-ok` result in an attack file's SARIF is a PASS claim on that
+    surface, even next to a violation."""
+    rel = "cfg/a02_ios_seq_reorder_permit_first.cfg"
+    real = g.to_sarif
+
+    def plus_ok(gate, version=None):
+        s = json.loads(real(gate, version))
+        r = dict(s["runs"][0]["results"][0])
+        r["ruleId"] = "segmentation-ok"
+        s["runs"][0]["results"].append(r)
+        return json.dumps(s)
+
+    pol, allowed = _ATTACKS[rel]
+    before = _observe("sarif", rel, pol, tmp_path)
+    assert not _SURFACES["sarif"][1](before, allowed, rel), before
+    monkeypatch.setattr(g, "to_sarif", plus_ok)
+    after = _observe("sarif", rel, pol, tmp_path)
+    assert _SURFACES["sarif"][1](after, allowed, rel), after
+
+
+def test_sarif_observation_counts_results_not_rule_ids(monkeypatch, tmp_path):
+    rel = "cfg/a02_ios_seq_reorder_permit_first.cfg"
+    real = g.to_sarif
+
+    def twice(gate, version=None):
+        s = json.loads(real(gate, version))
+        s["runs"][0]["results"] = s["runs"][0]["results"] * 2
+        return json.dumps(s)
+
+    pol, _ = _ATTACKS[rel]
+    before = _observe("sarif", rel, pol, tmp_path)
+    monkeypatch.setattr(g, "to_sarif", twice)
+    assert _observe("sarif", rel, pol, tmp_path) != before
+
+
+def test_red_sets_stay_within_the_stopgap():
+    """L2: under the stopgap no boundary cell is red, and every red cell is
+    on the two surfaces slice 2 turns green. Widening either is an edit here."""
+    assert not _RED_B, sorted(_RED_B)
+    assert {s for _, s in _RED} <= {"sarif", "mcp_audit"}, sorted({s for _, s in _RED})
