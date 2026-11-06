@@ -43,26 +43,32 @@ def _length(text: str) -> int:
     """Length as GitHub counts it (UTF-16 code units: an emoji counts 2)."""
     return len(text.encode("utf-16-le")) // 2
 
-_RANK = {"PASS": 0, "UNKNOWN": 1, "FAIL": 2}
-_ICON = {"PASS": "✅", "UNKNOWN": "❌", "FAIL": "❌"}
+_RANK = {"PASS": 0, "ADVISORY": 1, "UNKNOWN": 2, "FAIL": 3}
+_ICON = {"PASS": "✅", "ADVISORY": "❌", "UNKNOWN": "❌", "FAIL": "❌"}
 _EXIT = {"PASS": 0, "FAIL": 1, "UNKNOWN": 2}
+_NOT_ENFORCED = " (not enforced)"
 _FAIL_ON = ("critical", "high", "medium", "low", "none")
 _SEVERITIES = ("critical", "high", "medium", "low", "info", "none")
 
 
 def _report_verdict(md: str) -> Optional[str]:
-    """PASS / FAIL as the report itself states it — its title icon AND its
-    verdict line must agree — or None when they do not."""
+    """PASS / FAIL / UNKNOWN as the report itself states it — its title icon
+    AND its verdict line must agree — or None when they do not. An
+    unenforced (`fail-on none`) report reads e.g. "UNKNOWN (not enforced)"."""
     lines = [l for l in md.splitlines() if l.strip()]
     if len(lines) < 2:
         return None
     title, line = lines[0], lines[1]
     if title.startswith("## ✅ ") and line.startswith("**PASS**"):
         return "PASS"
-    if title.startswith("## ❌ ") and line.startswith("**FAIL"):
-        return "FAIL"
-    if title.startswith("## ❌ ") and line.startswith("**UNKNOWN**"):
-        return "UNKNOWN"
+    if title.startswith("## ❌ "):
+        for v in ("ADVISORY", "UNKNOWN", "FAIL"):
+            if line.startswith(f"**{v}{_NOT_ENFORCED}**"):
+                return v + _NOT_ENFORCED
+        if line.startswith("**FAIL"):
+            return "FAIL"
+        if line.startswith("**UNKNOWN**"):
+            return "UNKNOWN"
     return None
 
 
@@ -79,11 +85,14 @@ usage:
   --needs JSON     the combining job's toJSON(needs): a gate job that did not
                    succeed, but whose results show no failure, is UNKNOWN
   --comment PATH   write the sticky PR-comment body
+  --verdict PATH   write the headline verdict as shown (a `fail-on none`
+                   check's is marked "(not enforced)" and never blocks)
   --summary PATH   write the report (default: $GITHUB_STEP_SUMMARY when set)
   -q, --quiet      no console report
 
 Directories are searched recursively for *.json.
-Exit code: 0 PASS, 1 FAIL, 2 UNKNOWN (or a usage error).
+Exit code: 0 PASS, 1 FAIL, 2 UNKNOWN (or a usage error), over the enforced
+checks; a `fail-on none` check is shown with its real verdict, not enforced.
 """
 
 
@@ -96,6 +105,12 @@ class Check:
     job: str = ""
     attempt: int = 1
     reported: bool = False   # a well-formed result record backs this check
+    enforced: bool = True    # False for a `fail-on none` check: shown, never blocks
+
+    @property
+    def shown(self) -> str:
+        return self.verdict + ("" if self.enforced or self.verdict == "PASS"
+                               else _NOT_ENFORCED)
 
 
 def _result_files(paths: Sequence[str]) -> Tuple[List[str], List[Check]]:
@@ -152,10 +167,32 @@ def _load(path: str) -> Check:
             and fail_on in _FAIL_ON and worst in _SEVERITIES):
         return Check(label=name, verdict="UNKNOWN",
                      detail=f"`{name}` is an incomplete result record")
+    if fail_on == "none":
+        # Not enforced: the record carries the real verdict, and `passed` is
+        # true only for a real PASS. A record without one (written before the
+        # real verdict existed) proves nothing: inconsistent, UNKNOWN.
+        rv = rec.get("verdict")
+        if passed:
+            ok = (rv == "PASS" and code == 0 and n == 0 and pf == 0
+                  and _report_verdict(md) == "PASS")
+            verdict, detail = "PASS", "nothing found (`fail-on: none`)"
+        else:
+            ok = (rv in ("ADVISORY", "UNKNOWN", "FAIL") and code == 0
+                  and rec.get("enforced") is False
+                  and _report_verdict(md) == f"{rv}{_NOT_ENFORCED}")
+            verdict = rv if ok else "UNKNOWN"
+            detail = (f"not enforced (`fail-on: none`): the check reports "
+                      f"{rv} and exits 0")
+        if not ok:
+            return Check(label=label or name, verdict="UNKNOWN",
+                         detail=f"`{name}` reports an inconsistent verdict")
+        return Check(label=label or name, verdict=verdict, detail=detail,
+                     markdown=md, job=job, attempt=attempt, reported=True,
+                     enforced=verdict == "PASS")
     if passed:
         # PASS only when every field agrees: exit 0, nothing at the threshold,
-        # every file parsed (advisory `none` never blocks), a passing report.
-        ok = (code == 0 and n == 0 and (pf == 0 or fail_on == "none")
+        # every file parsed, a passing report.
+        ok = (code == 0 and n == 0 and pf == 0
               and _report_verdict(md) == "PASS")
         verdict, detail = "PASS", f"no findings at or above `{fail_on}`"
     elif code == 3:
@@ -270,6 +307,8 @@ def _section(c: Check) -> str:
         rest = lines[1:]
     else:
         rest, lines = lines, [f"### {_ICON[c.verdict]} {_cell(c.label)}"]
+    if not c.enforced and c.verdict != "PASS":
+        lines[0] += _NOT_ENFORCED
     rest = [("#" + l) if l.startswith("#") else l for l in rest]
     return "\n".join(lines[:1] + rest).rstrip()
 
@@ -278,6 +317,8 @@ def _render_many(checks: List[Check], worst: str, detail: str) -> str:
     total = len(checks)
     failed = sum(1 for c in checks if c.verdict == "FAIL")
     unknown = sum(1 for c in checks if c.verdict == "UNKNOWN")
+    advisory = sum(1 for c in checks if c.verdict == "ADVISORY")
+    unenforced = sum(1 for c in checks if not c.enforced and c.verdict != "PASS")
     if worst == "PASS":
         summary = f"All {total} checks passed."
     else:
@@ -287,10 +328,15 @@ def _render_many(checks: List[Check], worst: str, detail: str) -> str:
         if unknown:
             parts.append(f"{unknown} of {total} {'has' if unknown == 1 else 'have'} "
                          f"no verdict (UNKNOWN)")
+        if advisory:
+            parts.append(f"{advisory} of {total} reported findings (ADVISORY)")
+        if unenforced:
+            parts.append(f"{unenforced} of these {'is' if unenforced == 1 else 'are'} "
+                         f"not enforced (`fail-on: none`)")
         summary = "; ".join(parts) + "."
     head = [
         _COMMENT_MARKER,
-        f"## {_ICON[worst]} RuleHawk firewall gate: {worst}",
+        f"## {_ICON[worst]} RuleHawk firewall gate: {_headline(checks, worst)}",
         "",
         f"{summary} The headline is the worst verdict across every check in "
         f"this run.",
@@ -298,7 +344,7 @@ def _render_many(checks: List[Check], worst: str, detail: str) -> str:
         "| Check | Verdict | Detail |",
         "|---|---|---|",
     ]
-    rows = [f"| {_cell(c.label)} | {_ICON[c.verdict]} {c.verdict} | {_cell(c.detail)} |"
+    rows = [f"| {_cell(c.label)} | {_ICON[c.verdict]} {c.shown} | {_cell(c.detail)} |"
             for c in checks]
     tail = ["", FOOTER]
 
@@ -338,6 +384,20 @@ def render(paths: Sequence[str], expect: Optional[int] = None,
            needs: Optional[Dict[str, dict]] = None) -> Tuple[str, str]:
     """(comment body, worst verdict) for every result under `paths`."""
     return render_checks(collect(paths, expect, needs))
+
+
+def _headline(checks: List[Check], worst: str) -> str:
+    """The worst verdict, marked not enforced when no enforced check has it."""
+    if worst == "PASS" or any(c.enforced and c.verdict == worst for c in checks):
+        return worst
+    return worst + _NOT_ENFORCED
+
+
+def enforced_verdict(checks: List[Check]) -> str:
+    """The worst verdict over the checks that are enforced: the exit code.
+    A `fail-on none` check never blocks, whatever it reports."""
+    return max((c.verdict for c in checks if c.enforced), default="PASS",
+               key=lambda v: _RANK[v])
 
 
 def render_checks(checks: List[Check]) -> Tuple[str, str]:
@@ -381,6 +441,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         comment_path = _take(argv, "--comment")
         summary_path = _take(argv, "--summary")
         needs_s = _take(argv, "--needs")
+        verdict_path = _take(argv, "--verdict")
     except ValueError as e:
         print(f"rulehawk combine: {e}", file=sys.stderr)
         return 2
@@ -416,8 +477,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     body, worst = render_checks(checks)
     if not quiet:
         for c in checks:
-            print(f"  [{c.verdict:7}] {c.label}: {c.detail}")
-        print(f"  VERDICT: {worst} ({len(checks)} check(s))")
+            print(f"  [{c.shown:7}] {c.label}: {c.detail}")
+        print(f"  VERDICT: {_headline(checks, worst)} ({len(checks)} check(s))")
     # The step summary is a convenience: failing to write it is a warning, so
     # the exit code and the comment body can never disagree.
     summary_target = summary_path or os.environ.get("GITHUB_STEP_SUMMARY")
@@ -429,6 +490,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         except OSError as e:
             print(f"rulehawk combine: warning: cannot write the summary: {e}",
                   file=sys.stderr)
+    if verdict_path:
+        # The headline verdict as shown (e.g. "UNKNOWN (not enforced)"); the
+        # exit code is the enforced one.
+        try:
+            with open(verdict_path, "w", encoding="utf-8") as fh:
+                fh.write(_headline(checks, worst) + "\n")
+        except OSError as e:
+            print(f"rulehawk combine: cannot write the verdict: {e}", file=sys.stderr)
+            return 2
     if comment_path:
         try:
             with open(comment_path, "w", encoding="utf-8") as fh:
@@ -436,7 +506,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         except OSError as e:
             print(f"rulehawk combine: cannot write the comment: {e}", file=sys.stderr)
             return 2
-    return _EXIT[worst]
+    return _EXIT[enforced_verdict(checks)]
 
 
 if __name__ == "__main__":

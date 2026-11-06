@@ -208,7 +208,10 @@ def test_fail_on_critical_still_blocks_here(tmp_path):
 
 def test_fail_on_none_never_blocks(tmp_path):
     g = _gate(tmp_path, "none")
-    assert g.passed and g.violations == []
+    assert g.exit_code() == 0 and g.violations == []
+    # ...but a run with findings is not a pass: `passed` only on a real PASS
+    # (review of #42, F3); the broken isolation is reported as FAIL, not enforced.
+    assert not g.passed and g.verdict == "FAIL" and not g.enforced
     assert g.worst == "critical"                # worst still reported, just not gated
 
 

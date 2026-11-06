@@ -194,6 +194,37 @@ jobs:
           [ "${EXIT_CODE}" = "3" ]     || { echo "::error::outputs.exit-code should be 3, got '${EXIT_CODE}'"; exit 1; }
           echo "UNKNOWN path verified: outcome=${OUTCOME}, verdict=${VERDICT}, exit-code=${EXIT_CODE}"
 
+  action-selftest-advisory-unknown:
+    name: Dogfood the Action (fail-on none never reads as PASS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # fail-on none never blocks, but it must report the real verdict:
+      # the unbound sample is UNKNOWN, so passed=false and verdict=UNKNOWN
+      # while the step still succeeds (exit 0).
+      - name: RuleHawk gate (expect UNKNOWN, not enforced)
+        id: adv
+        uses: ./
+        with:
+          configs: samples/adv_realistic.txt
+          policy: samples/policy.json
+          fail-on: none
+          upload-sarif: false
+          comment: false
+      - name: Assert the step passed but the verdict is UNKNOWN
+        env:
+          OUTCOME: ${{ steps.adv.outcome }}
+          PASSED: ${{ steps.adv.outputs.passed }}
+          VERDICT: ${{ steps.adv.outputs.verdict }}
+          EXIT_CODE: ${{ steps.adv.outputs.exit-code }}
+        run: |
+          set -euo pipefail
+          [ "${OUTCOME}" = "success" ] || { echo "::error::fail-on none must not fail the step"; exit 1; }
+          [ "${PASSED}" = "false" ]    || { echo "::error::outputs.passed should be false, got '${PASSED}'"; exit 1; }
+          [ "${VERDICT}" = "UNKNOWN" ] || { echo "::error::outputs.verdict should be UNKNOWN, got '${VERDICT}'"; exit 1; }
+          [ "${EXIT_CODE}" = "0" ]     || { echo "::error::outputs.exit-code should be 0, got '${EXIT_CODE}'"; exit 1; }
+          echo "advisory UNKNOWN verified: outcome=${OUTCOME}, verdict=${VERDICT}, passed=${PASSED}"
+
   # One PR comment for several checks: the headline is the WORST verdict, so a
   # passing check can never hide a failing one. Same-job: every gate step's
   # result stays in the job's results dir for the comment to combine.

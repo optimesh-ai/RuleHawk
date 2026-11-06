@@ -408,15 +408,36 @@ class GateResult:
         return 3 if self.undecided else 0
 
     @property
+    def enforced(self) -> bool:
+        """False under `--fail-on none`: the verdict is reported, not enforced
+        (the exit code is 0 whatever it is)."""
+        return self.fail_on != "none"
+
+    @property
     def verdict(self) -> str:
-        """PASS | FAIL | UNKNOWN | ADVISORY (fail-on none)."""
-        if self.fail_on == "none":
+        """PASS | FAIL | UNKNOWN | ADVISORY.
+
+        Enforced, it follows the exit code. Under `--fail-on none` it is the
+        real verdict, never a PASS unless the run is one: FAIL for a file that
+        parsed to zero rules or a broken policy assertion, UNKNOWN for an
+        assertion that could not be proven, ADVISORY for any other finding,
+        PASS only when there is nothing at all."""
+        if self.enforced:
+            return {0: "PASS", 3: "UNKNOWN"}.get(self.exit_code(), "FAIL")
+        if self.parse_failures or any(
+                getattr(f, "verdict", None) == "FAIL" and f.accepted is None
+                for fr in self.files for f in fr.findings):
+            return "FAIL"
+        if self.undecided:
+            return "UNKNOWN"
+        if any(f.accepted is None for _, f in self.real_findings):
             return "ADVISORY"
-        return {0: "PASS", 3: "UNKNOWN"}.get(self.exit_code(), "FAIL")
+        return "PASS"
 
     @property
     def passed(self) -> bool:
-        return self.exit_code() == 0
+        """True only when the verdict is PASS (under `--fail-on none` too)."""
+        return self.verdict == "PASS"
 
     @property
     def score(self) -> Optional[int]:
@@ -631,7 +652,9 @@ def to_json(gate: GateResult) -> str:
     return json.dumps({
         "passed": gate.passed,
         # PASS | FAIL | UNKNOWN | ADVISORY. UNKNOWN (exit 3) is never a pass.
+        # Under fail-on none the real verdict, with enforced false.
         "verdict": gate.verdict,
+        "enforced": gate.enforced,
         "exit_code": gate.exit_code(),
         "fail_on": gate.fail_on,
         "worst_severity": gate.worst,
@@ -683,6 +706,25 @@ def _sorted(findings: List[Finding]) -> List[Finding]:
     return sorted(findings, key=key)
 
 
+def _why_not_pass(gate: GateResult) -> str:
+    """One sentence on why an unenforced run is not a PASS."""
+    pf = gate.parse_failures
+    failed = [f for fr in gate.files for f in fr.findings
+              if getattr(f, "verdict", None) == "FAIL" and f.accepted is None]
+    parts = []
+    if failed:
+        parts.append(f"{len(failed)} policy assertion(s) failed")
+    if pf:
+        parts.append(f"{len(pf)} file(s) parsed to zero rules")
+    if gate.undecided:
+        parts.append(f"{len(gate.undecided)} policy assertion(s) could not be "
+                     f"proven")
+    real = [f for _, f in gate.real_findings if f.accepted is None]
+    if real and not parts:
+        parts.append(f"{len(real)} finding(s), worst {gate.worst}")
+    return "; ".join(parts) + "." if parts else "."
+
+
 def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> str:
     """A self-contained markdown report used verbatim as the Step Summary and the
     PR comment body (the comment prepends a hidden marker for sticky updates)."""
@@ -691,6 +733,10 @@ def to_markdown(gate: GateResult, *, title: str = "RuleHawk firewall gate") -> s
     und = gate.undecided
     if gate.passed:
         verdict = f"**PASS** — no findings at or above `{gate.fail_on}`."
+    elif not gate.enforced:
+        verdict = (f"**{gate.verdict} (not enforced)** — `fail-on: none` never "
+                   f"blocks, so this check exits 0, but the verdict is "
+                   f"{gate.verdict}: {_why_not_pass(gate)} This is not a PASS.")
     elif gate.exit_code() == 3:
         verdict = (f"**UNKNOWN** — no finding at or above `{gate.fail_on}`, "
                    f"but {len(und)} policy assertion(s) could not be proven "
@@ -867,6 +913,7 @@ def to_result(gate: GateResult, label: str) -> str:
         "violations": len(gate.violations),
         "parse_failures": len(gate.parse_failures),
         "verdict": gate.verdict,
+        "enforced": gate.enforced,
         "markdown": to_markdown(gate),
     }, indent=2)
 
@@ -929,6 +976,13 @@ def to_console(gate: GateResult) -> str:
                                                         "medium", "low")))
     if gate.passed:
         out.append(f"  VERDICT: PASS (threshold --fail-on {gate.fail_on})")
+    elif not gate.enforced:
+        out.append(f"  VERDICT: {gate.verdict} (not enforced: --fail-on none, "
+                   f"exit 0) — {_why_not_pass(gate)} Not a PASS.")
+        for fr, f in gate.undecided:
+            codes = ", ".join(r["code"] for r in (f.reasons or []))
+            out.append(f"           {os.path.basename(fr.path)}: {f.rule_id} "
+                       f"[{codes}]")
     elif gate.exit_code() == 3:
         out.append(f"  VERDICT: UNKNOWN (exit 3, fail-closed) — "
                    f"{len(gate.undecided)} policy assertion(s) could not be "

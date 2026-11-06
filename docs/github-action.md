@@ -65,7 +65,7 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 
 | Output | Description |
 |---|---|
-| `passed` | `true` when no finding met the `fail-on` threshold (and every file parsed). |
+| `passed` | `true` only on a PASS: no finding met the `fail-on` threshold, every file parsed and every policy assertion was proven. Under `fail-on: none` it is `true` only when the real verdict is PASS. |
 | `score` | Lowest hygiene score (0–100) across the audited files. |
 | `worst-severity` | Highest severity found: `critical` \| `high` \| `medium` \| `low` \| `none`. |
 | `evidence-file` | Path to the compliance-evidence JSON artifact (empty unless `evidence: true`). |
@@ -195,8 +195,12 @@ assessor reads the output:
 | `3` | **UNKNOWN** — no finding reached `fail-on`, but a policy assertion could not be proven: an ACL with no interface or `access-group` binding, an ACL used as something other than a transit filter (vty `access-class`, SNMP, route-map, NAT, crypto, QoS), a parse note, an unmodelled vendor default (PAN-OS `default-security-rules`, iptables chain policy without `-P`, IPv6 implicit ND), or an ambiguous IOS mask. Each such assertion lists its reason codes in the comment, the job summary and the JSON. UNKNOWN is never a PASS. |
 
 The Action maps `1`, `2` and `3` to a red check. The `verdict` output is
-`PASS`, `FAIL`, `UNKNOWN` or `ADVISORY` (`fail-on: none`), and `exit-code` is
-the raw code. Before 0.5.0 the UNKNOWN cases exited 0 and printed PASS. Even on failure it still uploads
+`PASS`, `FAIL`, `UNKNOWN` or `ADVISORY`, and `exit-code` is the raw code.
+Under `fail-on: none` the step never fails (exit 0), but the verdict, the
+console, the PR comment and `rulehawk combine` all show the real verdict,
+marked *not enforced*: FAIL for a broken assertion or an unparsed file,
+UNKNOWN for an unproven assertion, ADVISORY for other findings. Only a real
+PASS reads as PASS. Before 0.5.0 the UNKNOWN cases exited 0 and printed PASS. Even on failure it still uploads
 SARIF and posts the comment first, so the gate always reports its value.
 
 ## What you get

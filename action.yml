@@ -85,14 +85,17 @@ inputs:
 outputs:
   passed:
     description: >-
-      true only on PASS (exit 0): no finding met the fail-on threshold and
-      every policy assertion was proven. false on FAIL, parse failure and
-      UNKNOWN.
+      true only on PASS: no finding met the fail-on threshold and every
+      policy assertion was proven. false on FAIL, parse failure and UNKNOWN.
+      Under fail-on none it is true only when the real verdict is PASS (the
+      step still exits 0).
     value: ${{ steps.gate.outputs.passed }}
   verdict:
     description: >-
-      PASS | FAIL | UNKNOWN | ADVISORY (fail-on none). UNKNOWN means a policy
-      assertion could not be proven; the finding's reason codes say why.
+      PASS | FAIL | UNKNOWN | ADVISORY. UNKNOWN means a policy assertion
+      could not be proven; the finding's reason codes say why. Under fail-on
+      none this is the real verdict (ADVISORY: findings, nothing failed or
+      unproven), reported but not enforced.
     value: ${{ steps.gate.outputs.verdict }}
   exit-code:
     description: >-
@@ -328,6 +331,7 @@ runs:
         # script-injection hygiene as the comment step).
         RH_FAIL_ON: ${{ inputs.fail-on }}
         RH_WORST: ${{ steps.gate.outputs.worst }}
+        RH_VERDICT: ${{ steps.gate.outputs.verdict }}
       run: |
         RC="$(cat "${RUNNER_TEMP:-/tmp}/rulehawk.rc" 2>/dev/null || echo missing)"
         if [ "${RC}" = "missing" ]; then
@@ -342,5 +346,11 @@ runs:
         elif [ "${RC}" != "0" ]; then
           echo "::error title=RuleHawk gate failed::Findings at or above '${RH_FAIL_ON}' block this change — see the job summary and PR comment."
           exit 1
+        fi
+        if [ "${RH_FAIL_ON}" = "none" ] && [ "${RH_VERDICT:-}" != "PASS" ]; then
+          # Advisory: never blocks, but never reads as a pass either.
+          echo "::warning title=RuleHawk verdict ${RH_VERDICT:-unknown} (not enforced)::fail-on is none, so this step does not fail, but the verdict is ${RH_VERDICT:-unknown}, not PASS. See the PR comment and job summary."
+          echo "RuleHawk verdict: ${RH_VERDICT:-unknown} (not enforced: fail-on none; worst severity: ${RH_WORST})."
+          exit 0
         fi
         echo "RuleHawk gate passed (worst severity: ${RH_WORST})."
