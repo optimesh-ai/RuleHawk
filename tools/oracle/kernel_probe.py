@@ -164,11 +164,23 @@ def build(p, idx):
     return ip + l4, pn
 
 
+def _hdr_masked(b: bytes) -> bytes:
+    """IPv4 bytes with the fields forwarding rewrites zeroed: TTL (byte 8)
+    and the header checksum (bytes 10-11)."""
+    return b[:8] + b"\0" + b[9:10] + b"\0\0" + b[12:]
+
+
 def find_tag(frame: bytes, l2: bool):
-    """The probe index carried by a captured packet, or None. The OUTER IPv4
-    header must be the probe itself: a REJECT reply (ICMP unreachable / RST)
-    quotes the probe's header and tag inside its own payload, so a tag found
-    under a different outer (src, dst, proto) is a reply, not the probe."""
+    """The probe index carried by a captured packet, or None.
+
+    The captured packet must BE the probe: its bytes from the IPv4 header up
+    to the end of the tag equal what was sent, except TTL and the header
+    checksum (which forwarding rewrites). Matching on the outer
+    (proto, src, dst) alone is not enough: a REJECT reply quotes the probe,
+    tag included, and a self-addressed probe's ICMP error has exactly the
+    probe's outer (proto, src, dst). The quoted tag sits deeper (after the
+    error's own ICMP header and the quoted IPv4 header), and the ICMP header
+    in front of it is the error's, not the probe's, so it fails here."""
     ip = frame[14:] if l2 else frame
     if l2 and frame[12:14] != b"\x08\x00":
         return None
@@ -178,8 +190,8 @@ def find_tag(frame: bytes, l2: bool):
     if k < 0 or k + 8 > len(ip):
         return None
     idx = struct.unpack("!I", ip[k + 4:k + 8])[0]
-    want = EXPECT.get(idx)
-    if want is None or (ip[9], ip[12:16], ip[16:20]) != want:
+    sent = EXPECT.get(idx)
+    if sent is None or k + 8 != len(sent) or _hdr_masked(ip[:k + 8]) != sent:
         return None
     return idx
 
@@ -188,8 +200,10 @@ EXPECT = {}
 
 
 def expect(idx: int, frame: bytes):
-    """Register what probe `idx` looked like when sent, for find_tag."""
-    EXPECT[idx] = (frame[9], frame[12:16], frame[16:20])
+    """Register probe `idx` as sent (header through tag, TTL/checksum
+    masked), for find_tag."""
+    k = frame.find(MAGIC + struct.pack("!I", idx))
+    EXPECT[idx] = _hdr_masked(frame[:k + 8])
 
 
 SENDER = r"""
