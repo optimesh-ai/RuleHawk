@@ -313,10 +313,13 @@ def test_r6_3_comments_after_a_statement_stay_pass(tmp_path, old, new):
 # R6-4: two mutation labels
 # --------------------------------------------------------------------------- #
 def test_r6_4_no_annotation_inside_a_block_comment():
+    """Round 8 (R7-8) restored these mutants: inside a block the annotation's
+    `*/` ends the block early, so the label is `never`, not `preserve`."""
     from test_fail_closed_mutation_all import _junos
     lines = ["firewall {", "/* a", "b", "*/", "}"]
-    tags = [t for f, t, _, _, _ in _junos(lines) if f == "junos-annotation"]
-    assert "3" not in tags and "4" not in tags, tags
+    kinds = {t: k for f, t, _, k, _ in _junos(lines) if f == "junos-annotation"}
+    assert kinds.get("3") == "never" and kinds.get("4") == "never", kinds
+    assert kinds.get("1") == "preserve" and kinds.get("2") == "preserve", kinds
 
 
 def test_r6_4_trailing_comment_on_a_continued_line_is_never():
