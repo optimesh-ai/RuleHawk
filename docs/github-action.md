@@ -66,6 +66,8 @@ A copy-pasteable, runnable example (with a live "bad PR" demo) lives in the
 | Output | Description |
 |---|---|
 | `passed` | `true` only on a PASS: no finding met the `fail-on` threshold, every file parsed and every policy assertion was proven. Under `fail-on: none` it is `true` only when the real verdict is PASS. |
+| `verdict` | `PASS` \| `FAIL` \| `UNKNOWN` \| `ADVISORY`. UNKNOWN means a policy assertion could not be proven; the finding's reason codes say why. Under `fail-on: none` this is the real verdict (ADVISORY: findings, nothing failed or unproven), reported but not enforced. |
+| `exit-code` | The gate's exit code: `0` PASS, `1` FAIL, `2` parse failure or invalid input, `3` UNKNOWN. |
 | `score` | Lowest hygiene score (0–100) across the audited files. |
 | `worst-severity` | Highest severity found: `critical` \| `high` \| `medium` \| `low` \| `none`. |
 | `evidence-file` | Path to the compliance-evidence JSON artifact (empty unless `evidence: true`). |

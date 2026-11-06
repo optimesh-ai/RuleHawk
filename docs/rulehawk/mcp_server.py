@@ -339,7 +339,9 @@ def _coverage(gate, base: str, skipped: List[dict]) -> dict:
     return {
         "state": state,
         "explanation": {
-            "complete": "every file was parsed and every line was modelled",
+            "complete": ("every file was parsed and the parser left no note "
+                         "(Cisco and Junos parsers read ACLs and filters and "
+                         "ignore other configuration)"),
             "partial": ("every file was parsed, but some lines were not "
                         "modelled (see unmodelled_lines); review them"),
             "incomplete": ("at least one input was NOT analysed (see "

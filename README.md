@@ -52,15 +52,19 @@ could not be proven (3, UNKNOWN), so it drops into CI.
 | `2` | fail-closed | A config parsed to zero rules, a path matched nothing, or an input was invalid. |
 | `3` | UNKNOWN | Nothing reached the threshold, but a policy assertion could not be proven. |
 
-RuleHawk fails closed: it never prints PASS or `VERIFIED` on an answer it cannot
-support. An assertion is UNKNOWN, with a machine-readable reason code and a
-message, when the search is empty (no rules, or no ACL bound to an interface or
-`access-group`), when any parse note exists in the evaluated config, when an
-ACL's role is unknown or is not a transit packet filter (`line vty`
-`access-class`, SNMP, route-map, NAT, crypto, QoS), when a vendor default it does
-not model applies (PAN-OS `default-security-rules`, the iptables chain policy
-when no `-P` is given, IPv6 implicit ND permits, ...), or when an IOS ACL mask is
-ambiguous. The `--json` report carries `assertion_verdict` and, per finding,
+RuleHawk fails closed on a listed set of conditions. An assertion is UNKNOWN,
+with a machine-readable reason code and a message, when the search is empty (no
+rules, or no ACL bound to an interface or `access-group`), when any parse note
+exists in the evaluated config (on PAN-OS and iptables every line the parser
+does not model gets one), when an ACL's role is unknown or is not a transit
+packet filter (`line vty` `access-class`, SNMP, route-map, NAT, crypto, QoS),
+when a binding is removed or deactivated (`no ip access-group`, Junos
+`inactive:`), when a vendor default it does not model applies (PAN-OS
+`default-security-rules`, the iptables chain policy when no `-P` is given, IPv6
+implicit ND permits, ...), when NAT or nftables text is present, or when an IOS
+ACL mask is ambiguous. The full list is in the CHANGELOG. A PASS still assumes
+every interface is in the file and does not evaluate routing, NAT translation or
+topology. The `--json` report carries `assertion_verdict` and, per finding,
 `verdict` and `reasons` (`[{"code": ..., "message": ...}]`); `--evidence` marks
 such a claim `INDETERMINATE` with the same reasons, never `VERIFIED`.
 `--fail-on none` stays advisory and exits 0.
@@ -127,7 +131,7 @@ claude mcp add --transport stdio rulehawk --env RULEHAWK_MCP_ROOT="$PWD" -- rule
 
 | Tool | What it does |
 |---|---|
-| `rulehawk_audit` | Audit a config file or a directory: verdict `PASS` / `FAIL` / `INCOMPLETE` / `ERROR`, the blocking findings, and what was and wasn't analysed |
+| `rulehawk_audit` | Audit a config file or a directory: verdict `PASS` / `FAIL` / `UNKNOWN` / `INCOMPLETE` / `ERROR` (`ADVISORY` under `fail_on=none`), the blocking findings, and what was and wasn't analysed |
 | `rulehawk_list_findings` | Every finding, worst first, filterable by severity and kind, each with a stable id |
 | `rulehawk_explain_finding` | One finding by id (rule, source line, witness, fix), or what a finding kind means |
 | `rulehawk_compare` | Before vs after (files or directories): the findings a change introduces or resolves, and the rules it adds |

@@ -2,10 +2,12 @@
 
 ## 0.5.0 (unreleased)
 
-RuleHawk now fails closed. It no longer prints PASS or `VERIFIED` on an
-answer it cannot support: such an answer is the new **UNKNOWN** verdict, with
-a machine-readable reason code and a message, and the CLI and `rulehawk gate`
-exit **3**.
+RuleHawk now fails closed on the conditions listed under "False-PASS
+fixes" below: where one of them applies, an answer that used to print PASS
+or `VERIFIED` is the new **UNKNOWN** verdict, with a machine-readable reason
+code and a message, and the CLI and `rulehawk gate` exit **3**. A PASS still
+rests on the assumptions under "Known limits"; it is not a proof about the
+device.
 
 ### New: the UNKNOWN verdict
 
@@ -107,9 +109,55 @@ run is one.
   blocks the run.
 - PAN-OS: an empty address-group no longer widens to ANY exactly; the rule is
   imprecise, so the assertion is indeterminate (UNKNOWN), never a PASS.
+- PAN-OS and iptables: every input line is consumed by a modelled handler or
+  gets a parse note citing its line number -> UNKNOWN (`parse-note`). On
+  PAN-OS that covers `delete`, `edit` / `top` / `up` with relative `set`
+  lines, `rename`, `move`, NAT, PBF and decryption rules, and any subtree
+  outside a short allowlist (management plane, tags, zone / application /
+  profile definitions, `network`), each justified in the code. On iptables
+  it covers shell lines, `-X`, `-E`, unknown verbs and malformed headers
+  (`-Z`, `-L` and `-S` change nothing and are consumed).
+- nftables text next to parsed rules (a `table ... {` block, an `nft`
+  command, `flush ruleset`) -> UNKNOWN (`nftables-present`), not only when
+  no rule parsed.
+- A removed or deactivated binding -> UNKNOWN (`acl-binding-negated`):
+  `no ip access-group`, `no ipv6 traffic-filter`, `no ip port
+  access-group`, `no access-class`, ASA `no access-group`, Junos `inactive:`
+  on an interface, unit, family, filter binding or filter, and set-form
+  `deactivate` / `delete` of an interface or a filter. The removal is not
+  applied.
+- iptables with no FORWARD policy at all (no `-P FORWARD` / `:FORWARD`)
+  -> UNKNOWN (`iptables-chain-policy-unset`), also when no rule is in
+  FORWARD (a user chain nothing jumps to).
+- must_reach: connectivity OK now needs every audited rule context to
+  permit the whole flow. One permitting and another denying part of it
+  (an egress ACL on the destination interface) -> UNKNOWN
+  (`reach-not-every-context`).
+- PAN-OS: an address, address-group or service name defined in more than one
+  `shared` / vsys / device-group scope is unresolved (imprecise) and noted
+  -> UNKNOWN (`object-scope-ambiguous`).
+- NAT in the config -> UNKNOWN (`nat-present`): Cisco `ip nat inside |
+  outside | source | destination | pool | static`, ASA `nat (...)` /
+  `static (...)`, the PAN-OS NAT rulebase, Junos security/services NAT, the
+  iptables nat table.
+
+### Known limits (a PASS still rests on these)
+
+- Routing, NAT translation and topology are not evaluated, and every
+  interface is assumed to be in the file. NAT is detected (`nat-present`)
+  but never applied.
+- Only the PAN-OS and iptables frontends account for every line. The Cisco
+  IOS / NX-OS / EOS / ASA and Junos frontends read ACLs, filters and the
+  constructs listed above, and ignore other configuration.
+- RuleHawk models the L3/L4 packet space. Zones, applications, users and
+  connection state are over-approximated (UNKNOWN), never modelled.
+- iptables: only the filter table is modelled; other tables are noted.
+- A pasted snippet is audited as if it were the whole config.
 
 ### Fixes
 
+- The hosted page's `report_json.vendor` is the parsed vendor (it read
+  `ios-asa` for every input).
 - `--evidence` no longer crashes with a TypeError on a scalar `ports` value
   (`"ports": 445`); it attests the same claim as `[445]`.
 - server.json: the `uvx --from` pin no longer names a PyPI release
@@ -151,13 +199,21 @@ run is one.
   the Action outputs show the verdict marked "not enforced"; the exit code
   is still 0, and combine's exit code counts enforced checks only. A result
   record from an earlier version with `fail_on: none` and `passed: true` but
-  no real verdict is read as UNKNOWN by `rulehawk combine`.
+  no real verdict is read as UNKNOWN by `rulehawk combine`, which exits 2.
 - MCP `rulehawk_compare` returns `UNKNOWN` where it used to return
   `NO_NEW_RISK` when the after-config has an assertion RuleHawk cannot
   prove; only `NO_NEW_RISK` is an all-clear.
 - PASS messages now end with their scope ("no audited ruleset permits this
   flow; assumes every interface is in the file; routing, NAT and topology
   not evaluated"); match on the `verdict` field, not the message text.
+- PAN-OS set files and iptables scripts with lines RuleHawk does not
+  model (a shell `echo`, an `edit` block, a NAT rule) now carry a parse note
+  per line and are UNKNOWN; so is any input with nftables text, NAT, or a
+  `no ip access-group` / Junos `inactive:` binding.
+- must_reach with several rule contexts: connectivity OK used to need one
+  context permitting the whole flow; it now needs every one (else
+  UNKNOWN). The connectivity scope text reads "every audited ruleset
+  permits the whole flow".
 - An indeterminate assertion used to exit 0 below the threshold; it now exits 3.
 - A violation suppressed by Hammerhead path-grounding used to exit 0; it is now UNKNOWN (`pathground-witness-only`) and exits 3.
 - The evidence schema stays `rulehawk.evidence/v1`; `reasons` is additive.
