@@ -223,7 +223,10 @@ def test_segmentation_ok_is_info_not_a_violation(tmp_path):
     assert "segmentation-unknown" in kinds      # the UNKNOWN is recorded...
     assert g.real_findings == []                # ...but is not a "real" finding
     sarif = json.loads(gate.to_sarif(g))
-    assert sarif["runs"][0]["results"] == []    # ...and never annotates a line
+    # ...and never annotates a line: the only result is the file-level note
+    # that the file is not certified (#42 phase 2 slice 2).
+    assert [(r["ruleId"], r["locations"][0]["physicalLocation"]["region"]["startLine"])
+            for r in sarif["runs"][0]["results"]] == [("rulehawk/uncertified", 1)]
 
 
 # --------------------------------------------------------------------------- #
@@ -332,7 +335,8 @@ def test_sarif_fingerprints_distinct_per_zone_pair():
                          findings=findings, line_by_id={("EDGE", 30): 30})
     g = gate.GateResult([fr], "high")
     s = json.loads(gate.to_sarif(g))
-    results = s["runs"][0]["results"]
+    results = [r for r in s["runs"][0]["results"]
+               if r["ruleId"] != gate.UNCERTIFIED_RULE]   # one per file, not per breach
     assert len(results) == 3
     fps = [r["partialFingerprints"]["ruleHawk/v2"] for r in results]
     # All three genuine breaches must be uniquely fingerprinted.

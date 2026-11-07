@@ -38,6 +38,19 @@ GOLDEN = os.path.join(ROOT, "tests", "stopgap_fail_golden.json")
 # What the stopgap changes; everything else must be identical.
 CHANGED_KINDS = frozenset({"segmentation-ok", "connectivity-ok",
                            "segmentation-unknown", "connectivity-unknown"})
+# The one SARIF result #42 phase 2 slice 2 adds to every file: a note that the
+# file is not certified. It is not a FAIL result, so it is left out here, but
+# only in its exact shape (review of #48, L3): rule id, level `note`, line 1,
+# the fingerprint `rulehawk/uncertified:<uri>` and its message. Anything else
+# under that rule id stays in sarif_results and so is compared with the golden.
+# Each row counts the notes it left out (sarif_uncertified; one per file).
+UNCERTIFIED_RULE = "rulehawk/uncertified"
+
+
+def _is_uncertified_note(r: dict, uri: str) -> bool:
+    return r == {"ruleId": UNCERTIFIED_RULE, "level": "note",
+                 "message": f"{uri} is not certified. {gate._UNCERTIFIED_TEXT}",
+                 "line": 1, "fp": f"{UNCERTIFIED_RULE}:{uri}"}
 
 # A must_reach assertion so connectivity FAILs (connectivity-broken) are pinned
 # too, beside the shipped must_not_reach policies.
@@ -124,16 +137,19 @@ def _one(label, path, pol_label, pol_path):
             policy = json.load(fh)
     g = gate.run_gate([path], policy, "high")
     sarif = json.loads(gate.to_sarif(g, version="x"))
-    results = [{"ruleId": r["ruleId"], "level": r["level"],
-                "message": r["message"]["text"],
-                "line": r["locations"][0]["physicalLocation"]["region"]["startLine"],
-                "fp": r["partialFingerprints"]["ruleHawk/v2"]}
-               for r in sarif["runs"][0]["results"]]
+    every = [{"ruleId": r["ruleId"], "level": r["level"],
+              "message": r["message"]["text"],
+              "line": r["locations"][0]["physicalLocation"]["region"]["startLine"],
+              "fp": r["partialFingerprints"]["ruleHawk/v2"]}
+             for r in sarif["runs"][0]["results"]]
+    uri = gate._sarif_uri(path)
+    results = [r for r in every if not _is_uncertified_note(r, uri)]
     return {
         "config": label, "policy": pol_label,
         "cli_exit": rc, "gate_exit_high": g.exit_code(),
         "findings": findings, "failed_claims": failed_claims,
         "sarif_results": results,
+        "sarif_uncertified": len(every) - len(results),
         "gate_violations": sorted(
             json.dumps(_finding({"rule_id": f.rule_id, "kind": f.kind,
                                  "severity": f.severity, "message": f.message,

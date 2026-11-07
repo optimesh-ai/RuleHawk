@@ -2,9 +2,10 @@
 v4 errata R4-M2 and R4-L5).
 
 An all-clear is a PASS, a VERIFIED claim, a NO_NEW_RISK compare, a
-`segmentation-ok` / `connectivity-ok` finding, `passed: true` or exit 0 on an
-enforced run. Every site in rulehawk/ that would give one asks this module
-through `emit()`, `exit_code()` or `passed()`. While RULEHAWK_CERT is 0 they
+`segmentation-ok` / `connectivity-ok` finding, `coverage.state = complete`,
+`passed: true` or exit 0 on an enforced run. Every site in rulehawk/ that
+would give one asks this module through `emit()`, `exit_code()`, `passed()`
+or `certified()`. While RULEHAWK_CERT is 0 they
 give the fail-closed stopgap's answer (UNKNOWN, INDETERMINATE, exit 3), which
 is what 0.4.1 already reports.
 
@@ -32,6 +33,7 @@ VERIFIED = "VERIFIED"
 NO_NEW_RISK = "NO_NEW_RISK"
 SEG_OK = "segmentation-ok"
 REACH_OK = "connectivity-ok"
+COMPLETE = "complete"         # MCP coverage.state: every file is file-certified
 
 # What each one is while it is not certified (the 0.4.1 stopgap's answers).
 _STOPGAP = {
@@ -40,6 +42,7 @@ _STOPGAP = {
     VERIFIED: "INDETERMINATE",
     SEG_OK: "segmentation-unknown",
     REACH_OK: "connectivity-unknown",
+    COMPLETE: "partial",
 }
 
 

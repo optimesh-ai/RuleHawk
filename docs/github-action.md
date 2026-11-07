@@ -222,6 +222,10 @@ SARIF and posts the comment first, so the gate always reports its value.
 - **Inline diff annotations** — SARIF results land on the exact source line of each
   finding (exact for all five vendors, thanks to per-rule line tracking). They show
   in the *Files changed* tab and the Security tab, bucketed by severity.
+  Every file that is not certified (every file, in this release) also gets one
+  `rulehawk/uncertified` result at level `note` on line 1, fingerprinted on the
+  file path, so an empty report never stands for a clean file. It does not fail
+  the check; the exit code does.
 - **A single sticky comment** — one comment per PR, updated in place each push
   (keyed by a hidden `<!-- rulehawk-gate -->` marker on a comment the workflow's
   own token wrote), led by the worst verdict and the segmentation witness packets.
