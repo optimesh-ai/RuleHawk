@@ -19,11 +19,18 @@ time. Tests fail on an all-clear outside that module that is not on a pinned,
 reviewed exemption list: an all-clear literal; an exit-code constant or exit
 call worth 0; a PASS or VERIFIED constant, keyed by what the use does (a
 comparison by the whole condition it sits in); an assignment to, or a
-`setattr`/`delattr`/`vars` call on, a name bound to `allclear`; in any engine
-module (both copies), `sys.modules`, `exec`/`eval`/`compile`, an `importlib`
-import, `__dict__` and the other rebinding dunders, `setattr`/`delattr` on
-anything but `self`, or an absolute `rulehawk` import; or an environment write
-naming RULEHAWK_*. (They read spellings and emissions, not data flow; an
+`setattr`/`delattr`/`vars` call on, a name bound to `allclear`; any reference
+to `allclear.certified` (a call, the function held as a value, or an import of
+it by name); a `passed` name, attribute, keyword argument, dict key or
+`["passed"]` item given anything but an `allclear.passed()` call, by
+assignment (an augmented one always counts), by `setattr(x, "passed", ...)`,
+`x.setdefault("passed", ...)` or `x.__setitem__("passed", ...)`, or by a
+`return` in a function named `passed`, and any `passed` bound by unpacking or
+as a `for`, `with` or comprehension target; in any engine module (both
+copies), `sys.modules`, `exec`/`eval`/`compile`, an `importlib` import,
+`__dict__` and the other rebinding dunders, `setattr`/`delattr` on anything
+but `self`, or an absolute `rulehawk` import; or an environment write naming
+RULEHAWK_*. (They read spellings and emissions, not data flow; an
 all-clear built at run time is left to the behavioural tests.)
 `allclear.py` itself may import nothing but `typing` and `exitcodes`, may
 use no decorator, dunder attribute or environment and module hooks, has a
