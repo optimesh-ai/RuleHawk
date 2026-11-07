@@ -190,9 +190,17 @@ def _const_use(node, par):
         return "allclear-const-def", c
     if isinstance(p, ast.Compare) and len(p.ops) == 1 \
             and isinstance(p.ops[0], (ast.Eq, ast.NotEq)) and node in [p.left] + p.comparators:
-        other = p.comparators[0] if node is p.left else p.left
-        op = "==" if isinstance(p.ops[0], ast.Eq) else "!="
-        return "allclear-const-read", f"{ast.unparse(other)} {op} {c}"[:72]
+        # R3-F2: a read is keyed on the whole condition it sits in, climbing
+        # through `and`/`or`/`not`/arithmetic, so widening it
+        # (`== VERIFIED or ...`, `(== VERIFIED) + (...)`) changes the key.
+        root = p
+        while isinstance(par.get(root), (ast.BoolOp, ast.UnaryOp, ast.BinOp, ast.Compare)):
+            root = par[root]
+        text = ast.unparse(root)
+        if len(text) > 72:                       # keep the tail visible
+            import hashlib
+            text = text[:55] + "..#" + hashlib.sha256(text.encode()).hexdigest()[:12]
+        return ("allclear-const-read" if root is p else "allclear-const-compound"), text
     if isinstance(p, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and p.value is node:
         tg = p.targets if isinstance(p, ast.Assign) else [p.target]
         return "allclear-const-write", f"{' = '.join(ast.unparse(t) for t in tg)} = {c}"[:72]
@@ -211,6 +219,8 @@ def _module_aliases(tree, module: str) -> set:
     names = {module}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module is None:
+            names |= {a.asname or a.name for a in node.names if a.name == module}
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "rulehawk":
             names |= {a.asname or a.name for a in node.names if a.name == module}
         elif isinstance(node, ast.Import):
             names |= {a.asname for a in node.names
@@ -322,7 +332,41 @@ def _scan_module(name: str):
             if f in ("setattr", "delattr", "vars") and node.args \
                     and isinstance(node.args[0], ast.Name) and node.args[0].id in ac:
                 hit(node, "allclear-write", ast.unparse(node))
+        _rebind_hooks(node, hit)
     return out
+
+
+_DYNAMIC = {"exec", "eval", "compile", "__import__", "globals", "vars", "locals"}
+
+
+def _rebind_hooks(node, hit):
+    """Review of #47, R3-F1: the ways one engine module could rebind another's
+    functions (allclear's, above all) without naming `allclear.x = ...`:
+    sys.modules, dynamic code, importlib, __dict__ and the other attribute
+    dunders, setattr/delattr on anything but `self`, and absolute `rulehawk`
+    imports (which _module_aliases would otherwise have to follow)."""
+    if isinstance(node, ast.Attribute) and node.attr == "modules":
+        hit(node, "module-hook", ast.unparse(node)[:72])
+    elif isinstance(node, ast.Attribute) and node.attr in (
+            "__dict__", "__setattr__", "__delattr__", "__code__", "__globals__",
+            "__class__", "__builtins__"):
+        hit(node, "dunder-hook", ast.unparse(node)[:72])
+    elif isinstance(node, ast.Name) and node.id in _DYNAMIC:
+        hit(node, "dynamic-code", node.id)
+    elif isinstance(node, ast.Import):
+        for a in node.names:
+            if a.name.split(".")[0] in ("importlib", "rulehawk"):
+                hit(node, "import-hook", f"import {a.name}")
+    elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module \
+            and node.module.split(".")[0] in ("importlib", "rulehawk", "sys"):
+        names = ", ".join(a.name for a in node.names)
+        if node.module != "sys" or "modules" in names.split(", "):
+            hit(node, "import-hook", f"from {node.module} import {names}"[:72])
+    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+            and node.func.id in ("setattr", "delattr"):
+        first = node.args[0] if node.args else None
+        if not (isinstance(first, ast.Name) and first.id == "self"):
+            hit(node, "setattr-hook", ast.unparse(node)[:72])
 
 
 def _scan():
@@ -407,6 +451,13 @@ _EXEMPT = collections.Counter({
     "evidence.py::_control_rollup::allclear-const-read::a['status'] == VERIFIED": 1,
     "evidence.py::_control_rollup::allclear-const-write::s['status'] = VERIFIED": 1,
     "evidence.py::build_evidence::allclear-const-read::a['status'] == VERIFIED": 1,
+    # Rebind hooks (review of #47, R3-F1): the two package-version lookups
+    # (importlib.metadata, read only) and iptables' match-module list, an
+    # attribute of the parsed rule that happens to be called `modules`.
+    "evidence.py::tool_version::import-hook::from importlib.metadata import PackageNotFoundError, version": 1,
+    "mcp_server.py::_sdk_version::import-hook::from importlib.metadata import version": 1,
+    "parse_iptables.py::_Rule.__init__::module-hook::self.modules": 1,
+    "parse_iptables.py::_parse_rule::module-hook::r.modules": 1,
 })
 
 
