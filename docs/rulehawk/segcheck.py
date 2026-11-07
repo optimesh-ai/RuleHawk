@@ -33,6 +33,7 @@ from __future__ import annotations
 import ipaddress
 from typing import Dict, List, Optional
 
+from . import allclear
 from .analyze import STOPGAP_MESSAGE, Finding, stopgap_reasons
 from .model import (ACE, ANY_PORTS, _ICMP_PROTOS, _IPNet, _PORTED,
                     _WILDCARD_PROTO, PortRange)
@@ -456,7 +457,7 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                     rule, wit = info
                     _line_part = f" (line {rule.line})" if rule.line else ""
                     findings.append(Finding(
-                        f"{rule.acl}:{rule.seq}", "connectivity-unknown", "info",
+                        f"{rule.acl}:{rule.seq}", allclear.emit(allclear.REACH_OK), "info",
                         f"UNKNOWN ({sname} must reach {dname}{scope}): the "
                         f"ENTIRE flow space is permitted by the parsed rules "
                         f"— e.g. rule {rule.seq}{_line_part} permits {wit} — "
@@ -465,7 +466,7 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
                         rule.raw,
                         witness=wit,
                         line=rule.line,
-                        verdict="UNKNOWN", reasons=stopgap_reasons()))
+                        verdict=allclear.emit(allclear.PASS), reasons=stopgap_reasons()))
                 elif kind == "indeterminate":
                     rule, acl_name = info
                     if rule is not None:
@@ -563,11 +564,11 @@ def check_segmentation(aces: List[ACE], policy: dict) -> List[Finding]:
             # Fail-closed stopgap: no permitted witness was found, but that
             # is reported UNKNOWN, never as proven isolation.
             findings.append(Finding(
-                label, "segmentation-unknown", "info",
+                label, allclear.emit(allclear.SEG_OK), "info",
                 f"UNKNOWN ({sname} must not reach {dname}{scope}): no parsed "
                 f"rule permits a witness flow, but isolation is not "
                 f"certified: {STOPGAP_MESSAGE}.", "",
-                fix="", verdict="UNKNOWN", reasons=stopgap_reasons()))
+                fix="", verdict=allclear.emit(allclear.PASS), reasons=stopgap_reasons()))
     return findings
 
 

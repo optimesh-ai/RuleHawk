@@ -44,7 +44,7 @@ import sys
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
-from . import __version__
+from . import __version__, allclear
 from .analyze import STOPGAP_CODE, STOPGAP_MESSAGE, Finding, stopgap_reasons
 from .boundary import to_dict as boundary_dict
 from .gate import (_KIND_HELP, _SEV_ORDER, _SEV_RANK, _VENDORS, FileResult,
@@ -427,7 +427,7 @@ def _verdict(gate, coverage: dict, fail_on: str) -> Tuple[str, str]:
         return "ADVISORY", ("fail_on=none: nothing blocks, so no PASS is given; "
                             "read findings_by_severity")
     # Fail-closed stopgap: the would-be PASS is UNKNOWN.
-    return "UNKNOWN", (f"no finding at or above fail_on={fail_on}, but the "
+    return allclear.emit(allclear.PASS), (f"no finding at or above fail_on={fail_on}, but the "
                        f"result is not certified ({STOPGAP_CODE}: "
                        f"{STOPGAP_MESSAGE})")
 
@@ -703,7 +703,7 @@ def compare(before: str, after: str, policy_path: str = "",
                                     f"{len(introduced)} finding(s) introduced")
     else:
         # Fail-closed stopgap: no all-clear (the old NO_NEW_RISK) is given.
-        verdict, why = "UNKNOWN", (
+        verdict, why = allclear.emit(allclear.NO_NEW_RISK), (
             f"no new finding at or above fail_on={fail_on}"
             + (f"; {still_blocking} pre-existing blocking finding(s) remain"
                if still_blocking else "")

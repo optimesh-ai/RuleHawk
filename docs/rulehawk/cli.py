@@ -35,6 +35,7 @@ from .parse_junos import detect as detect_junos, parse_junos
 from .parse_nxos import detect as detect_nxos, parse_nxos
 from .parse_panos import detect as detect_panos, parse_panos
 from .pathground import HammerheadReachOracle, path_ground
+from . import exitcodes
 from .report import exit_code, to_json, to_text
 from .riskaccept import apply_to_findings, evaluate, finalize
 from .segcheck import check_segmentation
@@ -80,13 +81,7 @@ passing extra files here is an error (exit 2), never a partial audit.
 Scope: the rule layer only. RuleHawk does not evaluate routing, NAT or
 topology, so it cannot tell you what a change breaks on your network.
 
-exit codes (0.4.1, fail-closed stopgap: PASS is never reported):
-  1  FAIL: at least one critical/high finding
-  2  parse failure (no rules parsed), unreadable input, or bad usage
-  3  UNKNOWN: no critical/high finding, but not certified (reason
-     fail-closed-stopgap: fail-closed stopgap pending soundness review)
-  0  only for --help; an audited run never exits 0
-"""
+""" + exitcodes.help_section("file")
 
 
 def _take_opt(argv: list[str], name: str) -> str | None:
@@ -120,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     # be mistaken for a config-file path (mirrors gate.py's pattern).
     if "-h" in argv or "--help" in argv:
         print(_USAGE)
-        return 0
+        return exitcodes.HELP
     as_json = "--json" in argv
     as_evidence_md = "--evidence-md" in argv
     as_evidence = "--evidence" in argv or as_evidence_md

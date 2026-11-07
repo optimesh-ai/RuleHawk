@@ -42,6 +42,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from . import allclear, exitcodes
 from .analyze import (STOPGAP_CODE, STOPGAP_MESSAGE, UNKNOWN_KINDS, Finding,
                       analyze, score, stopgap_reasons)
 from .boundary import markdown_lines as boundary_markdown, triggers
@@ -392,10 +393,12 @@ class GateResult:
         an enforced run, which would read as a PASS. `--fail-on none` is
         advisory: it exits 0, and its verdict still says UNKNOWN or FAIL."""
         if self.fail_on == "none":
-            return 0
+            return exitcodes.ADVISORY
         if self.parse_failures:
-            return 2
-        return 1 if self.violations else 3
+            return exitcodes.INVALID
+        # Nothing at the threshold is the would-be PASS: exit 3 (UNKNOWN)
+        # until allclear certifies it.
+        return exitcodes.FAIL if self.violations else allclear.exit_code()
 
     @property
     def enforced(self) -> bool:
@@ -431,7 +434,7 @@ class GateResult:
     def passed(self) -> bool:
         """Never true in 0.4.1: the fail-closed stopgap emits no PASS, under
         `--fail-on none` too."""
-        return False
+        return allclear.passed()
 
     @property
     def score(self) -> Optional[int]:
@@ -989,14 +992,7 @@ options:
   -q, --quiet          suppress the console report
   -h, --help           show this help
 
-exit codes (0.4.1, fail-closed stopgap: PASS is never reported):
-  1  FAIL: a finding at or above --fail-on
-  2  a file parsed to zero rules, or invalid input / usage
-  3  UNKNOWN: nothing at or above --fail-on, but not certified
-     (fail-closed-stopgap: fail-closed stopgap pending soundness review)
-  0  only with --fail-on none (advisory; the verdict still says UNKNOWN/FAIL)
-  Precedence: 2, then 1, then 3.
-"""
+""" + exitcodes.help_section("gate")
 
 
 def _take(argv: List[str], flag: str) -> Optional[str]:
@@ -1016,7 +1012,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or "-h" in argv or "--help" in argv:
         print(_USAGE)
-        return 0 if argv else 2
+        return exitcodes.HELP if argv else exitcodes.INVALID
     quiet = False
     for q in ("-q", "--quiet"):
         if q in argv:
