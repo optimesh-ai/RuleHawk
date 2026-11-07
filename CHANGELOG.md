@@ -16,10 +16,15 @@ enforced exit 0) now goes through one function, `rulehawk.allclear.emit`. It
 gives the stopgap's answer (UNKNOWN, exit 3) because its compiled-in switch is
 off; it is not read from the environment, and nothing overrides it at run
 time. Tests fail on an all-clear outside that module that is not on a pinned,
-reviewed exemption list: an all-clear literal, an exit-code constant or exit
-call worth 0, a PASS or VERIFIED constant, a write to `allclear`, or an
-environment write naming RULEHAWK_*. (They read spellings and emissions, not data
-flow; an all-clear built at run time is left to the behavioural tests.)
+reviewed exemption list: an all-clear literal; an exit-code constant or exit
+call worth 0; a PASS or VERIFIED constant, keyed by what the use does (a
+comparison by the whole condition it sits in); an assignment to, or a
+`setattr`/`delattr`/`vars` call on, a name bound to `allclear`; in any engine
+module (both copies), `sys.modules`, `exec`/`eval`/`compile`, an `importlib`
+import, `__dict__` and the other rebinding dunders, `setattr`/`delattr` on
+anything but `self`, or an absolute `rulehawk` import; or an environment write
+naming RULEHAWK_*. (They read spellings and emissions, not data flow; an
+all-clear built at run time is left to the behavioural tests.)
 `allclear.py` itself may import nothing but `typing` and `exitcodes`, may
 use no decorator, dunder attribute or environment and module hooks, has a
 fixed list of top-level statements, and is pinned whole, byte for byte, in

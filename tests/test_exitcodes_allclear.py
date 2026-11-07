@@ -190,9 +190,17 @@ def _const_use(node, par):
         return "allclear-const-def", c
     if isinstance(p, ast.Compare) and len(p.ops) == 1 \
             and isinstance(p.ops[0], (ast.Eq, ast.NotEq)) and node in [p.left] + p.comparators:
-        other = p.comparators[0] if node is p.left else p.left
-        op = "==" if isinstance(p.ops[0], ast.Eq) else "!="
-        return "allclear-const-read", f"{ast.unparse(other)} {op} {c}"[:72]
+        # R3-F2: a read is keyed on the whole condition it sits in, climbing
+        # through `and`/`or`/`not`/arithmetic, so widening it
+        # (`== VERIFIED or ...`, `(== VERIFIED) + (...)`) changes the key.
+        root = p
+        while isinstance(par.get(root), (ast.BoolOp, ast.UnaryOp, ast.BinOp, ast.Compare)):
+            root = par[root]
+        text = ast.unparse(root)
+        if len(text) > 72:                       # keep the tail visible
+            import hashlib
+            text = text[:55] + "..#" + hashlib.sha256(text.encode()).hexdigest()[:12]
+        return ("allclear-const-read" if root is p else "allclear-const-compound"), text
     if isinstance(p, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and p.value is node:
         tg = p.targets if isinstance(p, ast.Assign) else [p.target]
         return "allclear-const-write", f"{' = '.join(ast.unparse(t) for t in tg)} = {c}"[:72]
@@ -211,6 +219,8 @@ def _module_aliases(tree, module: str) -> set:
     names = {module}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module is None:
+            names |= {a.asname or a.name for a in node.names if a.name == module}
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "rulehawk":
             names |= {a.asname or a.name for a in node.names if a.name == module}
         elif isinstance(node, ast.Import):
             names |= {a.asname for a in node.names
@@ -325,6 +335,7 @@ def _scan_module(name: str):
                     and isinstance(node.args[0], ast.Name) and node.args[0].id in ac:
                 hit(node, "allclear-write", ast.unparse(node))
         _passed_sets(node, ac, hit)
+        _rebind_hooks(node, hit)
     return out
 
 
@@ -399,6 +410,40 @@ def _passed_sets(node, ac, hit):
         for r in ast.walk(node):
             if isinstance(r, ast.Return) and not _is_passed_call(r.value, ac):
                 h(r, f"def passed: return {ast.unparse(r.value) if r.value else 'None'}")
+
+
+
+_DYNAMIC = {"exec", "eval", "compile", "__import__", "globals", "vars", "locals"}
+
+
+def _rebind_hooks(node, hit):
+    """Review of #47, R3-F1: the ways one engine module could rebind another's
+    functions (allclear's, above all) without naming `allclear.x = ...`:
+    sys.modules, dynamic code, importlib, __dict__ and the other attribute
+    dunders, setattr/delattr on anything but `self`, and absolute `rulehawk`
+    imports (which _module_aliases would otherwise have to follow)."""
+    if isinstance(node, ast.Attribute) and node.attr == "modules":
+        hit(node, "module-hook", ast.unparse(node)[:72])
+    elif isinstance(node, ast.Attribute) and node.attr in (
+            "__dict__", "__setattr__", "__delattr__", "__code__", "__globals__",
+            "__class__", "__builtins__"):
+        hit(node, "dunder-hook", ast.unparse(node)[:72])
+    elif isinstance(node, ast.Name) and node.id in _DYNAMIC:
+        hit(node, "dynamic-code", node.id)
+    elif isinstance(node, ast.Import):
+        for a in node.names:
+            if a.name.split(".")[0] in ("importlib", "rulehawk"):
+                hit(node, "import-hook", f"import {a.name}")
+    elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module \
+            and node.module.split(".")[0] in ("importlib", "rulehawk", "sys"):
+        names = ", ".join(a.name for a in node.names)
+        if node.module != "sys" or "modules" in names.split(", "):
+            hit(node, "import-hook", f"from {node.module} import {names}"[:72])
+    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+            and node.func.id in ("setattr", "delattr"):
+        first = node.args[0] if node.args else None
+        if not (isinstance(first, ast.Name) and first.id == "self"):
+            hit(node, "setattr-hook", ast.unparse(node)[:72])
 
 
 def _scan():
@@ -497,6 +542,13 @@ _EXEMPT = collections.Counter({
     "gate.py::to_result::passed-set::\"passed\": gate.passed": 1,
     "gate.py::_failed_result::passed-set::\"passed\": False": 1,
     "combine.py::_load::passed-set::passed": 1,
+    # Rebind hooks (review of #47, R3-F1): the two package-version lookups
+    # (importlib.metadata, read only) and iptables' match-module list, an
+    # attribute of the parsed rule that happens to be called `modules`.
+    "evidence.py::tool_version::import-hook::from importlib.metadata import PackageNotFoundError, version": 1,
+    "mcp_server.py::_sdk_version::import-hook::from importlib.metadata import version": 1,
+    "parse_iptables.py::_Rule.__init__::module-hook::self.modules": 1,
+    "parse_iptables.py::_parse_rule::module-hook::r.modules": 1,
 })
 
 
@@ -780,6 +832,99 @@ def test_scan_catches_a_widened_verified_read(tmp_path, monkeypatch):
     assert collections.Counter(_scan_module("evidence.py")) == pinned
     (tmp_path / "evidence.py").write_text(src.replace(*_R9), encoding="utf-8")
     assert collections.Counter(_scan_module("evidence.py")) != pinned
+
+
+# --------------------------------------------------------------------------- #
+# Review of #47, round 3 (red first).
+# R3-F1: allclear rebound from another engine module. The reviewer's six
+# env-gated plants in report.py; the scan of report.py must change for each.
+# --------------------------------------------------------------------------- #
+_R3_IMPORT = "from . import allclear, exitcodes\n"
+_R3_GATE = (_R3_IMPORT + "import os as _o, sys as _s\n"
+            "if _o.environ.get('RH_FORCE') == '1':\n")
+_R3_REBINDS = {
+    "B1-sys-modules": "    _s.modules['rulehawk.allclear'].certified = lambda cert=None: True\n",
+    "B2-absolute-alias": ("    from rulehawk import allclear as _zz\n"
+                          "    _zz.emit = lambda verdict, cert=None: verdict\n"),
+    "B3-dunder-dict": "    allclear.__dict__.update(certified=lambda cert=None: True)\n",
+    "B4-exec": "    exec('allclear.emit = lambda verdict, cert=None: verdict')\n",
+    "B5-importlib": ("    import importlib as _il\n"
+                     "    _il.import_module('rulehawk.allclear').certified = lambda cert=None: True\n"),
+    "B6-setattr-computed": ("    setattr(_s.modules[__package__ + '.all' + 'clear'], 'cert' + 'ified', "
+                            "lambda cert=None: True)\n"),
+}
+
+
+def _pinned_for(module: str) -> collections.Counter:
+    return collections.Counter({k: v for k, v in _EXEMPT.items()
+                                if k.startswith(module + "::")})
+
+
+def _scan_planted(tmp_path, monkeypatch, module, old, new):
+    src = _read(os.path.join("rulehawk", module))
+    assert src.count(old) == 1
+    monkeypatch.setattr(sys.modules[__name__], "_PKG", str(tmp_path))
+    (tmp_path / module).write_text(src, encoding="utf-8")
+    clean = collections.Counter(_scan_module(module))
+    (tmp_path / module).write_text(src.replace(old, new), encoding="utf-8")
+    return clean, collections.Counter(_scan_module(module))
+
+
+@pytest.mark.parametrize("plant", sorted(_R3_REBINDS))
+def test_scan_catches_a_rebind_from_another_module(plant, tmp_path, monkeypatch):
+    clean, planted = _scan_planted(tmp_path, monkeypatch, "report.py", _R3_IMPORT,
+                                   _R3_GATE + _R3_REBINDS[plant])
+    assert clean == _pinned_for("report.py")
+    assert planted - clean, (plant, sorted(planted.elements()))
+
+
+def test_scan_covers_both_copies(monkeypatch):
+    """R3-F1: the vendored copy scans the same as rulehawk/."""
+    want = _scan()
+    monkeypatch.setattr(sys.modules[__name__], "_PKG",
+                        os.path.join(_ROOT, "docs", "rulehawk"))
+    assert _scan() == want
+
+
+# R3-F2: a read widened inside a compound condition (`or`, `+`) must change
+# the pinned scan. The precondition is the unplanted source matching the pins,
+# so a failure here is the scan's, not the setup's.
+_VER_IF = '            if a["status"] == VERIFIED:\n                s["verified"] += 1\n'
+_VER_SUM = '"attestations_verified": sum(a["status"] == VERIFIED for a in attestations),'
+_R3_READS = {
+    "rollup-or": (_VER_IF, _VER_IF.replace('== VERIFIED:', '== VERIFIED or a["status"] == INDETERMINATE:')),
+    "rollup-or-true": (_VER_IF, _VER_IF.replace('== VERIFIED:', '== VERIFIED or a["status"]:')),
+    "count-or": (_VER_SUM, _VER_SUM.replace('== VERIFIED for', '== VERIFIED or a["status"] == INDETERMINATE for')),
+    "count-plus": (_VER_SUM, _VER_SUM.replace('sum(a["status"] == VERIFIED for',
+                                              'sum((a["status"] == VERIFIED) + (a["status"] == INDETERMINATE) for')),
+}
+
+
+@pytest.mark.parametrize("plant", sorted(_R3_READS))
+def test_scan_catches_a_read_widened_in_a_condition(plant, tmp_path, monkeypatch):
+    old, new = _R3_READS[plant]
+    clean, planted = _scan_planted(tmp_path, monkeypatch, "evidence.py", old, new)
+    assert clean == _pinned_for("evidence.py")
+    assert planted != clean, plant
+
+
+# R3-F3: each new allclear.py rule on its own. These plants name nothing else
+# on the deny-list, so turning the decorator or the dunder rule off fails here.
+_R3_SINGLE = {
+    "decorator-only": ("def _require_certified(cert: object) -> bool:\n",
+                       "@staticmethod\ndef _require_certified(cert: object) -> bool:\n",
+                       ["decorator on _require_certified"]),
+    "dunder-only": ("RULEHAWK_CERT = 0\n", "RULEHAWK_CERT = 0\n_N = exitcodes.__name__\n",
+                    ["dunder attribute __name__"]),
+}
+
+
+@pytest.mark.parametrize("plant", sorted(_R3_SINGLE))
+def test_allclear_names_check_catches_a_single_rule_plant(plant):
+    old, new, want = _R3_SINGLE[plant]
+    src = _read(os.path.join("rulehawk", "allclear.py"))
+    assert src.count(old) == 1
+    assert _allclear_violations(src.replace(old, new)) == want
 
 
 # Low suggestion: the guard fixture re-derives from git when the commits are

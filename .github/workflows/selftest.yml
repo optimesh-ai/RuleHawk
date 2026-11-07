@@ -27,7 +27,13 @@ jobs:
       matrix:
         python-version: ['3.9', '3.12']
     steps:
+      # Full history and tags, so tests/test_exitcodes_allclear.py can
+      # re-derive #44's guard fixture from git (v0.4.0..e04630e) instead of
+      # skipping that check on a shallow clone.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
