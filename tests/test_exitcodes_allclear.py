@@ -336,6 +336,7 @@ def _scan_module(name: str):
                 hit(node, "allclear-write", ast.unparse(node))
         _passed_sets(node, ac, hit)
         _rebind_hooks(node, hit)
+        _module_uses(node, par, ac, ec, name, hit)
     return out
 
 
@@ -411,6 +412,68 @@ def _passed_sets(node, ac, hit):
             if isinstance(r, ast.Return) and not _is_passed_call(r.value, ac):
                 h(r, f"def passed: return {ast.unparse(r.value) if r.value else 'None'}")
 
+def _root_alias(t, names):
+    """The alias name an Attribute/Subscript/Call chain hangs off, or None."""
+    while isinstance(t, (ast.Attribute, ast.Subscript, ast.Call)):
+        t = t.func if isinstance(t, ast.Call) else t.value
+    return t.id if isinstance(t, ast.Name) and t.id in names else None
+
+
+def _unpacked(t):
+    """The single targets inside a (possibly nested) unpacking target."""
+    if isinstance(t, (ast.Tuple, ast.List)):
+        return [x for e in t.elts for x in _unpacked(e)]
+    if isinstance(t, ast.Starred):
+        return _unpacked(t.value)
+    return [t]
+
+
+_INTROSPECT = {"getattr", "hasattr", "setattr", "delattr", "type", "vars", "dir"}
+
+
+def _module_uses(node, par, ac, ec, name, hit):
+    """Review of #47, R4-F1: what another engine module may do with allclear or
+    exitcodes, by structure rather than spelling. Only `alias.PUBLIC` read or
+    called is allowed; flagged are:
+    - private-access: any `_name` attribute on a chain rooted at the alias
+      (allclear._STOPGAP, allclear.emit.__globals__, ...);
+    - module-escape: the module object itself used as a value (passed,
+      assigned, returned, put in a container), so nothing can reach it
+      through a helper;
+    - introspect: getattr/hasattr/setattr/delattr/type/vars/dir whose first
+      argument is the alias or a chain on it, and any operator.attrgetter or
+      methodcaller at all;
+    - member-call: a method called on a member (allclear.X.update(...)), so
+      a public table cannot be mutated in place;
+    - exitcodes-write: an assignment whose target is rooted at exitcodes,
+      as `allclear-write` is for allclear.
+    allclear.py and exitcodes.py may use their own names; neither names
+    itself, so this holds there too."""
+    aliases = ac | ec
+    if isinstance(node, ast.Name) and node.id in aliases and isinstance(node.ctx, ast.Load):
+        p = par.get(node)
+        if not (isinstance(p, ast.Attribute) and p.value is node):
+            hit(node, "module-escape", ast.unparse(p)[:72] if p is not None else node.id)
+    elif isinstance(node, ast.Attribute) and node.attr.startswith("_") \
+            and _root_alias(node.value, aliases):
+        hit(node, "private-access", ast.unparse(node)[:72])
+    elif isinstance(node, (ast.Name, ast.Attribute)) \
+            and (node.id if isinstance(node, ast.Name) else node.attr) in ("attrgetter", "methodcaller"):
+        hit(node, "introspect", ast.unparse(node)[:72])
+    if isinstance(node, ast.Call):
+        f = node.func
+        if isinstance(f, ast.Name) and f.id in _INTROSPECT and node.args \
+                and _root_alias(node.args[0], aliases):
+            hit(node, "introspect", ast.unparse(node)[:72])
+        if isinstance(f, ast.Attribute) and isinstance(f.value, (ast.Attribute, ast.Subscript, ast.Call)) \
+                and _root_alias(f.value, aliases):
+            hit(node, "member-call", ast.unparse(f)[:72])
+    if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
+        targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
+        for t in targets:
+            for e in _unpacked(t):
+                if isinstance(e, (ast.Attribute, ast.Subscript)) and _root_alias(e, ec):
+                    hit(node, "exitcodes-write", ast.unparse(e)[:72])
 
 
 _DYNAMIC = {"exec", "eval", "compile", "__import__", "globals", "vars", "locals"}
@@ -884,6 +947,35 @@ def test_scan_covers_both_copies(monkeypatch):
     monkeypatch.setattr(sys.modules[__name__], "_PKG",
                         os.path.join(_ROOT, "docs", "rulehawk"))
     assert _scan() == want
+
+
+# R4-F1: the reviewer's round-4 plants, env-gated in report.py: computed
+# getattr / attrgetter routes (G1b-G4b), an in-place mutation of allclear's
+# private table (U1) and a rebind of an exitcodes constant (U2). Each must
+# change the scan of report.py on its own.
+_R4_GATE = (_R3_IMPORT + "import os as _o\n"
+            "if _o.environ.get('RH_FORCE') == '1':\n")
+_R4_PLANTS = {
+    "G1b-getattr-globals": ("    getattr(allclear.emit, '__glo' + 'bals__')['cert' + 'ified'] = "
+                            "lambda cert=None: True\n"),
+    "G2-getattr-stopgap": ("    _g = getattr(allclear, '_STOP' + 'GAP')\n"
+                           "    _g.update({_k: _k for _k in _g})\n"),
+    "G3b-type-setattr": ("    getattr(type(allclear), '__set' + 'attr__')(allclear, 'cert' + 'ified', "
+                         "lambda cert=None: True)\n"),
+    "G4b-attrgetter": ("    import operator as _op\n"
+                       "    _op.attrgetter('emit.__glo' + 'bals__')(allclear)['cert' + 'ified'] = "
+                       "lambda cert=None: True\n"),
+    "U1-stopgap-update": "    allclear._STOPGAP.update({_k: _k for _k in allclear._STOPGAP})\n",
+    "U2-exitcodes-rebind": "    exitcodes.UNKNOWN = exitcodes.FAIL - 1\n",
+}
+
+
+@pytest.mark.parametrize("plant", sorted(_R4_PLANTS))
+def test_scan_catches_a_round_4_plant(plant, tmp_path, monkeypatch):
+    clean, planted = _scan_planted(tmp_path, monkeypatch, "report.py", _R3_IMPORT,
+                                   _R4_GATE + _R4_PLANTS[plant])
+    assert clean == _pinned_for("report.py")
+    assert planted - clean, (plant, sorted(planted.elements()))
 
 
 # R3-F2: a read widened inside a compound condition (`or`, `+`) must change

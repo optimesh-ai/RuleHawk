@@ -29,9 +29,17 @@ assignment (an augmented one always counts), by `setattr(x, "passed", ...)`,
 as a `for`, `with` or comprehension target; in any engine module (both
 copies), `sys.modules`, `exec`/`eval`/`compile`, an `importlib` import,
 `__dict__` and the other rebinding dunders, `setattr`/`delattr` on anything
-but `self`, or an absolute `rulehawk` import; or an environment write naming
-RULEHAWK_*. (They read spellings and emissions, not data flow; an
-all-clear built at run time is left to the behavioural tests.)
+but `self`, or an absolute `rulehawk` import; outside their own
+files, a private (`_name`) attribute of `allclear` or `exitcodes`, either
+module object used as a value, `getattr`/`hasattr`/`setattr`/`delattr`/`type`/
+`vars`/`dir` on either or on a member of either, a method call on a member of
+either, or an assignment to or deletion of a member of `exitcodes`; any
+`operator.attrgetter` or `methodcaller`; or an environment write naming
+RULEHAWK_*. This is a static scan of spellings and structure, not of data
+flow: it catches the forms listed here, a spelling it does not recognise
+remains possible, and code review is the backstop. An override gated on an
+environment variable that no test sets is not caught by the behavioural tests
+either.
 `allclear.py` itself may import nothing but `typing` and `exitcodes`, may
 use no decorator, dunder attribute or environment and module hooks, has a
 fixed list of top-level statements, and is pinned whole, byte for byte, in
