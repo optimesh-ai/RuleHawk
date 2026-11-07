@@ -752,6 +752,35 @@ def test_scan_covers_both_copies(monkeypatch):
     assert _scan() == want
 
 
+# R4-F1: the reviewer's round-4 plants, env-gated in report.py: computed
+# getattr / attrgetter routes (G1b-G4b), an in-place mutation of allclear's
+# private table (U1) and a rebind of an exitcodes constant (U2). Each must
+# change the scan of report.py on its own.
+_R4_GATE = (_R3_IMPORT + "import os as _o\n"
+            "if _o.environ.get('RH_FORCE') == '1':\n")
+_R4_PLANTS = {
+    "G1b-getattr-globals": ("    getattr(allclear.emit, '__glo' + 'bals__')['cert' + 'ified'] = "
+                            "lambda cert=None: True\n"),
+    "G2-getattr-stopgap": ("    _g = getattr(allclear, '_STOP' + 'GAP')\n"
+                           "    _g.update({_k: _k for _k in _g})\n"),
+    "G3b-type-setattr": ("    getattr(type(allclear), '__set' + 'attr__')(allclear, 'cert' + 'ified', "
+                         "lambda cert=None: True)\n"),
+    "G4b-attrgetter": ("    import operator as _op\n"
+                       "    _op.attrgetter('emit.__glo' + 'bals__')(allclear)['cert' + 'ified'] = "
+                       "lambda cert=None: True\n"),
+    "U1-stopgap-update": "    allclear._STOPGAP.update({_k: _k for _k in allclear._STOPGAP})\n",
+    "U2-exitcodes-rebind": "    exitcodes.UNKNOWN = exitcodes.FAIL - 1\n",
+}
+
+
+@pytest.mark.parametrize("plant", sorted(_R4_PLANTS))
+def test_scan_catches_a_round_4_plant(plant, tmp_path, monkeypatch):
+    clean, planted = _scan_planted(tmp_path, monkeypatch, "report.py", _R3_IMPORT,
+                                   _R4_GATE + _R4_PLANTS[plant])
+    assert clean == _pinned_for("report.py")
+    assert planted - clean, (plant, sorted(planted.elements()))
+
+
 # R3-F2: a read widened inside a compound condition (`or`, `+`) must change
 # the pinned scan. The precondition is the unplanted source matching the pins,
 # so a failure here is the scan's, not the setup's.
