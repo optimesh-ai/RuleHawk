@@ -102,6 +102,23 @@ the grammar's (`line-not-allowlisted`, `parse-ambiguous`, or
 still `file-uncertified`: parsing is not a certificate, and `would_pass` stays
 false.
 
+### PAN-OS grammar, computed in shadow only (#42 phase 2)
+
+`rulehawk/grammar_panos.py` is the second allowlist grammar: PAN-OS set
+form, and of it only a whole security rule on one line,
+`set rulebase security rules NAME from any to any source ADDR destination
+ADDR application any service any action allow|deny`, with an address `any` or
+one IPv4 prefix. Zone names, address objects, lists, quotes, per-attribute
+lines, a rule name set twice, `move`, `delete`, `disabled`, `vsys` and every
+other construct match nothing, because no fetched first-party row covers them
+yet. The citation registry gains the PAN-OS rows (the 11.1 "Components of a
+Security Policy Rule" page and two knowledge-base articles) and lists rule
+order, release scope, lexing and set-CLI list semantics as pending. Nothing
+reads the result: verdicts, exit codes and every output are unchanged. With
+`RULEHAWK_SHADOW=1`, a file the boundary lets through as PAN-OS gets a
+`grammar` entry in its `shadow` block, as Junos files do, and `would_pass`
+stays false.
+
 ### No file is certified, so code scanning and MCP coverage say so (#42 phase 2)
 
 **Under the stopgap, every config gets a standing `rulehawk/uncertified`
