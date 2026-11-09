@@ -276,11 +276,12 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
          "chain policy determines the fate of the packet."),
     _row("iptables-filter-default", _IPT, _IPT_TITLE, _IPT_RELEASE,
          "This is the default table (if no -t option is passed)."),
-    # The start of the next sentence: the rest wraps `locally-` across two
-    # lines in this rendering, so it is not quoted.
+    # Quoted up to the line wrap in `locally-` (review of #52/#53, F4:
+    # fetched twice more, verbatim); the rest of the sentence is not quoted.
     _row("iptables-filter-chains", _IPT, _IPT_TITLE, _IPT_RELEASE,
          "It contains the built-in chains INPUT (for packets destined to "
-         "local sockets), FORWARD (for packets being routed through the box)"),
+         "local sockets), FORWARD (for packets being routed through the box), "
+         "and OUTPUT (for locally-"),
     _row("iptables-append", _IPT, _IPT_TITLE, _IPT_RELEASE,
          "Append one or more rules to the end of the selected chain."),
     _row("iptables-policy", _IPT, _IPT_TITLE, _IPT_RELEASE,
@@ -389,7 +390,13 @@ PENDING: Dict[str, str] = {
         "a script is run by a shell against the rule set already loaded; no "
         "fetched first-party page states the rule set before the script, "
         "that its lines run in order, or any shell construct, so every "
-        "production records this row and no shell syntax is read"),
+        "production records this row and no shell syntax is read. Only the "
+        "filter table of iptables is read: iptables(8) says 'There are "
+        "currently five independent tables', and 'The security table is "
+        "called after the filter table'; rules in the security table, the "
+        "nat, mangle and raw tables, ip6tables and nftables on the same host "
+        "also decide a packet's fate and are not seen (review of #52/#53, "
+        "F5)"),
     "iptables-release-scope": (
         "the fetched page applies to iptables 1.8.13 only; the legacy and "
         "nft back ends and other releases are not cited, so the "

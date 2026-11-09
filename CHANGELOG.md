@@ -160,6 +160,10 @@ release scope and the save format are pending rows. Nothing reads the
 result: verdicts, exit codes and every output are unchanged. With
 `RULEHAWK_SHADOW=1`, an iptables file gets a `grammar` entry, and
 `would_pass` stays false.
+After the #53 review, every production lists the script scope, lexing and
+release scope under `pending`; the script-scope row says that only the filter
+table is read, and that the security, nat, mangle and raw tables, ip6tables
+and nftables are not seen; and the filter-chains row quotes OUTPUT too.
 
 ### No file is certified, so code scanning and MCP coverage say so (#42 phase 2)
 

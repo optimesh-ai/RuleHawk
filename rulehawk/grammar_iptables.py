@@ -22,7 +22,10 @@ the grammar reads, one command per line:
 No shell syntax is read: no shebang, comment, blank line, variable,
 quote, function, conditional, heredoc, `exit` or `;`. A script runs
 against the rule set already loaded, and `iptables-script-scope` is
-pending, so every production records it in `needs`. No `-I`, `-N`, `-F`,
+pending; so are `iptables-lexing` and `iptables-release-scope`, and every
+production records all three in `needs` (review of #52/#53, F1). Only the
+filter table is read: the security, nat, mangle and raw tables, ip6tables
+and nftables are not seen (F5). No `-I`, `-N`, `-F`,
 `-X`, `-D`, `-g`, `-m`, `-p` or `-f`, and no iptables-save format
 (`iptables-save-format` is pending).
 
@@ -50,7 +53,8 @@ _PRINTABLE = re.compile(r"[\x20-\x7e]*")
 MODE = "line"
 _CHAINS = ("INPUT", "FORWARD", "OUTPUT")
 _TARGETS = ("ACCEPT", "DROP")
-_NEEDS = ("iptables-script-scope",)
+# File-level rows every production rests on (review of #52/#53, F1).
+_NEEDS = ("iptables-lexing", "iptables-release-scope", "iptables-script-scope")
 _TABLE_ROWS = ("iptables-filter-default", "iptables-filter-chains")
 
 
