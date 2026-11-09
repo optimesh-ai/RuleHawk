@@ -139,10 +139,12 @@ rule is off at its line, and the predefined names `intrazone-default` and
 rules' fall-through, the meaning of `any`, the rule-type default and session
 semantics are pending rows, and every production lists the file-level rows
 (release scope, lexing, list semantics and those four) under `pending`; the
-Junos productions now list `junos-lexing` and `junos-evolved-scope` too. Rule
-order is cited from the unversioned "Security Policy Rules" page, and the
-one-line form from a knowledge-base article that sets several attributes on
-one line. A grammar that fails to load for any reason leaves a shadow run
+Junos productions now list `junos-lexing` and `junos-evolved-scope` too. The
+one-line form is cited from a knowledge-base article that sets several
+attributes on one line. Rule order (quoted from the unversioned "Security
+Policy Rules" page, which states evaluation order but not where a new rule
+lands) and the grammar's fixed token order stay pending, in every
+production's `needs`. A grammar that fails to load for any reason leaves a shadow run
 `file-uncertified` with a `grammar_unavailable` entry.
 
 ### iptables grammar, computed in shadow only (#42 phase 2)
@@ -172,9 +174,10 @@ write it makes: an attribute and a merge rule (`create`, `append-in-order`
 or `error`; none replaces or deletes, because no row cites that). The final
 model is the fold of every write in text order, and a second write to one
 (object, attribute) is `write-merge-uncited`. Ordered children rest on a
-cited order row (Junos term order, iptables append order, and PAN-OS rule
-order from the unversioned "Security Policy Rules" page); a PAN-OS file
-still holds one rule, since the default rules' fall-through is pending. Nothing reads the model: verdicts, exit codes and every output
+cited order row (Junos term order, iptables append order); PAN-OS rule order
+is not cited (the unversioned "Security Policy Rules" page states evaluation
+order, not where a new rule lands), so each PAN-OS rule records
+`panos-rule-order` under `pending`, and a PAN-OS file holds one rule. Nothing reads the model: verdicts, exit codes and every output
 are unchanged. With `RULEHAWK_SHADOW=1`, a file the grammar parses gets a
 `model` entry beside `grammar`, and `would_pass` stays false.
 
