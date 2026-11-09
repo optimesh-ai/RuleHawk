@@ -130,7 +130,7 @@ def _well_formed(sh):
     b = sh["boundary"]
     assert set(b) >= {"dialects", "cisco_veto", "reason"}, b
     assert b["reason"] in _BOUNDARY_REASONS | {None}, b   # review of #49, I3
-    if "grammar" in sh:                              # slice 4b, Junos only
+    if "grammar" in sh:                              # slices 4b and 4c
         gm = sh["grammar"]
         assert set(gm) == {"accepted", "reason", "line", "rows", "tags"}, gm
         assert isinstance(gm["accepted"], bool), gm
@@ -247,9 +247,12 @@ def test_control_gets_through_the_boundary(rel, shadow):
         b = sh["boundary"]
         assert b["dialects"] == [_THROUGH[rel]], sh
         assert b["cisco_veto"] == [] and b["reason"] is None, sh
-        # No grammar yet (slice 4): the first blocking reason is the absence
-        # of a certificate, never a boundary reason.
-        assert sh["blocking_reason"] == "file-uncertified", sh
+        # The first blocking reason is never a boundary reason: the absence
+        # of a certificate, or, for p10, the PAN-OS grammar (slice 4c) has no
+        # production for its quoted description.
+        want = ("line-not-allowlisted" if rel.startswith("cfg3/p10_")
+                else "file-uncertified")
+        assert sh["blocking_reason"] == want, sh
 
 
 @pytest.mark.parametrize("vendor", _CISCO_VENDORS)
@@ -306,9 +309,9 @@ def test_comments_only_file(tmp_path, shadow):
     ("version 15.2", "dialect-not-exclusive"),
     ("access-list 101 deny ip any any", "dialect-not-exclusive"),
     # These are not in the veto set (bare tokens never veto, v3 section
-    # 1.2). The Junos grammar (slice 4b) has no production for them; PAN-OS
-    # and iptables get theirs in slices 4c and 4d, so until then those files
-    # stay file-uncertified.
+    # 1.2). The Junos (slice 4b) and PAN-OS (slice 4c) grammars have no
+    # production for them; iptables gets its grammar in slice 4d, so until
+    # then that file stays file-uncertified.
     ("!", "grammar"),
     ("hostname x", "grammar"),
     ("end", "grammar"),
@@ -317,7 +320,7 @@ def test_comments_only_file(tmp_path, shadow):
                                  "controls/i00_base.sh"])
 def test_control_with_a_cisco_marker_line(rel, marker, reason, where, tmp_path, shadow):
     if reason == "grammar":
-        reason = ("line-not-allowlisted" if rel.endswith(".conf")
+        reason = ("line-not-allowlisted" if rel.endswith((".conf", ".set"))
                   else "file-uncertified")
     body = _read(rel)
     text = (marker + "\n" + body) if where == "prepend" else (body.rstrip("\n") + "\n" + marker + "\n")
@@ -460,13 +463,13 @@ def test_crlf_line_endings_alone_are_not_a_separator_finding(rel, tmp_path, shad
     """A CR directly before LF is a CRLF line end, not a lone CR: the
     boundary lets it through. The Junos grammar (slice 4b) reads LF only
     (v2 section 7: a CR anywhere is off until a per-dialect row is cited),
-    so k00 with CRLF ends is off at line 1; PAN-OS and iptables get their
-    grammars in slices 4c and 4d."""
+    so k00 with CRLF ends is off at line 1, and so does the PAN-OS grammar
+    (slice 4c) for p00; iptables gets its grammar in slice 4d."""
     text = _read(rel).replace("\n", "\r\n")
     _, sh = _gate_shadow(_write(tmp_path, os.path.basename(rel), text))
     _well_formed(sh)
     assert sh["boundary"]["reason"] is None, sh
-    if rel.endswith(".conf"):
+    if rel.endswith((".conf", ".set")):
         assert sh["blocking_reason"] == "line-not-allowlisted", sh
         assert sh["grammar"]["line"] == 1, sh
     else:

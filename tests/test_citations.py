@@ -38,9 +38,25 @@ _CITED = {
     "junos-term-name", "junos-from-statement", "junos-then-statement",
     "junos-accept-terminating", "junos-discard-term",
 }
+# slice 4c: the PAN-OS rows.
+_CITED |= {
+    "panos-rule-name", "panos-source-zone", "panos-destination-zone",
+    "panos-source-address", "panos-destination-address", "panos-application",
+    "panos-service-any", "panos-action", "panos-cli-create-rule",
+    "panos-set-from-any", "panos-set-to-any", "panos-set-source-any",
+    "panos-set-destination-any", "panos-set-application-any",
+    "panos-set-service-any", "panos-set-action-allow",
+}
 # v4 section 14 Junos rows not yet cited: keyword case has no first-party
 # statement found, and no fetched page states its rows for Junos OS Evolved.
-_PENDING = {"junos-lexing", "junos-evolved-scope"}
+_PENDING = {"junos-lexing", "junos-evolved-scope",
+            # slice 4c: rule order, the release scope, lexing and the set-CLI
+            # list semantics have no fetched first-party statement.
+            "panos-rule-order", "panos-release-scope", "panos-lexing",
+            "panos-list-semantics"}
+_FIRST_PARTY = ("https://www.juniper.net/documentation/",
+                "https://docs.paloaltonetworks.com/",
+                "https://knowledgebase.paloaltonetworks.com/")
 
 
 def _mod():
@@ -53,7 +69,7 @@ def test_every_cited_row_is_complete():
     assert set(c.ROWS) == _CITED
     for cid, row in c.ROWS.items():
         assert row.id == cid
-        assert row.url.startswith("https://www.juniper.net/documentation/"), row
+        assert row.url.startswith(_FIRST_PARTY), row
         assert row.title and row.release and row.quote, row
         assert row.fetched == "2026-11-09" and row.confirmed == "2026-11-09", row
         assert "\n" not in row.quote and "  " not in row.quote, row
