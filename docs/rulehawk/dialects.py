@@ -262,7 +262,7 @@ def boundary(raw: bytes, vendor: str = "auto") -> dict:
             "cisco_veto": veto, "reason": reason, "line": line}
 
 
-def shadow_block(raw: bytes, vendor: str = "auto") -> dict:
+def shadow_block(raw: bytes, vendor: str = "auto", policy: Optional[dict] = None) -> dict:
     """The shadow block for one file (v4 section 13). In this release no
     file is certified, so `would_pass` is false. The first blocking reason
     is the boundary's; then, for a file the boundary lets through as Junos,
@@ -271,7 +271,9 @@ def shadow_block(raw: bytes, vendor: str = "auto") -> dict:
     `write-merge-uncited`, in a `grammar` entry, or `file-uncertified` with
     a `grammar_unavailable` entry when the grammar cannot load); otherwise
     `file-uncertified`. A file the grammar parses also gets its final model
-    (slice 5) in a `model` entry."""
+    (slice 5) in a `model` entry and, with a policy, its zone placement
+    (slice 6) in a `placement` entry, with `blocking_reason_strict` for the
+    strict placement mode."""
     b = boundary(raw, vendor)
     block = {"boundary": b, "would_pass": False,
              "blocking_reason": b["reason"] or UNCERTIFIED}
@@ -296,4 +298,15 @@ def shadow_block(raw: bytes, vendor: str = "auto") -> dict:
         if model is not None:
             # Slice 5: the final model of a file the grammar parses.
             block["model"] = model
+            zones = policy.get("zones") if isinstance(policy, dict) else None
+            if isinstance(zones, dict):
+                # Slice 6: zone placement, both modes (v4 sections 10, 13).
+                from . import placement
+                pl = placement.assess(model, zones)
+                block["placement"] = pl
+                if gm["reason"] is None and pl["reason"]:
+                    block["blocking_reason"] = pl["reason"]
+                block["blocking_reason_strict"] = (
+                    block["blocking_reason"] if block["blocking_reason"] != UNCERTIFIED
+                    else pl["strict_reason"] or UNCERTIFIED)
     return block

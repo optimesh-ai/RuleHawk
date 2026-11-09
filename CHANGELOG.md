@@ -163,6 +163,20 @@ is not cited, so each PAN-OS rule records `panos-rule-order` under
 are unchanged. With `RULEHAWK_SHADOW=1`, a file the grammar parses gets a
 `model` entry beside `grammar`, and `would_pass` stays false.
 
+### Zone placement, computed in shadow only (#42 phase 2)
+
+With `RULEHAWK_SHADOW=1` and a policy, a file the grammar parses gets a
+`placement` entry read from its final model. Addressed Junos units are
+segments; a segment that overlaps two asserted zones is
+`zones-share-segment` (design rule (a)). A zone not contained in a segment
+of its own is unpinned: the entry then carries the placement assumption
+(`scope_assumptions`, `headline_assumptions`, row `zone-placement-assumed`),
+and `blocking_reason_strict` gives `zone-placement-unpinned` for the strict
+mode. Bridging, PAN-OS zones, static routes and `rule-type` have no grammar
+production, so files holding them do not parse. Nothing reads the result:
+verdicts, exit codes and every output are unchanged, `would_pass` stays
+false, and no `--strict-placement` option is added yet.
+
 ### No file is certified, so code scanning and MCP coverage say so (#42 phase 2)
 
 **Under the stopgap, every config gets a standing `rulehawk/uncertified`
