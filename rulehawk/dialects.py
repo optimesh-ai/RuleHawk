@@ -358,7 +358,21 @@ def _certificate(block: dict, raw: bytes, gm: dict, model: dict, dr: dict,
                "detail": "checker unavailable: " + type(e).__name__}
     block["certificate"] = {"config_sha256": rec["config_sha256"],
                             "blockers": rec["blockers"], "checker": chk}
-    if not chk.get("agrees"):
+    # Slice 7, second part: the checker's own evaluation of each assertion,
+    # from its own reading, beside the engine's (a separate field).
+    asserted = certificate.assertions(policy)
+    try:
+        import rulehawk_check
+        mine = rulehawk_check.evaluate(model.get("dialect"), raw, asserted)
+    except Exception:  # fail closed
+        mine = ["indeterminate" for _ in asserted]
+    engine = certificate.engine_reading(raw, model.get("dialect"), policy)
+    agree = len(mine) == len(engine) == len(asserted) and mine == engine
+    block["checker_verdict"] = {"agrees": agree, "assertions": [
+        {"assertion": a, "checker": c, "engine": e}
+        for a, c, e in zip(asserted, mine + ["indeterminate"] * len(asserted),
+                           engine + ["error"] * len(asserted))]}
+    if not chk.get("agrees") or not agree:
         for key in ("blocking_reason", "blocking_reason_strict"):
             if block.get(key) == UNCERTIFIED:
                 block[key] = CHECKER_DISAGREES

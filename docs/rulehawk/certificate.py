@@ -97,6 +97,54 @@ def build(raw: bytes, grammar: dict, model: dict, dual: Optional[dict],
     }
 
 
-def eligible(record: dict) -> bool:
-    """A record with any blocker cannot stand (none can, in this slice)."""
-    return not record.get("blockers")
+def eligible(record) -> bool:
+    """No record is eligible in this slice, whatever it holds (slice 7,
+    second part: `checker-verdict-deferred` is removed in a later, separate
+    step, and pending rows always block)."""
+    return False
+
+
+# The engine's reading of one assertion, in the checker's words (slice 7,
+# second part). The finding kinds are those `check_segmentation` writes.
+_WITNESS_KINDS = {"segmentation-violation": "witness",
+                  "segmentation-indeterminate": "indeterminate",
+                  "segmentation-unknown": "no-witness"}
+_REACH_KINDS = {"connectivity-broken": "hole",
+                "connectivity-indeterminate": "indeterminate",
+                "connectivity-unknown": "all-permitted"}
+_RANK = ("witness", "hole", "indeterminate", "error", "no-witness", "all-permitted")
+
+
+def engine_reading(raw: bytes, dialect: str, policy: Optional[dict]) -> List[str]:
+    """For each assertion (in `assertions` order), what the engine's own
+    reading says: the legacy parser and `check_segmentation`, run on that
+    assertion alone."""
+    from .segcheck import check_segmentation
+    if dialect == "junos":
+        from .parse_junos import parse_junos as legacy
+    elif dialect == "panos":
+        from .parse_panos import parse_panos as legacy
+    else:
+        from .parse_iptables import parse_iptables as legacy
+    out = []
+    if not isinstance(policy, dict):
+        return out
+    try:
+        aces, _ = legacy(raw.decode("utf-8"))
+    except Exception:
+        aces = None
+    for kind in _KINDS:
+        items = policy.get(kind)
+        for a in items if isinstance(items, list) else []:
+            if aces is None:
+                out.append("error")
+                continue
+            try:
+                found = check_segmentation(aces, {"zones": policy.get("zones"), kind: [a]})
+            except Exception:
+                out.append("error")
+                continue
+            table = _WITNESS_KINDS if kind == "must_not_reach" else _REACH_KINDS
+            words = [table.get(f.kind, "error") for f in found] or ["error"]
+            out.append(min(words, key=_RANK.index))
+    return out

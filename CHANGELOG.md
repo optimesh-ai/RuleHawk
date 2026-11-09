@@ -178,6 +178,25 @@ still holds one rule, since the default rules' fall-through is pending. Nothing 
 are unchanged. With `RULEHAWK_SHADOW=1`, a file the grammar parses gets a
 `model` entry beside `grammar`, and `would_pass` stays false.
 
+### The checker's own assertion evaluation, computed in shadow only (#42 phase 2)
+
+The independent checker now evaluates each policy assertion from its own
+reading of the raw bytes, never from the record:
+- it walks the bindings by its own per-role rules: a Junos `input` filter
+  on the unit that holds the source, the PAN-OS rulebase, the iptables
+  FORWARD chain;
+- it runs its own exact first-match search over the address space;
+- it applies only cited defaults: Junos implicit discard, or an iptables
+  chain policy.
+
+Its answer per assertion (`witness`, `no-witness`, `hole`,
+`all-permitted` or `indeterminate`) sits beside the engine's own reading
+in a separate shadow field, `checker_verdict`. A disagreement is
+`checker-disagrees`. No record can be eligible: `eligible()` is false for
+every input, `checker-verdict-deferred` stays on every record, and pending
+rows always block. Nothing reads the result: verdicts, exit codes and
+every output are unchanged, and `would_pass` stays false.
+
 ### Certificate record and independent checker, computed in shadow only (#42 phase 2)
 
 For each file the grammar parses, `rulehawk/certificate.py` builds a
