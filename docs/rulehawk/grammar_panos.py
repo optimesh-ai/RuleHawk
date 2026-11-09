@@ -5,17 +5,21 @@ design v2 sections 6-8, v3 sections 6.1, 7, 8 and 9.2, v4 sections 3 and
 A production exists only for a row cited in `citations.py`; each names the
 rows it rests on, and every one must resolve (a pending row cannot). What the
 grammar reads:
-- the set form only, and of it only whole security rules on one line, in
-  the order of the knowledge-base template (`panos-cli-create-rule`) with
-  `source` in the place the set-format article prints it
-  (`panos-set-source-any`):
+- the set form only, and of it only one whole security rule per file, on
+  one line. The create template (`panos-cli-create-rule`) has no `source`;
+  the set-format article sets `source` on a line of its own
+  (`panos-set-source-any`), and another article sets several attributes,
+  `source` among them, on one line in another order
+  (`panos-one-line-form`). Reading `source` after `to` is an inference
+  from those rows (review of #52/#53, F3):
   `set rulebase security rules NAME from any to any source ADDR
   destination ADDR application any service any action allow|deny`;
 - zones, application and service `any` only; an address `any` or one IPv4
   prefix; no object name, list, range, negation, log or profile setting;
 - rule names of letters, digits and hyphens, starting with a letter or
   digit, up to 63 characters (`panos-rule-name` states the length only, so
-  the set is narrowed), never a keyword;
+  the set is narrowed), never a keyword, and never `intrazone-default` or
+  `interzone-default` in any case (review of #52/#53, F2);
 - LF line ends only, printable ASCII only, no indentation, tokens separated
   by single spaces with no trailing space, keywords in their exact
   lowercase spelling. A quote, a `[ ]` list, a comment or a blank line is
@@ -23,12 +27,17 @@ grammar reads:
 - each rule name once: setting a rule again adds to its list attributes,
   and `panos-list-semantics` is pending (v3 section 6.1), so a second line
   for one name is `write-merge-uncited` (as in the Junos grammar, review of
-  #51, F1). `move`, `delete`, `rename`, `override` and `disabled` have no
-  production;
+  #51, F1); a second rule of another name is `line-not-allowlisted`: the
+  default rules' fall-through, the meaning of `any`, the rule-type default
+  and session semantics are pending, and order between rules is not read
+  (review of #52/#53, F2). `move`, `delete`, `rename`, `override` and
+  `disabled` have no production;
 - an address prefix with host bits set is off.
 
 The rule-name character set and the IPv4 prefix form are pending rows
-(review of #51, F4): each production lists them in `needs`, and the result
+(review of #51, F4), and so are the file-level rows (release scope,
+lexing, list semantics, default rules, `any`, rule type, sessions; review
+of #52/#53, F1, F2): each production lists them in `needs`, and the result
 under `pending`.
 
 Each line must match exactly one production: none is
@@ -36,8 +45,8 @@ Each line must match exactly one production: none is
 production names an object or a zone, so nothing can be `config-incomplete`
 yet (v3 section 9.2).
 
-Parsing a file is not a certificate: `panos-rule-order` and
-`panos-release-scope` are pending, and the certificate comes in slice 7.
+Parsing a file is not a certificate: `panos-rule-order` is cited from an
+unversioned page and `panos-release-scope` is pending, and the certificate comes in slice 7.
 """
 from __future__ import annotations
 
@@ -63,6 +72,8 @@ _COMMON = (
     "panos-application", "panos-set-application-any",
     "panos-service-any", "panos-set-service-any",
     "panos-action",
+    # review of #52/#53: the one-line form (F3) and rule order (F6)
+    "panos-one-line-form", "panos-rule-order",
 )
 
 
@@ -90,24 +101,30 @@ KEYWORDS: FrozenSet[str] = frozenset(
     s for slots, _ in _PRODUCTION_TABLE for s in slots if not s.isupper())
 
 CLASSES: Dict[str, Klass] = {
-    "RULENAME": Klass(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}", KEYWORDS),
+    # The predefined default rules' names are never a user rule's name
+    # (review of #52/#53, F2), in any case.
+    "RULENAME": Klass(r"(?!(?i:intrazone-default|interzone-default)$)"
+                      r"[A-Za-z0-9][A-Za-z0-9-]{0,62}", KEYWORDS),
     "V4PREFIX": Klass(_V4PREFIX, KEYWORDS),
 }
 
 _CLASS_NEEDS = {"RULENAME": "panos-rule-name-chars", "V4PREFIX": "panos-v4-prefix"}
 # Slice 5: a rule is appended to the rulebase in order; the order it is
-# evaluated in is not cited (`panos-rule-order` is pending), so every
-# production records it.
-_ORDER_NEEDS = ("panos-rule-order",)
+# evaluated in is cited (`panos-rule-order`, in every production's cites,
+# review of #52/#53, F6).
 _WRITE = ("rules", "append-in-order")
 # The model's values for a rule: the keyword before each value slot.
 _VALUE_KEYS = ("from", "to", "source", "destination", "application", "service",
                "action")
+# File-level rows every production rests on (review of #52/#53, F1, F2).
+_FILE_NEEDS = ("panos-release-scope", "panos-lexing", "panos-list-semantics",
+               "panos-default-rules", "panos-any-meaning", "panos-rule-type-default",
+               "panos-session-semantics")
 
 PRODUCTIONS: Tuple[Production, ...] = tuple(
     Production(MODE, slots, None, cites,
                tuple(sorted({_CLASS_NEEDS[s] for s in slots if s in _CLASS_NEEDS}
-                            | set(_ORDER_NEEDS))),
+                            | set(_FILE_NEEDS))),
                _WRITE)
     for slots, cites in _PRODUCTION_TABLE)
 
@@ -179,6 +196,7 @@ def parse_model(raw: bytes) -> Tuple[dict, Optional[dict]]:
     fold = Fold("panos")
     base = ("rulebase security",)
     fold.ensure(base)
+    first: Optional[str] = None
     for n, ln in enumerate(lines, 1):
         if not ln or not _PRINTABLE.fullmatch(ln):
             return off(LINE_NOT_ALLOWLISTED, n)
@@ -194,6 +212,12 @@ def parse_model(raw: bytes) -> Tuple[dict, Optional[dict]]:
         if any(s == "V4PREFIX" and _host_bits(t) for s, t in zip(p.slots, toks)):
             return off(LINE_NOT_ALLOWLISTED, n)
         name = toks[p.slots.index("RULENAME")]
+        if first is not None and name != first:
+            # One rule per file (review of #52/#53, F2): a second rule needs
+            # the default rules' fall-through and name case, uncited. The
+            # same name again goes to the fold: write-merge-uncited.
+            return off(LINE_NOT_ALLOWLISTED, n)
+        first = name
         values = {k: toks[i + 1] for i, k in enumerate(toks[:-1]) if k in _VALUE_KEYS
                   and i >= p.slots.index("RULENAME")}
         refused = fold.write(n, base, f"rules {name}", p.write[1], values)

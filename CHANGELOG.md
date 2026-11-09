@@ -133,6 +133,17 @@ reads the result: verdicts, exit codes and every output are unchanged. With
 stays false. The #51 review rules apply here too: a rule name written twice
 is `write-merge-uncited`, a prefix with host bits is off, and the rule-name
 character set and the prefix form are listed under `pending`.
+After the #52 review, the grammar reads one security rule per file: a second
+rule is off at its line, and the predefined names `intrazone-default` and
+`interzone-default` (in any case) are never a user rule's name. The default
+rules' fall-through, the meaning of `any`, the rule-type default and session
+semantics are pending rows, and every production lists the file-level rows
+(release scope, lexing, list semantics and those four) under `pending`; the
+Junos productions now list `junos-lexing` and `junos-evolved-scope` too. Rule
+order is cited from the unversioned "Security Policy Rules" page, and the
+one-line form from a knowledge-base article that sets several attributes on
+one line. A grammar that fails to load for any reason leaves a shadow run
+`file-uncertified` with a `grammar_unavailable` entry.
 
 ### iptables grammar, computed in shadow only (#42 phase 2)
 
@@ -149,6 +160,10 @@ release scope and the save format are pending rows. Nothing reads the
 result: verdicts, exit codes and every output are unchanged. With
 `RULEHAWK_SHADOW=1`, an iptables file gets a `grammar` entry, and
 `would_pass` stays false.
+After the #53 review, every production lists the script scope, lexing and
+release scope under `pending`; the script-scope row says that only the filter
+table is read, and that the security, nat, mangle and raw tables, ip6tables
+and nftables are not seen; and the filter-chains row quotes OUTPUT too.
 
 ### Final model and merge rules, computed in shadow only (#42 phase 2)
 
@@ -157,9 +172,9 @@ write it makes: an attribute and a merge rule (`create`, `append-in-order`
 or `error`; none replaces or deletes, because no row cites that). The final
 model is the fold of every write in text order, and a second write to one
 (object, attribute) is `write-merge-uncited`. Ordered children rest on a
-cited order row (Junos term order, iptables append order); PAN-OS rule order
-is not cited, so each PAN-OS rule records `panos-rule-order` under
-`pending`. Nothing reads the model: verdicts, exit codes and every output
+cited order row (Junos term order, iptables append order, and PAN-OS rule
+order from the unversioned "Security Policy Rules" page); a PAN-OS file
+still holds one rule, since the default rules' fall-through is pending. Nothing reads the model: verdicts, exit codes and every output
 are unchanged. With `RULEHAWK_SHADOW=1`, a file the grammar parses gets a
 `model` entry beside `grammar`, and `would_pass` stays false.
 

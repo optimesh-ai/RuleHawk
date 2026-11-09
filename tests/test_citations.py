@@ -48,6 +48,8 @@ _CITED |= {
     "panos-set-from-any", "panos-set-to-any", "panos-set-source-any",
     "panos-set-destination-any", "panos-set-application-any",
     "panos-set-service-any", "panos-set-action-allow",
+    # review of #52/#53, F3 and F6
+    "panos-one-line-form", "panos-rule-order",
 }
 # slice 4d: the iptables rows (iptables(8), 1.8.13).
 _CITED |= {
@@ -65,8 +67,10 @@ _PENDING = {"junos-lexing", "junos-evolved-scope",
             "junos-address-list-or",
             # slice 4c: rule order, the release scope, lexing and the set-CLI
             # list semantics have no fetched first-party statement.
-            "panos-rule-order", "panos-release-scope", "panos-lexing",
-            "panos-list-semantics",
+            "panos-release-scope", "panos-lexing", "panos-list-semantics",
+            # review of #52/#53, F2: what one rule's meaning still rests on
+            "panos-default-rules", "panos-any-meaning", "panos-rule-type-default",
+            "panos-session-semantics",
             # review of #51, F4, for PAN-OS: the name class and the prefix form
             "panos-rule-name-chars", "panos-v4-prefix",
             # slice 4d: iptables lexing, the script's scope, the release
