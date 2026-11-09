@@ -100,28 +100,28 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
     # come through a full Exa fetch, so the hierarchy is cited from prose.
     _row("junos-match-source-address", _MATCH_V4, _MATCH_V4_TITLE, _NO_RELEASE,
          "Match the IPv4 address of the source node sending the packet unless "
-         "the `except` option is included."),
+         "the except option is included."),
     _row("junos-interface-filter-hierarchy", _MATCH_V4, _MATCH_V4_TITLE, _NO_RELEASE,
-         "To assign a logical interface to an interface group `group-number`, "
-         "specify the `group-number` at the `[interfaces interface-name unit "
-         "number family family filter group]` hierarchy level."),
+         "To assign a logical interface to an interface group group-number, "
+         "specify the group-number at the [interfaces interface-name unit "
+         "number family family filter group] hierarchy level."),
     # The design's "Stateless Firewall Filter Components" page is not in the
     # current documentation (the juniper.net URL is not found, and the copy
     # on networkingdocs.hpe.com is the release-scoped Junos 12.3 set). This
     # current page states the same implicit discard.
     _row("junos-implicit-discard", _EVALUATE, _EVALUATE_TITLE, _NO_RELEASE,
-         "Every firewall filter configuration includes an implicit `discard` "
+         "Every firewall filter configuration includes an implicit discard "
          "action at the end of the filter."),
     _row("junos-discard-term", _EVALUATE, _EVALUATE_TITLE, _NO_RELEASE,
          "This implicit terminating action is equivalent to including the "
-         "following example term `t_explicit_discard` as the final term in the "
+         "following example term t_explicit_discard as the final term in the "
          "firewall filter: term t_explicit_discard { then discard; }"),
     _row("junos-accept-terminating", _EVALUATE, _EVALUATE_TITLE, _NO_RELEASE,
          "In this case, we recommend that you configure the firewall filter "
-         "with a final term that specifies the `accept` terminating action."),
+         "with a final term that specifies the accept terminating action."),
     _row("junos-comments", _JSON_MAP, _JSON_MAP_TITLE, _NO_RELEASE,
          "Comments are indicated using one of two delimiters: the paired "
-         "strings `/*` and `*/` enclosing the comment, or the `#` character "
+         "strings /* and */ enclosing the comment, or the # character "
          "preceding the comment."),
     _row("junos-config-indent", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
          "The CLI indents each level in the hierarchy to indicate each "
@@ -135,16 +135,16 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
     _row("junos-interface-family-hierarchy", _PROTO_FAMILY, _PROTO_FAMILY_TITLE,
          _NO_RELEASE,
          "To configure the protocol family, complete the minimum configuration "
-         "tasks under the `[edit interfaces interface-name unit "
-         "logical-unit-number family family]` hierarchy."),
-    # Verbatim, with the page's `interface` for `interfaces`.
+         "tasks under the [edit interfaces interface-name unit "
+         "logical-unit-number family family] hierarchy."),
+    # Verbatim, with the page's interface for interfaces.
     _row("junos-interface-address-inet", _PROTO_FAMILY, _PROTO_FAMILY_TITLE,
          _NO_RELEASE,
          "To configure an IP version 4 (IPv4) address on routers and switches, "
-         "use the `interface interface-name unit number family inet address "
-         "a.b.c.d/nn` statement at the `[edit interfaces]` hierarchy level."),
-    # Table 2, "Configuration Mode Top-Level Statements" (the `firewall`
-    # and `interfaces` rows).
+         "use the interface interface-name unit number family inet address "
+         "a.b.c.d/nn statement at the [edit interfaces] hierarchy level."),
+    # Table 2, "Configuration Mode Top-Level Statements" (the firewall
+    # and interfaces rows).
     _row("junos-top-firewall", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
          "Configure filters that select packets based on their contents."),
     _row("junos-top-interfaces", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
@@ -152,21 +152,21 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
          "virtual channel identifiers (VCIs), and data-link connection "
          "identifiers (DLCIs)."),
     _row("junos-firewall-family-inet", _GUIDELINES, _GUIDELINES_TITLE, _NO_RELEASE,
-         "`family inet`—To filter Internet Protocol version 4 (IPv4) traffic."),
+         "family inet—To filter Internet Protocol version 4 (IPv4) traffic."),
     _row("junos-filter-statement", _GUIDELINES, _GUIDELINES_TITLE, _NO_RELEASE,
-         "Under the `family family-name` statement, you can include `filter "
-         "filter-name` statements to create and name firewall filters."),
+         "Under the family family-name statement, you can include filter "
+         "filter-name statements to create and name firewall filters."),
     _row("junos-term-statement", _GUIDELINES, _GUIDELINES_TITLE, _NO_RELEASE,
-         "Under the `filter filter-name` statement, you can include `term "
-         "term-name` statements to create and name filter terms."),
+         "Under the filter filter-name statement, you can include term "
+         "term-name statements to create and name filter terms."),
     _row("junos-term-name", _GUIDELINES, _GUIDELINES_TITLE, _NO_RELEASE,
          "The term name can contain letters, numbers, and hyphens (-) and can "
          "be up to 64 characters long."),
     _row("junos-from-statement", _GUIDELINES, _GUIDELINES_TITLE, _NO_RELEASE,
          "With the exception of MPLS-tagged IPv4 or IPv6 traffic, you specify "
-         "the term’s match conditions under the `from` statement."),
+         "the term’s match conditions under the from statement."),
     _row("junos-then-statement", _GUIDELINES, _GUIDELINES_TITLE, _NO_RELEASE,
-         "Under the `then` statement for a firewall filter term, you can "
+         "Under the then statement for a firewall filter term, you can "
          "specify the actions to be taken on a packet that matches the term."),
 )}
 
