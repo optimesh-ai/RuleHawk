@@ -5,7 +5,9 @@ A grammar production may exist only for a row cited here. Each row is a
 verbatim quote from a first-party page, fetched in full and confirmed by a
 second fetch, with its URL, the page title, the release the page states
 (or that it states none) and the dates. Whitespace inside a quote is
-collapsed to single spaces; nothing else is changed.
+collapsed to single spaces, and the markdown backticks the fetch puts
+around code font are dropped (they are not page text); nothing else is
+changed.
 
 Rows of v4 section 14 that are not yet fetched and confirmed are in
 PENDING, with the reason. `resolve` refuses them, so no production can rest
@@ -65,13 +67,13 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
          "existing terminating action."),
     _row("junos-firewall-family-inet-equivalent", _GUIDELINES, _GUIDELINES_TITLE,
          _NO_RELEASE,
-         "because the `[edit firewall]` and `[edit firewall family inet]` "
+         "because the [edit firewall] and [edit firewall family inet] "
          "hierarchy levels are equivalent."),
     _row("junos-filter-name", _GUIDELINES, _GUIDELINES_TITLE, _NO_RELEASE,
          "The filter name can contain letters, numbers, and hyphens (-) and be "
          "up to 64 characters long."),
     _row("junos-match-destination-address", _MATCH_V4, _MATCH_V4_TITLE, _NO_RELEASE,
-         "Match the IPv4 destination address field unless the `except` option "
+         "Match the IPv4 destination address field unless the except option "
          "is included."),
     _row("junos-filter-input", _FILTER_UNIT, _FILTER_UNIT_TITLE, _SINCE_7_4,
          "Name of one filter to evaluate when packets are received on the "
