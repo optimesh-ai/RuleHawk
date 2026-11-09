@@ -178,6 +178,23 @@ still holds one rule, since the default rules' fall-through is pending. Nothing 
 are unchanged. With `RULEHAWK_SHADOW=1`, a file the grammar parses gets a
 `model` entry beside `grammar`, and `would_pass` stays false.
 
+### Legacy-parser dual read, computed in shadow only (#42 phase 2)
+
+`rulehawk/dualread.py` reads each file the grammar parses a second time
+with the existing dialect parser (`parse_junos`, `parse_panos`,
+`parse_iptables`), and compares the two readings of every access list:
+entries in order, grouped by the term, rule or line that made them, with
+action, protocol, addresses, ports, ICMP type and state flags. Any
+difference, a legacy parse note, or a legacy parser that fails is
+`reading-mismatch`, and that becomes the shadow blocking reason ahead of
+placement. Fields the legacy parser does not expose (Junos interface
+addresses and filter bindings, PAN-OS zones, application and service) are
+listed under `single` (`reading-single`); those files stay
+`file-uncertified`. The module imports no grammar module, and the dual read
+is an extra check, not independence. Nothing reads the result: verdicts,
+exit codes and every output are unchanged. With `RULEHAWK_SHADOW=1`, a
+parsed file gets a `dual_read` entry, and `would_pass` stays false.
+
 ### Zone placement, computed in shadow only (#42 phase 2)
 
 With `RULEHAWK_SHADOW=1` and a policy, a file the grammar parses gets a

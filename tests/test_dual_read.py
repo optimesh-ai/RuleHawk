@@ -20,6 +20,7 @@ alone, nothing changes with the switch unset, and `would_pass` stays false.
 from __future__ import annotations
 
 import ast
+import importlib
 import json
 import os
 import sys
@@ -90,6 +91,10 @@ def test_the_dual_read_module_imports_no_grammar_module():
         elif isinstance(node, ast.ImportFrom):
             mod = node.module or ""
             names |= {mod} | {f"{mod}.{a.name}" if mod else a.name for a in node.names}
+    # Modules named by string (importlib) count too.
+    names |= {n.value.lstrip(".") for n in ast.walk(tree)
+              if isinstance(n, ast.Constant) and isinstance(n.value, str)
+              and n.value.startswith(".")}
     flat = " ".join(sorted(names))
     for banned in ("grammar", "failclosed", "dialects", "placement", "boundary"):
         assert banned not in flat, (banned, names)
@@ -186,7 +191,7 @@ def test_a_legacy_parse_note_is_reading_mismatch(tmp_path, shadow):
 
 
 def test_a_different_action_is_reading_mismatch(monkeypatch, shadow):
-    from rulehawk import parse_panos
+    parse_panos = importlib.import_module("rulehawk.parse_panos")
     monkeypatch.setattr(parse_panos, "parse_panos",
                         lambda text: ([_ace(action="permit")], []))
     sh = _gate_shadow(_P00)
@@ -199,7 +204,7 @@ def test_a_different_action_is_reading_mismatch(monkeypatch, shadow):
     ("acl", "other"),
 ])
 def test_any_entry_field_that_differs_is_reading_mismatch(monkeypatch, shadow, field, value):
-    from rulehawk import parse_panos
+    parse_panos = importlib.import_module("rulehawk.parse_panos")
     monkeypatch.setattr(parse_panos, "parse_panos",
                         lambda text: ([_ace(**{field: value})], []))
     assert _gate_shadow(_P00)["dual_read"]["reason"] == "reading-mismatch"
@@ -208,26 +213,26 @@ def test_any_entry_field_that_differs_is_reading_mismatch(monkeypatch, shadow, f
 def test_the_unchanged_legacy_reading_agrees(monkeypatch, shadow):
     """The control for the mutations above: the same ACE as the legacy
     parser's agrees."""
-    from rulehawk import parse_panos
+    parse_panos = importlib.import_module("rulehawk.parse_panos")
     monkeypatch.setattr(parse_panos, "parse_panos", lambda text: ([_ace()], []))
     assert _gate_shadow(_P00)["dual_read"]["reason"] == "reading-single"
 
 
 def test_an_extra_legacy_entry_is_reading_mismatch(monkeypatch, shadow):
-    from rulehawk import parse_panos
+    parse_panos = importlib.import_module("rulehawk.parse_panos")
     monkeypatch.setattr(parse_panos, "parse_panos",
                         lambda text: ([_ace(), _ace(seq=2, line=2)], []))
     assert _gate_shadow(_P00)["dual_read"]["reason"] == "reading-mismatch"
 
 
 def test_a_missing_legacy_entry_is_reading_mismatch(monkeypatch, shadow):
-    from rulehawk import parse_panos
+    parse_panos = importlib.import_module("rulehawk.parse_panos")
     monkeypatch.setattr(parse_panos, "parse_panos", lambda text: ([], []))
     assert _gate_shadow(_P00)["dual_read"]["reason"] == "reading-mismatch"
 
 
 def test_order_is_compared(monkeypatch, shadow):
-    from rulehawk import parse_junos
+    parse_junos = importlib.import_module("rulehawk.parse_junos")
     real = parse_junos.parse_junos
     monkeypatch.setattr(parse_junos, "parse_junos",
                         lambda text: (list(reversed(real(text)[0])), []))
@@ -235,7 +240,7 @@ def test_order_is_compared(monkeypatch, shadow):
 
 
 def test_a_legacy_parser_that_fails_is_reading_mismatch(monkeypatch, shadow):
-    from rulehawk import parse_iptables
+    parse_iptables = importlib.import_module("rulehawk.parse_iptables")
 
     def boom(text):
         raise RuntimeError("boom")
@@ -248,7 +253,7 @@ def test_a_legacy_parser_that_fails_is_reading_mismatch(monkeypatch, shadow):
 def test_a_mismatch_comes_before_placement(monkeypatch, shadow):
     """With a policy, a reading-mismatch is the blocking reason in both
     modes, ahead of any placement reason."""
-    from rulehawk import parse_junos
+    parse_junos = importlib.import_module("rulehawk.parse_junos")
     monkeypatch.setattr(parse_junos, "parse_junos", lambda text: ([], []))
     sh = _gate_shadow(_K00)
     assert "placement" in sh, sh

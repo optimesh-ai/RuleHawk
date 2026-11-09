@@ -273,7 +273,10 @@ def shadow_block(raw: bytes, vendor: str = "auto", policy: Optional[dict] = None
     `file-uncertified`. A file the grammar parses also gets its final model
     (slice 5) in a `model` entry and, with a policy, its zone placement
     (slice 6) in a `placement` entry, with `blocking_reason_strict` for the
-    strict placement mode."""
+    strict placement mode. Before placement, the legacy-parser dual read
+    (`dual_read` entry): `reading-mismatch` is the blocking reason in both
+    modes; `reading-single` stays in the entry, and the file stays
+    `file-uncertified`."""
     b = boundary(raw, vendor)
     block = {"boundary": b, "would_pass": False,
              "blocking_reason": b["reason"] or UNCERTIFIED}
@@ -301,13 +304,20 @@ def shadow_block(raw: bytes, vendor: str = "auto", policy: Optional[dict] = None
         if model is not None:
             # Slice 5: the final model of a file the grammar parses.
             block["model"] = model
+            # The legacy-parser dual read (v2 section 2.2, v3 section 6.2,
+            # v4 section 5): a mismatch blocks, ahead of placement.
+            from . import dualread
+            dr = dualread.dual_read(raw, model)
+            block["dual_read"] = dr
+            if dr["reason"] == dualread.READING_MISMATCH:
+                block["blocking_reason"] = dr["reason"]
             zones = policy.get("zones") if isinstance(policy, dict) else None
             if isinstance(zones, dict):
                 # Slice 6: zone placement, both modes (v4 sections 10, 13).
                 from . import placement
                 pl = placement.assess(model, zones)
                 block["placement"] = pl
-                if gm["reason"] is None and pl["reason"]:
+                if block["blocking_reason"] == UNCERTIFIED and pl["reason"]:
                     block["blocking_reason"] = pl["reason"]
                 block["blocking_reason_strict"] = (
                     block["blocking_reason"] if block["blocking_reason"] != UNCERTIFIED
