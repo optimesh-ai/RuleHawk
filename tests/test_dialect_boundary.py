@@ -132,9 +132,10 @@ def _well_formed(sh):
     assert b["reason"] in _BOUNDARY_REASONS | {None}, b   # review of #49, I3
     if "grammar" in sh:                              # slice 4b, Junos only
         gm = sh["grammar"]
-        assert set(gm) == {"accepted", "reason", "line", "rows", "tags"}, gm
-        assert isinstance(gm["accepted"], bool), gm
-        assert gm["accepted"] == (gm["reason"] is None), gm
+        # review of #51, F5: `parses`, not the verdict word `accepted`.
+        assert set(gm) == {"parses", "reason", "line", "rows", "tags", "pending"}, gm
+        assert isinstance(gm["parses"], bool), gm
+        assert gm["parses"] == (gm["reason"] is None), gm
     else:
         assert sh["blocking_reason"] not in ("parse-ambiguous", "config-incomplete"), sh
     return sh

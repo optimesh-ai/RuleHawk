@@ -37,10 +37,15 @@ _CITED = {
     "junos-firewall-family-inet", "junos-filter-statement", "junos-term-statement",
     "junos-term-name", "junos-from-statement", "junos-then-statement",
     "junos-accept-terminating", "junos-discard-term",
+    # review of #51, F4: the Statement cells of Table 2
+    "junos-top-statements", "junos-top-firewall-keyword", "junos-top-interfaces-keyword",
 }
 # v4 section 14 Junos rows not yet cited: keyword case has no first-party
 # statement found, and no fetched page states its rows for Junos OS Evolved.
-_PENDING = {"junos-lexing", "junos-evolved-scope"}
+_PENDING = {"junos-lexing", "junos-evolved-scope",
+            # review of #51, F4: name classes and the address-list meaning
+            "junos-unit-number", "junos-interface-name", "junos-v4-prefix",
+            "junos-address-list-or"}
 
 
 def _mod():
