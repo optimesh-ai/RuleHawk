@@ -489,3 +489,39 @@ def test_tab_in_an_interface_line_is_pinned_with_k14(tmp_path, shadow):
     _well_formed(sh)
     assert sh["boundary"]["cisco_veto"] == [], sh
     assert sh["blocking_reason"] == "file-uncertified", sh
+
+
+# ------------------------------------------------- review of #49 round 2 (N1, N2)
+
+@pytest.mark.parametrize("lines", [
+    # N1: alternating quotes leave a single-quoted string open across lines
+    # with an even count of each quote on every line.
+    ["x=\"'\"'", "iptables -A FORWARD -j ACCEPT", "'\"'\""],
+    # N1: a heredoc body is never executed.
+    ["cat >/dev/null <<'EOF'", "iptables -A FORWARD -j ACCEPT", "EOF"],
+    ["cat >/dev/null <<EOF", "iptables -A FORWARD -j ACCEPT", "EOF"],
+    ["cat >/dev/null <<-EOF", "iptables -A FORWARD -j ACCEPT", "EOF"],
+    # Info: a backslash line continuation joins two lines into one command.
+    ["iptables -A FORWARD \\", "-j ACCEPT"],
+], ids=["alternating-quotes", "heredoc-quoted", "heredoc", "heredoc-dash",
+        "continuation"])
+def test_a_shell_region_that_hides_lines_is_off(lines, tmp_path, shadow):
+    text = _read("controls/i00_base.sh") + "\n".join(lines) + "\n"
+    _, sh = _gate_shadow(_write(tmp_path, "i.sh", text))
+    _well_formed(sh)
+    assert sh["blocking_reason"] == "line-not-allowlisted", sh
+
+
+@pytest.mark.parametrize("prompt", ["--More-- ", " --More-- \b\b\b ", "<--- More ---> ",
+                                    "---(more 45%)--- "])
+@pytest.mark.parametrize("rel", ["controls/k00_base.conf", "controls/p00_base.set",
+                                 "controls/i00_base.sh"])
+def test_a_pager_prompt_line_is_off(rel, prompt, tmp_path, shadow):
+    """N2: the parsers strip a pager prompt at line start and the veto does
+    not, so a prompt can hide a line's start from the veto. Any raw line the
+    pager pattern matches is off, in every dialect."""
+    body = _read(rel).rstrip("\n").split("\n")
+    text = "\n".join(body[:-1] + [prompt + body[-1]]) + "\n"
+    _, sh = _gate_shadow(_write(tmp_path, os.path.basename(rel), text))
+    _well_formed(sh)
+    assert sh["blocking_reason"] == "line-not-allowlisted", sh
