@@ -51,7 +51,9 @@ _REASONS = {"dialect-not-exclusive", "dialect-undetected", "line-not-allowlisted
             # (v2 section 2.1, v3)
             "write-merge-uncited",
             # slice 6, zone placement (v3 section 5.1, v4 section 10)
-            "zones-share-segment", "zone-placement-unpinned"}
+            "zones-share-segment", "zone-placement-unpinned",
+            # the dual read (v2 section 2.2, v3 section 6.2, v4 section 5)
+            "reading-mismatch"}
 _BOUNDARY_REASONS = {"dialect-not-exclusive", "dialect-undetected",
                      "line-not-allowlisted", "file-uncertified"}
 
@@ -146,6 +148,12 @@ def _well_formed(sh):
     if "model" in sh:                                # slice 5: parsed files only
         assert sh["grammar"]["parses"] is True, sh
         assert set(sh["model"]) == {"dialect", "objects"}, sh
+    if "dual_read" in sh:                            # the dual read: parsed files
+        assert "model" in sh, sh
+        assert set(sh["dual_read"]) == {"reason", "compared", "single", "mismatch"}, sh
+        assert sh["dual_read"]["reason"] in ("reading-mismatch", "reading-single", None), sh
+    elif "model" in sh:
+        assert False, ("a parsed file without a dual read", sh)
     if "placement" in sh:                            # slice 6: with a policy
         assert "model" in sh, sh
         assert sh["blocking_reason_strict"] in _REASONS, sh
