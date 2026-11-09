@@ -312,7 +312,11 @@ def shadow_block(raw: bytes, vendor: str = "auto", policy: Optional[dict] = None
             # The legacy-parser dual read (v2 section 2.2, v3 section 6.2,
             # v4 section 5): a mismatch blocks, ahead of placement.
             from . import dualread
-            dr = dualread.dual_read(raw, model)
+            try:
+                dr = dualread.dual_read(raw, model)
+            except Exception as e:  # fail closed (review of #52-#57, G8)
+                dr = {"reason": dualread.READING_MISMATCH, "compared": [], "single": [],
+                      "mismatch": f"dual read failed: {type(e).__name__}"}
             block["dual_read"] = dr
             if dr["reason"] == dualread.READING_MISMATCH:
                 block["blocking_reason"] = dr["reason"]
@@ -320,7 +324,10 @@ def shadow_block(raw: bytes, vendor: str = "auto", policy: Optional[dict] = None
             if isinstance(zones, dict):
                 # Slice 6: zone placement, both modes (v4 sections 10, 13).
                 from . import placement
-                pl = placement.assess(model, zones)
+                try:
+                    pl = placement.assess(model, zones)
+                except Exception as e:  # fail closed (review of #52-#57, G8)
+                    pl = placement.unavailable(e)
                 block["placement"] = pl
                 if block["blocking_reason"] == UNCERTIFIED and pl["reason"]:
                     block["blocking_reason"] = pl["reason"]
