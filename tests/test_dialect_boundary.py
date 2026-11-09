@@ -44,7 +44,11 @@ _CISCO_VENDORS = ("ios-asa", "nxos", "eos")
 # Reasons a shadow block may give in this slice (names from the design:
 # v3 section 1.1/1.2 and v2 section 7). Nothing else.
 _REASONS = {"dialect-not-exclusive", "dialect-undetected", "line-not-allowlisted",
-            "file-uncertified"}
+            "file-uncertified",
+            # slice 4b, the Junos grammar (v3 sections 8 and 9.2)
+            "parse-ambiguous", "config-incomplete"}
+_BOUNDARY_REASONS = {"dialect-not-exclusive", "dialect-undetected",
+                     "line-not-allowlisted", "file-uncertified"}
 
 # The Cisco-family attack files of cfg/ and cfg2/ (the B boundary set of the
 # attack file, minus the four cfg3 files listed on their own below).
@@ -64,9 +68,8 @@ _POLYGLOTS = {
     # k14's IOS lines are `hostname r1`, `banner motd ^` and interfaces with a
     # space in the name: bare tokens, which never veto (v3 section 1.2). Its
     # only detected dialect is Junos, so the boundary lets it through, and
-    # slice 4's Junos grammar rejects those lines. Pinned so that slice 4
-    # must move it to line-not-allowlisted.
-    "cfg3/k14_ios_banner_holds_junos.cfg": "file-uncertified",
+    # slice 4b's Junos grammar has no production for `hostname r1`.
+    "cfg3/k14_ios_banner_holds_junos.cfg": "line-not-allowlisted",
 }
 # The dialect each polyglot is detected as: a vendor value naming another
 # non-Cisco dialect leaves no dialect to certify.
@@ -126,7 +129,14 @@ def _well_formed(sh):
     assert sh["blocking_reason"] in _REASONS, sh
     b = sh["boundary"]
     assert set(b) >= {"dialects", "cisco_veto", "reason"}, b
-    assert b["reason"] in _REASONS | {None}, b       # review of #49, I3
+    assert b["reason"] in _BOUNDARY_REASONS | {None}, b   # review of #49, I3
+    if "grammar" in sh:                              # slice 4b, Junos only
+        gm = sh["grammar"]
+        assert set(gm) == {"accepted", "reason", "line", "rows", "tags"}, gm
+        assert isinstance(gm["accepted"], bool), gm
+        assert gm["accepted"] == (gm["reason"] is None), gm
+    else:
+        assert sh["blocking_reason"] not in ("parse-ambiguous", "config-incomplete"), sh
     return sh
 
 
@@ -296,15 +306,19 @@ def test_comments_only_file(tmp_path, shadow):
     ("version 15.2", "dialect-not-exclusive"),
     ("access-list 101 deny ip any any", "dialect-not-exclusive"),
     # These are not in the veto set (bare tokens never veto, v3 section
-    # 1.2); in this slice the file still has no certificate, and slice 4's
-    # grammar rejects the line.
-    ("!", "file-uncertified"),
-    ("hostname x", "file-uncertified"),
-    ("end", "file-uncertified"),
+    # 1.2). The Junos grammar (slice 4b) has no production for them; PAN-OS
+    # and iptables get theirs in slices 4c and 4d, so until then those files
+    # stay file-uncertified.
+    ("!", "grammar"),
+    ("hostname x", "grammar"),
+    ("end", "grammar"),
 ])
 @pytest.mark.parametrize("rel", ["controls/k00_base.conf", "controls/p00_base.set",
                                  "controls/i00_base.sh"])
 def test_control_with_a_cisco_marker_line(rel, marker, reason, where, tmp_path, shadow):
+    if reason == "grammar":
+        reason = ("line-not-allowlisted" if rel.endswith(".conf")
+                  else "file-uncertified")
     body = _read(rel)
     text = (marker + "\n" + body) if where == "prepend" else (body.rstrip("\n") + "\n" + marker + "\n")
     _, sh = _gate_shadow(_write(tmp_path, os.path.basename(rel), text))
@@ -443,11 +457,20 @@ def test_a_line_separator_other_than_lf_is_off(rel, sep, tmp_path, shadow):
 @pytest.mark.parametrize("rel", ["controls/k00_base.conf", "controls/p00_base.set",
                                  "controls/i00_base.sh"])
 def test_crlf_line_endings_alone_are_not_a_separator_finding(rel, tmp_path, shadow):
-    """A CR directly before LF is a CRLF line end, not a lone CR."""
+    """A CR directly before LF is a CRLF line end, not a lone CR: the
+    boundary lets it through. The Junos grammar (slice 4b) reads LF only
+    (v2 section 7: a CR anywhere is off until a per-dialect row is cited),
+    so k00 with CRLF ends is off at line 1; PAN-OS and iptables get their
+    grammars in slices 4c and 4d."""
     text = _read(rel).replace("\n", "\r\n")
     _, sh = _gate_shadow(_write(tmp_path, os.path.basename(rel), text))
     _well_formed(sh)
-    assert sh["blocking_reason"] == "file-uncertified", sh
+    assert sh["boundary"]["reason"] is None, sh
+    if rel.endswith(".conf"):
+        assert sh["blocking_reason"] == "line-not-allowlisted", sh
+        assert sh["grammar"]["line"] == 1, sh
+    else:
+        assert sh["blocking_reason"] == "file-uncertified", sh
 
 
 # F4: in a shell script, a # after ; & | ( ) starts a comment.
@@ -482,13 +505,14 @@ def test_a_shell_hash_at_line_start_or_in_a_closed_quote_is_not_off(line, tmp_pa
 
 def test_tab_in_an_interface_line_is_pinned_with_k14(tmp_path, shadow):
     """I1: `interface<TAB>Gi0/1` is a bare token to the veto (v3 section 1.2),
-    like k14's spaced names. Pinned at file-uncertified so that slice 4's
-    grammar must move it."""
+    like k14's spaced names. The Junos grammar (slice 4b) reads single spaces
+    between tokens only, so the line is off."""
     text = _read("controls/k00_base.conf") + "interface\tGi0/1\n"
     _, sh = _gate_shadow(_write(tmp_path, "k.conf", text))
     _well_formed(sh)
     assert sh["boundary"]["cisco_veto"] == [], sh
-    assert sh["blocking_reason"] == "file-uncertified", sh
+    assert sh["blocking_reason"] == "line-not-allowlisted", sh
+    assert sh["grammar"]["line"] == 16, sh
 
 
 # ------------------------------------------------- review of #49 round 2 (N1, N2)
