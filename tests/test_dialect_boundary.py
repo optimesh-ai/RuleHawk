@@ -53,7 +53,9 @@ _REASONS = {"dialect-not-exclusive", "dialect-undetected", "line-not-allowlisted
             # slice 6, zone placement (v3 section 5.1, v4 section 10)
             "zones-share-segment", "zone-placement-unpinned",
             # the dual read (v2 section 2.2, v3 section 6.2, v4 section 5)
-            "reading-mismatch"}
+            "reading-mismatch",
+            # slice 7: the independent checker (v2 section 1.3)
+            "checker-disagrees"}
 _BOUNDARY_REASONS = {"dialect-not-exclusive", "dialect-undetected",
                      "line-not-allowlisted", "file-uncertified"}
 
@@ -154,6 +156,10 @@ def _well_formed(sh):
         assert sh["dual_read"]["reason"] in ("reading-mismatch", "reading-single", None), sh
     elif "model" in sh:
         assert False, ("a parsed file without a dual read", sh)
+    if "certificate" in sh:                          # slice 7: parsed files
+        assert "model" in sh, sh
+        assert set(sh["certificate"]) == {"config_sha256", "blockers", "checker"}, sh
+        assert "checker-verdict-deferred" in sh["certificate"]["blockers"], sh
     if "placement" in sh:                            # slice 6: with a policy
         assert "model" in sh, sh
         assert sh["blocking_reason_strict"] in _REASONS, sh
