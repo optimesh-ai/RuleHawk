@@ -1,20 +1,28 @@
 """The dialect boundary for the PASS allowlist (#42 design v3 section 1.2,
 v4 sections 1 and 8 L1). Shadow only: nothing here changes a verdict.
 
-A file can be certified only if, on its raw lines:
-- exactly one non-Cisco dialect with a phase-2 grammar is detected (Junos,
-  PAN-OS or iptables), with every detector run and counted, never first-match;
+A file clears the boundary only if, on its raw lines:
+- exactly one non-Cisco dialect is detected, with every detector run and
+  counted, never first-match, and the vendor value (read through the gate's
+  aliases) does not name another one. Junos, PAN-OS and iptables have a
+  phase-2 grammar; an AWS security-group file clears the boundary but stays
+  `file-uncertified` until a grammar lands for it (v3 section 1.2, item 1);
 - no Cisco-family detector fires: the line-anchored markers below, the NX-OS
   and EOS detectors, the IOS/ASA fallback finding a rule, the IOS interface
   and binding forms, or a broad Cisco shape inside a comment body;
+- no line holds a line separator other than LF (a CR right before LF is a
+  line end), no line holds a backslash together with a quote, and in
+  iptables no `#` stands anywhere but at line start or inside a quote that
+  closes on its line (review of #49, F1, F3, F4);
 - no comment or quoted string spans lines.
 
 Anything else is UNKNOWN with the design's reason: `dialect-not-exclusive`
 when a Cisco form fired (or a Cisco vendor value was given),
 `dialect-undetected` when no single non-Cisco dialect is left, and
-`line-not-allowlisted` for a region that spans lines. A file that clears the
-boundary still has no certificate in this release (`file-uncertified`): the
-grammars come in slice 4. Every rule here narrows; none needs a citation.
+`line-not-allowlisted` for a line the rules above put off. A file that
+clears the boundary still has no certificate in this release
+(`file-uncertified`): the grammars come in slice 4. Every rule here narrows;
+none needs a citation.
 
 The result goes only into a `shadow` block, and only when the environment
 variable RULEHAWK_SHADOW is exactly "1" (v4 section 13). The block never
@@ -148,13 +156,14 @@ def detect_dialects(text: str) -> List[str]:
 
 
 def _comment_bodies(line: str) -> List[str]:
-    """The comment bodies on one raw line: the text after a `#` that starts a
-    word, and the text between a same-line `/*` and `*/`. Over-reading here
+    """The comment bodies on one raw line: the text after a `#` at line start
+    or after whitespace or a shell metacharacter (`;`, `&`, `|`, `(`, `)`;
+    review of #49, F4), and the text between a same-line `/*` and `*/`. Over-reading here
     only blocks more: a comment carries no meaning."""
     out = []
     for m in re.finditer(r"/\*(.*?)\*/", line):
         out.append(m.group(1))
-    m = re.search(r"(?:^|\s)#(.*)$", line)
+    m = re.search(r"(?:^|[\s;&|()])#(.*)$", line)
     if m:
         out.append(m.group(1))
     return out
@@ -178,10 +187,32 @@ def cisco_veto(lines: List[str]) -> List[dict]:
     return hits
 
 
-def _spanning_region(lines: List[str], dialect: str) -> Optional[int]:
-    """The first raw line where a comment or quoted string does not close on
-    the line it opens (v4 section 1, item 1), or None."""
+# Line separators other than LF that str.splitlines() honours, so that every
+# parser splits there and the veto does not (review of #49, F3). A CR right
+# before LF is a CRLF line end, and is not counted here.
+_OTHER_SEPARATORS = re.compile("[\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
+def _off_line(lines: List[str], dialect: str) -> Optional[int]:
+    """The first raw line that is off the allowlist before any grammar reads
+    it, or None:
+    - a line separator other than LF (review of #49, F3);
+    - a backslash on a line that holds a quote: an escaped quote can carry a
+      string across lines with an even quote count on every line (F1);
+    - in iptables, a `#` that is not at line start (after optional
+      whitespace) and not inside a quote that closes on the line (F4);
+    - a comment or quoted string that does not close on the line it opens
+      (v4 section 1, item 1)."""
     for n, ln in enumerate(lines, 1):
+        body = ln[:-1] if ln.endswith("\r") else ln
+        if _OTHER_SEPARATORS.search(body):
+            return n
+        if "\\" in ln and ('"' in ln or "'" in ln):
+            return n
+        if dialect == "iptables":
+            unquoted = re.sub(r"\"[^\"]*\"|'[^']*'", "", ln)
+            if "#" in unquoted and not re.match(r"^\s*#", unquoted):
+                return n
         if dialect == "junos":
             rest = re.sub(r"/\*.*?\*/", "", ln)
             if "/*" in rest or "*/" in rest:
@@ -209,8 +240,8 @@ def boundary(raw: bytes, vendor: str = "auto") -> dict:
         tried = [d for d in dialects if vendor in ("auto", d)]
         if len(dialects) != 1 or len(tried) != 1:
             reason = UNDETECTED
-        elif tried[0] in GRAMMAR_DIALECTS:
-            line = _spanning_region(lines, tried[0])
+        else:
+            line = _off_line(lines, tried[0])
             if line is not None:
                 reason = LINE_NOT_ALLOWLISTED
     return {"dialects": dialects, "detectors_fired": len(dialects),

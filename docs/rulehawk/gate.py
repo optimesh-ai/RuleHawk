@@ -729,8 +729,12 @@ def to_json(gate: GateResult) -> str:
     if dialects.shadow_on():
         # #42 slice 3: the boundary result per file, only under
         # RULEHAWK_SHADOW=1; without it the JSON is unchanged.
+        # The vendor value read through the gate's aliases, as _pick_parser
+        # reads it (`ios`, `cisco`, `juniper`...; review of #49, F2).
+        asked = gate.vendor if gate.vendor == "auto" else \
+            _VENDORS.get(gate.vendor.lower(), gate.vendor)
         for entry, fr in zip(d["files"], gate.files):
-            entry["shadow"] = dialects.shadow_block(fr.raw or b"", gate.vendor)
+            entry["shadow"] = dialects.shadow_block(fr.raw or b"", asked)
     return json.dumps(d, indent=2)
 
 
