@@ -154,7 +154,7 @@ def test_p00_parses_but_would_pass_stays_false(shadow):
 def test_every_address_and_action_form_parses(src, dst, action):
     line = (f"set rulebase security rules r-1 from any to any source {src} "
             f"destination {dst} application any service any action {action}\n")
-    assert _parse(line + line.replace("r-1", "r-2"))["parses"] is True
+    assert _parse(line)["parses"] is True
 
 
 # ------------------------------------------------- per-production meaning examples
@@ -205,11 +205,11 @@ _LINE = _read(_P00).rstrip("\n")
 ])
 def test_a_mutation_is_off_at_its_line(old, new):
     assert old in _LINE, old
-    text = "set rulebase security rules z from any to any source any destination any " \
-           "application any service any action allow\n" + _LINE.replace(old, new, 1) + "\n"
-    r = _parse(text)
+    # review of #52/#53, F2: a file holds one rule, so the mutated rule is
+    # the only line.
+    r = _parse(_LINE.replace(old, new, 1) + "\n")
     assert r["parses"] is False and r["reason"] == "line-not-allowlisted", (new, r)
-    assert r["line"] == 2, (new, r)
+    assert r["line"] == 1, (new, r)
 
 
 @pytest.mark.parametrize("extra", [
@@ -249,21 +249,70 @@ def test_a_rule_name_twice_is_off_even_when_identical():
     assert r["reason"] == "write-merge-uncited" and r["line"] == 2, r
 
 
+_FILE_ROWS = {"panos-release-scope", "panos-lexing", "panos-list-semantics",
+              "panos-default-rules", "panos-any-meaning", "panos-rule-type-default",
+              "panos-session-semantics"}
+
+
 def test_every_production_records_its_pending_rows():
-    """Review of #51, F4: the rule-name character set and the IPv4 prefix
-    form are not cited; the productions record them as needs."""
+    """Review of #51, F4, and of #52/#53, F1 and F2: the rule-name character
+    set, the IPv4 prefix form and every file-level row are pending; each
+    production records them as needs."""
     gm = _gm()
     from rulehawk import citations
     for p in gm.PRODUCTIONS:
-        want = {"panos-rule-name-chars"}
+        want = {"panos-rule-name-chars"} | _FILE_ROWS
         if "V4PREFIX" in p.slots:
             want.add("panos-v4-prefix")
         assert set(p.needs) == want, p
         assert set(p.needs) <= set(citations.PENDING), p
 
 
+def test_every_production_cites_rule_order_and_the_one_line_form():
+    """Review of #52/#53, F3 and F6: the one-line form rests on the KB
+    article's one-line `set ... action allow source ...`, and rule order on
+    the Security Policy Rules page."""
+    for p in _gm().PRODUCTIONS:
+        assert {"panos-one-line-form", "panos-rule-order"} <= set(p.cites), p
+
+
 def test_p00_lists_its_pending_rows():
-    assert _parse(_read(_P00))["pending"] == ["panos-rule-name-chars", "panos-v4-prefix"]
+    assert _parse(_read(_P00))["pending"] == sorted(
+        {"panos-rule-name-chars", "panos-v4-prefix"} | _FILE_ROWS)
+
+
+def test_a_second_rule_is_off():
+    """Review of #52/#53, F2: two rules need rule order and the default
+    rules' fall-through; a file holds one rule."""
+    other = _LINE.replace("rules d ", "rules e ")
+    r = _parse(_LINE + "\n" + other + "\n")
+    assert r["reason"] == "line-not-allowlisted" and r["line"] == 2, r
+
+
+@pytest.mark.parametrize("name", ["D", "Rule1"])
+def test_names_that_differ_only_in_case_are_off(name):
+    first = _LINE.replace("rules d ", f"rules {name.lower()} ")
+    second = _LINE.replace("rules d ", f"rules {name} ")
+    r = _parse(first + "\n" + second + "\n")
+    assert r["parses"] is False and r["line"] == 2, r
+
+
+@pytest.mark.parametrize("name", ["intrazone-default", "interzone-default",
+                                  "Intrazone-Default", "INTERZONE-DEFAULT"])
+def test_a_default_rule_name_is_off(name):
+    r = _parse(_LINE.replace("rules d ", f"rules {name} ") + "\n")
+    assert r["reason"] == "line-not-allowlisted" and r["line"] == 1, r
+
+
+def test_any_import_error_fails_a_shadow_run_closed(monkeypatch, shadow):
+    """Review of #52/#53, F9: not only a pending row."""
+    import rulehawk
+    monkeypatch.setitem(sys.modules, "rulehawk.grammar_panos", None)
+    monkeypatch.delattr(rulehawk, "grammar_panos", raising=False)
+    sh = _gate_shadow(_P00)
+    assert sh["blocking_reason"] == "file-uncertified", sh
+    assert "grammar" not in sh and sh["grammar_unavailable"], sh
+    assert sh["would_pass"] is False, sh
 
 
 def test_a_pending_panos_row_fails_a_shadow_run_closed(monkeypatch, shadow):
@@ -294,7 +343,7 @@ _OFF = {
     "cfg/p01_panos_object_named_like_literal.set": 1,
     "cfg3/p02_panos_rule_type_interzone_deny.set": 1,
     "cfg3/p03_panos_same_zone_two_segments.set": 1,
-    "cfg3/p04_panos_move_rule_top.set": 3,
+    "cfg3/p04_panos_move_rule_top.set": 2,     # a second rule (review F2)
     "cfg3/p05_panos_vsys_split_rulebase.set": 1,
     "cfg3/p06_panos_shared_object_shadowed.set": 1,
     "cfg3/p07_panos_ip_range_partial.set": 1,

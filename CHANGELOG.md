@@ -133,6 +133,17 @@ reads the result: verdicts, exit codes and every output are unchanged. With
 stays false. The #51 review rules apply here too: a rule name written twice
 is `write-merge-uncited`, a prefix with host bits is off, and the rule-name
 character set and the prefix form are listed under `pending`.
+After the #52 review, the grammar reads one security rule per file: a second
+rule is off at its line, and the predefined names `intrazone-default` and
+`interzone-default` (in any case) are never a user rule's name. The default
+rules' fall-through, the meaning of `any`, the rule-type default and session
+semantics are pending rows, and every production lists the file-level rows
+(release scope, lexing, list semantics and those four) under `pending`; the
+Junos productions now list `junos-lexing` and `junos-evolved-scope` too. Rule
+order is cited from the unversioned "Security Policy Rules" page, and the
+one-line form from a knowledge-base article that sets several attributes on
+one line. A grammar that fails to load for any reason leaves a shadow run
+`file-uncertified` with a `grammar_unavailable` entry.
 
 ### iptables grammar, computed in shadow only (#42 phase 2)
 
