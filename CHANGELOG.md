@@ -195,6 +195,13 @@ production, so files holding them do not parse. Nothing reads the result:
 verdicts, exit codes and every output are unchanged, `would_pass` stays
 false, and no `--strict-placement` option is added yet.
 
+After the #55 review: a zone with any CIDR placement cannot read as IPv4
+(IPv6 or invalid) turns placement off (`zones-share-segment`, both modes)
+instead of dropping out of rule (a); the units of one physical interface are
+one segment, since no VLAN separation is cited; a placement error is
+`zone-placement-unpinned` in both modes, not a traceback; and the scope
+sentence no longer says static routes were checked.
+
 ### No file is certified, so code scanning and MCP coverage say so (#42 phase 2)
 
 **Under the stopgap, every config gets a standing `rulehawk/uncertified`

@@ -31,8 +31,10 @@ ZONES_SHARE_SEGMENT = "zones-share-segment"
 ZONE_PLACEMENT_UNPINNED = "zone-placement-unpinned"
 ZONE_PLACEMENT_ASSUMED = "zone-placement-assumed"
 
-SCOPE = ("RuleHawk checked the interfaces and static routes this file "
-         "configures; zones not attached in this file are assumed not to "
+# Review of #52-#57, G9: no grammar has a static-route production, so the
+# sentence does not claim routes were checked.
+SCOPE = ("RuleHawk checked the interfaces this file configures; it read no "
+         "static route; zones not attached in this file are assumed not to "
          "share a segment with another asserted zone.")
 
 
@@ -72,12 +74,23 @@ def _join(names: List[str]) -> str:
 def assess(model: dict, zones: Dict[str, object]) -> dict:
     """The placement entry for one parsed file under a policy's zones."""
     nets = {name: _networks(cidrs) for name, cidrs in sorted(zones.items())}
+    # Review of #52-#57, G3: a zone with any CIDR placement cannot read as
+    # IPv4 is not dropped from rule (a); it may sit on any segment, so
+    # placement is off (fail closed).
+    unreadable = sorted(name for name, ns in nets.items() if ns is None)
     segments = _segments(model)
-    reason = None
+    reason = ZONES_SHARE_SEGMENT if unreadable else None
+    # Review of #52-#57, G4: the units of one physical interface are one L2
+    # wire (no VLAN separation is cited), so they are one segment.
+    port_nets: Dict[tuple, list] = {}
     for seg in segments:
-        snet = ipaddress.ip_network(seg["network"])
-        seg["zones"] = sorted(name for name, ns in nets.items()
-                              if ns and any(snet.overlaps(n) for n in ns))
+        port_nets.setdefault(tuple(seg["path"][:2]), []).append(
+            ipaddress.ip_network(seg["network"]))
+    for seg in segments:
+        wire = port_nets[tuple(seg["path"][:2])]
+        seg["zones"] = sorted(
+            name for name, ns in nets.items()
+            if ns is None or any(w.overlaps(n) for w in wire for n in ns))
         if len(seg["zones"]) >= 2:
             reason = ZONES_SHARE_SEGMENT
     pinned = []
@@ -88,15 +101,25 @@ def assess(model: dict, zones: Dict[str, object]) -> dict:
         if all(any(n.subnet_of(o) for o in own) for n in ns):
             pinned.append(name)
     unpinned = [name for name in nets if name not in pinned]
-    assumed = bool(unpinned)
+    assumed = bool(unpinned) and not unreadable
     return {
         "segments": segments,
         "pinned": pinned,
         "unpinned": unpinned,
+        "unreadable": unreadable,
         "reason": reason,
         "scope_assumptions": [SCOPE],
         "headline_assumptions": ([f"assumes {_join(list(nets))} are on separate segments"]
                                  if assumed else []),
         "rows": [ZONE_PLACEMENT_ASSUMED] if assumed else [],
-        "strict_reason": reason or (ZONE_PLACEMENT_UNPINNED if assumed else None),
+        "strict_reason": reason or (ZONE_PLACEMENT_UNPINNED if unpinned else None),
     }
+
+
+def unavailable(error: BaseException) -> dict:
+    """The placement entry when assessing failed (review of #52-#57, G8):
+    nothing is pinned, and both modes block."""
+    return {"segments": [], "pinned": [], "unpinned": [], "unreadable": [],
+            "error": type(error).__name__, "reason": ZONE_PLACEMENT_UNPINNED,
+            "scope_assumptions": [SCOPE], "headline_assumptions": [], "rows": [],
+            "strict_reason": ZONE_PLACEMENT_UNPINNED}
