@@ -21,8 +21,15 @@ grammar reads:
   lowercase spelling. A quote, a `[ ]` list, a comment or a blank line is
   off: `panos-lexing` is pending;
 - each rule name once: setting a rule again adds to its list attributes,
-  and `panos-list-semantics` is pending (v3 section 6.1). `move`, `delete`,
-  `rename`, `override` and `disabled` have no production.
+  and `panos-list-semantics` is pending (v3 section 6.1), so a second line
+  for one name is `write-merge-uncited` (as in the Junos grammar, review of
+  #51, F1). `move`, `delete`, `rename`, `override` and `disabled` have no
+  production;
+- an address prefix with host bits set is off.
+
+The rule-name character set and the IPv4 prefix form are pending rows
+(review of #51, F4): each production lists them in `needs`, and the result
+under `pending`.
 
 Each line must match exactly one production: none is
 `line-not-allowlisted`, two is `parse-ambiguous` (v3 section 8). No
@@ -37,9 +44,10 @@ from __future__ import annotations
 import re
 from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple
 
-from .citations import resolve
+from .citations import PENDING, resolve
 from .grammar_junos import (_TOKEN, _V4PREFIX, LINE_NOT_ALLOWLISTED,
-                            PARSE_AMBIGUOUS, Klass, Production)
+                            PARSE_AMBIGUOUS, WRITE_MERGE_UNCITED, Klass,
+                            Production, _host_bits)
 
 _PRINTABLE = re.compile(r"[\x20-\x7e]*")
 MODE = "line"
@@ -86,13 +94,21 @@ CLASSES: Dict[str, Klass] = {
     "V4PREFIX": Klass(_V4PREFIX, KEYWORDS),
 }
 
-PRODUCTIONS: Tuple[Production, ...] = tuple(
-    Production(MODE, slots, None, cites) for slots, cites in _PRODUCTION_TABLE)
+_CLASS_NEEDS = {"RULENAME": "panos-rule-name-chars", "V4PREFIX": "panos-v4-prefix"}
 
-# Every production's rows resolve at import: a pending row raises here.
+PRODUCTIONS: Tuple[Production, ...] = tuple(
+    Production(MODE, slots, None, cites,
+               tuple(sorted({_CLASS_NEEDS[s] for s in slots if s in _CLASS_NEEDS})))
+    for slots, cites in _PRODUCTION_TABLE)
+
+# Every production's rows resolve at import: a pending row raises here. Its
+# needs must be pending rows.
 for _p in PRODUCTIONS:
     for _cid in _p.cites:
         resolve(_cid)
+    for _cid in _p.needs:
+        if _cid not in PENDING:
+            raise KeyError(f"{_cid} is not a pending row")
 
 
 def shape_problems(prods: Iterable[Production], classes: Dict[str, Klass]) -> List[str]:
@@ -114,9 +130,9 @@ def shape_problems(prods: Iterable[Production], classes: Dict[str, Klass]) -> Li
     return out
 
 
-def _result(reason: Optional[str], line: Optional[int], rows) -> dict:
-    return {"accepted": reason is None, "reason": reason, "line": line,
-            "rows": sorted(rows), "tags": []}
+def _result(reason: Optional[str], line: Optional[int], rows, pending=()) -> dict:
+    return {"parses": reason is None, "reason": reason, "line": line,
+            "rows": sorted(rows), "tags": [], "pending": sorted(pending)}
 
 
 def _match(toks: List[str]) -> List[Production]:
@@ -137,22 +153,27 @@ def parse(raw: bytes) -> dict:
         lines = lines[:-1]          # the LF that ends the last line
     if not lines:
         return _result(LINE_NOT_ALLOWLISTED, None, ())
-    rows = set()
-    names = set()
+    rows: set = set()
+    pending: set = set()
+    names: set = set()
     for n, ln in enumerate(lines, 1):
         if not ln or not _PRINTABLE.fullmatch(ln):
-            return _result(LINE_NOT_ALLOWLISTED, n, rows)
+            return _result(LINE_NOT_ALLOWLISTED, n, rows, pending)
         toks = ln.split(" ")
         if not all(_TOKEN.fullmatch(t) for t in toks):
-            return _result(LINE_NOT_ALLOWLISTED, n, rows)
+            return _result(LINE_NOT_ALLOWLISTED, n, rows, pending)
         hits = _match(toks)
         if not hits:
-            return _result(LINE_NOT_ALLOWLISTED, n, rows)
+            return _result(LINE_NOT_ALLOWLISTED, n, rows, pending)
         if len(hits) > 1:
-            return _result(PARSE_AMBIGUOUS, n, rows)
-        name = toks[hits[0].slots.index("RULENAME")]
+            return _result(PARSE_AMBIGUOUS, n, rows, pending)
+        (p,) = hits
+        name = toks[p.slots.index("RULENAME")]
         if name in names:
-            return _result(LINE_NOT_ALLOWLISTED, n, rows)
+            return _result(WRITE_MERGE_UNCITED, n, rows, pending)
         names.add(name)
-        rows.update(hits[0].cites)
-    return _result(None, None, rows)
+        if any(s == "V4PREFIX" and _host_bits(t) for s, t in zip(p.slots, toks)):
+            return _result(LINE_NOT_ALLOWLISTED, n, rows, pending)
+        rows.update(p.cites)
+        pending.update(p.needs)
+    return _result(None, None, rows, pending)

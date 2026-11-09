@@ -130,7 +130,9 @@ order, release scope, lexing and set-CLI list semantics as pending. Nothing
 reads the result: verdicts, exit codes and every output are unchanged. With
 `RULEHAWK_SHADOW=1`, a file the boundary lets through as PAN-OS gets a
 `grammar` entry in its `shadow` block, as Junos files do, and `would_pass`
-stays false.
+stays false. The #51 review rules apply here too: a rule name written twice
+is `write-merge-uncited`, a prefix with host bits is off, and the rule-name
+character set and the prefix form are listed under `pending`.
 
 ### No file is certified, so code scanning and MCP coverage say so (#42 phase 2)
 

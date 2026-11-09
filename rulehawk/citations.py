@@ -285,6 +285,15 @@ PENDING: Dict[str, str] = {
         "setting an attribute of a rule that is already set adds members "
         "for a list attribute (v4 section 14); no fetched page states it, so "
         "a rule name set twice is off (v3 section 6.1)"),
+    # review of #51, F4, for PAN-OS
+    "panos-rule-name-chars": (
+        "panos-rule-name states the length only; the character set is "
+        "narrowed to letters, digits and hyphens, starting with a letter or "
+        "digit (decided by agent, unattended)"),
+    "panos-v4-prefix": (
+        "panos-source-address names subnets but no fetched page states the "
+        "a.b.c.d/nn form; the class is canonical dotted quad with a length "
+        "0-32, and a prefix with host bits set is off"),
 }
 
 
