@@ -48,8 +48,8 @@ _CITED |= {
     "panos-set-from-any", "panos-set-to-any", "panos-set-source-any",
     "panos-set-destination-any", "panos-set-application-any",
     "panos-set-service-any", "panos-set-action-allow",
-    # review of #52/#53, F3 and F6
-    "panos-one-line-form", "panos-rule-order",
+    # review of #52/#53, F3
+    "panos-one-line-form",
 }
 # v4 section 14 Junos rows not yet cited: keyword case has no first-party
 # statement found, and no fetched page states its rows for Junos OS Evolved.
@@ -63,6 +63,9 @@ _PENDING = {"junos-lexing", "junos-evolved-scope",
             # review of #52/#53, F2: what one rule's meaning still rests on
             "panos-default-rules", "panos-any-meaning", "panos-rule-type-default",
             "panos-session-semantics",
+            # review of #52-#57, G1 and G2: rule order (an unversioned page,
+            # evaluation order only) and the one-line token order
+            "panos-rule-order", "panos-one-line-order",
             # review of #51, F4, for PAN-OS: the name class and the prefix form
             "panos-rule-name-chars", "panos-v4-prefix"}
 _FIRST_PARTY = ("https://www.juniper.net/documentation/",
@@ -127,3 +130,26 @@ def test_citations_imports_only_the_standard_library():
 def test_no_all_clear_word_in_the_registry():
     src = open(os.path.join(_ROOT, "rulehawk", "citations.py"), encoding="utf-8").read()
     assert not re.search(r"\bPASS\b|\bVERIFIED\b|NO_NEW_RISK", src)
+
+
+def test_panos_rule_order_stays_pending_with_its_quote():
+    """Review of #52-#57, G1: the Security Policy Rules page is unversioned
+    and states evaluation order, not where a new rule lands."""
+    r = _mod().PENDING["panos-rule-order"]
+    assert "unversioned" in r, r
+    assert "evaluated left to right and from top to bottom" in r, r
+    assert "append" in r or "lands" in r, r
+
+
+def test_panos_release_scope_names_every_unversioned_source():
+    """Review of #52-#57, G1: the release-scope row names the Security Policy
+    Rules page and KB3."""
+    r = _mod().PENDING["panos-release-scope"]
+    assert "Security Policy Rules" in r and "kA10g000000ClcLCAS" in r, r
+
+
+def test_panos_one_line_order_is_pending():
+    """Review of #52-#57, G2: the grammar's seven-attribute order on one line
+    is an inference."""
+    r = _mod().PENDING["panos-one-line-order"]
+    assert "source" in r and "to" in r, r
