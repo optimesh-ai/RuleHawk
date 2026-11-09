@@ -57,6 +57,9 @@ def test_every_cited_row_is_complete():
         assert row.title and row.release and row.quote, row
         assert row.fetched == "2026-11-09" and row.confirmed == "2026-11-09", row
         assert "\n" not in row.quote and "  " not in row.quote, row
+        # The fetch renders code font as markdown backticks; they are not
+        # page text (review of #50, F7).
+        assert "`" not in row.quote, row
 
 
 def test_pending_rows_are_listed_and_not_cited():
