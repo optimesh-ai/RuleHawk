@@ -77,6 +77,25 @@ the number of uncertified files, and a new count,
 or not (in this release, every input). `incomplete` (an input not analysed) is
 unchanged, and so are every verdict and exit code.
 
+### Dialect boundary, computed in shadow only (#42 phase 2)
+
+A file can only ever be certified if, on its raw lines, exactly one of Junos,
+PAN-OS or iptables is detected (every detector runs; there is no first match),
+no Cisco-family form fires (the IOS, ASA, NX-OS and EOS marker lines, the
+NX-OS and EOS detectors, the IOS/ASA parser finding a rule, a top-level
+`interface X` or ` ip access-group X in|out` line, or a Cisco-shaped line
+inside a comment), and no comment or quoted string runs onto a second line.
+This release computes that check and nothing reads it: verdicts, exit codes and
+every output are unchanged, and PASS is still never reported. With
+`RULEHAWK_SHADOW=1` in the environment, `rulehawk FILE --json` and
+`rulehawk gate --json` add a `shadow` block per file: the dialects detected,
+the Cisco lines that vetoed, `would_pass: false`, and the first reason the
+file could not be certified (`dialect-not-exclusive`, `dialect-undetected`,
+`line-not-allowlisted`, or `file-uncertified` when it clears the boundary,
+since no grammar exists yet). The block is for testing the allowlist; it is
+not an interface, the Action and the MCP server never set the variable, and it
+may change in any release.
+
 ### Compatibility
 
 - **`rulehawk/uncertified` in code scanning:** every config in every dialect

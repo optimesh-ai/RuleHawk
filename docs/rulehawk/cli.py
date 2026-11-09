@@ -35,7 +35,7 @@ from .parse_junos import detect as detect_junos, parse_junos
 from .parse_nxos import detect as detect_nxos, parse_nxos
 from .parse_panos import detect as detect_panos, parse_panos
 from .pathground import HammerheadReachOracle, path_ground
-from . import exitcodes
+from . import dialects, exitcodes
 from .report import exit_code, to_json, to_text
 from .riskaccept import apply_to_findings, evaluate, finalize
 from .segcheck import check_segmentation
@@ -258,7 +258,12 @@ def main(argv: list[str] | None = None) -> int:
         print(to_evidence_markdown(art) if as_evidence_md
               else json.dumps(art, indent=2))
     elif as_json:
-        print(to_json(findings, notes, n_rules, vendor))
+        shadow = None
+        if dialects.shadow_on():
+            asked = ("junos" if force_junos else "panos" if force_panos
+                     else "iptables" if force_iptables else "auto")
+            shadow = dialects.shadow_block(raw, asked)
+        print(to_json(findings, notes, n_rules, vendor, shadow=shadow))
     else:
         print(to_text(findings, notes, n_rules, vendor))
     # Distinct exit codes: 1 finding at critical/high · 2 parse failure · 3

@@ -61,8 +61,16 @@ _POLYGLOTS = {
     # interface name, two-space indents), but they sit in a /* */ region
     # that spans lines, which is off the allowlist (v4 section 1, item 1).
     "cfg3/k12_polyglot_veto_dodging_forms.conf": "line-not-allowlisted",
-    "cfg3/k14_ios_banner_holds_junos.cfg": "dialect-not-exclusive",
+    # k14's IOS lines are `hostname r1`, `banner motd ^` and interfaces with a
+    # space in the name: bare tokens, which never veto (v3 section 1.2). Its
+    # only detected dialect is Junos, so the boundary lets it through, and
+    # slice 4's Junos grammar rejects those lines. Pinned so that slice 4
+    # must move it to line-not-allowlisted.
+    "cfg3/k14_ios_banner_holds_junos.cfg": "file-uncertified",
 }
+# The dialect each polyglot is detected as: a vendor value naming another
+# non-Cisco dialect leaves no dialect to certify.
+_POLYGLOT_DIALECT = "junos"
 
 # v4 section 1 cost list: the three Junos files with a multi-line /* */.
 _COST = ("j13_block_comment_multiline.conf", "d01_junos_block_comment_braces.conf",
@@ -100,10 +108,18 @@ def _cli_shadow(path, vendor="auto"):
     return d, d.get("shadow")
 
 
+def _keys(x):
+    if isinstance(x, dict):
+        return set(x) | set().union(*(_keys(v) for v in x.values()))
+    if isinstance(x, list):
+        return set().union(*(_keys(v) for v in x))
+    return set()
+
+
 def _well_formed(sh):
     """The shadow block's shape: no certificate key, no all-clear string."""
     assert sh is not None, "no shadow block under RULEHAWK_SHADOW=1"
-    assert "certified" not in json.dumps(sh), sh
+    assert "certified" not in _keys(sh), sh          # R4-L1
     for word in ("PASS", "VERIFIED", "NO_NEW_RISK"):
         assert word not in json.dumps(sh), sh
     assert sh["would_pass"] is False, sh
@@ -168,15 +184,20 @@ def test_cisco_attack_is_not_exclusive_on_the_cli(rel, vendor, shadow):
     assert sh["blocking_reason"] == "dialect-not-exclusive", sh
 
 
+def _want(rel, vendor):
+    if vendor in _CISCO_VENDORS or _POLYGLOTS[rel] == "dialect-not-exclusive":
+        return "dialect-not-exclusive"
+    if vendor not in ("auto", _POLYGLOT_DIALECT):
+        return "dialect-undetected"
+    return _POLYGLOTS[rel]
+
+
 @pytest.mark.parametrize("vendor", _VENDORS)
 @pytest.mark.parametrize("rel", sorted(_POLYGLOTS))
 def test_polyglot_is_blocked_on_the_gate(rel, vendor, shadow):
     _, sh = _gate_shadow(os.path.join(_D, rel), vendor)
     _well_formed(sh)
-    want = _POLYGLOTS[rel]
-    if vendor in _CISCO_VENDORS:
-        want = "dialect-not-exclusive"
-    assert sh["blocking_reason"] == want, sh
+    assert sh["blocking_reason"] == _want(rel, vendor), sh
 
 
 @pytest.mark.parametrize("vendor", sorted(_CLI_FLAGS))
@@ -185,7 +206,7 @@ def test_polyglot_is_blocked_on_the_cli(rel, vendor, shadow):
     d, sh = _cli_shadow(os.path.join(_D, rel), vendor)
     assert d["verdict"] in ("FAIL", "UNKNOWN"), d["verdict"]
     _well_formed(sh)
-    assert sh["blocking_reason"] == _POLYGLOTS[rel], sh
+    assert sh["blocking_reason"] == _want(rel, vendor), sh
 
 
 def test_k10_veto_names_the_raw_cisco_lines(shadow):

@@ -66,9 +66,9 @@ def _verdict_line(findings: List[Finding], n_rules: int) -> str:
 
 
 def to_json(findings: List[Finding], notes: List[str], n_rules: int,
-            vendor: Optional[str] = None) -> str:
+            vendor: Optional[str] = None, shadow: Optional[dict] = None) -> str:
     v = verdict(findings, n_rules)
-    return json.dumps({
+    d = {
         # Additive field: machine-readable vendor label (ios-asa | junos | panos |
         # iptables | nxos | eos). "ios-asa" is also the default/fallback.
         "vendor": vendor or "ios-asa",
@@ -93,7 +93,11 @@ def to_json(findings: List[Finding], notes: List[str], n_rules: int,
         ],
         "parse_notes": notes,
         "verification_boundary": boundary_dict(findings),
-    }, indent=2)
+    }
+    if shadow is not None:
+        # #42 slice 3: only under RULEHAWK_SHADOW=1 (dialects.shadow_on).
+        d["shadow"] = shadow
+    return json.dumps(d, indent=2)
 
 
 def to_text(findings: List[Finding], notes: List[str], n_rules: int,
