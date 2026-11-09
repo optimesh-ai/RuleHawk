@@ -254,7 +254,10 @@ def test_control_gets_through_the_boundary(rel, shadow):
         # The first blocking reason is never a boundary reason: the absence
         # of a certificate, or, for p10, the PAN-OS grammar (slice 4c) has no
         # production for its quoted description.
-        want = ("line-not-allowlisted" if rel.startswith("cfg3/p10_")
+        # Slice 4d: i09 is iptables-save format, which the iptables grammar
+        # has no production for.
+        want = ("line-not-allowlisted"
+                if rel.startswith(("cfg3/p10_", "cfg3/i09_"))
                 else "file-uncertified")
         assert sh["blocking_reason"] == want, sh
 
@@ -314,7 +317,7 @@ def test_comments_only_file(tmp_path, shadow):
     ("access-list 101 deny ip any any", "dialect-not-exclusive"),
     # These are not in the veto set (bare tokens never veto, v3 section
     # 1.2). The Junos (slice 4b) and PAN-OS (slice 4c) grammars have no
-    # production for them; iptables gets its grammar in slice 4d, so until
+    # production for them; nor does the iptables grammar (slice 4d), so until
     # then that file stays file-uncertified.
     ("!", "grammar"),
     ("hostname x", "grammar"),
@@ -324,8 +327,7 @@ def test_comments_only_file(tmp_path, shadow):
                                  "controls/i00_base.sh"])
 def test_control_with_a_cisco_marker_line(rel, marker, reason, where, tmp_path, shadow):
     if reason == "grammar":
-        reason = ("line-not-allowlisted" if rel.endswith((".conf", ".set"))
-                  else "file-uncertified")
+        reason = "line-not-allowlisted"
     body = _read(rel)
     text = (marker + "\n" + body) if where == "prepend" else (body.rstrip("\n") + "\n" + marker + "\n")
     _, sh = _gate_shadow(_write(tmp_path, os.path.basename(rel), text))
@@ -468,16 +470,13 @@ def test_crlf_line_endings_alone_are_not_a_separator_finding(rel, tmp_path, shad
     boundary lets it through. The Junos grammar (slice 4b) reads LF only
     (v2 section 7: a CR anywhere is off until a per-dialect row is cited),
     so k00 with CRLF ends is off at line 1, and so does the PAN-OS grammar
-    (slice 4c) for p00; iptables gets its grammar in slice 4d."""
+    (slice 4c) for p00 and the iptables grammar (slice 4d) for i00."""
     text = _read(rel).replace("\n", "\r\n")
     _, sh = _gate_shadow(_write(tmp_path, os.path.basename(rel), text))
     _well_formed(sh)
     assert sh["boundary"]["reason"] is None, sh
-    if rel.endswith((".conf", ".set")):
-        assert sh["blocking_reason"] == "line-not-allowlisted", sh
-        assert sh["grammar"]["line"] == 1, sh
-    else:
-        assert sh["blocking_reason"] == "file-uncertified", sh
+    assert sh["blocking_reason"] == "line-not-allowlisted", sh
+    assert sh["grammar"]["line"] == 1, sh
 
 
 # F4: in a shell script, a # after ; & | ( ) starts a comment.
@@ -504,10 +503,14 @@ def test_a_shell_hash_not_at_line_start_is_off(line, tmp_path, shadow):
 
 @pytest.mark.parametrize("line", ["  # indented comment", 'echo "a#b"', "echo 'a # b'"])
 def test_a_shell_hash_at_line_start_or_in_a_closed_quote_is_not_off(line, tmp_path, shadow):
+    """The boundary lets these through; the iptables grammar (slice 4d) has
+    no production for a comment or an echo, so it takes them off."""
     text = _read("controls/i00_base.sh") + line + "\n"
     _, sh = _gate_shadow(_write(tmp_path, "i.sh", text))
     _well_formed(sh)
-    assert sh["blocking_reason"] == "file-uncertified", sh
+    assert sh["boundary"]["reason"] is None, sh
+    assert sh["blocking_reason"] == "line-not-allowlisted", sh
+    assert sh["grammar"]["line"] == 3, sh
 
 
 def test_tab_in_an_interface_line_is_pinned_with_k14(tmp_path, shadow):

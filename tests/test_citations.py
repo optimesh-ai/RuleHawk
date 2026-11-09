@@ -49,6 +49,14 @@ _CITED |= {
     "panos-set-destination-any", "panos-set-application-any",
     "panos-set-service-any", "panos-set-action-allow",
 }
+# slice 4d: the iptables rows (iptables(8), 1.8.13).
+_CITED |= {
+    "iptables-synopsis-append", "iptables-synopsis-policy", "iptables-rule-specification",
+    "iptables-first-match", "iptables-accept-drop", "iptables-policy-end",
+    "iptables-filter-default", "iptables-filter-chains", "iptables-append",
+    "iptables-policy", "iptables-source", "iptables-mask", "iptables-destination",
+    "iptables-jump",
+}
 # v4 section 14 Junos rows not yet cited: keyword case has no first-party
 # statement found, and no fetched page states its rows for Junos OS Evolved.
 _PENDING = {"junos-lexing", "junos-evolved-scope",
@@ -60,10 +68,15 @@ _PENDING = {"junos-lexing", "junos-evolved-scope",
             "panos-rule-order", "panos-release-scope", "panos-lexing",
             "panos-list-semantics",
             # review of #51, F4, for PAN-OS: the name class and the prefix form
-            "panos-rule-name-chars", "panos-v4-prefix"}
+            "panos-rule-name-chars", "panos-v4-prefix",
+            # slice 4d: iptables lexing, the script's scope, the release
+            # scope and the iptables-save format
+            "iptables-lexing", "iptables-script-scope", "iptables-release-scope",
+            "iptables-save-format"}
 _FIRST_PARTY = ("https://www.juniper.net/documentation/",
                 "https://docs.paloaltonetworks.com/",
-                "https://knowledgebase.paloaltonetworks.com/")
+                "https://knowledgebase.paloaltonetworks.com/",
+                "https://man7.org/linux/man-pages/man8/")
 
 
 def _mod():
