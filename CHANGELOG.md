@@ -198,6 +198,11 @@ is an extra check, not independence. Nothing reads the result: verdicts,
 exit codes and every output are unchanged. With `RULEHAWK_SHADOW=1`, a
 parsed file gets a `dual_read` entry, and `would_pass` stays false.
 
+After the #56 review: every iptables file lists the chain hook (the legacy
+parser's `transit`) under `single`, and so does every compared Junos filter's
+binding, bound or not; an error anywhere in the dual read is
+`reading-mismatch`, not a traceback.
+
 ### Zone placement, computed in shadow only (#42 phase 2)
 
 With `RULEHAWK_SHADOW=1` and a policy, a file the grammar parses gets a

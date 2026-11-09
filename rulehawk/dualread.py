@@ -15,8 +15,10 @@ parse note, or a legacy parser that fails, is `reading-mismatch`.
 
 What is not compared: a field side B does not expose has no second
 reading and is listed under `single` (`reading-single`, v3 section 6.2):
-Junos interface addresses and filter bindings, PAN-OS zones, application
-and service. Slice 7's checker is what may re-derive them; until then the
+Junos interface addresses and filter bindings (for every compared filter,
+bound or not), PAN-OS zones, application and service, and the iptables
+chain hook (the legacy `transit`, review of #52-#57, G5, G6). Slice 7's
+checker is what may re-derive them; until then the
 file stays uncertified.
 
 The dual read is an extra check. It is not counted as independence, and
@@ -80,6 +82,9 @@ def _side_a_junos(model: dict) -> Tuple[Lists, List[str]]:
                 dsts = _members(objs, t + ("from", "destination-address")) or [_ANY]
                 groups.append(sorted(_entry(act, s, d) for s in srcs for d in dsts))
             out[path[2][len("filter "):]] = groups
+            # Review of #52-#57, G6: whether a compared filter is bound, and
+            # where, is read by the grammar alone, bound or not.
+            single.add("junos-filter-binding")
     return out, sorted(single)
 
 
@@ -112,7 +117,9 @@ def _side_a_iptables(model: dict) -> Tuple[Lists, List[str]]:
             groups.append([_entry(_ACTIONS.get(o["values"]["policy"]), _ANY, _ANY)])
         if groups:
             out[path[1]] = groups
-    return out, []
+    # Review of #52-#57, G5: which chains a transit packet crosses is the
+    # legacy parser's `transit`, with no second reading.
+    return out, ["iptables-chain-hook"]
 
 
 def _side_b(aces) -> Lists:
@@ -148,7 +155,11 @@ _SIDE_A = {"junos": _side_a_junos, "panos": _side_a_panos, "iptables": _side_a_i
 def dual_read(raw: bytes, model: dict) -> dict:
     """The dual-read entry for one file the grammar parses."""
     dialect = model.get("dialect")
-    a, single = _SIDE_A[dialect](model)
+    try:
+        a, single = _SIDE_A[dialect](model)
+    except Exception as e:  # side A fails: fail closed (review of #52-#57, G8)
+        return {"reason": READING_MISMATCH, "compared": [], "single": [],
+                "mismatch": f"model mapping failed: {type(e).__name__}"}
     out = {"reason": None, "compared": sorted(a), "single": single, "mismatch": None}
     try:
         aces, notes = _legacy(dialect)(raw.decode("utf-8"))
