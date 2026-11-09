@@ -287,8 +287,11 @@ def shadow_block(raw: bytes, vendor: str = "auto") -> dict:
                 from . import grammar_panos as grammar
             else:
                 from . import grammar_iptables as grammar
-        except KeyError as e:
-            block["grammar_unavailable"] = str(e.args[0] if e.args else e)
+        except Exception as e:  # any failure fails closed (review of #52/#53, F9)
+            if isinstance(e, KeyError) and e.args:
+                block["grammar_unavailable"] = str(e.args[0])
+            else:
+                block["grammar_unavailable"] = str(e) or type(e).__name__
             return block
         gm, model = grammar.parse_model(raw)
         block["grammar"] = gm

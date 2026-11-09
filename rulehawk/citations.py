@@ -75,6 +75,16 @@ _KB_SET = ("https://knowledgebase.paloaltonetworks.com/KCSArticleDetail?"
            "id=kA10g000000ClHoCAK&lang=en_US")
 _KB_SET_TITLE = "Viewing the configuration in set and XML format"
 _KB_SET_RELEASE = "the article states Environment: Any PAN-OS, and no release"
+_KB_ONE_LINE = ("https://knowledgebase.paloaltonetworks.com/KCSArticleDetail?"
+                "id=kA10g000000ClcLCAS")
+_KB_ONE_LINE_TITLE = ("How to Add and Verify Address Objects to Address Group and "
+                      "Security Policy through the CLI")
+_KB_ONE_LINE_RELEASE = "the article states Environment: PanOS's CLI access., and no release"
+_SEC_RULES = ("https://docs.paloaltonetworks.com/network-security/security-policy/"
+              "administration/security-rules")
+_SEC_RULES_TITLE = "Security Policy Rules"
+_SEC_RULES_RELEASE = ("the Network Security documentation set, with no version in the "
+                      "URL or on the page (unversioned)")
 
 # iptables (slice 4d).
 _IPT = "https://man7.org/linux/man-pages/man8/iptables.8.html"
@@ -234,6 +244,16 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
          "set rulebase security rules rule1 service any"),
     _row("panos-set-action-allow", _KB_SET, _KB_SET_TITLE, _KB_SET_RELEASE,
          "set rulebase security rules rule1 action allow"),
+    # review of #52/#53, F3: several attributes on one `set` line, in an
+    # order other than the create template's
+    _row("panos-one-line-form", _KB_ONE_LINE, _KB_ONE_LINE_TITLE, _KB_ONE_LINE_RELEASE,
+         "# set rulebase security rules trust-DMZ action allow source testgroup"),
+    # review of #52/#53, F6
+    _row("panos-rule-order", _SEC_RULES, _SEC_RULES_TITLE, _SEC_RULES_RELEASE,
+         "Security rules are evaluated left to right and from top to bottom. A "
+         "packet is matched against the first rule that meets the defined "
+         "criteria and, after a match is triggered, subsequent rules are not "
+         "evaluated."),
     # iptables (slice 4d)
     _row("iptables-synopsis-append", _IPT, _IPT_TITLE, _IPT_RELEASE,
          "iptables [-t table] {-A|-C|-D|-V} chain rule-specification"),
@@ -256,11 +276,12 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
          "chain policy determines the fate of the packet."),
     _row("iptables-filter-default", _IPT, _IPT_TITLE, _IPT_RELEASE,
          "This is the default table (if no -t option is passed)."),
-    # The start of the next sentence: the rest wraps `locally-` across two
-    # lines in this rendering, so it is not quoted.
+    # Quoted up to the line wrap in `locally-` (review of #52/#53, F4:
+    # fetched twice more, verbatim); the rest of the sentence is not quoted.
     _row("iptables-filter-chains", _IPT, _IPT_TITLE, _IPT_RELEASE,
          "It contains the built-in chains INPUT (for packets destined to "
-         "local sockets), FORWARD (for packets being routed through the box)"),
+         "local sockets), FORWARD (for packets being routed through the box), "
+         "and OUTPUT (for locally-"),
     _row("iptables-append", _IPT, _IPT_TITLE, _IPT_RELEASE,
          "Append one or more rules to the end of the selected chain."),
     _row("iptables-policy", _IPT, _IPT_TITLE, _IPT_RELEASE,
@@ -317,12 +338,6 @@ PENDING: Dict[str, str] = {
         "no fetched page states that the prefixes in one source-address or "
         "destination-address list match as an OR"),
     # PAN-OS (slice 4c)
-    "panos-rule-order": (
-        "no fetched first-party page states that security rules are matched "
-        "first-match in rulebase order (the components page has no order "
-        "statement, and the set-format article notes 'The output of show is "
-        "not necessarily the sequence to execute the commands.'), so rule "
-        "order, move and the default rules give no meaning yet"),
     "panos-release-scope": (
         "the components page is in the PAN-OS 11.1 documentation set and the "
         "two knowledge-base articles state no release; v4 section 8 needs "
@@ -336,6 +351,25 @@ PENDING: Dict[str, str] = {
         "setting an attribute of a rule that is already set adds members "
         "for a list attribute (v4 section 14); no fetched page states it, so "
         "a rule name set twice is off (v3 section 6.1)"),
+    # review of #52/#53, F2: what the meaning of one rule still rests on
+    "panos-default-rules": (
+        "the Security Policy Rules page says traffic that matches no rule "
+        "goes to the default rules, which allow intrazone and deny interzone "
+        "traffic and can be overridden; the outcome depends on zones and "
+        "overrides the file does not hold (v4 section 3: not a row)"),
+    "panos-any-meaning": (
+        "the rows show the syntax `from any`, `to any`, `source any`, "
+        "`destination any`; no fetched row states that `any` means every "
+        "zone or every address"),
+    "panos-rule-type-default": (
+        "the Security Policy Rules page lists 'universal (default)' in its "
+        "Rule Type cell; no row quotes it, and v4 section 3 keeps rule-type "
+        "off until its KB row is cited"),
+    "panos-session-semantics": (
+        "the Security Policy Rules page says 'When a session match occurs, "
+        "the Security rule is applied to bidirectional traffic in that "
+        "session'; a per-packet reading differs, and no model of sessions is "
+        "built"),
     # review of #51, F4, for PAN-OS
     "panos-rule-name-chars": (
         "panos-rule-name states the length only; the character set is "
@@ -356,7 +390,13 @@ PENDING: Dict[str, str] = {
         "a script is run by a shell against the rule set already loaded; no "
         "fetched first-party page states the rule set before the script, "
         "that its lines run in order, or any shell construct, so every "
-        "production records this row and no shell syntax is read"),
+        "production records this row and no shell syntax is read. Only the "
+        "filter table of iptables is read: iptables(8) says 'There are "
+        "currently five independent tables', and 'The security table is "
+        "called after the filter table'; rules in the security table, the "
+        "nat, mangle and raw tables, ip6tables and nftables on the same host "
+        "also decide a packet's fate and are not seen (review of #52/#53, "
+        "F5)"),
     "iptables-release-scope": (
         "the fetched page applies to iptables 1.8.13 only; the legacy and "
         "nft back ends and other releases are not cited, so the "
