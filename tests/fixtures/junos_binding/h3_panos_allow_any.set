@@ -1,0 +1,1 @@
+set rulebase security rules r1 from any to any source any destination any application any service any action allow
