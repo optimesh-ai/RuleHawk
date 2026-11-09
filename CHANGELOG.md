@@ -102,6 +102,19 @@ the grammar's (`line-not-allowlisted`, `parse-ambiguous`, or
 still `file-uncertified`: parsing is not a certificate, and `would_pass` stays
 false.
 
+After review, the grammar also takes off, at their line, the forms whose
+Junos meaning differs from a statement-by-statement reading: a stanza or a
+single-valued leaf (`then`, `input`, `address`) written twice
+(`write-merge-uncited`), the same interface address on two units, a term
+with no `then`, a match prefix with host bits set, out-of-range unit and
+interface names, and a filter reference with no filter
+(`config-incomplete`). A tag in a comment means no parse. The grammar entry's
+key is `parses`, and it lists under `pending` the uncited rows the parse
+rests on (unit number, interface name, IPv4 prefix, address-list meaning).
+The grammar is imported only in a shadow run, so a row that went pending
+cannot affect a run with the switch unset; a shadow run then reports
+`grammar_unavailable` and stays `file-uncertified`.
+
 ### PAN-OS grammar, computed in shadow only (#42 phase 2)
 
 `rulehawk/grammar_panos.py` is the second allowlist grammar: PAN-OS set

@@ -189,7 +189,7 @@ def test_two_productions_matching_one_statement_is_parse_ambiguous(monkeypatch):
     assert len(dup) == 1
     monkeypatch.setattr(gm, "PRODUCTIONS", tuple(gm.PRODUCTIONS) + tuple(dup))
     r = _parse(_read(_K00))
-    assert r["reason"] == "parse-ambiguous" and r["accepted"] is False, r
+    assert r["reason"] == "parse-ambiguous" and r["parses"] is False, r
     assert r["line"] == 12, r
 
 
@@ -197,8 +197,8 @@ def test_two_productions_matching_one_statement_is_parse_ambiguous(monkeypatch):
 
 def test_the_grammar_accepts_k00():
     r = _parse(_read(_K00))
-    assert r == {"accepted": True, "reason": None, "line": None,
-                 "rows": r["rows"], "tags": []}, r
+    assert r == {"parses": True, "reason": None, "line": None,
+                 "rows": r["rows"], "tags": [], "pending": r["pending"]}, r
     assert {"junos-match-source-address", "junos-match-destination-address",
             "junos-filter-input", "junos-interface-address-inet",
             "junos-term-statement", "junos-discard-term",
@@ -210,7 +210,7 @@ def test_k00_parses_but_would_pass_stays_false(shadow):
     """The brief's pin: the grammar accepts k00, and without a certificate
     (slice 7) the shadow still says file-uncertified."""
     sh = _gate_shadow(_K00)
-    assert sh["grammar"]["accepted"] is True, sh
+    assert sh["grammar"]["parses"] is True, sh
     assert sh["would_pass"] is False, sh
     assert sh["blocking_reason"] == "file-uncertified", sh
     assert "certified" not in json.dumps(sh).replace("file-uncertified", ""), sh
@@ -275,7 +275,7 @@ def test_a_mutation_is_off_at_its_line(old, new):
     assert _BASE.count(old) >= 1, old
     text = _BASE.replace(old, new, 1)
     r = _parse(text)
-    assert r["accepted"] is False and r["reason"] == "line-not-allowlisted", (new, r)
+    assert r["parses"] is False and r["reason"] == "line-not-allowlisted", (new, r)
     first = text.split("\n").index(next(
         ln for ln, base in zip(text.split("\n"), _BASE.split("\n")) if ln != base))
     assert r["line"] == first + 1, (new, r)
@@ -292,7 +292,7 @@ def test_a_whole_line_comment_at_its_level_is_read(comment, where):
     else:
         lines.insert(7, "            " + comment)     # inside `filter F {`
     r = _parse("\n".join(lines))
-    assert r["accepted"] is True, r
+    assert r["parses"] is True, r
     assert "junos-comments" in r["rows"], r
 
 
@@ -308,7 +308,7 @@ def test_a_file_that_ends_inside_a_stanza_is_incomplete():
     stanza, give config-incomplete."""
     text = _BASE.rstrip("\n").rsplit("\n", 1)[0] + "\n"     # drop the last `}`
     r = _parse(text)
-    assert r["accepted"] is False and r["reason"] == "config-incomplete", r
+    assert r["parses"] is False and r["reason"] == "config-incomplete", r
 
 
 def test_an_extra_closing_brace_is_off():
@@ -317,29 +317,32 @@ def test_an_extra_closing_brace_is_off():
 
 
 def test_a_missing_final_newline_still_parses():
-    assert _parse(_BASE.rstrip("\n"))["accepted"] is True
+    assert _parse(_BASE.rstrip("\n"))["parses"] is True
 
 
 def test_an_empty_file_is_not_accepted():
     r = _parse("")
-    assert r["accepted"] is False, r
+    assert r["parses"] is False, r
 
 
 # ------------------------------------------------ the slice-4 attack rows
 
-@pytest.mark.parametrize("rel,line", [
-    ("cfg3/k05_junos_delete_annotation_binding.conf", 2),   # `delete:`
-    ("cfg3/k18_junos_replace_tag_subtree_save.conf", 18),   # `replace:`
-    ("cfg3/k19_junos_inactive_binding.conf", 2),            # `inactive:`
+@pytest.mark.parametrize("rel,line,reason,tag", [
+    ("cfg3/k05_junos_delete_annotation_binding.conf", 2, "line-not-allowlisted", 2),
+    # k18 enters `firewall` a second time (line 16) before its `replace:`
+    # tag (line 18): the re-entry is off first (review of #51, F1).
+    ("cfg3/k18_junos_replace_tag_subtree_save.conf", 16, "write-merge-uncited", 18),
+    ("cfg3/k19_junos_inactive_binding.conf", 2, "line-not-allowlisted", 2),
 ])
-def test_a_junos_tag_is_off_and_marks_a_patch(rel, line, shadow):
+def test_a_junos_tag_is_off_and_marks_a_patch(rel, line, reason, tag, shadow):
     """v4 section 4: no lexing row strips a `word:` prefix, and a tagged
-    file is a patch. The line reason comes first; the tag is recorded."""
+    file is a patch. The first off line gives the reason; the tag is
+    recorded."""
     sh = _gate_shadow(os.path.join(_D, rel))
     assert sh["boundary"]["reason"] is None, sh
-    assert sh["blocking_reason"] == "line-not-allowlisted", sh
+    assert sh["blocking_reason"] == reason, sh
     assert sh["grammar"]["line"] == line, sh
-    assert sh["grammar"]["tags"] == [line], sh
+    assert sh["grammar"]["tags"] == [tag], sh
     assert sh["would_pass"] is False, sh
 
 
@@ -371,7 +374,7 @@ def test_only_the_positive_control_parses(shadow, monkeypatch):
         # Slice 4c: PAN-OS files get the PAN-OS grammar's block.
         if "grammar" not in sh or sh["boundary"]["dialects"] != ["junos"]:
             continue
-        if sh["grammar"]["accepted"]:
+        if sh["grammar"]["parses"]:
             accepted.append(rel)
             assert sh["blocking_reason"] == "file-uncertified", (rel, sh)
     assert accepted == ["design/controls/k00_base.conf"], accepted

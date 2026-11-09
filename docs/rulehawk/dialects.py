@@ -37,7 +37,6 @@ import os
 import re
 from typing import List, Optional
 
-from . import grammar_junos, grammar_panos
 from .model import _PAGER
 from .parse import parse_acls
 from .parse_awssg import detect as _detect_awssg
@@ -268,15 +267,27 @@ def shadow_block(raw: bytes, vendor: str = "auto") -> dict:
     file is certified, so `would_pass` is false. The first blocking reason
     is the boundary's; then, for a file the boundary lets through as Junos
     or PAN-OS, that dialect's grammar's (slices 4b and 4c:
-    `line-not-allowlisted`, `parse-ambiguous` or `config-incomplete`, in a
-    `grammar` entry); otherwise `file-uncertified`. iptables gets its
-    grammar in slice 4d."""
+    `line-not-allowlisted`, `parse-ambiguous`, `config-incomplete` or
+    `write-merge-uncited`, in a `grammar` entry, or `file-uncertified` with
+    a `grammar_unavailable` entry when the grammar cannot load); otherwise
+    `file-uncertified`. iptables gets its grammar in slice 4d."""
     b = boundary(raw, vendor)
     block = {"boundary": b, "would_pass": False,
              "blocking_reason": b["reason"] or UNCERTIFIED}
-    grammars = {"junos": grammar_junos, "panos": grammar_panos}
-    if b["reason"] is None and len(b["dialects"]) == 1 and b["dialects"][0] in grammars:
-        gm = grammars[b["dialects"][0]].parse(raw)
+    if b["reason"] is None and b["dialects"] in (["junos"], ["panos"]):
+        # Imported here, not at module level (review of #51, F3): a grammar
+        # resolves its rows on import, and a row that went pending must not
+        # break a run with the switch unset. In a shadow run it fails
+        # closed: no grammar entry, and the file stays file-uncertified.
+        try:
+            if b["dialects"] == ["junos"]:
+                from . import grammar_junos as grammar
+            else:
+                from . import grammar_panos as grammar
+        except KeyError as e:
+            block["grammar_unavailable"] = str(e.args[0] if e.args else e)
+            return block
+        gm = grammar.parse(raw)
         block["grammar"] = gm
         block["blocking_reason"] = gm["reason"] or UNCERTIFIED
     return block

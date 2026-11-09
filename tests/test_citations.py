@@ -37,6 +37,8 @@ _CITED = {
     "junos-firewall-family-inet", "junos-filter-statement", "junos-term-statement",
     "junos-term-name", "junos-from-statement", "junos-then-statement",
     "junos-accept-terminating", "junos-discard-term",
+    # review of #51, F4: the Statement cells of Table 2
+    "junos-top-statements", "junos-top-firewall-keyword", "junos-top-interfaces-keyword",
 }
 # slice 4c: the PAN-OS rows.
 _CITED |= {
@@ -50,6 +52,9 @@ _CITED |= {
 # v4 section 14 Junos rows not yet cited: keyword case has no first-party
 # statement found, and no fetched page states its rows for Junos OS Evolved.
 _PENDING = {"junos-lexing", "junos-evolved-scope",
+            # review of #51, F4: name classes and the address-list meaning
+            "junos-unit-number", "junos-interface-name", "junos-v4-prefix",
+            "junos-address-list-or",
             # slice 4c: rule order, the release scope, lexing and the set-CLI
             # list semantics have no fetched first-party statement.
             "panos-rule-order", "panos-release-scope", "panos-lexing",
@@ -73,6 +78,9 @@ def test_every_cited_row_is_complete():
         assert row.title and row.release and row.quote, row
         assert row.fetched == "2026-11-09" and row.confirmed == "2026-11-09", row
         assert "\n" not in row.quote and "  " not in row.quote, row
+        # The fetch renders code font as markdown backticks; they are not
+        # page text (review of #50, F7).
+        assert "`" not in row.quote, row
 
 
 def test_pending_rows_are_listed_and_not_cited():
