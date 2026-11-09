@@ -139,10 +139,12 @@ rule is off at its line, and the predefined names `intrazone-default` and
 rules' fall-through, the meaning of `any`, the rule-type default and session
 semantics are pending rows, and every production lists the file-level rows
 (release scope, lexing, list semantics and those four) under `pending`; the
-Junos productions now list `junos-lexing` and `junos-evolved-scope` too. Rule
-order is cited from the unversioned "Security Policy Rules" page, and the
-one-line form from a knowledge-base article that sets several attributes on
-one line. A grammar that fails to load for any reason leaves a shadow run
+Junos productions now list `junos-lexing` and `junos-evolved-scope` too. The
+one-line form is cited from a knowledge-base article that sets several
+attributes on one line. Rule order (quoted from the unversioned "Security
+Policy Rules" page, which states evaluation order but not where a new rule
+lands) and the grammar's fixed token order stay pending, in every
+production's `needs`. A grammar that fails to load for any reason leaves a shadow run
 `file-uncertified` with a `grammar_unavailable` entry.
 
 ### iptables grammar, computed in shadow only (#42 phase 2)

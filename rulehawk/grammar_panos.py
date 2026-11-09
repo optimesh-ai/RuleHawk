@@ -11,7 +11,8 @@ grammar reads:
   (`panos-set-source-any`), and another article sets several attributes,
   `source` among them, on one line in another order
   (`panos-one-line-form`). Reading `source` after `to` is an inference
-  from those rows (review of #52/#53, F3):
+  from those rows (review of #52/#53, F3), so `panos-one-line-order` is
+  pending (review of #52-#57, G2):
   `set rulebase security rules NAME from any to any source ADDR
   destination ADDR application any service any action allow|deny`;
 - zones, application and service `any` only; an address `any` or one IPv4
@@ -45,8 +46,9 @@ Each line must match exactly one production: none is
 production names an object or a zone, so nothing can be `config-incomplete`
 yet (v3 section 9.2).
 
-Parsing a file is not a certificate: `panos-rule-order` is cited from an
-unversioned page and `panos-release-scope` is pending, and the certificate comes in slice 7.
+Parsing a file is not a certificate: `panos-rule-order` (unversioned, and
+evaluation order only), `panos-one-line-order` and `panos-release-scope` are
+pending (review of #52-#57, G1, G2), and the certificate comes in slice 7.
 """
 from __future__ import annotations
 
@@ -72,8 +74,8 @@ _COMMON = (
     "panos-application", "panos-set-application-any",
     "panos-service-any", "panos-set-service-any",
     "panos-action",
-    # review of #52/#53: the one-line form (F3) and rule order (F6)
-    "panos-one-line-form", "panos-rule-order",
+    # review of #52/#53, F3: the one-line form
+    "panos-one-line-form",
 )
 
 
@@ -112,7 +114,9 @@ _CLASS_NEEDS = {"RULENAME": "panos-rule-name-chars", "V4PREFIX": "panos-v4-prefi
 # File-level rows every production rests on (review of #52/#53, F1, F2).
 _FILE_NEEDS = ("panos-release-scope", "panos-lexing", "panos-list-semantics",
                "panos-default-rules", "panos-any-meaning", "panos-rule-type-default",
-               "panos-session-semantics")
+               "panos-session-semantics",
+               # review of #52-#57, G1 and G2: rule order and the token order
+               "panos-rule-order", "panos-one-line-order")
 
 PRODUCTIONS: Tuple[Production, ...] = tuple(
     Production(MODE, slots, None, cites,
