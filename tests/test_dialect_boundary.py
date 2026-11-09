@@ -141,6 +141,9 @@ def _well_formed(sh):
         assert gm["parses"] == (gm["reason"] is None), gm
     else:
         assert sh["blocking_reason"] not in ("parse-ambiguous", "config-incomplete"), sh
+    if "model" in sh:                                # slice 5: parsed files only
+        assert sh["grammar"]["parses"] is True, sh
+        assert set(sh["model"]) == {"dialect", "objects"}, sh
     return sh
 
 

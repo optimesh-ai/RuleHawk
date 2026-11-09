@@ -255,7 +255,9 @@ def test_every_production_records_its_pending_rows():
     gm = _gm()
     from rulehawk import citations
     for p in gm.PRODUCTIONS:
-        want = {"panos-rule-name-chars"}
+        # slice 5: a rule is appended in order, which panos-rule-order
+        # (pending) would cite
+        want = {"panos-rule-name-chars", "panos-rule-order"}
         if "V4PREFIX" in p.slots:
             want.add("panos-v4-prefix")
         assert set(p.needs) == want, p
@@ -263,7 +265,8 @@ def test_every_production_records_its_pending_rows():
 
 
 def test_p00_lists_its_pending_rows():
-    assert _parse(_read(_P00))["pending"] == ["panos-rule-name-chars", "panos-v4-prefix"]
+    assert _parse(_read(_P00))["pending"] == ["panos-rule-name-chars", "panos-rule-order",
+                                              "panos-v4-prefix"]
 
 
 def test_a_pending_panos_row_fails_a_shadow_run_closed(monkeypatch, shadow):
