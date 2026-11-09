@@ -68,10 +68,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       # Use the action from this very checkout (local `./`). A clean sample +
-      # the segmentation policy must pass the gate with exit 0 — proving the
-      # zero-install PYTHONPATH wiring works on a real runner.
-      - name: RuleHawk gate (expect PASS on a clean sample)
+      # the segmentation policy runs end to end through the zero-install
+      # PYTHONPATH wiring on a real runner. Fail-closed stopgap (0.4.1): a
+      # clean run is UNKNOWN, exit 3, and fails the step (never a PASS).
+      - name: RuleHawk gate (expect UNKNOWN on a clean sample)
         id: clean
+        continue-on-error: true
         uses: ./
         with:
           configs: samples/adv_realistic.txt
@@ -80,8 +82,9 @@ jobs:
           upload-sarif: false      # no code-scanning dependency in the self-test
           comment: false
       # No-policy run exercises the empty POLICY_ARGS path (the bash-3.2 trap).
-      - name: RuleHawk gate (expect PASS, no policy input)
+      - name: RuleHawk gate (expect UNKNOWN, no policy input)
         id: nopolicy
+        continue-on-error: true
         uses: ./
         with:
           configs: samples/adv_realistic.txt
@@ -90,8 +93,9 @@ jobs:
           comment: false
       # Evidence run exercises the EVIDENCE_ARGS path and both evidence outputs
       # — the newest wiring, and the one a compliance consumer relies on.
-      - name: RuleHawk gate (expect PASS, evidence artifact on)
+      - name: RuleHawk gate (expect UNKNOWN, evidence artifact on)
         id: evidence
+        continue-on-error: true
         uses: ./
         with:
           configs: samples/adv_realistic.txt
@@ -100,8 +104,14 @@ jobs:
           evidence: true
           upload-sarif: false
           comment: false
-      - name: Assert the PASS outputs and the evidence artifact
+      - name: Assert the UNKNOWN outputs and the evidence artifact
         env:
+          OUTCOME: ${{ steps.clean.outcome }}
+          VERDICT: ${{ steps.clean.outputs.verdict }}
+          EXIT_CODE: ${{ steps.clean.outputs.exit-code }}
+          NOPOLICY_OUTCOME: ${{ steps.nopolicy.outcome }}
+          NOPOLICY_EXIT_CODE: ${{ steps.nopolicy.outputs.exit-code }}
+          EVIDENCE_EXIT_CODE: ${{ steps.evidence.outputs.exit-code }}
           PASSED: ${{ steps.clean.outputs.passed }}
           WORST: ${{ steps.clean.outputs.worst-severity }}
           SCORE: ${{ steps.clean.outputs.score }}
@@ -112,11 +122,17 @@ jobs:
           EVIDENCE_MD: ${{ steps.evidence.outputs.evidence-md-file }}
         run: |
           set -euo pipefail
-          [ "${PASSED}" = "true" ]          || { echo "::error::outputs.passed should be true, got '${PASSED}'"; exit 1; }
+          [ "${OUTCOME}" = "failure" ]      || { echo "::error::exit 3 should fail the step, got '${OUTCOME}'"; exit 1; }
+          [ "${VERDICT}" = "UNKNOWN" ]      || { echo "::error::outputs.verdict should be UNKNOWN, got '${VERDICT}'"; exit 1; }
+          [ "${EXIT_CODE}" = "3" ]          || { echo "::error::outputs.exit-code should be 3, got '${EXIT_CODE}'"; exit 1; }
+          [ "${PASSED}" = "false" ]         || { echo "::error::outputs.passed should be false, got '${PASSED}'"; exit 1; }
           [ "${WORST}" = "none" ]           || { echo "::error::outputs.worst-severity should be none, got '${WORST}'"; exit 1; }
           [[ "${SCORE}" =~ ^[0-9]+$ ]]      || { echo "::error::outputs.score should be numeric, got '${SCORE}'"; exit 1; }
           [ -s "${SARIF}" ]                 || { echo "::error::outputs.sarif-file should name a non-empty file, got '${SARIF}'"; exit 1; }
-          [ "${NOPOLICY_PASSED}" = "true" ] || { echo "::error::no-policy run should pass, got '${NOPOLICY_PASSED}'"; exit 1; }
+          [ "${NOPOLICY_PASSED}" = "false" ] || { echo "::error::no-policy run should not pass, got '${NOPOLICY_PASSED}'"; exit 1; }
+          [ "${NOPOLICY_OUTCOME}" = "failure" ] || { echo "::error::no-policy exit 3 should fail the step, got '${NOPOLICY_OUTCOME}'"; exit 1; }
+          [ "${NOPOLICY_EXIT_CODE}" = "3" ] || { echo "::error::no-policy exit-code should be 3, got '${NOPOLICY_EXIT_CODE}'"; exit 1; }
+          [ "${EVIDENCE_EXIT_CODE}" = "3" ] || { echo "::error::evidence run exit-code should be 3, got '${EVIDENCE_EXIT_CODE}'"; exit 1; }
           [ -z "${NOPOLICY_EVIDENCE}" ]     || { echo "::error::evidence-file must be empty when evidence is off, got '${NOPOLICY_EVIDENCE}'"; exit 1; }
           [ -s "${EVIDENCE}" ]              || { echo "::error::evidence-file should name a non-empty file, got '${EVIDENCE}'"; exit 1; }
           [ -s "${EVIDENCE_MD}" ]           || { echo "::error::evidence-md-file should name a non-empty file, got '${EVIDENCE_MD}'"; exit 1; }
@@ -127,10 +143,14 @@ jobs:
           assert d["tool"]["generator"] == "ci", d["tool"]
           assert d["coverage"]["complete"] is True, d["coverage"]
           assert d["result"]["attestations_failed"] == 0, d["result"]
-          assert d["result"]["attestations_verified"] >= 1, d["result"]
+          # fail-closed stopgap: nothing is VERIFIED; each claim is INDETERMINATE
+          assert d["result"]["attestations_verified"] == 0, d["result"]
+          assert d["result"]["attestations_indeterminate"] >= 1, d["result"]
+          assert all(a["reasons"][0]["code"] == "fail-closed-stopgap"
+                     for a in d["attestations"]), d["attestations"]
           print("evidence artifact OK:", d["result"])
           PY
-          echo "PASS path verified: passed=${PASSED}, worst=${WORST}, score=${SCORE}"
+          echo "UNKNOWN path verified: verdict=${VERDICT}, exit-code=${EXIT_CODE}, passed=${PASSED}, worst=${WORST}, score=${SCORE}"
 
   action-selftest-fail-path:
     name: Dogfood the Action (FAIL verdict is enforced)
@@ -155,12 +175,47 @@ jobs:
           OUTCOME: ${{ steps.dirty.outcome }}
           PASSED: ${{ steps.dirty.outputs.passed }}
           WORST: ${{ steps.dirty.outputs.worst-severity }}
+          VERDICT: ${{ steps.dirty.outputs.verdict }}
+          EXIT_CODE: ${{ steps.dirty.outputs.exit-code }}
         run: |
           set -euo pipefail
           [ "${OUTCOME}" = "failure" ] || { echo "::error::gate did not fail on a dirty sample"; exit 1; }
+          [ "${VERDICT}" = "FAIL" ]    || { echo "::error::outputs.verdict should be FAIL, got '${VERDICT}'"; exit 1; }
+          [ "${EXIT_CODE}" = "1" ]     || { echo "::error::outputs.exit-code should be 1, got '${EXIT_CODE}'"; exit 1; }
           [ "${PASSED}" = "false" ]    || { echo "::error::outputs.passed should be false, got '${PASSED}'"; exit 1; }
           [ "${WORST}" = "critical" ]  || { echo "::error::outputs.worst-severity should be critical, got '${WORST}'"; exit 1; }
           echo "FAIL path verified: outcome=${OUTCOME}, passed=${PASSED}, worst=${WORST}"
+
+  action-selftest-advisory-unknown:
+    name: Dogfood the Action (fail-on none never reads as PASS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # fail-on none never blocks, but under the fail-closed stopgap it
+      # reports UNKNOWN: passed=false, verdict=UNKNOWN, and the step still
+      # succeeds (exit 0).
+      - name: RuleHawk gate (expect UNKNOWN, not enforced)
+        id: adv
+        uses: ./
+        with:
+          configs: samples/adv_realistic.txt
+          policy: samples/policy.json
+          fail-on: none
+          upload-sarif: false
+          comment: false
+      - name: Assert the step passed but the verdict is UNKNOWN
+        env:
+          OUTCOME: ${{ steps.adv.outcome }}
+          PASSED: ${{ steps.adv.outputs.passed }}
+          VERDICT: ${{ steps.adv.outputs.verdict }}
+          EXIT_CODE: ${{ steps.adv.outputs.exit-code }}
+        run: |
+          set -euo pipefail
+          [ "${OUTCOME}" = "success" ] || { echo "::error::fail-on none must not fail the step"; exit 1; }
+          [ "${PASSED}" = "false" ]    || { echo "::error::outputs.passed should be false, got '${PASSED}'"; exit 1; }
+          [ "${VERDICT}" = "UNKNOWN" ] || { echo "::error::outputs.verdict should be UNKNOWN, got '${VERDICT}'"; exit 1; }
+          [ "${EXIT_CODE}" = "0" ]     || { echo "::error::outputs.exit-code should be 0, got '${EXIT_CODE}'"; exit 1; }
+          echo "advisory UNKNOWN verified: outcome=${OUTCOME}, verdict=${VERDICT}, passed=${PASSED}"
 
   # One PR comment for several checks: the headline is the WORST verdict, so a
   # passing check can never hide a failing one. Same-job: every gate step's
@@ -179,7 +234,8 @@ jobs:
           label: dirty
           upload-sarif: false
           comment: false
-      - name: Clean check (expect PASS)
+      - name: Clean check (expect UNKNOWN, fail-closed stopgap)
+        continue-on-error: true
         uses: ./
         with:
           configs: samples/adv_realistic.txt
@@ -196,8 +252,9 @@ jobs:
           set -e
           [ "${RC}" = "1" ] || { echo "::error::expected FAIL (exit 1), got ${RC}"; exit 1; }
           grep -q '^## ❌ RuleHawk firewall gate: FAIL' combined.md
-          grep -q '| clean | ✅ PASS |' combined.md
+          grep -q '| clean | ❌ UNKNOWN |' combined.md
           grep -q '| dirty | ❌ FAIL' combined.md
+          if grep -q '✅' combined.md; then echo "::error::a check read PASS"; exit 1; fi
           echo "same-job combine verified"
 
   # Across jobs: each gate shares its result as an artifact and one job
@@ -225,6 +282,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./
+        # Fail-closed stopgap: the clean check is UNKNOWN (exit 3) and fails
+        # the step; keep the job green so the combine below reads its result.
+        continue-on-error: true
         with:
           configs: samples/adv_realistic.txt
           policy: samples/policy.json
@@ -291,6 +351,6 @@ jobs:
           [ "${MISSING}" = "UNKNOWN" ]        || { echo "::error::expected UNKNOWN, got '${MISSING}'"; exit 1; }
           if grep -q '^## ✅' "${MISSING_FILE}"; then echo "::error::a shortfall read PASS"; exit 1; fi
           [ "${MISSING_OUTCOME}" = "failure" ] || { echo "::error::the UNKNOWN did not fail the step"; exit 1; }
-          grep -q '| clean | ✅ PASS |' "${BOTH_FILE}"
+          grep -q '| clean | ❌ UNKNOWN |' "${BOTH_FILE}"
           grep -q '| dirty | ❌ FAIL' "${BOTH_FILE}"
           echo "across-jobs combine verified: ${BOTH}, ${WORST}, ${MISSING}"

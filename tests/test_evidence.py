@@ -121,13 +121,14 @@ def test_pass_and_fail_are_attributed_to_the_right_assertion():
     corp = by_claim["CORP cannot reach PCI on tcp/445"]
     assert corp["status"] == FAILED
     assert "10.20.0.1 -> 10.10.0.1:445" in corp["witness"]
-    assert by_claim["DMZ cannot reach PCI"]["status"] == VERIFIED
+    assert by_claim["DMZ cannot reach PCI"]["status"] == INDETERMINATE   # stopgap
 
 
 def test_clean_config_yields_verified_attestations():
     art = _build(_CLEAN)
-    assert [a["status"] for a in art["attestations"]] == [VERIFIED, VERIFIED]
-    assert art["result"]["attestations_verified"] == 2
+    # fail-closed stopgap: the would-be VERIFIED claims are INDETERMINATE
+    assert [a["status"] for a in art["attestations"]] == [INDETERMINATE, INDETERMINATE]
+    assert art["result"]["attestations_verified"] == 0
 
 
 def test_must_reach_is_attested_too():
@@ -183,14 +184,15 @@ def test_one_leaky_config_fails_the_whole_fleet_claim():
     corp = next(a for a in art["attestations"] if a["claim"].startswith("CORP"))
     assert corp["status"] == FAILED
     assert [f["subject"] for f in corp["failed_on"]] == ["cfg2.txt"]
-    assert corp["verified_on"] == ["cfg0.txt", "cfg1.txt"]
+    # fail-closed stopgap: the clean configs are listed as undecided, not verified
+    assert [p["subject"] for p in corp["indeterminate_on"]] == ["cfg0.txt", "cfg1.txt"]
 
 
 def test_all_clean_configs_verify_and_name_their_basis():
     corp = next(a for a in _build(_CLEAN, _CLEAN)["attestations"]
                 if a["claim"].startswith("CORP"))
-    assert corp["status"] == VERIFIED
-    assert corp["basis"] == "no audited ruleset permits this flow"
+    assert corp["status"] == INDETERMINATE                 # fail-closed stopgap
+    assert corp["basis"].startswith("no audited ruleset permits this flow")
 
 
 def test_unparseable_config_blocks_every_verified_attestation():

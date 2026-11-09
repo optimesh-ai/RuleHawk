@@ -179,7 +179,7 @@ def test_unresolvable_source_never_certifies_isolation():
     claim CORP is isolated from PCI."""
     kinds = _kinds(_sg({"IpProtocol": "tcp", "FromPort": 3306, "ToPort": 3306,
                         "UserIdGroupPairs": [{"GroupId": "sg-app"}]}))
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
     assert "segmentation-indeterminate" in kinds
 
 
@@ -212,7 +212,7 @@ def test_genuinely_isolated_group_is_allowed_to_pass():
     """Fail-closed must not mean fail-always — a clean group still proves."""
     kinds = _kinds(_sg({"IpProtocol": "tcp", "FromPort": 3306, "ToPort": 3306,
                         "IpRanges": [{"CidrIp": "10.30.0.0/16"}]}))
-    assert kinds == {"segmentation-ok"}
+    assert kinds == {"segmentation-unknown"}
 
 
 # --------------------------------------------------------------------------- #

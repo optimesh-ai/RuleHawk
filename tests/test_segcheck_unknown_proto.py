@@ -37,7 +37,7 @@ def test_unknown_proto_never_certifies_isolation():
     """Regression: reported `PASS: CORP cannot reach PCI on tpc`."""
     f = _check({"zones": _ZONES,
                 "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tpc"}]})
-    assert not any(x.kind == "segmentation-ok" for x in f)
+    assert not any(x.kind == "segmentation-unknown" for x in f)
     err = next(x for x in f if x.kind == "segmentation-error")
     assert err.severity == "high"          # must not be silently ignorable
     assert "unknown protocol 'tpc'" in err.message

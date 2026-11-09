@@ -44,7 +44,7 @@ def test_earlier_deny_blocks_no_false_alarm():
            " permit ip any any\n")
     kinds = {k for k, _ in _kinds(acl)}
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
 
 
 def test_permit_any_any_violates_segmentation():
@@ -58,7 +58,7 @@ def test_unrelated_permit_does_not_violate():
            " permit tcp 10.20.0.0 0.0.255.255 10.30.0.0 0.0.255.255 eq 445\n")
     kinds = {k for k, _ in _kinds(acl)}
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
 
 
 def test_neq_covering_445_is_precise_critical():
@@ -82,7 +82,7 @@ def test_partial_deny_cannot_hide_the_leak():
            " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq 445\n")
     kinds = {k for k, _ in _kinds(acl)}
     assert "segmentation-violation" in kinds
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
 
 
 def test_proto_specific_deny_does_not_block_wildcard_assertion():
@@ -123,7 +123,7 @@ def test_icmp_typed_deny_does_not_block_untyped_assertion():
               " permit icmp any any\n")
     kinds_ok = {k for k, _ in _kinds(acl_ok, pol)}
     assert "segmentation-violation" not in kinds_ok
-    assert "segmentation-ok" in kinds_ok
+    assert "segmentation-unknown" in kinds_ok
 
 
 def test_unknown_zone_name_fails_closed_not_pass():
@@ -132,7 +132,7 @@ def test_unknown_zone_name_fails_closed_not_pass():
            "must_not_reach": [{"src": "CROP", "dst": "PCI"}]}   # typo
     kinds = {k for k, _ in _kinds("ip access-list extended T\n permit ip any any\n", pol)}
     assert "segmentation-error" in kinds
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
 
 
 def test_invalid_zone_cidr_fails_closed_without_traceback():
@@ -140,7 +140,7 @@ def test_invalid_zone_cidr_fails_closed_without_traceback():
            "must_not_reach": [{"src": "CORP", "dst": "PCI"}]}
     kinds = {k for k, _ in _kinds("ip access-list extended T\n deny ip any any\n", pol)}
     assert "segmentation-error" in kinds
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
 
 
 def test_string_ports_are_coerced():
@@ -172,7 +172,7 @@ def test_neq_excluding_445_is_precise_pass_never_false():
            " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 neq 445\n")
     kinds = {k for k, _ in _kinds(acl)}
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +193,7 @@ def test_deny_fragments_above_broad_permit_is_not_a_false_pass():
            " deny ip any 10.10.0.0 0.0.255.255 fragments\n"
            " permit ip 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255\n")
     kinds = {k for k, _ in _kinds(acl)}
-    assert "segmentation-ok" not in kinds          # the old false PASS
+    assert "segmentation-unknown" not in kinds          # the old false PASS
     assert "segmentation-indeterminate" in kinds   # fail closed, review manually
 
 
@@ -205,7 +205,7 @@ def test_deny_time_range_above_broad_permit_is_not_a_false_pass():
            "time-range NIGHT\n"
            " permit ip 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255\n")
     kinds = {k for k, _ in _kinds(acl)}
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
     assert "segmentation-indeterminate" in kinds
 
 
@@ -217,7 +217,7 @@ def test_narrowed_permit_is_indeterminate_not_false_critical():
            "time-range WORKHOURS\n")
     kinds = {k for k, _ in _kinds(acl)}
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
     assert "segmentation-indeterminate" in kinds
 
 
@@ -245,7 +245,7 @@ def test_log_and_established_stay_exact():
            " deny tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255 eq 445 log\n"
            " permit ip any any\n")
     kinds = {k for k, _ in _kinds(acl)}
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
     assert "segmentation-violation" not in kinds
 
 
@@ -287,7 +287,7 @@ def test_portless_port_scoped_deny_is_not_a_false_pass():
     aces, _ = parse_acls(acl)
     f = check_segmentation(aces, _PORTLESS_POLICY)
     kinds = {x.kind for x in f}
-    assert "segmentation-ok" not in kinds          # the old false PASS
+    assert "segmentation-unknown" not in kinds          # the old false PASS
     assert "segmentation-violation" in kinds
     viol = next(x for x in f if x.kind == "segmentation-violation")
     # The witness is a real packet: concrete port, never the abstract None,
@@ -318,7 +318,7 @@ def test_portless_full_width_deny_is_a_genuine_pass():
     aces, _ = parse_acls(acl)
     kinds = {x.kind for x in check_segmentation(aces, _PORTLESS_POLICY)}
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
 
 
 def test_portless_scoped_denies_fully_covering_permit_range_pass():
@@ -332,7 +332,7 @@ def test_portless_scoped_denies_fully_covering_permit_range_pass():
     aces, _ = parse_acls(acl)
     kinds = {x.kind for x in check_segmentation(aces, _PORTLESS_POLICY)}
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
 
 
 def test_portless_gap_between_scoped_denies_is_found():
@@ -357,7 +357,7 @@ def test_portless_imprecise_earlier_deny_fails_closed():
            " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255\n")
     aces, _ = parse_acls(acl)
     kinds = {x.kind for x in check_segmentation(aces, _PORTLESS_POLICY)}
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
     assert "segmentation-indeterminate" in kinds
 
 
@@ -368,7 +368,7 @@ def test_portless_no_candidate_permit_still_passes():
            " permit tcp 10.20.0.0 0.0.255.255 10.30.0.0 0.0.255.255\n")
     aces, _ = parse_acls(acl)
     f = check_segmentation(aces, _PORTLESS_POLICY)
-    ok = next(x for x in f if x.kind == "segmentation-ok")
+    ok = next(x for x in f if x.kind == "segmentation-unknown")
     assert "on tcp" in ok.message and "None" not in ok.message
 
 
@@ -379,7 +379,7 @@ def test_ported_assertion_behavior_unchanged_by_portless_path():
            " permit tcp 10.20.0.0 0.0.255.255 10.10.0.0 0.0.255.255\n")
     kinds = {k for k, _ in _kinds(acl)}          # _POLICY asserts ports=[445]
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
 
 
 # ---------------------------------------------------------------------------
@@ -414,7 +414,7 @@ def test_ipv6_segmentation_violation_has_concrete_v6_witness():
     f = check_segmentation(aces, _V6_POLICY)
     kinds = {x.kind for x in f}
     assert "segmentation-violation" in kinds
-    assert "segmentation-ok" not in kinds          # never a false PASS on a leak
+    assert "segmentation-unknown" not in kinds          # never a false PASS on a leak
     viol = next(x for x in f if x.kind == "segmentation-violation")
     assert viol.severity == "critical"
     # Witness is inside the forbidden v6 space and carries the forbidden port.
@@ -444,7 +444,7 @@ def test_v4_zones_over_v6_only_config_pass_no_exception():
     f = check_segmentation(aces, v4_policy)   # must not raise
     kinds = {x.kind for x in f}
     assert "segmentation-violation" not in kinds
-    assert "segmentation-ok" in kinds
+    assert "segmentation-unknown" in kinds
 
 
 def test_nxos_inherits_narrowing_guard():
@@ -456,7 +456,7 @@ def test_nxos_inherits_narrowing_guard():
     aces, notes = parse_nxos(cfg)
     from rulehawk.segcheck import check_segmentation as _cs
     kinds = {f.kind for f in _cs(aces, _POLICY)}
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds
     assert "segmentation-indeterminate" in kinds
 
 
@@ -474,4 +474,4 @@ def test_scalar_port_zero_is_literal_not_any():
            "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "tcp",
                                "ports": 0}]}
     # port 0 is genuinely not permitted (only 80 is) -> honest PASS, no witness.
-    assert {f.kind for f in check_segmentation(aces, pol)} == {"segmentation-ok"}
+    assert {f.kind for f in check_segmentation(aces, pol)} == {"segmentation-unknown"}

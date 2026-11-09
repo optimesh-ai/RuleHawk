@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Dict, List, Optional
 
-from .analyze import Finding, score
+from .analyze import STOPGAP_CODE, STOPGAP_MESSAGE, Finding, score, stopgap_reasons
 from .boundary import text_lines as boundary_text, to_dict as boundary_dict
 
 _ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
@@ -34,8 +34,38 @@ def _note_lines(notes: List[str]) -> List[str]:
     return out
 
 
+def exit_code(findings: List[Finding], n_rules: int) -> int:
+    """The single-file exit code: 2 parse failure (nothing parsed), 1 FAIL (an
+    unaccepted critical/high finding), else 3 UNKNOWN. Fail-closed stopgap: an
+    audited run never exits 0, because 0 would read as a PASS."""
+    if not n_rules:
+        return 2
+    # An ACCEPTED finding is reported but does not fail the run — that is what
+    # a time-boxed, attributed risk acceptance is for.
+    if any(f.severity in ("critical", "high") and f.accepted is None
+           for f in findings):
+        return 1
+    return 3
+
+
+def verdict(findings: List[Finding], n_rules: int) -> str:
+    """FAIL (exit 1 or 2) or UNKNOWN (exit 3). Never PASS (fail-closed stopgap)."""
+    return "UNKNOWN" if exit_code(findings, n_rules) == 3 else "FAIL"
+
+
+def _verdict_line(findings: List[Finding], n_rules: int) -> str:
+    rc = exit_code(findings, n_rules)
+    if rc == 3:
+        return (f" VERDICT: UNKNOWN (exit 3) — {STOPGAP_CODE}: "
+                f"{STOPGAP_MESSAGE}")
+    if rc == 2:
+        return " VERDICT: FAIL (exit 2, fail-closed) — no rules parsed"
+    return " VERDICT: FAIL (exit 1) — at least one critical/high finding"
+
+
 def to_json(findings: List[Finding], notes: List[str], n_rules: int,
             vendor: Optional[str] = None) -> str:
+    v = verdict(findings, n_rules)
     return json.dumps({
         # Additive field: machine-readable vendor label (ios-asa | junos | panos |
         # iptables | nxos | eos). "ios-asa" is also the default/fallback.
@@ -47,10 +77,16 @@ def to_json(findings: List[Finding], notes: List[str], n_rules: int,
         "rules_analyzed": n_rules,
         "findings_total": len(findings),
         "findings_by_severity": _counts(findings),
+        # FAIL | UNKNOWN (never PASS: fail-closed stopgap) and, for UNKNOWN, the
+        # machine-readable reason. Matches the exit code: 1/2 FAIL, 3 UNKNOWN.
+        "verdict": v,
+        "reasons": stopgap_reasons() if v == "UNKNOWN" else [],
         "findings": [
             {"rule_id": f.rule_id, "kind": f.kind, "severity": f.severity,
              "message": f.message, "rule": f.rule, "cited": f.cited, "fix": f.fix,
-             "witness": f.witness, "accepted": f.accepted, "line": f.line}
+             "witness": f.witness, "accepted": f.accepted, "line": f.line,
+             # assertion findings the stopgap reports UNKNOWN (null otherwise)
+             "verdict": f.verdict, "reasons": list(f.reasons or [])}
             for f in _sorted(findings)
         ],
         "parse_notes": notes,
@@ -71,7 +107,8 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int,
                "=" * 64,
                "",
                " No ACL/firewall rules found — nothing was audited.",
-               " This is NOT a clean result."]
+               " This is NOT a clean result.",
+               _verdict_line(findings, n_rules)]
         if _vendor == "ios-asa":
             # "ios-asa" is the fallback: no vendor was positively detected.
             out += [
@@ -97,13 +134,16 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int,
     lines.append(f" Hygiene score: {sc}/100   "
                  + "  ".join(f"{k}:{counts[k]}" for k in
                              ("critical", "high", "medium", "low")))
+    lines.append(_verdict_line(findings, n_rules))
     lines.append("=" * 64)
     if not findings:
         # Explicit: distinguish "0 findings with N rules analyzed" from "nothing
         # parsed". The header already carries the rule count; this line names the
-        # vendor so the operator knows what format was actually audited.
+        # vendor so the operator knows what format was actually audited. Not a
+        # clean bill of health: the verdict is UNKNOWN (fail-closed stopgap).
         lines.append(
-            f"\n  0 findings — {n_rules} rules analyzed ({_vendor}): policy is clean."
+            f"\n  0 findings — {n_rules} rules analyzed ({_vendor}); verdict "
+            f"UNKNOWN: {STOPGAP_MESSAGE}."
         )
     for f in _sorted(findings):
         lines.append("")
@@ -122,6 +162,8 @@ def to_text(findings: List[Finding], notes: List[str], n_rules: int,
             # already shows it; the CLI text report must too.
             lines.append(f"   pkt  : {f.witness}")
         lines.append(f"   why  : {f.message}")
+        for r in (f.reasons or []):
+            lines.append(f"   reason: {r['code']}: {r['message']}")
         if f.accepted:
             a = f.accepted
             # Say plainly that the risk is OWNED, not gone: the finding stands,

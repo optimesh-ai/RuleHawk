@@ -68,7 +68,7 @@ def test_a_failing_check_beside_a_passing_one_heads_the_comment_with_fail(tmp_pa
     head = _headline(body)
     assert "❌" in head and "FAIL" in head and "✅" not in head
     # Every check appears in the summary table with its own verdict.
-    assert "| segmentation | ✅ PASS |" in body
+    assert "| segmentation | ❌ UNKNOWN |" in body      # fail-closed stopgap
     assert "| egress | ❌ FAIL" in body
     # The failing check's full report, witness packets included, is on the PR.
     assert "10.20.0.1 -> 10.10.0.1:445" in body
@@ -78,8 +78,8 @@ def test_two_passing_checks_pass(tmp_path):
     a = _result(tmp_path, "a.json", _CLEAN, label="one")
     b = _result(tmp_path, "b.json", _CLEAN, label="two")
     body, verdict = combine.render([a, b], expect=2)
-    assert verdict == "PASS"
-    assert "✅" in _headline(body) and "PASS" in _headline(body)
+    assert verdict == "UNKNOWN"                        # fail-closed stopgap
+    assert "❌" in _headline(body) and "UNKNOWN" in _headline(body)
 
 
 def test_a_missing_expected_check_is_unknown_never_pass(tmp_path):
@@ -136,7 +136,7 @@ def test_a_rerun_attempt_replaces_the_same_check_from_an_older_attempt(tmp_path)
     new = _result(tmp_path, "new.json", _CLEAN, label="egress", job="e", attempt="2")
     seg = _result(tmp_path, "seg.json", _CLEAN, label="seg", job="s", attempt="1")
     body, verdict = combine.render([old, new, seg], expect=2)
-    assert verdict == "PASS", body
+    assert verdict == "UNKNOWN", body                  # fail-closed stopgap
     assert body.count("| egress |") == 1
 
 
@@ -166,7 +166,7 @@ def test_cli_exit_codes_and_comment_file(tmp_path):
     a = _result(tmp_path, "a.json", _CLEAN, label="one")
     b = _result(tmp_path, "b.json", _DIRTY, label="two")
     out = tmp_path / "c.md"
-    assert combine.main([a, "--comment", str(out), "-q"]) == 0
+    assert combine.main([a, "--comment", str(out), "-q"]) == 2   # stopgap UNKNOWN
     assert combine.main([a, b, "--comment", str(out), "-q"]) == 1
     assert out.read_text().startswith(gate._COMMENT_MARKER)
     assert combine.main([a, "--expect", "2", "--comment", str(out), "-q"]) == 2
@@ -205,9 +205,10 @@ def test_a_pass_claim_with_findings_at_the_threshold_is_not_a_pass(tmp_path):
 def test_a_pass_claim_with_unparsed_files_is_not_a_pass(tmp_path):
     p = _record(tmp_path, "unparsed", parse_failures=1)
     assert combine.render([p])[1] == "UNKNOWN"
-    # ...except under the advisory threshold, which never blocks.
+    # Under the advisory threshold it never blocks, but a `passed: true`
+    # record (a gate before 0.4.1) is still never a pass (fail-closed stopgap).
     q = _record(tmp_path, "advisory", parse_failures=1, fail_on="none")
-    assert combine.render([q])[1] == "PASS"
+    assert combine.render([q])[1] == "UNKNOWN"
 
 
 def test_a_record_missing_its_counts_is_not_a_pass(tmp_path):
@@ -257,7 +258,9 @@ def test_a_failed_job_that_reported_its_failure_is_plain_fail(tmp_path):
 def test_a_failed_job_that_runs_no_rulehawk_check_is_ignored(tmp_path):
     ok = _result(tmp_path, "ok.json", _CLEAN, label="seg", job="segmentation")
     needs = {"segmentation": {"result": "success"}, "lint": {"result": "failure"}}
-    assert combine.render([ok], expect=1, needs=needs)[1] == "PASS"
+    body, verdict = combine.render([ok], expect=1, needs=needs)
+    assert verdict == "UNKNOWN"                        # fail-closed stopgap
+    assert "job lint" not in body
 
 
 def test_cli_needs(tmp_path):
@@ -347,4 +350,4 @@ def test_an_unwritable_summary_does_not_split_the_verdict_from_the_comment(tmp_p
     out = tmp_path / "c.md"
     rc = combine.main([a, "--comment", str(out), "--summary", str(tmp_path), "-q"])
     body = out.read_text(encoding="utf-8")
-    assert rc == 0 and "✅" in _headline(body)
+    assert rc == 2 and "❌" in _headline(body) and "**UNKNOWN**" in body   # stopgap

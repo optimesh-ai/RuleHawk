@@ -56,4 +56,4 @@ def test_next_term_still_falls_through():
 def test_unknown_then_action_is_not_a_confident_verdict():
     aces, kinds = _kinds(_cfg(" then { frobnicate x; }"))
     assert aces[0].imprecise
-    assert "segmentation-ok" not in kinds
+    assert "segmentation-unknown" not in kinds

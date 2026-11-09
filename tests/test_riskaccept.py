@@ -279,7 +279,8 @@ def test_gate_is_red_without_an_exception(tmp_path):
 
 def test_gate_is_green_with_an_in_force_acceptance(tmp_path):
     """The whole point: a documented, owned, expiring risk stops blocking."""
-    assert _gate(tmp_path, _policy(_exc())).returncode == 0
+    # fail-closed stopgap: no longer FAIL (1); UNKNOWN (3), since no run is a PASS
+    assert _gate(tmp_path, _policy(_exc())).returncode == 3
 
 
 def test_gate_is_red_again_once_the_acceptance_expires(tmp_path):
@@ -300,5 +301,5 @@ def test_gate_still_reports_the_accepted_finding(tmp_path):
         [sys.executable, "-m", "rulehawk", "gate", str(tmp_path / "*.txt"),
          "--policy", str(pol), "--fail-on", "high"],
         cwd=_ROOT, capture_output=True, text=True)
-    assert proc.returncode == 0
+    assert proc.returncode == 3              # fail-closed stopgap: UNKNOWN, not FAIL
     assert "segmentation-violation" in proc.stdout

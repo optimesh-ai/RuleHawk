@@ -21,8 +21,9 @@ branding:
 #
 # FAIL if any check failed; UNKNOWN if fewer than `expect` checks reported (a
 # job crashed, was cancelled or skipped), a result could not be read, or a gate
-# job did not succeed although its results show no failure; PASS only when
-# every expected check reported and passed.
+# job did not succeed although its results show no failure. Fail-closed
+# stopgap (0.4.1): never PASS; a check that does not fail is UNKNOWN, and a
+# `passed: true` record from an older gate is UNKNOWN too.
 
 inputs:
   expect:
@@ -49,13 +50,19 @@ inputs:
     required: false
     default: 'true'
   fail:
-    description: 'Fail this step unless the combined verdict is PASS (true|false)'
+    description: >-
+      Fail this step on any enforced FAIL or UNKNOWN (true|false). In 0.4.1
+      every enforced check that does not fail is UNKNOWN (fail-closed
+      stopgap), so this step fails unless every check is fail-on none.
     required: false
     default: 'true'
 
 outputs:
   verdict:
-    description: 'PASS | FAIL | UNKNOWN: the worst verdict across every check'
+    description: >-
+      FAIL | UNKNOWN: the worst verdict across every check, suffixed
+      " (not enforced)" when only fail-on none checks have it. Never PASS in
+      0.4.1 (fail-closed stopgap): a check that does not fail is UNKNOWN.
     value: ${{ steps.combine.outputs.verdict }}
   comment-file:
     description: 'Path to the combined comment body (markdown)'
@@ -101,26 +108,40 @@ runs:
         rm -f "${BODY}"
         # noglob: the inputs are paths, split on whitespace only.
         set +e -f
+        VFILE="${BODY}.verdict"
         python3 -m rulehawk combine ${IN} --expect "${RH_EXPECT}" --needs "${RH_NEEDS}" \
-          --comment "${BODY}"
+          --comment "${BODY}" --verdict "${VFILE}"
         RC=$?
         set +f
+        # ENFORCED is the verdict over the enforced checks: "PASS" here only
+        # means no enforced check blocks (every check is fail-on none).
         case "${RC}" in
-          0) VERDICT=PASS ;;
-          1) VERDICT=FAIL ;;
-          *) VERDICT=UNKNOWN ;;
+          0) ENFORCED=PASS ;;
+          1) ENFORCED=FAIL ;;
+          *) ENFORCED=UNKNOWN ;;
         esac
-        # Belt and braces: a body that reads PASS beside a verdict that is not
-        # PASS is replaced, never posted.
-        if [ -s "${BODY}" ] && [ "${VERDICT}" != "PASS" ] && grep -q '^## ✅' "${BODY}"; then
+        VERDICT="${ENFORCED}"
+        # Exit 0: only fail-on none checks; report the headline as shown.
+        if [ "${RC}" = "0" ]; then
+          VERDICT="$(head -n 1 "${VFILE}" 2>/dev/null)"
+          # Fail-closed stopgap: 0.4.1 never reports PASS. A missing or empty
+          # verdict file, or one that says PASS, is not trusted.
+          case "${VERDICT}" in
+            ""|PASS*) VERDICT=UNKNOWN; ENFORCED=UNKNOWN ;;
+          esac
+        fi
+        # Belt and braces: a body that reads PASS is replaced, never posted
+        # (the verdict is never PASS in 0.4.1).
+        if [ -s "${BODY}" ] && grep -q '^## ✅' "${BODY}"; then
           rm -f "${BODY}"
         fi
         if [ ! -s "${BODY}" ]; then
           VERDICT=UNKNOWN
+          ENFORCED=UNKNOWN
           printf '%s\n## ❌ RuleHawk firewall gate: UNKNOWN\n\nThe checks could not be combined into a comment; see the job log.\n' \
             '<!-- rulehawk-gate -->' > "${BODY}"
         fi
-        { echo "verdict=${VERDICT}"; echo "comment=${BODY}"; } >> "${GITHUB_OUTPUT}"
+        { echo "verdict=${VERDICT}"; echo "enforced=${ENFORCED}"; echo "comment=${BODY}"; } >> "${GITHUB_OUTPUT}"
 
     - name: Sticky PR comment
       if: always() && inputs.comment == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && steps.combine.outputs.comment != ''
@@ -140,9 +161,16 @@ runs:
       shell: bash
       env:
         RH_VERDICT: ${{ steps.combine.outputs.verdict }}
+        RH_ENFORCED: ${{ steps.combine.outputs.enforced }}
       run: |
-        if [ "${RH_VERDICT}" != "PASS" ]; then
-          echo "::error title=RuleHawk combined verdict: ${RH_VERDICT:-UNKNOWN}::Not every RuleHawk check in this run passed — see the PR comment and each job's summary."
+        if [ "${RH_ENFORCED:-UNKNOWN}" != "PASS" ]; then
+          echo "::error title=RuleHawk combined verdict: ${RH_VERDICT:-UNKNOWN}::Not every RuleHawk check in this run passed — see the PR comment and each job's summary. An UNKNOWN check is the 0.4.1 fail-closed stopgap (fail-closed stopgap pending soundness review)."
           exit 1
         fi
-        echo "Every RuleHawk check in this run passed."
+        case "${RH_VERDICT:-}" in
+          ""|PASS*)
+            # 0.4.1 never reports PASS (fail-closed stopgap): fail closed.
+            echo "::error title=RuleHawk combined verdict (fail-closed-stopgap)::Unexpected combined verdict '${RH_VERDICT:-}': this release never reports PASS (fail-closed stopgap pending soundness review); failing closed."
+            exit 1 ;;
+        esac
+        echo "::warning title=RuleHawk combined verdict: ${RH_VERDICT}::Only fail-on none checks have this verdict; they are reported, not enforced."
