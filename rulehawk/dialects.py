@@ -303,7 +303,11 @@ def shadow_block(raw: bytes, vendor: str = "auto", policy: Optional[dict] = None
             else:
                 block["grammar_unavailable"] = str(e) or type(e).__name__
             return block
-        gm, model = grammar.parse_model(raw)
+        try:
+            gm, model = grammar.parse_model(raw)
+        except Exception as e:  # fail closed (review r2 of #52-#59, N2)
+            block["grammar_unavailable"] = "grammar failed: " + type(e).__name__
+            return block
         block["grammar"] = gm
         block["blocking_reason"] = gm["reason"] or UNCERTIFIED
         if model is not None:

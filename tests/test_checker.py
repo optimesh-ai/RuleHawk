@@ -544,3 +544,81 @@ def test_citations_does_nothing_at_import_but_build_its_tables():
                 if isinstance(sub, ast.Call):
                     assert isinstance(sub.func, ast.Name) and sub.func.id == "_row", \
                         ast.unparse(sub)[:80]
+
+
+# ------------------------------------------------- review r2 of #52-#59, G10a and G10b
+
+_K00_ADDR_ONLY = (
+    "interfaces {\n"
+    "    ge-0/0/0 { unit 0 { family inet { filter { input F; } address 192.0.2.1/24; } } }\n"
+    "}\n"
+    "firewall {\n    family inet {\n        filter F {\n"
+    "            term a { then discard; }\n        }\n    }\n}\n")
+
+
+def _record_bytes(raw, pol):
+    from rulehawk import certificate, dialects
+    sh = dialects.shadow_block(raw, "auto", pol)
+    return certificate.build(raw, sh["grammar"], sh["model"], sh["dual_read"],
+                             sh.get("placement"), pol, None)
+
+
+def test_g10a_an_interface_address_alone_needs_the_v4_prefix_row():
+    """G10a: any IPv4 prefix in the file, an interface `address` included,
+    rests on `junos-v4-prefix`; a record without it, row and blocker, is
+    refused."""
+    raw = _K00_ADDR_ONLY.encode()
+    pol = _policy()
+    rec = _record_bytes(raw, pol)
+    assert _check(rec, raw, pol)["agrees"] is True, _check(rec, raw, pol)
+    assert "junos-v4-prefix" in rec["subs"][0]["pending"], rec["subs"][0]["pending"]
+    rec = _copy(rec)
+    rec["subs"][0]["pending"].remove("junos-v4-prefix")
+    rec["blockers"].remove("pending:junos-v4-prefix")
+    r = _check(rec, raw, pol)
+    assert r["agrees"] is False and r["reason"] == "checker-disagrees", r
+
+
+def test_g10a_the_v4_prefix_blocker_alone_is_required():
+    raw = _K00_ADDR_ONLY.encode()
+    pol = _policy()
+    rec = _copy(_record_bytes(raw, pol))
+    rec["blockers"].remove("pending:junos-v4-prefix")
+    assert _check(rec, raw, pol)["agrees"] is False
+
+
+def _cited_drops():
+    out = []
+    for path in _CONTROLS:
+        rec, _, _ = _record(path)
+        out += [(path, row) for row in rec["subs"][0]["rows"]]
+    return out
+
+
+@pytest.mark.parametrize("path,row", _cited_drops(),
+                         ids=[f"{os.path.basename(p)}:{r}" for p, r in _cited_drops()])
+def test_g10b_dropping_any_cited_row_is_refused(path, row):
+    """G10b: the checker derives the cited rows in full from its own
+    reading; dropping any one is `checker-disagrees`."""
+    rec, raw, pol = _record(path)
+    rec = _copy(rec)
+    rec["subs"][0]["rows"].remove(row)
+    r = _check(rec, raw, pol)
+    assert r["agrees"] is False and r["reason"] == "checker-disagrees", (row, r)
+
+
+def test_g10b_dropping_a_cited_row_of_the_address_only_file_is_refused():
+    raw = _K00_ADDR_ONLY.encode()
+    pol = _policy()
+    rec = _record_bytes(raw, pol)
+    for row in rec["subs"][0]["rows"]:
+        r2 = _copy(rec)
+        r2["subs"][0]["rows"].remove(row)
+        assert _check(r2, raw, pol)["agrees"] is False, row
+
+
+def test_g10b_an_extra_cited_row_is_refused():
+    rec, raw, pol = _record(_I00)
+    rec = _copy(rec)
+    rec["subs"][0]["rows"].append("junos-term-order")
+    assert _check(rec, raw, pol)["agrees"] is False
