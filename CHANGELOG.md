@@ -174,9 +174,10 @@ write it makes: an attribute and a merge rule (`create`, `append-in-order`
 or `error`; none replaces or deletes, because no row cites that). The final
 model is the fold of every write in text order, and a second write to one
 (object, attribute) is `write-merge-uncited`. Ordered children rest on a
-cited order row (Junos term order, iptables append order, and PAN-OS rule
-order from the unversioned "Security Policy Rules" page); a PAN-OS file
-still holds one rule, since the default rules' fall-through is pending. Nothing reads the model: verdicts, exit codes and every output
+cited order row (Junos term order, iptables append order); PAN-OS rule order
+is not cited (the unversioned "Security Policy Rules" page states evaluation
+order, not where a new rule lands), so each PAN-OS rule records
+`panos-rule-order` under `pending`, and a PAN-OS file holds one rule. Nothing reads the model: verdicts, exit codes and every output
 are unchanged. With `RULEHAWK_SHADOW=1`, a file the grammar parses gets a
 `model` entry beside `grammar`, and `would_pass` stays false.
 

@@ -111,9 +111,10 @@ CLASSES: Dict[str, Klass] = {
 }
 
 _CLASS_NEEDS = {"RULENAME": "panos-rule-name-chars", "V4PREFIX": "panos-v4-prefix"}
-# Slice 5: a rule is appended to the rulebase in order; the order it is
-# evaluated in is cited (`panos-rule-order`, in every production's cites,
-# review of #52/#53, F6).
+# Slice 5: a rule is appended to the rulebase in order; no cited row states
+# where a new rule lands (`panos-rule-order` is pending), so every production
+# records it (review of #52-#57, G1: the order block is back).
+_ORDER_NEEDS = ("panos-rule-order",)
 _WRITE = ("rules", "append-in-order")
 # The model's values for a rule: the keyword before each value slot.
 _VALUE_KEYS = ("from", "to", "source", "destination", "application", "service",
@@ -128,7 +129,7 @@ _FILE_NEEDS = ("panos-release-scope", "panos-lexing", "panos-list-semantics",
 PRODUCTIONS: Tuple[Production, ...] = tuple(
     Production(MODE, slots, None, cites,
                tuple(sorted({_CLASS_NEEDS[s] for s in slots if s in _CLASS_NEEDS}
-                            | set(_FILE_NEEDS))),
+                            | set(_FILE_NEEDS) | set(_ORDER_NEEDS))),
                _WRITE)
     for slots, cites in _PRODUCTION_TABLE)
 
