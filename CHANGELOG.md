@@ -134,6 +134,22 @@ stays false. The #51 review rules apply here too: a rule name written twice
 is `write-merge-uncited`, a prefix with host bits is off, and the rule-name
 character set and the prefix form are listed under `pending`.
 
+### iptables grammar, computed in shadow only (#42 phase 2)
+
+`rulehawk/grammar_iptables.py` is the third allowlist grammar: `iptables`
+commands one per line, `iptables -P CHAIN ACCEPT|DROP` and
+`iptables -A CHAIN [-s PREFIX] [-d PREFIX] -j ACCEPT|DROP`, on the filter
+table's INPUT, FORWARD and OUTPUT chains, with every row quoted from
+iptables(8) 1.8.13. No shell syntax is read (shebang, comments, variables,
+quotes, functions, conditionals, heredocs, `exit`), nor any other command,
+match, target, long or abbreviated option, or the iptables-save format. A
+chain policy set twice is `write-merge-uncited` and the same rule appended
+twice is off. The script's scope (the rule set it runs against), lexing,
+release scope and the save format are pending rows. Nothing reads the
+result: verdicts, exit codes and every output are unchanged. With
+`RULEHAWK_SHADOW=1`, an iptables file gets a `grammar` entry, and
+`would_pass` stays false.
+
 ### No file is certified, so code scanning and MCP coverage say so (#42 phase 2)
 
 **Under the stopgap, every config gets a standing `rulehawk/uncertified`

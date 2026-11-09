@@ -193,7 +193,9 @@ for _cid in _COMMENT_ROWS:
 # ----------------------------------------------------------- CI shape checks
 
 def _is_class(slot: str, classes: Dict[str, Klass]) -> bool:
-    return slot.isupper() or slot in classes
+    # A slot is a class only when it names one: the iptables grammar has
+    # upper-case literals (`FORWARD`, `DROP`).
+    return slot in classes
 
 
 def _slots_disjoint(a: str, b: str, classes: Dict[str, Klass]) -> bool:

@@ -117,9 +117,16 @@ def test_no_all_clear_word_in_the_grammar():
 def test_the_productions_are_pairwise_disjoint_and_fixed_shape():
     gm = _gm()
     from rulehawk import grammar_junos as core
-    from rulehawk import grammar_panos
     assert core.overlaps(gm.PRODUCTIONS, gm.CLASSES) == []
-    assert grammar_panos.shape_problems(gm.PRODUCTIONS, gm.CLASSES) == []
+    assert gm.shape_problems(gm.PRODUCTIONS, gm.CLASSES) == []
+
+
+def test_the_shape_check_finds_a_bad_production():
+    gm = _gm()
+    from rulehawk.grammar_junos import Production
+    bad = (Production("line", ("iptables", "a b"), None, ("iptables-append",)),
+           Production("line", (), None, ("iptables-append",)))
+    assert len(gm.shape_problems(bad, gm.CLASSES)) == 2
 
 
 def test_classes_exclude_every_keyword():
