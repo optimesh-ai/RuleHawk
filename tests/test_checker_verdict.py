@@ -157,6 +157,7 @@ def test_a_disagreement_blocks(tmp_path, shadow):
 
 _LEAK = "leak"          # truth: CORP reaches PCI
 _HOLE = "hole"          # under must_reach, truth: some part is denied
+_OPEN = None            # truth not settled by cited rows: never no-witness
 
 _MUTANTS = [
     # family 1: cross-line rewrite, re-entry, `no` / `delete`
@@ -210,11 +211,13 @@ def test_no_leaking_mutant_gets_no_witness(tmp_path, shadow, name, text, vendor,
     if "checker_verdict" not in sh:
         return                                   # refused before the model
     got = _verdicts(sh)
+    # Review of #58, shared wrong answer: the checker is held to the
+    # mutant's ground truth, never to the engine's answer.
     if truth == _LEAK:
         assert got == ["witness"], (name, sh["checker_verdict"])
     else:
-        assert "no-witness" not in got or "-half-prefix" in name or \
-            got == _verdicts(sh, "engine"), (name, sh["checker_verdict"])
+        assert truth is _OPEN, name
+        assert "no-witness" not in got, (name, sh["checker_verdict"])
     if not sh["checker_verdict"]["agrees"]:
         assert sh["blocking_reason"] in ("checker-disagrees", "reading-mismatch",
                                          "zones-share-segment"), sh
@@ -264,10 +267,11 @@ def test_family_10_no_mutant_with_a_hole_gets_all_permitted(tmp_path, shadow, na
         assert _verdicts(sh) == ["hole"], (name, sh["checker_verdict"])
 
 
-def test_family_10_an_open_path_is_all_permitted(tmp_path, shadow):
+def test_family_10_an_open_path_is_indeterminate_without_cited_forwarding(tmp_path, shadow):
+    """Review of #58, H3: no cited row says the device forwards what its
+    filter permits, so `all-permitted` is never the checker's answer."""
     sh = _shadow(tmp_path, "open.sh", "iptables -P FORWARD ACCEPT\n", _reach_policy())
-    assert _verdicts(sh) == ["all-permitted"], sh
-    assert _verdicts(sh, "engine") == ["all-permitted"], sh
+    assert _verdicts(sh) == ["indeterminate"], sh
     assert sh["would_pass"] is False
 
 
@@ -310,3 +314,126 @@ def test_the_mutants_that_reach_the_checker_are_pinned(tmp_path, shadow):
             got.add(name)
     assert got == _REACHES_CHECKER, (sorted(got - _REACHES_CHECKER),
                                      sorted(_REACHES_CHECKER - got))
+
+
+# ------------------------------------------------------------ review of #58, H1-H5
+
+_UNITS_3 = _K.replace(
+    "    ge-0/0/1 { unit 0 { family inet { filter { input F; } address 198.51.100.1/24; } } }\n",
+    "    ge-0/0/1 { unit 0 { family inet { filter { input F; } address 198.51.100.1/24; } } }\n"
+    "    ge-0/0/2 { unit 0 { family inet { address 203.0.113.1/24; } } }\n")
+
+
+def test_h1_a_third_unit_with_no_filter_is_indeterminate(tmp_path, shadow):
+    """H1: the source may enter at any unit, not only its own subnet's;
+    an unfiltered unit leaves the flow undecided."""
+    assert "ge-0/0/2" in _UNITS_3
+    sh = _shadow(tmp_path, "h1.conf", _UNITS_3)
+    assert _verdicts(sh) == ["indeterminate"], sh
+    assert sh["would_pass"] is False
+
+
+def test_h1_another_unit_whose_filter_lets_the_source_through_is_a_witness(tmp_path, shadow):
+    """H1: every unit's filter is walked for the source, not only the
+    filter on the source's own unit."""
+    text = _UNITS_3.replace(
+        "ge-0/0/2 { unit 0 { family inet { address",
+        "ge-0/0/2 { unit 0 { family inet { filter { input G; } address").replace(
+        "    }\n}\n", "        filter G {\n            term a { then accept; }\n        }\n"
+        "    }\n}\n")
+    assert "filter G" in text
+    sh = _shadow(tmp_path, "h1g.conf", text)
+    assert _verdicts(sh) == ["witness"], sh
+
+
+def test_h1_every_unit_filtered_by_the_deny_keeps_no_witness(tmp_path, shadow):
+    text = _UNITS_3.replace("ge-0/0/2 { unit 0 { family inet { address",
+                            "ge-0/0/2 { unit 0 { family inet { filter { input F; } address")
+    sh = _shadow(tmp_path, "h1f.conf", text)
+    assert _verdicts(sh) == ["no-witness"], sh
+
+
+@pytest.mark.parametrize("pci", ["192.0.0.0/22", "192.0.2.0/23", "0.0.0.0/0"])
+def test_h2_a_destination_over_the_source_segment_is_indeterminate(tmp_path, shadow, pci):
+    """H2: a destination that is a supernet of the source's segment (or
+    overlaps it) is not decided by the filter."""
+    pol = _policy()
+    pol["zones"]["PCI"] = [pci]
+    sh = _shadow(tmp_path, "h2.conf", _K, pol)
+    assert _verdicts(sh) == ["indeterminate"], (pci, sh)
+
+
+def test_h2_a_destination_overlapping_the_segment_in_part_is_indeterminate(tmp_path, shadow):
+    pol = _policy()
+    pol["zones"]["CORP"] = ["192.0.2.0/25"]
+    pol["zones"]["PCI"] = ["192.0.2.0/24"]
+    sh = _shadow(tmp_path, "h2p.conf", _K, pol)
+    assert _verdicts(sh) == ["indeterminate"], sh
+
+
+_ACCEPT_ALL = [
+    ("h3.conf", "interfaces {\n"
+     "    ge-0/0/0 { unit 0 { family inet { filter { input F; } address 192.0.2.1/24; } } }\n"
+     "    ge-0/0/1 { unit 0 { family inet { filter { input F; } address 198.51.100.1/24; } } }\n"
+     "}\nfirewall {\n    family inet {\n        filter F {\n"
+     "            term a { from { source-address { 192.0.2.0/24; } destination-address "
+     "{ 198.51.100.0/24; } } then accept; }\n        }\n    }\n}\n"),
+    ("h3.sh", "iptables -P FORWARD DROP\niptables -A FORWARD -s 192.0.2.0/24 -d "
+     "198.51.100.0/24 -j ACCEPT\n"),
+    ("h3.set", "set rulebase security rules a from any to any source 192.0.2.0/24 "
+     "destination 198.51.100.0/24 application any service any action allow\n"),
+]
+
+
+@pytest.mark.parametrize("name,text", _ACCEPT_ALL, ids=[a[0] for a in _ACCEPT_ALL])
+def test_h3_must_reach_is_never_all_permitted_without_cited_forwarding(tmp_path, shadow,
+                                                                       name, text):
+    sh = _shadow(tmp_path, name, text, _reach_policy())
+    assert "checker_verdict" in sh, sh
+    assert _verdicts(sh) == ["indeterminate"], (name, sh["checker_verdict"])
+    assert sh["would_pass"] is False
+
+
+def test_h4_a_destination_on_the_source_segment_is_a_witness(tmp_path, shadow):
+    """H4: source and destination on one segment never cross a filter, so
+    a filter that denies everything still leaves a witness (kills the
+    mutant that drops the same-segment rule)."""
+    pol = _policy()
+    pol["zones"]["CORP"] = ["192.0.2.0/25"]
+    pol["zones"]["PCI"] = ["192.0.2.128/25"]
+    text = _K.replace(
+        "term a { from { source-address { 203.0.113.0/24; } } then accept; }",
+        "term z { then discard; }")
+    sh = _shadow(tmp_path, "h4.conf", text, pol)
+    assert _verdicts(sh) == ["witness"], sh
+    assert sh["would_pass"] is False
+
+
+def test_h5_an_engine_reading_that_fails_blocks(tmp_path, shadow, monkeypatch):
+    """H5: an error in the engine's reading fails closed: the field says
+    `error` for each assertion and the run is `checker-disagrees`."""
+    from rulehawk import certificate
+
+    def boom(*a):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(certificate, "engine_reading", boom)
+    sh = _shadow(tmp_path, "h5.conf", _K)
+    cv = sh["checker_verdict"]
+    assert cv["agrees"] is False, cv
+    assert _verdicts(sh, "engine") == ["error"], cv
+    assert sh["blocking_reason"] == "checker-disagrees", sh
+    assert sh["would_pass"] is False
+
+
+def test_the_checker_evaluates_the_raw_policy(tmp_path, shadow, monkeypatch):
+    """G11 carried to the evaluation: an engine that resolves a zone
+    wrongly does not change what the checker evaluates."""
+    from rulehawk import certificate
+    real = certificate.assertions
+
+    def forged(policy):
+        return [a.replace("192.0.2.0/24", "203.0.113.0/24") for a in real(policy)]
+    monkeypatch.setattr(certificate, "assertions", forged)
+    sh = _shadow(tmp_path, "g11.conf", _K)
+    assert _verdicts(sh) == ["no-witness"], sh
+    assert sh["blocking_reason"] == "checker-disagrees", sh
