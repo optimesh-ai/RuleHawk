@@ -521,7 +521,9 @@ def test_a_pager_prompt_line_is_off(rel, prompt, tmp_path, shadow):
     not, so a prompt can hide a line's start from the veto. Any raw line the
     pager pattern matches is off, in every dialect."""
     body = _read(rel).rstrip("\n").split("\n")
-    text = "\n".join(body[:-1] + [prompt + body[-1]]) + "\n"
+    # The prompt goes on a repeated last line, so the dialect is still
+    # detected on the unprompted lines (p00 is a single line).
+    text = "\n".join(body + [prompt + body[-1]]) + "\n"
     _, sh = _gate_shadow(_write(tmp_path, os.path.basename(rel), text))
     _well_formed(sh)
     assert sh["blocking_reason"] == "line-not-allowlisted", sh

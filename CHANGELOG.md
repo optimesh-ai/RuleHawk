@@ -59,8 +59,9 @@ NX-OS and EOS detectors, the IOS/ASA parser finding a rule, a top-level
 `interface X` or ` ip access-group X in|out` line, or a Cisco-shaped line
 inside a comment); no line holds a line separator other than LF, or a
 backslash together with a quote; in iptables, no `#` stands anywhere but at
-line start or inside a quote closed on its line; and no comment or quoted
-string runs onto a second line. Only Junos, PAN-OS and iptables are planned
+line start or inside a quote closed on its line, and no line holds both quote
+kinds or a `<<`; no line starts with a pager prompt or ends in a backslash
+continuation; and no comment or quoted string runs onto a second line. Only Junos, PAN-OS and iptables are planned
 to be certifiable; an AWS security-group file clears the boundary but stays
 uncertified.
 This release computes that check and nothing reads it: verdicts, exit codes and

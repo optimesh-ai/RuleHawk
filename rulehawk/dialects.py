@@ -13,7 +13,9 @@ A file clears the boundary only if, on its raw lines:
 - no line holds a line separator other than LF (a CR right before LF is a
   line end), no line holds a backslash together with a quote, and in
   iptables no `#` stands anywhere but at line start or inside a quote that
-  closes on its line (review of #49, F1, F3, F4);
+  closes on its line (review of #49, F1, F3, F4); no line matches a pager
+  prompt or ends in a backslash continuation, and in iptables no line holds
+  both quote kinds or a `<<` (round 2, N1, N2);
 - no comment or quoted string spans lines.
 
 Anything else is UNKNOWN with the design's reason: `dialect-not-exclusive`
@@ -35,6 +37,7 @@ import os
 import re
 from typing import List, Optional
 
+from .model import _PAGER
 from .parse import parse_acls
 from .parse_awssg import detect as _detect_awssg
 from .parse_eos import detect as _detect_eos
@@ -209,7 +212,18 @@ def _off_line(lines: List[str], dialect: str) -> Optional[int]:
             return n
         if "\\" in ln and ('"' in ln or "'" in ln):
             return n
+        # Any raw line a pager prompt matches: the parsers strip the prompt
+        # and the veto does not (review of #49 round 2, N2).
+        if _PAGER.match(ln):
+            return n
+        # A backslash line continuation joins two lines into one statement.
+        if body.rstrip().endswith("\\"):
+            return n
         if dialect == "iptables":
+            # A line holding both quote kinds can leave a string open with an
+            # even count of each; a heredoc body is never run (N1).
+            if ('"' in ln and "'" in ln) or "<<" in ln:
+                return n
             unquoted = re.sub(r"\"[^\"]*\"|'[^']*'", "", ln)
             if "#" in unquoted and not re.match(r"^\s*#", unquoted):
                 return n
