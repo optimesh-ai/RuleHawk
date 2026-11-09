@@ -126,6 +126,7 @@ def _well_formed(sh):
     assert sh["blocking_reason"] in _REASONS, sh
     b = sh["boundary"]
     assert set(b) >= {"dialects", "cisco_veto", "reason"}, b
+    assert b["reason"] in _REASONS | {None}, b       # review of #49, I3
     return sh
 
 
@@ -371,3 +372,120 @@ def test_every_detector_runs_and_is_counted(tmp_path, shadow):
     assert "junos" in sh["boundary"]["dialects"], sh
     assert "ios-asa" in sh["boundary"]["dialects"], sh
     assert sh["boundary"]["detectors_fired"] == len(sh["boundary"]["dialects"]), sh
+
+
+
+# ------------------------------------------------- review of #49 (F1-F4, I1, I3)
+
+def test_well_formed_rejects_an_unknown_boundary_reason():
+    """I3: the boundary's own reason is held to the design's codes too."""
+    sh = {"boundary": {"dialects": [], "cisco_veto": [], "reason": "made-up"},
+          "would_pass": False, "blocking_reason": "file-uncertified"}
+    with pytest.raises(AssertionError):
+        _well_formed(sh)
+
+
+@pytest.mark.parametrize("rel,lines", [
+    # F1: an escaped quote carries a string across lines with an even quote
+    # count on every line (the reviewer's three probes).
+    ("controls/i00_base.sh", ['echo "x\\"', "iptables -A FORWARD -j ACCEPT", 'y\\""']),
+    ("controls/i00_base.sh", ["echo $'x\\'", "iptables -A FORWARD -j ACCEPT", "y\\''"]),
+    ("controls/k00_base.conf", ['description "a\\";', "term z { then accept; }", 'b\\"";']),
+    # One line is enough: a backslash on a line that holds a quote.
+    ("controls/p00_base.set", ['set rulebase security rules d description "a\\"b"']),
+])
+def test_a_backslash_on_a_line_with_a_quote_is_off(rel, lines, tmp_path, shadow):
+    text = _read(rel).rstrip("\n") + "\n" + "\n".join(lines) + "\n"
+    _, sh = _gate_shadow(_write(tmp_path, os.path.basename(rel), text))
+    _well_formed(sh)
+    assert sh["blocking_reason"] == "line-not-allowlisted", sh
+
+
+# F2: the gate's vendor aliases (gate._VENDORS) are read as their dialect.
+_CISCO_ALIASES = ("ios", "asa", "cisco", "nexus", "nx-os", "arista", "IOS")
+_OWN_ALIASES = {"controls/k00_base.conf": ("juniper", "Junos"),
+                "controls/p00_base.set": ("paloalto", "palo-alto"),
+                "controls/i00_base.sh": ("netfilter",)}
+
+
+@pytest.mark.parametrize("vendor", _CISCO_ALIASES)
+@pytest.mark.parametrize("rel", sorted(_OWN_ALIASES))
+def test_a_cisco_vendor_alias_is_not_exclusive(rel, vendor, shadow):
+    _, sh = _gate_shadow(os.path.join(_D, rel), vendor)
+    _well_formed(sh)
+    assert sh["blocking_reason"] == "dialect-not-exclusive", (vendor, sh)
+
+
+@pytest.mark.parametrize("rel", sorted(_OWN_ALIASES))
+def test_a_dialect_alias_resolves_to_its_dialect(rel, shadow):
+    for vendor in _OWN_ALIASES[rel]:
+        _, sh = _gate_shadow(os.path.join(_D, rel), vendor)
+        _well_formed(sh)
+        assert sh["blocking_reason"] == "file-uncertified", (vendor, sh)
+
+
+# F3: every line separator other than LF that str.splitlines() honours.
+_SEPARATORS = ["\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", " ", " "]
+
+
+@pytest.mark.parametrize("sep", _SEPARATORS, ids=[f"U+{ord(c):04X}" for c in _SEPARATORS])
+@pytest.mark.parametrize("rel", ["controls/k00_base.conf", "controls/p00_base.set",
+                                 "controls/i00_base.sh"])
+def test_a_line_separator_other_than_lf_is_off(rel, sep, tmp_path, shadow):
+    text = _read(rel).rstrip("\n") + "\n# x" + sep + "interface Gi0/1" + sep + " ip access-group F in\n"
+    if not rel.endswith((".conf", ".sh")):
+        text = _read(rel).rstrip("\n") + sep + "interface Gi0/1\n"
+    _, sh = _gate_shadow(_write(tmp_path, os.path.basename(rel), text))
+    _well_formed(sh)
+    assert sh["blocking_reason"] == "line-not-allowlisted", sh
+
+
+@pytest.mark.parametrize("rel", ["controls/k00_base.conf", "controls/p00_base.set",
+                                 "controls/i00_base.sh"])
+def test_crlf_line_endings_alone_are_not_a_separator_finding(rel, tmp_path, shadow):
+    """A CR directly before LF is a CRLF line end, not a lone CR."""
+    text = _read(rel).replace("\n", "\r\n")
+    _, sh = _gate_shadow(_write(tmp_path, os.path.basename(rel), text))
+    _well_formed(sh)
+    assert sh["blocking_reason"] == "file-uncertified", sh
+
+
+# F4: in a shell script, a # after ; & | ( ) starts a comment.
+@pytest.mark.parametrize("line", ["true;#interface Gi0/1", "true&#ip access-group F in",
+                                  "true|#no shutdown", "(#hostname r1)"])
+def test_a_shell_comment_after_a_metacharacter_is_vetoed(line, tmp_path, shadow):
+    text = _read("controls/i00_base.sh") + line + "\n"
+    _, sh = _gate_shadow(_write(tmp_path, "i.sh", text))
+    _well_formed(sh)
+    assert sh["blocking_reason"] == "dialect-not-exclusive", sh
+
+
+@pytest.mark.parametrize("line", ["true;# hello", "iptables -A FORWARD -j DROP # note",
+                                  "echo a#b", "x=1 #"])
+def test_a_shell_hash_not_at_line_start_is_off(line, tmp_path, shadow):
+    """Most conservative: any # that is not at line start (after optional
+    whitespace) in an iptables file is off, unless it sits inside a quote
+    that closes on the line."""
+    text = _read("controls/i00_base.sh") + line + "\n"
+    _, sh = _gate_shadow(_write(tmp_path, "i.sh", text))
+    _well_formed(sh)
+    assert sh["blocking_reason"] == "line-not-allowlisted", sh
+
+
+@pytest.mark.parametrize("line", ["  # indented comment", 'echo "a#b"', "echo 'a # b'"])
+def test_a_shell_hash_at_line_start_or_in_a_closed_quote_is_not_off(line, tmp_path, shadow):
+    text = _read("controls/i00_base.sh") + line + "\n"
+    _, sh = _gate_shadow(_write(tmp_path, "i.sh", text))
+    _well_formed(sh)
+    assert sh["blocking_reason"] == "file-uncertified", sh
+
+
+def test_tab_in_an_interface_line_is_pinned_with_k14(tmp_path, shadow):
+    """I1: `interface<TAB>Gi0/1` is a bare token to the veto (v3 section 1.2),
+    like k14's spaced names. Pinned at file-uncertified so that slice 4's
+    grammar must move it."""
+    text = _read("controls/k00_base.conf") + "interface\tGi0/1\n"
+    _, sh = _gate_shadow(_write(tmp_path, "k.conf", text))
+    _well_formed(sh)
+    assert sh["boundary"]["cisco_veto"] == [], sh
+    assert sh["blocking_reason"] == "file-uncertified", sh
