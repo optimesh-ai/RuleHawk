@@ -84,11 +84,16 @@ def test_no_production_rests_on_a_pending_row():
     assert not used & set(citations.PENDING)
 
 
-def test_every_production_records_the_script_scope_as_pending():
+_FILE_ROWS = ("iptables-lexing", "iptables-release-scope", "iptables-script-scope")
+
+
+def test_every_production_records_the_file_level_rows_as_pending():
+    """Review of #52/#53, F1: release scope and lexing too, not only the
+    script scope."""
     gm = _gm()
     from rulehawk import citations
     for p in gm.PRODUCTIONS:
-        assert p.needs == ("iptables-script-scope",), p
+        assert p.needs == _FILE_ROWS, p
         assert set(p.needs) <= set(citations.PENDING), p
 
 
@@ -148,7 +153,7 @@ def test_two_productions_matching_one_line_is_parse_ambiguous(monkeypatch):
 def test_the_grammar_accepts_i00():
     r = _parse(_read(_I00))
     assert r == {"parses": True, "reason": None, "line": None, "rows": r["rows"],
-                 "tags": [], "pending": ["iptables-script-scope"]}, r
+                 "tags": [], "pending": list(_FILE_ROWS)}, r
     assert {"iptables-policy", "iptables-append", "iptables-source",
             "iptables-destination", "iptables-mask", "iptables-jump",
             "iptables-accept-drop", "iptables-first-match",
@@ -323,6 +328,33 @@ def test_a_vendor_value_that_is_not_iptables_runs_no_grammar(shadow):
     sh = _gate_shadow(_I00, "junos")
     assert sh["blocking_reason"] == "dialect-undetected", sh
     assert "grammar" not in sh, sh
+
+
+def test_any_import_error_fails_a_shadow_run_closed(monkeypatch, shadow):
+    """Review of #52/#53, F9, for iptables: not only a pending row."""
+    import rulehawk
+    monkeypatch.setitem(sys.modules, "rulehawk.grammar_iptables", None)
+    monkeypatch.delattr(rulehawk, "grammar_iptables", raising=False)
+    sh = _gate_shadow(_I00)
+    assert sh["blocking_reason"] == "file-uncertified", sh
+    assert "grammar" not in sh and sh["grammar_unavailable"], sh
+    assert sh["would_pass"] is False, sh
+
+
+def test_the_filter_chains_row_quotes_output():
+    """Review of #52/#53, F4: the grammar reads OUTPUT, so the row quotes it
+    (man7 iptables(8), fetched twice more, verbatim to the line wrap)."""
+    from rulehawk import citations
+    q = citations.resolve("iptables-filter-chains").quote
+    assert q.endswith("and OUTPUT (for locally-"), q
+
+
+def test_the_script_scope_reason_names_what_is_not_read():
+    """Review of #52/#53, F5."""
+    from rulehawk import citations
+    r = citations.PENDING["iptables-script-scope"]
+    for word in ("security table", "nat", "mangle", "raw", "ip6tables", "nftables"):
+        assert word in r, word
 
 
 def test_a_pending_iptables_row_fails_a_shadow_run_closed(monkeypatch, shadow):
