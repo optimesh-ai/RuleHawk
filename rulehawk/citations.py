@@ -147,6 +147,13 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
     # and interfaces rows).
     _row("junos-top-firewall", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
          "Configure filters that select packets based on their contents."),
+    # review of #51, F4: Table 2's Statement cells, not only its Description
+    _row("junos-top-statements", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
+         "Table 2 lists top-level configuration statements."),
+    _row("junos-top-firewall-keyword", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
+         "firewall"),
+    _row("junos-top-interfaces-keyword", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
+         "interfaces"),
     _row("junos-top-interfaces", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
          "Configure interface information, such as encapsulation, interfaces, "
          "virtual channel identifiers (VCIs), and data-link connection "
@@ -187,6 +194,23 @@ PENDING: Dict[str, str] = {
         "is named only in side notes); v4 section 8 needs each row cited for "
         "Junos OS and Junos OS Evolved, so the uncited-remainder member "
         "(v3 section 6.3) stays"),
+    # review of #51, F4: what the name classes and an address list rest on.
+    # A production that needs one of these still parses in shadow and
+    # lists it under `pending`; each needs a row before slice 7.
+    "junos-unit-number": (
+        "no fetched page states the range of a logical unit number; the "
+        "class is narrowed to 0-9999 (decided by agent, unattended)"),
+    "junos-interface-name": (
+        "no fetched page states the interface-naming rule; the class is "
+        "narrowed to ge-F/P/N with F 0-9, P 0-3 and N 0-47 (decided by "
+        "agent, unattended)"),
+    "junos-v4-prefix": (
+        "no fetched page states how an a.b.c.d/nn prefix is lexed; the class "
+        "is canonical dotted quad with a length 0-32, and a match prefix "
+        "with host bits set is off"),
+    "junos-address-list-or": (
+        "no fetched page states that the prefixes in one source-address or "
+        "destination-address list match as an OR"),
 }
 
 

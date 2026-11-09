@@ -37,7 +37,6 @@ import os
 import re
 from typing import List, Optional
 
-from . import grammar_junos
 from .model import _PAGER
 from .parse import parse_acls
 from .parse_awssg import detect as _detect_awssg
@@ -268,13 +267,23 @@ def shadow_block(raw: bytes, vendor: str = "auto") -> dict:
     file is certified, so `would_pass` is false. The first blocking reason
     is the boundary's; then, for a file the boundary lets through as Junos,
     the Junos grammar's (slice 4b: `line-not-allowlisted`,
-    `parse-ambiguous` or `config-incomplete`, in a `grammar` entry);
-    otherwise `file-uncertified`. PAN-OS and iptables get their grammars in
+    `parse-ambiguous`, `config-incomplete` or `write-merge-uncited`, in a
+    `grammar` entry, or `file-uncertified` with a `grammar_unavailable`
+    entry when the grammar cannot load); otherwise `file-uncertified`. PAN-OS and iptables get their grammars in
     slices 4c and 4d."""
     b = boundary(raw, vendor)
     block = {"boundary": b, "would_pass": False,
              "blocking_reason": b["reason"] or UNCERTIFIED}
     if b["reason"] is None and b["dialects"] == ["junos"]:
+        # Imported here, not at module level (review of #51, F3): a grammar
+        # resolves its rows on import, and a row that went pending must not
+        # break a run with the switch unset. In a shadow run it fails
+        # closed: no grammar entry, and the file stays file-uncertified.
+        try:
+            from . import grammar_junos
+        except KeyError as e:
+            block["grammar_unavailable"] = str(e.args[0] if e.args else e)
+            return block
         gm = grammar_junos.parse(raw)
         block["grammar"] = gm
         block["blocking_reason"] = gm["reason"] or UNCERTIFIED

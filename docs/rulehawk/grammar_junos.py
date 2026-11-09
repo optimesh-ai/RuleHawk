@@ -25,6 +25,23 @@ Each statement must match exactly one production of the mode it is in: none
 is `line-not-allowlisted`, two is `parse-ambiguous` (v3 section 8). A file
 that ends inside a stanza is `config-incomplete` (v3 section 9.2).
 
+Forms whose Junos meaning differs from a statement-by-statement reading are
+off at their line (review of #51, F1; v4: narrow, never model):
+- a second write to one stanza (the same keyword and identifier under one
+  parent), or to a single-valued leaf (`then`, `input`, `address`), or the
+  same prefix twice in one list: `write-merge-uncited` (v2 section 2.1);
+- the same interface address on two units (the two address pages
+  disagree), a term with no `then` (off at the `}` that closes it), and a
+  match prefix with host bits set: `line-not-allowlisted`;
+- `input` naming a filter the file does not define: `config-incomplete`.
+A Junos tag anywhere, a comment line included, means the file does not
+parse (F2).
+
+The name classes and the meaning of an address list are pending rows (F4):
+each production lists those it needs in `needs`, and the result lists them
+under `pending`. They do not stop a parse in shadow; they stop a
+certificate.
+
 Productions are fixed token sequences and every class is one space-free
 token, so a statement splits into tokens one way only. `overlaps` checks
 that the productions of each mode are pairwise disjoint and `shape_problems`
@@ -39,11 +56,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
-from .citations import resolve
+from .citations import PENDING, resolve
 
 LINE_NOT_ALLOWLISTED = "line-not-allowlisted"
 PARSE_AMBIGUOUS = "parse-ambiguous"
 CONFIG_INCOMPLETE = "config-incomplete"
+WRITE_MERGE_UNCITED = "write-merge-uncited"
 
 INDENT = 4
 # The token alphabet after lexing. Anything else on a line is off.
@@ -69,6 +87,7 @@ class Production:
     slots: Tuple[str, ...]        # literals, or class names in CLASSES
     child: Optional[str]          # the mode a container opens, None for a leaf
     cites: Tuple[str, ...]
+    needs: Tuple[str, ...] = ()   # pending rows the production still rests on
 
 
 _OCTET = r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])"
@@ -78,9 +97,11 @@ _V4PREFIX = rf"{_OCTET}\.{_OCTET}\.{_OCTET}\.{_OCTET}/(?:3[0-2]|[12][0-9]|[0-9])
 _PRODUCTION_TABLE: Tuple[Tuple[str, Tuple[str, ...], Optional[str], Tuple[str, ...]], ...] = (
     # [edit]
     ("top", ("interfaces", "{"), "interfaces",
-     ("junos-top-interfaces", "junos-interface-address-inet", "junos-config-braces")),
+     ("junos-top-statements", "junos-top-interfaces-keyword", "junos-top-interfaces",
+      "junos-interface-address-inet", "junos-config-braces")),
     ("top", ("firewall", "{"), "firewall",
-     ("junos-top-firewall", "junos-config-braces")),
+     ("junos-top-statements", "junos-top-firewall-keyword", "junos-top-firewall",
+      "junos-config-braces")),
     # [edit interfaces interface-name unit number family inet]
     ("interfaces", ("IFNAME", "{"), "ifd",
      ("junos-interface-address-inet", "junos-config-braces")),
@@ -127,11 +148,11 @@ def _keywords(table) -> FrozenSet[str]:
 KEYWORDS: FrozenSet[str] = _keywords(_PRODUCTION_TABLE)
 
 CLASSES: Dict[str, Klass] = {
-    # Only the Gigabit Ethernet `ge-fpc/pic/port` names: no interface-naming
-    # row is cited, so the class is narrowed to the one form the controls use.
-    "IFNAME": Klass(r"ge-(?:0|[1-9][0-9]?)/(?:0|[1-9][0-9]?)/(?:0|[1-9][0-9]{0,2})",
-                    KEYWORDS),
-    "UNIT": Klass(r"0|[1-9][0-9]{0,4}", KEYWORDS),
+    # Only the Gigabit Ethernet `ge-fpc/pic/port` names, in a small range:
+    # `junos-interface-name` is pending (review of #51, F1 item 10, F4).
+    "IFNAME": Klass(r"ge-[0-9]/[0-3]/(?:[0-9]|[1-3][0-9]|4[0-7])", KEYWORDS),
+    # `junos-unit-number` is pending: 0-9999.
+    "UNIT": Klass(r"0|[1-9][0-9]{0,3}", KEYWORDS),
     "V4PREFIX": Klass(_V4PREFIX, KEYWORDS),
     # junos-filter-name and junos-term-name: letters, numbers and hyphens,
     # up to 64 characters.
@@ -139,13 +160,31 @@ CLASSES: Dict[str, Klass] = {
     "TERM": Klass(r"[A-Za-z0-9-]{1,64}", KEYWORDS),
 }
 
-PRODUCTIONS: Tuple[Production, ...] = tuple(
-    Production(m, slots, child, cites) for m, slots, child, cites in _PRODUCTION_TABLE)
+# The pending row each class rests on, and the one an address list rests on.
+_CLASS_NEEDS = {"IFNAME": "junos-interface-name", "UNIT": "junos-unit-number",
+                "V4PREFIX": "junos-v4-prefix"}
+_LIST_MODES = {"addrs": "junos-address-list-or"}
 
-# Every production's rows resolve at import: a pending row raises here.
+
+def _needs(mode: str, slots: Tuple[str, ...]) -> Tuple[str, ...]:
+    out = {_CLASS_NEEDS[s] for s in slots if s in _CLASS_NEEDS}
+    if mode in _LIST_MODES:
+        out.add(_LIST_MODES[mode])
+    return tuple(sorted(out))
+
+
+PRODUCTIONS: Tuple[Production, ...] = tuple(
+    Production(m, slots, child, cites, _needs(m, slots))
+    for m, slots, child, cites in _PRODUCTION_TABLE)
+
+# Every production's rows resolve at import: a pending row raises here. Its
+# needs must be pending rows, not cited ones (cited, they belong in cites).
 for _p in PRODUCTIONS:
     for _cid in _p.cites:
         resolve(_cid)
+    for _cid in _p.needs:
+        if _cid not in PENDING:
+            raise KeyError(f"{_cid} is not a pending row")
 _COMMENT_ROWS = ("junos-comments", "junos-config-indent")
 for _cid in _COMMENT_ROWS:
     resolve(_cid)
@@ -211,13 +250,18 @@ def shape_problems(prods: Iterable[Production], classes: Dict[str, Klass]) -> Li
 
 # ------------------------------------------------------------------- parsing
 
-def _result(reason: Optional[str], line: Optional[int], rows, tags) -> dict:
-    return {"accepted": reason is None, "reason": reason, "line": line,
-            "rows": sorted(rows), "tags": sorted(tags)}
+# Leaves that hold one value: a second write replaces the first.
+_SINGLE = frozenset({"then", "input", "address"})
+
+
+def _result(reason: Optional[str], line: Optional[int], rows, tags, pending=()) -> dict:
+    return {"parses": reason is None, "reason": reason, "line": line,
+            "rows": sorted(rows), "tags": sorted(tags), "pending": sorted(pending)}
 
 
 def _tag_lines(lines: Sequence[str]) -> List[int]:
-    """Lines holding a Junos tag: a `word:` token (v4 section 4)."""
+    """Lines holding a Junos tag: a `word:` token (v4 section 4), comment
+    lines included (review of #51, F2)."""
     return [n for n, ln in enumerate(lines, 1)
             if any(re.fullmatch(r"[a-z-]+:", w) for w in ln.split())]
 
@@ -257,65 +301,122 @@ def _match(mode: str, stmt: List[str]) -> List[Production]:
     return out
 
 
+def _key(stmt: List[str]) -> Tuple[str, ...]:
+    """What a statement writes in its parent: a single-valued leaf by its
+    keyword, anything else by all its tokens."""
+    if stmt[-1] == ";" and stmt[0] in _SINGLE:
+        return (stmt[0],)
+    return tuple(t for t in stmt if t not in _PUNCT)
+
+
+def _host_bits(prefix: str) -> bool:
+    addr, plen = prefix.split("/")
+    value = 0
+    for octet in addr.split("."):
+        value = value * 256 + int(octet)
+    return value & ((1 << (32 - int(plen))) - 1) != 0
+
+
+class _Frame:
+    __slots__ = ("mode", "count", "keys")
+
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+        self.count = 0
+        self.keys: set = set()
+
+
 def parse(raw: bytes) -> dict:
     """The grammar result for one file's raw bytes."""
     lines = raw.decode("utf-8", errors="replace").split("\n")
     if lines and lines[-1] == "":
         lines = lines[:-1]          # the LF that ends the last line
     tags = _tag_lines(lines)
-    rows = set()
-    # The stack of open containers: (mode, child statements seen).
-    stack: List[List] = []
+    rows: set = set()
+    pending: set = set()
+
+    def off(reason: str, line: Optional[int]) -> dict:
+        return _result(reason, line, rows, tags, pending)
+
+    top = _Frame("top")
+    stack: List[_Frame] = []
     statements = 0
+    addresses: set = set()
+    filters: set = set()
+    refs: List[Tuple[str, int]] = []
     for n, ln in enumerate(lines, 1):
         if not _PRINTABLE.fullmatch(ln):
-            return _result(LINE_NOT_ALLOWLISTED, n, rows, tags)
+            return off(LINE_NOT_ALLOWLISTED, n)
         body = ln.lstrip(" ")
         indent = len(ln) - len(body)
         if not body:
-            return _result(LINE_NOT_ALLOWLISTED, n, rows, tags)
+            return off(LINE_NOT_ALLOWLISTED, n)
         depth = len(stack)
         if _is_comment(body):
-            if indent != INDENT * depth:
-                return _result(LINE_NOT_ALLOWLISTED, n, rows, tags)
+            if indent != INDENT * depth or n in tags:
+                return off(LINE_NOT_ALLOWLISTED, n)
             rows.update(_COMMENT_ROWS)
             continue
         toks = _lex(body)
         if toks is None:
-            return _result(LINE_NOT_ALLOWLISTED, n, rows, tags)
+            return off(LINE_NOT_ALLOWLISTED, n)
         want = INDENT * (depth - 1 if toks[0] == "}" else depth)
         if indent != want:
-            return _result(LINE_NOT_ALLOWLISTED, n, rows, tags)
+            return off(LINE_NOT_ALLOWLISTED, n)
         rows.add("junos-config-indent")
         stmt: List[str] = []
         for t in toks:
             if t == "}":
-                if stmt or not stack or stack[-1][1] == 0:
-                    return _result(LINE_NOT_ALLOWLISTED, n, rows, tags)
-                stack.pop()
+                if stmt or not stack or stack[-1].count == 0:
+                    return off(LINE_NOT_ALLOWLISTED, n)
+                closed = stack.pop()
+                if closed.mode == "term" and ("then",) not in closed.keys:
+                    # A term with no then: the pages disagree on its
+                    # meaning (review of #51, F1 item 7).
+                    return off(LINE_NOT_ALLOWLISTED, n)
                 continue
             stmt.append(t)
             if t not in ("{", ";"):
                 continue
-            mode = stack[-1][0] if stack else "top"
-            hits = _match(mode, stmt)
+            parent = stack[-1] if stack else top
+            hits = _match(parent.mode, stmt)
             if not hits:
-                return _result(LINE_NOT_ALLOWLISTED, n, rows, tags)
+                return off(LINE_NOT_ALLOWLISTED, n)
             if len(hits) > 1:
-                return _result(PARSE_AMBIGUOUS, n, rows, tags)
+                return off(PARSE_AMBIGUOUS, n)
             (p,) = hits
+            key = _key(stmt)
+            if key in parent.keys:
+                return off(WRITE_MERGE_UNCITED, n)
+            parent.keys.add(key)
+            if p.mode == "addrs" and _host_bits(stmt[0]):
+                return off(LINE_NOT_ALLOWLISTED, n)
+            if p.mode == "ifl-inet" and stmt[0] == "address":
+                ip = stmt[1].split("/")[0]
+                if ip in addresses:
+                    return off(LINE_NOT_ALLOWLISTED, n)
+                addresses.add(ip)
+            if p.mode == "ifl-filter":
+                refs.append((stmt[1], n))
+            if p.mode == "fw-inet":
+                filters.add(stmt[1])
             rows.update(p.cites)
-            if stack:
-                stack[-1][1] += 1
+            pending.update(p.needs)
+            parent.count += 1
             statements += 1
             if p.child is not None:
-                stack.append([p.child, 0])
+                stack.append(_Frame(p.child))
             stmt = []
         if stmt:
             # A statement must end on the line it starts.
-            return _result(LINE_NOT_ALLOWLISTED, n, rows, tags)
+            return off(LINE_NOT_ALLOWLISTED, n)
     if stack:
-        return _result(CONFIG_INCOMPLETE, None, rows, tags)
+        return off(CONFIG_INCOMPLETE, None)
     if statements == 0:
-        return _result(LINE_NOT_ALLOWLISTED, None, rows, tags)
-    return _result(None, None, rows, tags)
+        return off(LINE_NOT_ALLOWLISTED, None)
+    for name, n in refs:
+        if name not in filters:
+            return off(CONFIG_INCOMPLETE, n)
+    if tags:
+        return off(LINE_NOT_ALLOWLISTED, tags[0])
+    return _result(None, None, rows, tags, pending)

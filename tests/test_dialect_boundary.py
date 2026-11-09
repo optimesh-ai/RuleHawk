@@ -46,7 +46,10 @@ _CISCO_VENDORS = ("ios-asa", "nxos", "eos")
 _REASONS = {"dialect-not-exclusive", "dialect-undetected", "line-not-allowlisted",
             "file-uncertified",
             # slice 4b, the Junos grammar (v3 sections 8 and 9.2)
-            "parse-ambiguous", "config-incomplete"}
+            "parse-ambiguous", "config-incomplete",
+            # review of #51, F1: a second write with no cited merge rule
+            # (v2 section 2.1, v3)
+            "write-merge-uncited"}
 _BOUNDARY_REASONS = {"dialect-not-exclusive", "dialect-undetected",
                      "line-not-allowlisted", "file-uncertified"}
 

@@ -327,19 +327,22 @@ def test_an_empty_file_is_not_accepted():
 
 # ------------------------------------------------ the slice-4 attack rows
 
-@pytest.mark.parametrize("rel,line", [
-    ("cfg3/k05_junos_delete_annotation_binding.conf", 2),   # `delete:`
-    ("cfg3/k18_junos_replace_tag_subtree_save.conf", 18),   # `replace:`
-    ("cfg3/k19_junos_inactive_binding.conf", 2),            # `inactive:`
+@pytest.mark.parametrize("rel,line,reason,tag", [
+    ("cfg3/k05_junos_delete_annotation_binding.conf", 2, "line-not-allowlisted", 2),
+    # k18 enters `firewall` a second time (line 16) before its `replace:`
+    # tag (line 18): the re-entry is off first (review of #51, F1).
+    ("cfg3/k18_junos_replace_tag_subtree_save.conf", 16, "write-merge-uncited", 18),
+    ("cfg3/k19_junos_inactive_binding.conf", 2, "line-not-allowlisted", 2),
 ])
-def test_a_junos_tag_is_off_and_marks_a_patch(rel, line, shadow):
+def test_a_junos_tag_is_off_and_marks_a_patch(rel, line, reason, tag, shadow):
     """v4 section 4: no lexing row strips a `word:` prefix, and a tagged
-    file is a patch. The line reason comes first; the tag is recorded."""
+    file is a patch. The first off line gives the reason; the tag is
+    recorded."""
     sh = _gate_shadow(os.path.join(_D, rel))
     assert sh["boundary"]["reason"] is None, sh
-    assert sh["blocking_reason"] == "line-not-allowlisted", sh
+    assert sh["blocking_reason"] == reason, sh
     assert sh["grammar"]["line"] == line, sh
-    assert sh["grammar"]["tags"] == [line], sh
+    assert sh["grammar"]["tags"] == [tag], sh
     assert sh["would_pass"] is False, sh
 
 
