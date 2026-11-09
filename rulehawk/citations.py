@@ -80,11 +80,6 @@ _KB_ONE_LINE = ("https://knowledgebase.paloaltonetworks.com/KCSArticleDetail?"
 _KB_ONE_LINE_TITLE = ("How to Add and Verify Address Objects to Address Group and "
                       "Security Policy through the CLI")
 _KB_ONE_LINE_RELEASE = "the article states Environment: PanOS's CLI access., and no release"
-_SEC_RULES = ("https://docs.paloaltonetworks.com/network-security/security-policy/"
-              "administration/security-rules")
-_SEC_RULES_TITLE = "Security Policy Rules"
-_SEC_RULES_RELEASE = ("the Network Security documentation set, with no version in the "
-                      "URL or on the page (unversioned)")
 
 _NO_RELEASE = "the page states no release (Junos OS documentation, current)"
 _SINCE_7_4 = "Statement introduced before Junos OS Release 7.4."
@@ -243,12 +238,6 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
     # order other than the create template's
     _row("panos-one-line-form", _KB_ONE_LINE, _KB_ONE_LINE_TITLE, _KB_ONE_LINE_RELEASE,
          "# set rulebase security rules trust-DMZ action allow source testgroup"),
-    # review of #52/#53, F6
-    _row("panos-rule-order", _SEC_RULES, _SEC_RULES_TITLE, _SEC_RULES_RELEASE,
-         "Security rules are evaluated left to right and from top to bottom. A "
-         "packet is matched against the first rule that meets the defined "
-         "criteria and, after a match is triggered, subsequent rules are not "
-         "evaluated."),
 )}
 
 # v4 section 14 Junos and PAN-OS rows (and the interface address row's
@@ -287,8 +276,12 @@ PENDING: Dict[str, str] = {
         "destination-address list match as an OR"),
     # PAN-OS (slice 4c)
     "panos-release-scope": (
-        "the components page is in the PAN-OS 11.1 documentation set and the "
-        "two knowledge-base articles state no release; v4 section 8 needs "
+        "the components page is in the PAN-OS 11.1 documentation set; the "
+        "knowledge-base articles (kA10g000000ClcLCAS among them) state no "
+        "release, and the Security Policy Rules page "
+        "(docs.paloaltonetworks.com/network-security/security-policy/"
+        "administration/security-rules) is in the unversioned Network "
+        "Security documentation set (review of #52-#57, G1); v4 section 8 needs "
         "each row cited per supported release, so the uncited-remainder "
         "member (v3 section 6.3) stays"),
     "panos-lexing": (
@@ -299,6 +292,24 @@ PENDING: Dict[str, str] = {
         "setting an attribute of a rule that is already set adds members "
         "for a list attribute (v4 section 14); no fetched page states it, so "
         "a rule name set twice is off (v3 section 6.1)"),
+    # review of #52-#57, G1: verbatim on two fetches, but unversioned, and it
+    # states evaluation order, not where a new rule lands
+    "panos-rule-order": (
+        "the Security Policy Rules page "
+        "(docs.paloaltonetworks.com/network-security/security-policy/"
+        "administration/security-rules) says 'Security rules are evaluated "
+        "left to right and from top to bottom. A packet is matched against "
+        "the first rule that meets the defined criteria and, after a match "
+        "is triggered, subsequent rules are not evaluated.'; the page is in "
+        "the unversioned Network Security documentation set, and it states "
+        "evaluation order only, not where a `set` places a new rule (append "
+        "position)"),
+    # review of #52-#57, G2
+    "panos-one-line-order": (
+        "panos-one-line-form shows several attributes on one `set` line in "
+        "another order (`action allow source testgroup`); no fetched row "
+        "shows the grammar's seven attributes in its fixed order, `source` "
+        "after `to`, so that order is an inference"),
     # review of #52/#53, F2: what the meaning of one rule still rests on
     "panos-default-rules": (
         "the Security Policy Rules page says traffic that matches no rule "
