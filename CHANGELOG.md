@@ -202,7 +202,17 @@ declaration and every citation. Any difference, or anything it cannot
 read, is `checker-disagrees`, which becomes the shadow blocking reason in
 place of `file-uncertified`.
 
-No record is eligible yet. Every record lists its blockers:
+After the #57 review, the checker takes the raw policy and resolves the
+zones itself. From its own reading it also re-derives the pending rows the
+file's constructs rest on and the rows they cite, and checks the scope
+sentence and that the blockers name every pending row and
+`checker-verdict-deferred`; a record with any of these emptied or thinned
+is `checker-disagrees`. A record that fails to build is
+`checker-disagrees` too, and the engine uses only the `rulehawk_check`
+next to its own package.
+
+No record is eligible yet, whatever its blockers say. Every record lists
+its blockers:
 - pending rows;
 - the dual read and placement;
 - legacy reason codes and parse notes;
