@@ -204,7 +204,9 @@ place of `file-uncertified`.
 
 After the #57 review, the checker takes the raw policy and resolves the
 zones itself. From its own reading it also re-derives the pending rows the
-file's constructs rest on and the rows they cite, and checks the scope
+file's constructs rest on (any IPv4 prefix, an interface address included,
+needs `junos-v4-prefix`) and, in full, the cited rows: a dropped or added
+cited row disagrees. It checks the scope
 sentence and that the blockers name every pending row and
 `checker-verdict-deferred`; a record with any of these emptied or thinned
 is `checker-disagrees`. A record that fails to build is

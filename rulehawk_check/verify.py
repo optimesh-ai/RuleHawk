@@ -4,8 +4,9 @@ policy and the engine version.
 Review of #52-#57, G10 and G11: the checker takes the policy itself and
 writes each assertion's canonical form, with its zones resolved, on its
 own. From its own reading of the file it re-derives the pending rows the
-file's constructs rest on and the rows every reading of them cites, and
-checks the sub-record lists at least those; it checks the scope sentence,
+file's constructs rest on (the sub-record must list at least those) and,
+in full, the cited rows (the sub-record must list exactly those; review
+r2, G10b); it checks the scope sentence,
 and that the blockers name every pending row and the deferral. A record
 with any of these emptied or thinned is `checker-disagrees`.
 """
@@ -37,15 +38,73 @@ _FILE_PENDING = {
               "panos-rule-name-chars"),
     "iptables": ("iptables-lexing", "iptables-release-scope", "iptables-script-scope"),
 }
-# Rows every PAN-OS rule line cites: the one-line template and its keywords.
+# The cited rows each construct of the checker's own reading rests on
+# (review r2 of #52-#59, G10b: derived in full, so a dropped row is seen).
+_BRACES = "junos-config-braces"
+_LEAF = "junos-config-leaf-semicolon"
+_J_TOP = {
+    "interfaces": ("junos-top-statements", "junos-top-interfaces-keyword",
+                   "junos-top-interfaces", "junos-interface-address-inet", _BRACES),
+    "firewall": ("junos-top-statements", "junos-top-firewall-keyword",
+                 "junos-top-firewall", _BRACES),
+}
+_J_THEN = {"accept": ("junos-then-statement", "junos-accept-terminating",
+                      "junos-terminating-action"),
+           "discard": ("junos-then-statement", "junos-discard-term",
+                       "junos-terminating-action")}
+_J_MATCH = {"source-address": ("junos-match-source-address", _BRACES),
+            "destination-address": ("junos-match-destination-address", _BRACES)}
 _PANOS_ROWS = ("panos-cli-create-rule", "panos-rule-name", "panos-source-zone",
                "panos-set-from-any", "panos-destination-zone", "panos-set-to-any",
                "panos-source-address", "panos-set-source-any",
                "panos-destination-address", "panos-application",
                "panos-set-application-any", "panos-service-any",
                "panos-set-service-any", "panos-action", "panos-one-line-form")
-_IPTABLES_ROWS = ("iptables-accept-drop", "iptables-filter-default", "iptables-filter-chains")
+_IPT_TABLE = ("iptables-filter-default", "iptables-filter-chains")
+_IPT_POLICY = ("iptables-synopsis-policy", "iptables-policy", "iptables-policy-end",
+               "iptables-accept-drop") + _IPT_TABLE
+_IPT_APPEND = ("iptables-synopsis-append", "iptables-rule-specification",
+               "iptables-append", "iptables-first-match", "iptables-jump",
+               "iptables-accept-drop") + _IPT_TABLE
 _MATCH = ("source-address", "destination-address")
+
+
+def _junos_rows(p, values) -> set:
+    rows = set()
+    n = len(p)
+    if p[0] == "interfaces":
+        if n == 1:
+            rows |= set(_J_TOP["interfaces"])
+        elif n == 2:
+            rows |= {"junos-interface-address-inet", _BRACES}
+        elif n == 3:
+            rows |= {"junos-interface-family-hierarchy", _BRACES}
+        elif n == 4:
+            rows |= {"junos-interface-family-hierarchy", "junos-interface-address-inet"}
+            if "address" in values:
+                rows |= {"junos-interface-address", "junos-interface-address-inet", _LEAF}
+        elif n == 5:
+            rows |= {"junos-interface-filter-hierarchy", _BRACES}
+            if "input" in values:
+                rows |= {"junos-filter-input", "junos-filter-name", _LEAF}
+    elif p[0] == "firewall":
+        if n == 1:
+            rows |= set(_J_TOP["firewall"])
+        elif n == 2:
+            rows |= {"junos-firewall-family-inet", "junos-firewall-family-inet-equivalent"}
+        elif n == 3:
+            rows |= {"junos-filter-statement", "junos-filter-name", _BRACES}
+        elif n == 4:
+            rows |= {"junos-term-statement", "junos-term-name", "junos-term-order"}
+            if "then" in values:
+                rows |= set(_J_THEN[values["then"]])
+        elif n == 5:
+            rows |= {"junos-from-statement", _BRACES}
+        elif n == 6:
+            rows |= set(_J_MATCH[p[5]])
+        elif n == 7:
+            rows.add(_LEAF)
+    return rows
 
 
 def _needed(dialect: str, mine: dict):
@@ -55,27 +114,42 @@ def _needed(dialect: str, mine: dict):
     pending, rows = set(), set()
     if dialect == "junos" and paths:
         pending |= set(_FILE_PENDING["junos"])
-        for p in paths:
+        rows.add("junos-config-indent")
+        for p, (values, _) in mine.items():
+            rows |= _junos_rows(p, values)
             if p[0] == "interfaces" and len(p) >= 2:
                 pending.add("junos-interface-name")
-                rows.add("junos-top-interfaces")
             if p[0] == "interfaces" and len(p) >= 3:
                 pending.add("junos-unit-number")
-            if p[0] == "firewall":
-                rows.add("junos-top-firewall")
-            if len(p) >= 4 and p[0] == "firewall" and p[3].startswith("term "):
-                rows |= {"junos-term-statement", "junos-term-order"}
+            # G10a: any IPv4 prefix, an interface address included.
+            if p[0] == "interfaces" and "address" in values:
+                pending.add("junos-v4-prefix")
             if len(p) >= 7 and p[5] in _MATCH:
                 pending |= {"junos-v4-prefix", "junos-address-list-or"}
     elif dialect == "panos" and any(len(p) == 2 for p in paths):
         pending |= set(_FILE_PENDING["panos"])
-        rows |= set(_PANOS_ROWS)
         for p, (values, _) in mine.items():
-            if len(p) == 2 and any(values.get(k) != "any" for k in ("source", "destination")):
+            if len(p) != 2:
+                continue
+            rows |= set(_PANOS_ROWS)
+            if values.get("destination") == "any":
+                rows.add("panos-set-destination-any")
+            if values.get("action") == "allow":
+                rows.add("panos-set-action-allow")
+            if any(values.get(k) != "any" for k in ("source", "destination")):
                 pending.add("panos-v4-prefix")
     elif dialect == "iptables" and paths:
         pending |= set(_FILE_PENDING["iptables"])
-        rows |= set(_IPTABLES_ROWS)
+        for p, (values, _) in mine.items():
+            if len(p) == 2 and "policy" in values:
+                rows |= set(_IPT_POLICY)
+            if len(p) == 3:
+                rows |= set(_IPT_APPEND)
+                w = p[2].split(" ")
+                if "-s" in w:
+                    rows |= {"iptables-source", "iptables-mask"}
+                if "-d" in w:
+                    rows |= {"iptables-destination", "iptables-source", "iptables-mask"}
     return pending, rows
 
 
@@ -155,8 +229,10 @@ def _sub(sub: dict, lines: List[str], reg, zoned: bool) -> Optional[str]:
     pending, rows = _needed(dialect, mine)
     if not isinstance(sub.get("pending"), list) or not pending <= set(sub["pending"]):
         return "pending rows missing: " + ",".join(sorted(pending - set(sub.get("pending") or [])))
-    if not isinstance(sub.get("rows"), list) or not rows <= set(sub["rows"]):
-        return "rows missing: " + ",".join(sorted(rows - set(sub.get("rows") or [])))
+    if not isinstance(sub.get("rows"), list) or set(sub["rows"]) != rows:
+        got = set(sub.get("rows") or [])
+        return ("rows differ: missing " + ",".join(sorted(rows - got)) +
+                "; extra " + ",".join(sorted(got - rows)))
     if sub.get("scope_assumptions") != ([SCOPE_SENTENCE] if zoned else []):
         return "scope assumptions"
     return None
