@@ -292,7 +292,11 @@ def shadow_block(raw: bytes, vendor: str = "auto") -> dict:
             else:
                 block["grammar_unavailable"] = str(e) or type(e).__name__
             return block
-        gm = grammar.parse(raw)
+        try:
+            gm = grammar.parse(raw)
+        except Exception as e:  # fail closed (review r2 of #52-#59, N2)
+            block["grammar_unavailable"] = "grammar failed: " + type(e).__name__
+            return block
         block["grammar"] = gm
         block["blocking_reason"] = gm["reason"] or UNCERTIFIED
     return block
