@@ -75,6 +75,16 @@ _KB_SET = ("https://knowledgebase.paloaltonetworks.com/KCSArticleDetail?"
            "id=kA10g000000ClHoCAK&lang=en_US")
 _KB_SET_TITLE = "Viewing the configuration in set and XML format"
 _KB_SET_RELEASE = "the article states Environment: Any PAN-OS, and no release"
+_KB_ONE_LINE = ("https://knowledgebase.paloaltonetworks.com/KCSArticleDetail?"
+                "id=kA10g000000ClcLCAS")
+_KB_ONE_LINE_TITLE = ("How to Add and Verify Address Objects to Address Group and "
+                      "Security Policy through the CLI")
+_KB_ONE_LINE_RELEASE = "the article states Environment: PanOS's CLI access., and no release"
+_SEC_RULES = ("https://docs.paloaltonetworks.com/network-security/security-policy/"
+              "administration/security-rules")
+_SEC_RULES_TITLE = "Security Policy Rules"
+_SEC_RULES_RELEASE = ("the Network Security documentation set, with no version in the "
+                      "URL or on the page (unversioned)")
 
 _NO_RELEASE = "the page states no release (Junos OS documentation, current)"
 _SINCE_7_4 = "Statement introduced before Junos OS Release 7.4."
@@ -229,6 +239,16 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
          "set rulebase security rules rule1 service any"),
     _row("panos-set-action-allow", _KB_SET, _KB_SET_TITLE, _KB_SET_RELEASE,
          "set rulebase security rules rule1 action allow"),
+    # review of #52/#53, F3: several attributes on one `set` line, in an
+    # order other than the create template's
+    _row("panos-one-line-form", _KB_ONE_LINE, _KB_ONE_LINE_TITLE, _KB_ONE_LINE_RELEASE,
+         "# set rulebase security rules trust-DMZ action allow source testgroup"),
+    # review of #52/#53, F6
+    _row("panos-rule-order", _SEC_RULES, _SEC_RULES_TITLE, _SEC_RULES_RELEASE,
+         "Security rules are evaluated left to right and from top to bottom. A "
+         "packet is matched against the first rule that meets the defined "
+         "criteria and, after a match is triggered, subsequent rules are not "
+         "evaluated."),
 )}
 
 # v4 section 14 Junos and PAN-OS rows (and the interface address row's
@@ -266,12 +286,6 @@ PENDING: Dict[str, str] = {
         "no fetched page states that the prefixes in one source-address or "
         "destination-address list match as an OR"),
     # PAN-OS (slice 4c)
-    "panos-rule-order": (
-        "no fetched first-party page states that security rules are matched "
-        "first-match in rulebase order (the components page has no order "
-        "statement, and the set-format article notes 'The output of show is "
-        "not necessarily the sequence to execute the commands.'), so rule "
-        "order, move and the default rules give no meaning yet"),
     "panos-release-scope": (
         "the components page is in the PAN-OS 11.1 documentation set and the "
         "two knowledge-base articles state no release; v4 section 8 needs "
@@ -285,6 +299,25 @@ PENDING: Dict[str, str] = {
         "setting an attribute of a rule that is already set adds members "
         "for a list attribute (v4 section 14); no fetched page states it, so "
         "a rule name set twice is off (v3 section 6.1)"),
+    # review of #52/#53, F2: what the meaning of one rule still rests on
+    "panos-default-rules": (
+        "the Security Policy Rules page says traffic that matches no rule "
+        "goes to the default rules, which allow intrazone and deny interzone "
+        "traffic and can be overridden; the outcome depends on zones and "
+        "overrides the file does not hold (v4 section 3: not a row)"),
+    "panos-any-meaning": (
+        "the rows show the syntax `from any`, `to any`, `source any`, "
+        "`destination any`; no fetched row states that `any` means every "
+        "zone or every address"),
+    "panos-rule-type-default": (
+        "the Security Policy Rules page lists 'universal (default)' in its "
+        "Rule Type cell; no row quotes it, and v4 section 3 keeps rule-type "
+        "off until its KB row is cited"),
+    "panos-session-semantics": (
+        "the Security Policy Rules page says 'When a session match occurs, "
+        "the Security rule is applied to bidirectional traffic in that "
+        "session'; a per-packet reading differs, and no model of sessions is "
+        "built"),
     # review of #51, F4, for PAN-OS
     "panos-rule-name-chars": (
         "panos-rule-name states the length only; the character set is "
