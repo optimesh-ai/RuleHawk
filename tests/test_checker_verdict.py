@@ -363,12 +363,16 @@ def test_h2_a_destination_over_the_source_segment_is_indeterminate(tmp_path, sha
     assert _verdicts(sh) == ["indeterminate"], (pci, sh)
 
 
-def test_h2_a_destination_overlapping_the_segment_in_part_is_indeterminate(tmp_path, shadow):
+def test_h2_a_destination_that_is_the_segment_is_a_witness(tmp_path, shadow):
+    """Two CIDRs either nest or are disjoint, so a destination over the
+    segment is a supernet (above). One equal to the segment holds the
+    source's own subnet: the flow never crosses a filter, a witness
+    (corrected from the red commit, which expected indeterminate)."""
     pol = _policy()
     pol["zones"]["CORP"] = ["192.0.2.0/25"]
     pol["zones"]["PCI"] = ["192.0.2.0/24"]
     sh = _shadow(tmp_path, "h2p.conf", _K, pol)
-    assert _verdicts(sh) == ["indeterminate"], sh
+    assert _verdicts(sh) == ["witness"], sh
 
 
 _ACCEPT_ALL = [

@@ -5,8 +5,13 @@ Per-role rules, each the checker's own:
 - Junos: traffic from a source CIDR enters at the unit whose subnet holds
   it (exactly one, else indeterminate); that unit's `input` filter, if
   any, decides it. No filter: the flow is permitted. Source and
-  destination on one unit: the flow never crosses a filter. A filter's end
-  is the cited implicit discard (`junos-implicit-discard`).
+  destination on one unit: the flow never crosses a filter; a destination
+  that holds more than the source's segment (a supernet of it) is
+  indeterminate (review of #58, H2). Nothing says the source enters only
+  there (H1): for `must_not_reach`, every other unit's `input` filter is
+  walked for the source too, and a unit with no filter leaves the flow
+  indeterminate. A filter's end is the cited implicit discard
+  (`junos-implicit-discard`).
 - PAN-OS: the security rulebase decides every flow (zones `any`). Its end
   is the default rules, which are pending: indeterminate.
 - iptables: transit traffic crosses only the filter table's FORWARD
@@ -18,8 +23,12 @@ remains. No rule in the grammar matches a protocol or a port, so the
 asserted protocol and ports do not split the space.
 
 Answers: `must_not_reach` gives `witness`, `no-witness` or
-`indeterminate`; `must_reach` gives `all-permitted`, `hole` or
-`indeterminate`.
+`indeterminate`; `must_reach` gives `hole` or `indeterminate`. No cited
+row says the device forwards what its filters permit, so `all-permitted`
+is never given (review of #58, H3).
+
+The checker takes the policy itself and writes each assertion, with its
+zones resolved, on its own (review of #52-#57, G11).
 """
 from __future__ import annotations
 
@@ -29,6 +38,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .derive import derive
 from .split import split_bytes
+from .verify import _assertions
 
 WITNESS, NO_WITNESS = "witness", "no-witness"
 ALL_PERMITTED, HOLE = "all-permitted", "hole"
@@ -113,37 +123,51 @@ def _junos_filter(model, name: str):
     return out
 
 
-def _junos(model, src: List[Net], dst: List[Net]) -> List[Tuple[list, Optional[str], List[Rect]]]:
+def _junos(model, src: List[Net], dst: List[Net],
+           kind: str) -> List[Tuple[list, Optional[str], List[Rect]]]:
     """Per source CIDR: (entries, default, space), or raises LookupError when
-    the source has no single ingress."""
+    the source has no single ingress or a destination lies over its
+    segment."""
     units = {}
     for p, (vals, _) in model.items():
         if len(p) == 4 and p[0] == "interfaces" and p[3] == "family inet" and "address" in vals:
             units[p] = ipaddress.IPv4Interface(vals["address"]).network
+    every = [p for p in model if len(p) == 3 and p[0] == "interfaces"
+             and p[2].startswith("unit ")]
     plans = []
     for s in src:
         ins = [p for p, n in units.items() if s.subnet_of(n)]
         if len(ins) != 1:
             raise LookupError("no single ingress")
         unit = ins[0]
-        local = [d for d in dst if d.subnet_of(units[unit])]
+        seg = units[unit]
+        if any(d.overlaps(seg) and not d.subnet_of(seg) for d in dst):
+            raise LookupError("a destination over the source's segment")
+        local = [d for d in dst if d.subnet_of(seg)]
         if local:
             plans.append(([], "permit", [(s, d) for d in local]))
         far = [d for d in dst if d not in local]
         if not far:
             continue
-        binding = model.get(unit + ("filter",), ({}, []))[0].get("input")
-        if binding is None:
-            plans.append(([], "permit", [(s, d) for d in far]))
-            continue
-        entries = _junos_filter(model, binding)
-        if entries is None:
-            raise LookupError("bound filter not defined")
-        plans.append((entries, "deny", [(s, d) for d in far]))
+        ingress = [unit]
+        if kind == "must_not_reach":
+            ingress += [u + ("family inet",) for u in every if u + ("family inet",) != unit]
+        for at in ingress:
+            binding = model.get(at + ("filter",), ({}, []))[0].get("input")
+            if binding is None:
+                if at == unit:
+                    plans.append(([], "permit", [(s, d) for d in far]))
+                else:
+                    plans.append(([], None, [(s, d) for d in far]))
+                continue
+            entries = _junos_filter(model, binding)
+            if entries is None:
+                raise LookupError("bound filter not defined")
+            plans.append((entries, "deny", [(s, d) for d in far]))
     return plans
 
 
-def _panos(model, src, dst):
+def _panos(model, src, dst, kind):
     base = ("rulebase security",)
     entries = []
     for rule in model.get(base, ({}, []))[1]:
@@ -157,7 +181,7 @@ def _panos(model, src, dst):
     return [(entries, None, [(s, d) for s in src for d in dst])]
 
 
-def _iptables(model, src, dst):
+def _iptables(model, src, dst, kind):
     chain = ("filter", "FORWARD")
     vals, ordered = model.get(chain, ({}, []))
     entries = []
@@ -182,7 +206,7 @@ def _one(dialect: str, model, assertion: str) -> str:
         dst = [ipaddress.IPv4Network(c) for c in a["dst_cidrs"]]
         if not src or not dst or kind not in ("must_not_reach", "must_reach"):
             return INDETERMINATE
-        plans = _PLANS[dialect](model, src, dst)
+        plans = _PLANS[dialect](model, src, dst, kind)
     except (LookupError, ValueError, TypeError, KeyError):
         return INDETERMINATE
     permitted = denied = unknown = False
@@ -191,11 +215,15 @@ def _one(dialect: str, model, assertion: str) -> str:
         permitted, denied, unknown = permitted or p, denied or d, unknown or u
     if kind == "must_not_reach":
         return WITNESS if permitted else INDETERMINATE if unknown else NO_WITNESS
-    return HOLE if denied else INDETERMINATE if unknown else ALL_PERMITTED
+    # H3: no cited forwarding row, so a flow every filter permits is still
+    # indeterminate; ALL_PERMITTED is kept as a word for when one is cited.
+    return HOLE if denied else INDETERMINATE
 
 
-def evaluate(dialect: str, raw: bytes, assertions: List[str]) -> List[str]:
-    """The checker's answer for each assertion, from the raw bytes."""
+def evaluate(dialect: str, raw: bytes, policy) -> List[str]:
+    """The checker's answer for each assertion of the policy, from the raw
+    bytes."""
+    assertions = _assertions(policy)
     lines = split_bytes(raw)
     model = derive(dialect, lines) if lines is not None else None
     if model is None:

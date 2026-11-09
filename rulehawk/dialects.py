@@ -377,12 +377,16 @@ def _certificate(block: dict, raw: bytes, gm: dict, model: dict, dr: dict,
                             "blockers": rec["blockers"], "checker": chk}
     # Slice 7, second part: the checker's own evaluation of each assertion,
     # from its own reading, beside the engine's (a separate field).
+    # The checker gets the raw policy and resolves the zones itself (G11).
     asserted = certificate.assertions(policy)
     try:
-        mine = _checker().evaluate(model.get("dialect"), raw, asserted)
+        mine = _checker().evaluate(model.get("dialect"), raw, policy)
     except Exception:  # fail closed
         mine = ["indeterminate" for _ in asserted]
-    engine = certificate.engine_reading(raw, model.get("dialect"), policy)
+    try:
+        engine = certificate.engine_reading(raw, model.get("dialect"), policy)
+    except Exception:  # fail closed (review of #58, H5)
+        engine = ["error" for _ in asserted]
     agree = len(mine) == len(engine) == len(asserted) and mine == engine
     block["checker_verdict"] = {"agrees": agree, "assertions": [
         {"assertion": a, "checker": c, "engine": e}
