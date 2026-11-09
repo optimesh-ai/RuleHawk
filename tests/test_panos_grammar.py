@@ -134,8 +134,8 @@ def test_two_productions_matching_one_line_is_parse_ambiguous(monkeypatch):
 
 def test_the_grammar_accepts_p00():
     r = _parse(_read(_P00))
-    assert r == {"accepted": True, "reason": None, "line": None,
-                 "rows": r["rows"], "tags": []}, r
+    assert r == {"parses": True, "reason": None, "line": None,
+                 "rows": r["rows"], "tags": [], "pending": r["pending"]}, r
     assert {"panos-cli-create-rule", "panos-set-source-any", "panos-source-address",
             "panos-destination-address", "panos-action", "panos-rule-name"} <= set(r["rows"])
     assert r["rows"] == sorted(set(r["rows"]))
@@ -143,7 +143,7 @@ def test_the_grammar_accepts_p00():
 
 def test_p00_parses_but_would_pass_stays_false(shadow):
     sh = _gate_shadow(_P00)
-    assert sh["grammar"]["accepted"] is True, sh
+    assert sh["grammar"]["parses"] is True, sh
     assert sh["would_pass"] is False, sh
     assert sh["blocking_reason"] == "file-uncertified", sh
 
@@ -154,7 +154,7 @@ def test_p00_parses_but_would_pass_stays_false(shadow):
 def test_every_address_and_action_form_parses(src, dst, action):
     line = (f"set rulebase security rules r-1 from any to any source {src} "
             f"destination {dst} application any service any action {action}\n")
-    assert _parse(line + line.replace("r-1", "r-2"))["accepted"] is True
+    assert _parse(line + line.replace("r-1", "r-2"))["parses"] is True
 
 
 # ------------------------------------------------- per-production meaning examples
@@ -208,7 +208,7 @@ def test_a_mutation_is_off_at_its_line(old, new):
     text = "set rulebase security rules z from any to any source any destination any " \
            "application any service any action allow\n" + _LINE.replace(old, new, 1) + "\n"
     r = _parse(text)
-    assert r["accepted"] is False and r["reason"] == "line-not-allowlisted", (new, r)
+    assert r["parses"] is False and r["reason"] == "line-not-allowlisted", (new, r)
     assert r["line"] == 2, (new, r)
 
 
@@ -230,15 +230,62 @@ def test_a_rule_name_set_twice_is_off_at_the_second_line():
     v4 section 14), so the second line is off."""
     other = _LINE.replace("action deny", "action allow").replace("192.0.2.0/24", "any")
     r = _parse(_LINE + "\n" + other + "\n")
-    assert r["reason"] == "line-not-allowlisted" and r["line"] == 2, r
+    assert r["reason"] == "write-merge-uncited" and r["line"] == 2, r
+
+
+@pytest.mark.parametrize("old,new", [
+    ("source 192.0.2.0/24", "source 192.0.2.1/24"),
+    ("destination 198.51.100.0/24", "destination 198.51.100.7/24"),
+])
+def test_a_prefix_with_host_bits_is_off(old, new):
+    """As for Junos (review of #51, F1 item 8): no row says how a prefix
+    with host bits set is read."""
+    r = _parse(_LINE.replace(old, new) + "\n")
+    assert r["reason"] == "line-not-allowlisted" and r["line"] == 1, r
+
+
+def test_a_rule_name_twice_is_off_even_when_identical():
+    r = _parse(_LINE + "\n" + _LINE + "\n")
+    assert r["reason"] == "write-merge-uncited" and r["line"] == 2, r
+
+
+def test_every_production_records_its_pending_rows():
+    """Review of #51, F4: the rule-name character set and the IPv4 prefix
+    form are not cited; the productions record them as needs."""
+    gm = _gm()
+    from rulehawk import citations
+    for p in gm.PRODUCTIONS:
+        want = {"panos-rule-name-chars"}
+        if "V4PREFIX" in p.slots:
+            want.add("panos-v4-prefix")
+        assert set(p.needs) == want, p
+        assert set(p.needs) <= set(citations.PENDING), p
+
+
+def test_p00_lists_its_pending_rows():
+    assert _parse(_read(_P00))["pending"] == ["panos-rule-name-chars", "panos-v4-prefix"]
+
+
+def test_a_pending_panos_row_fails_a_shadow_run_closed(monkeypatch, shadow):
+    """Review of #51, F3, for PAN-OS."""
+    import rulehawk
+    from rulehawk import citations
+    monkeypatch.setitem(citations.PENDING, "panos-action", "test: pending")
+    monkeypatch.delitem(sys.modules, "rulehawk.grammar_panos", raising=False)
+    monkeypatch.delattr(rulehawk, "grammar_panos", raising=False)
+    sh = _gate_shadow(_P00)
+    monkeypatch.delitem(sys.modules, "rulehawk.grammar_panos", raising=False)
+    assert sh["blocking_reason"] == "file-uncertified", sh
+    assert "grammar" not in sh and "panos-action" in sh["grammar_unavailable"], sh
+    assert sh["would_pass"] is False, sh
 
 
 def test_a_missing_final_newline_still_parses():
-    assert _parse(_LINE)["accepted"] is True
+    assert _parse(_LINE)["parses"] is True
 
 
 def test_an_empty_file_is_not_accepted():
-    assert _parse("")["accepted"] is False
+    assert _parse("")["parses"] is False
 
 
 # ------------------------------------------------ the design's PAN-OS rows
@@ -288,7 +335,7 @@ def test_only_the_positive_controls_parse(shadow):
     for rel in _files():
         sh = _gate_shadow(os.path.join(_V, rel))
         assert sh["would_pass"] is False, (rel, sh)
-        if sh.get("grammar", {}).get("accepted"):
+        if sh.get("grammar", {}).get("parses"):
             accepted.append(rel)
             assert sh["blocking_reason"] == "file-uncertified", (rel, sh)
     assert accepted == ["design/controls/k00_base.conf", "design/controls/p00_base.set"]

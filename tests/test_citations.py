@@ -58,7 +58,9 @@ _PENDING = {"junos-lexing", "junos-evolved-scope",
             # slice 4c: rule order, the release scope, lexing and the set-CLI
             # list semantics have no fetched first-party statement.
             "panos-rule-order", "panos-release-scope", "panos-lexing",
-            "panos-list-semantics"}
+            "panos-list-semantics",
+            # review of #51, F4, for PAN-OS: the name class and the prefix form
+            "panos-rule-name-chars", "panos-v4-prefix"}
 _FIRST_PARTY = ("https://www.juniper.net/documentation/",
                 "https://docs.paloaltonetworks.com/",
                 "https://knowledgebase.paloaltonetworks.com/")
