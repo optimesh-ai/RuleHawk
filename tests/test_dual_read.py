@@ -124,10 +124,12 @@ def test_p00_agrees_and_lists_its_single_fields(shadow):
                   "mismatch": None}, dr
 
 
-def test_i00_agrees_with_nothing_single(shadow):
+def test_i00_agrees_and_lists_the_chain_hook_as_single(shadow):
+    """Review of #52-#57, G5: the legacy parser's `transit` (which chains a
+    transit packet crosses) has no second reading, so it is single."""
     sh = _gate_shadow(_I00)
-    assert sh["dual_read"] == {"reason": None, "compared": ["FORWARD"], "single": [],
-                               "mismatch": None}, sh
+    assert sh["dual_read"] == {"reason": "reading-single", "compared": ["FORWARD"],
+                               "single": ["iptables-chain-hook"], "mismatch": None}, sh
     assert sh["blocking_reason"] == "file-uncertified", sh
     assert sh["would_pass"] is False, sh
 
@@ -266,3 +268,68 @@ def test_no_all_clear_word_in_the_entry(shadow):
         text = json.dumps(_gate_shadow(path)["dual_read"])
         for word in ("PASS", "VERIFIED", "certified", "complete"):
             assert word not in text, (path, word)
+
+
+
+# ------------------------------------------------- review of #52-#57, G5-G8
+
+@pytest.mark.parametrize("text", [
+    "iptables -P INPUT DROP\niptables -A INPUT -d 192.0.2.0/24 -j ACCEPT\n",
+    "iptables -P OUTPUT ACCEPT\n",
+])
+def test_every_iptables_file_lists_the_chain_hook(tmp_path, shadow, text):
+    sh = _gate_shadow(_write(tmp_path, "x.sh", text))
+    assert "iptables-chain-hook" in sh["dual_read"]["single"], sh
+    assert sh["dual_read"]["reason"] in ("reading-single", "reading-mismatch"), sh
+
+
+def test_an_unbound_filter_lists_the_binding_as_single(tmp_path, shadow):
+    """G6: an unbound filter is read by the grammar alone, as a bound one."""
+    text = "firewall {\n    family inet {\n        filter F {\n" \
+           "            term a { then accept; }\n        }\n    }\n}\n"
+    sh = _gate_shadow(_write(tmp_path, "f.conf", text))
+    assert sh["dual_read"]["single"] == ["junos-filter-binding"], sh
+    assert sh["dual_read"]["reason"] == "reading-single", sh
+
+
+@pytest.mark.parametrize("field", ["src_port", "dst_port"])
+def test_a_port_range_that_differs_is_reading_mismatch(monkeypatch, shadow, field):
+    """G7: dropping the port ranges from the comparison must fail a test."""
+    from rulehawk.model import PortRange
+    parse_panos = importlib.import_module("rulehawk.parse_panos")
+    monkeypatch.setattr(parse_panos, "parse_panos",
+                        lambda text: ([_ace(**{field: PortRange(443, 443)})], []))
+    assert _gate_shadow(_P00)["dual_read"]["reason"] == "reading-mismatch"
+
+
+def test_state_limited_that_differs_is_reading_mismatch(monkeypatch, shadow):
+    """G7: dropping state_limited from the comparison must fail a test."""
+    parse_panos = importlib.import_module("rulehawk.parse_panos")
+    monkeypatch.setattr(parse_panos, "parse_panos",
+                        lambda text: ([_ace(state_limited=True)], []))
+    assert _gate_shadow(_P00)["dual_read"]["reason"] == "reading-mismatch"
+
+
+def test_a_dual_read_error_fails_closed(monkeypatch, shadow):
+    """G8: an error anywhere in the dual read, side A included, is a
+    reading-mismatch, never a traceback."""
+    from rulehawk import dualread
+
+    def boom(model):
+        raise RuntimeError("boom")
+    monkeypatch.setitem(dualread._SIDE_A, "panos", boom)
+    sh = _gate_shadow(_P00)
+    assert sh["dual_read"]["reason"] == "reading-mismatch", sh
+    assert sh["blocking_reason"] == "reading-mismatch", sh
+
+
+def test_a_dual_read_module_error_fails_closed(monkeypatch, shadow):
+    """G8: dual_read itself raising is caught in the shadow block."""
+    from rulehawk import dualread
+
+    def boom(*a):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(dualread, "dual_read", boom)
+    sh = _gate_shadow(_P00)
+    assert sh["dual_read"]["reason"] == "reading-mismatch", sh
+    assert sh["blocking_reason"] == "reading-mismatch", sh

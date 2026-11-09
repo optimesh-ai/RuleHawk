@@ -23,7 +23,8 @@ reason code and any legacy parse note, and always
 `checker-verdict-deferred`: the checker's own evaluation of each assertion
 is not built in this slice (decided by agent, unattended: it is the step
 that could make `would_pass` true, so it waits for review). A record with
-any blocker is not eligible, so no record is eligible in this slice.
+any blocker is not eligible, and `eligible` is false for every record in
+this slice, its blockers emptied or not (review of #52-#57, G10).
 """
 from __future__ import annotations
 
@@ -98,9 +99,10 @@ def build(raw: bytes, grammar: dict, model: dict, dual: Optional[dict],
 
 
 def eligible(record) -> bool:
-    """No record is eligible in this slice, whatever it holds (slice 7,
-    second part: `checker-verdict-deferred` is removed in a later, separate
-    step, and pending rows always block)."""
+    """No record is eligible in this slice, whatever it holds: a record
+    whose blockers were emptied is still not eligible (review of #52-#57,
+    G10). `checker-verdict-deferred` is removed in a later, separate step,
+    and pending rows always block. The record is not read."""
     return False
 
 

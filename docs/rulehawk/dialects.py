@@ -312,7 +312,11 @@ def shadow_block(raw: bytes, vendor: str = "auto", policy: Optional[dict] = None
             # The legacy-parser dual read (v2 section 2.2, v3 section 6.2,
             # v4 section 5): a mismatch blocks, ahead of placement.
             from . import dualread
-            dr = dualread.dual_read(raw, model)
+            try:
+                dr = dualread.dual_read(raw, model)
+            except Exception as e:  # fail closed (review of #52-#57, G8)
+                dr = {"reason": dualread.READING_MISMATCH, "compared": [], "single": [],
+                      "mismatch": f"dual read failed: {type(e).__name__}"}
             block["dual_read"] = dr
             if dr["reason"] == dualread.READING_MISMATCH:
                 block["blocking_reason"] = dr["reason"]
@@ -320,7 +324,10 @@ def shadow_block(raw: bytes, vendor: str = "auto", policy: Optional[dict] = None
             if isinstance(zones, dict):
                 # Slice 6: zone placement, both modes (v4 sections 10, 13).
                 from . import placement
-                pl = placement.assess(model, zones)
+                try:
+                    pl = placement.assess(model, zones)
+                except Exception as e:  # fail closed (review of #52-#57, G8)
+                    pl = placement.unavailable(e)
                 block["placement"] = pl
                 if block["blocking_reason"] == UNCERTIFIED and pl["reason"]:
                     block["blocking_reason"] = pl["reason"]
@@ -348,11 +355,21 @@ def _certificate(block: dict, raw: bytes, gm: dict, model: dict, dr: dict,
                  policy: Optional[dict], legacy: Optional[dict]) -> None:
     """Slice 7: the record and the independent checker's answer. No record
     is eligible in this slice (`checker-verdict-deferred`)."""
+    import hashlib
     from . import __version__, certificate
-    rec = certificate.build(raw, gm, model, dr, block.get("placement"), policy, legacy)
     try:
-        import rulehawk_check
-        chk = rulehawk_check.check(rec, raw, certificate.assertions(policy), __version__)
+        rec = certificate.build(raw, gm, model, dr, block.get("placement"), policy, legacy)
+    except Exception as e:  # fail closed (review of #52-#57, G8)
+        block["certificate"] = {
+            "config_sha256": hashlib.sha256(raw).hexdigest(),
+            "blockers": ["record-unavailable", certificate.CHECKER_VERDICT_DEFERRED],
+            "checker": {"agrees": False, "reason": CHECKER_DISAGREES,
+                        "detail": "record failed: " + type(e).__name__}}
+        _checker_blocks(block)
+        return
+    try:
+        # The raw policy: the checker resolves the zones itself (G11).
+        chk = _checker().check(rec, raw, policy, __version__)
     except Exception as e:  # no checker, or a checker that fails: fail closed
         chk = {"agrees": False, "reason": CHECKER_DISAGREES,
                "detail": "checker unavailable: " + type(e).__name__}
@@ -362,8 +379,7 @@ def _certificate(block: dict, raw: bytes, gm: dict, model: dict, dr: dict,
     # from its own reading, beside the engine's (a separate field).
     asserted = certificate.assertions(policy)
     try:
-        import rulehawk_check
-        mine = rulehawk_check.evaluate(model.get("dialect"), raw, asserted)
+        mine = _checker().evaluate(model.get("dialect"), raw, asserted)
     except Exception:  # fail closed
         mine = ["indeterminate" for _ in asserted]
     engine = certificate.engine_reading(raw, model.get("dialect"), policy)
@@ -373,6 +389,33 @@ def _certificate(block: dict, raw: bytes, gm: dict, model: dict, dr: dict,
         for a, c, e in zip(asserted, mine + ["indeterminate"] * len(asserted),
                            engine + ["error"] * len(asserted))]}
     if not chk.get("agrees") or not agree:
-        for key in ("blocking_reason", "blocking_reason_strict"):
-            if block.get(key) == UNCERTIFIED:
-                block[key] = CHECKER_DISAGREES
+        _checker_blocks(block)
+
+
+def _checker_blocks(block: dict) -> None:
+    for key in ("blocking_reason", "blocking_reason_strict"):
+        if block.get(key) == UNCERTIFIED:
+            block[key] = CHECKER_DISAGREES
+
+
+def _checker():
+    """The checker package next to this one, and no other (review of
+    #52-#57, G13): its directory goes first on the path for the import,
+    and a module loaded from any other file raises, so the caller fails
+    closed."""
+    import os
+    import sys
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    want = os.path.join(root, "rulehawk_check", "__init__.py")
+    sys.path.insert(0, root)
+    try:
+        import rulehawk_check
+    finally:
+        try:
+            sys.path.remove(root)
+        except ValueError:
+            pass
+    got = rulehawk_check.__file__ or ""
+    if os.path.realpath(got) != os.path.realpath(want):
+        raise ImportError("rulehawk_check is not the package next to rulehawk")
+    return rulehawk_check

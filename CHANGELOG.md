@@ -139,10 +139,12 @@ rule is off at its line, and the predefined names `intrazone-default` and
 rules' fall-through, the meaning of `any`, the rule-type default and session
 semantics are pending rows, and every production lists the file-level rows
 (release scope, lexing, list semantics and those four) under `pending`; the
-Junos productions now list `junos-lexing` and `junos-evolved-scope` too. Rule
-order is cited from the unversioned "Security Policy Rules" page, and the
-one-line form from a knowledge-base article that sets several attributes on
-one line. A grammar that fails to load for any reason leaves a shadow run
+Junos productions now list `junos-lexing` and `junos-evolved-scope` too. The
+one-line form is cited from a knowledge-base article that sets several
+attributes on one line. Rule order (quoted from the unversioned "Security
+Policy Rules" page, which states evaluation order but not where a new rule
+lands) and the grammar's fixed token order stay pending, in every
+production's `needs`. A grammar that fails to load for any reason leaves a shadow run
 `file-uncertified` with a `grammar_unavailable` entry.
 
 ### iptables grammar, computed in shadow only (#42 phase 2)
@@ -172,9 +174,10 @@ write it makes: an attribute and a merge rule (`create`, `append-in-order`
 or `error`; none replaces or deletes, because no row cites that). The final
 model is the fold of every write in text order, and a second write to one
 (object, attribute) is `write-merge-uncited`. Ordered children rest on a
-cited order row (Junos term order, iptables append order, and PAN-OS rule
-order from the unversioned "Security Policy Rules" page); a PAN-OS file
-still holds one rule, since the default rules' fall-through is pending. Nothing reads the model: verdicts, exit codes and every output
+cited order row (Junos term order, iptables append order); PAN-OS rule order
+is not cited (the unversioned "Security Policy Rules" page states evaluation
+order, not where a new rule lands), so each PAN-OS rule records
+`panos-rule-order` under `pending`, and a PAN-OS file holds one rule. Nothing reads the model: verdicts, exit codes and every output
 are unchanged. With `RULEHAWK_SHADOW=1`, a file the grammar parses gets a
 `model` entry beside `grammar`, and `would_pass` stays false.
 
@@ -218,7 +221,17 @@ declaration and every citation. Any difference, or anything it cannot
 read, is `checker-disagrees`, which becomes the shadow blocking reason in
 place of `file-uncertified`.
 
-No record is eligible yet. Every record lists its blockers:
+After the #57 review, the checker takes the raw policy and resolves the
+zones itself. From its own reading it also re-derives the pending rows the
+file's constructs rest on and the rows they cite, and checks the scope
+sentence and that the blockers name every pending row and
+`checker-verdict-deferred`; a record with any of these emptied or thinned
+is `checker-disagrees`. A record that fails to build is
+`checker-disagrees` too, and the engine uses only the `rulehawk_check`
+next to its own package.
+
+No record is eligible yet, whatever its blockers say. Every record lists
+its blockers:
 - pending rows;
 - the dual read and placement;
 - legacy reason codes and parse notes;
@@ -246,6 +259,11 @@ is an extra check, not independence. Nothing reads the result: verdicts,
 exit codes and every output are unchanged. With `RULEHAWK_SHADOW=1`, a
 parsed file gets a `dual_read` entry, and `would_pass` stays false.
 
+After the #56 review: every iptables file lists the chain hook (the legacy
+parser's `transit`) under `single`, and so does every compared Junos filter's
+binding, bound or not; an error anywhere in the dual read is
+`reading-mismatch`, not a traceback.
+
 ### Zone placement, computed in shadow only (#42 phase 2)
 
 With `RULEHAWK_SHADOW=1` and a policy, a file the grammar parses gets a
@@ -259,6 +277,13 @@ mode. Bridging, PAN-OS zones, static routes and `rule-type` have no grammar
 production, so files holding them do not parse. Nothing reads the result:
 verdicts, exit codes and every output are unchanged, `would_pass` stays
 false, and no `--strict-placement` option is added yet.
+
+After the #55 review: a zone with any CIDR placement cannot read as IPv4
+(IPv6 or invalid) turns placement off (`zones-share-segment`, both modes)
+instead of dropping out of rule (a); the units of one physical interface are
+one segment, since no VLAN separation is cited; a placement error is
+`zone-placement-unpinned` in both modes, not a traceback; and the scope
+sentence no longer says static routes were checked.
 
 ### No file is certified, so code scanning and MCP coverage say so (#42 phase 2)
 

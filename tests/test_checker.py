@@ -77,10 +77,11 @@ def _record(path, policy="default"):
 
 
 def _check(rec, raw, pol):
+    """Review of #52-#57, G11: the checker takes the raw policy and resolves
+    the zones itself."""
     import rulehawk
-    from rulehawk import certificate
     from rulehawk_check import check
-    return check(rec, raw, certificate.assertions(pol), rulehawk.__version__)
+    return check(rec, raw, pol, rulehawk.__version__)
 
 
 def _sources():
@@ -259,10 +260,9 @@ def test_another_policy_is_refused():
 
 
 def test_another_engine_version_is_refused():
-    from rulehawk import certificate
     from rulehawk_check import check
     rec, raw, pol = _record(_K00)
-    r = check(rec, raw, certificate.assertions(pol), "0.0.0")
+    r = check(rec, raw, pol, "0.0.0")
     assert r["agrees"] is False, r
 
 
@@ -349,3 +349,198 @@ def test_a_checker_that_fails_blocks_the_shadow_run(monkeypatch, shadow):
     sh = _gate_shadow(_K00)
     assert sh["certificate"]["checker"]["agrees"] is False, sh
     assert sh["blocking_reason"] == "checker-disagrees", sh
+
+
+# ------------------------------------------------- review of #52-#57, G8, G10-G13
+
+_CONTROLS = [_K00, _P00, _I00]
+
+
+def _copy(rec):
+    return json.loads(json.dumps(rec))
+
+
+@pytest.mark.parametrize("path", _CONTROLS)
+@pytest.mark.parametrize("field", ["pending", "rows", "scope_assumptions", "blockers", "all"])
+def test_an_emptied_record_is_refused(path, field):
+    """G10: the checker re-derives or verifies the pending rows, the rows,
+    the scope assumptions and the blockers; emptying any of them is
+    `checker-disagrees`."""
+    rec, raw, pol = _record(path)
+    assert _check(rec, raw, pol)["agrees"] is True
+    rec = _copy(rec)
+    sub = rec["subs"][0]
+    if field in ("pending", "all"):
+        sub["pending"] = []
+    if field in ("rows", "all"):
+        sub["rows"] = []
+    if field in ("scope_assumptions", "all"):
+        sub["scope_assumptions"] = []
+    if field in ("blockers", "all"):
+        rec["blockers"] = []
+    r = _check(rec, raw, pol)
+    assert r["agrees"] is False and r["reason"] == "checker-disagrees", (field, r)
+
+
+@pytest.mark.parametrize("path,row", [
+    (_K00, "junos-interface-name"), (_K00, "junos-unit-number"),
+    (_K00, "junos-v4-prefix"), (_K00, "junos-address-list-or"),
+    (_K00, "junos-lexing"), (_P00, "panos-rule-order"),
+    (_P00, "panos-one-line-order"), (_P00, "panos-rule-name-chars"),
+    (_P00, "panos-v4-prefix"), (_I00, "iptables-script-scope")])
+def test_a_record_that_drops_one_pending_row_is_refused(path, row):
+    """G10: a pending row the file's constructs rest on, dropped from the
+    sub-record and from the blockers, is refused."""
+    rec, raw, pol = _record(path)
+    rec = _copy(rec)
+    assert row in rec["subs"][0]["pending"], rec["subs"][0]["pending"]
+    rec["subs"][0]["pending"].remove(row)
+    rec["blockers"].remove("pending:" + row)
+    r = _check(rec, raw, pol)
+    assert r["agrees"] is False and r["reason"] == "checker-disagrees", (row, r)
+
+
+@pytest.mark.parametrize("path", _CONTROLS)
+def test_a_record_without_a_pending_blocker_or_the_deferral_is_refused(path):
+    rec, raw, pol = _record(path)
+    for drop in (rec["blockers"][0], _DEFERRED):
+        r2 = _copy(rec)
+        r2["blockers"].remove(drop)
+        r = _check(r2, raw, pol)
+        assert r["agrees"] is False and r["reason"] == "checker-disagrees", (drop, r)
+
+
+def test_a_record_with_another_scope_sentence_is_refused():
+    rec, raw, pol = _record(_K00)
+    rec = _copy(rec)
+    rec["subs"][0]["scope_assumptions"] = ["zones are on separate segments"]
+    assert _check(rec, raw, pol)["agrees"] is False
+
+
+def test_a_record_with_a_scope_sentence_but_no_zones_is_refused():
+    rec, raw, pol = _record(_K00)
+    r = _check(rec, raw, {"must_not_reach": []})
+    assert r["agrees"] is False, r
+
+
+def test_the_checker_scope_sentence_is_the_engine_one():
+    from rulehawk import placement
+    from rulehawk_check import verify
+    assert verify.SCOPE_SENTENCE == placement.SCOPE
+
+
+@pytest.mark.parametrize("path", _CONTROLS)
+def test_forged_empty_blockers_never_make_a_record_eligible(path):
+    """G10: `eligible()` is false for every record, even one whose
+    blockers were emptied."""
+    from rulehawk import certificate
+    rec, _, _ = _record(path)
+    forged = _copy(rec)
+    forged["blockers"] = []
+    assert certificate.eligible(forged) is False
+    assert certificate.eligible({"blockers": []}) is False
+    assert certificate.eligible({}) is False
+
+
+def test_the_shadow_run_hands_the_checker_the_raw_policy(monkeypatch, shadow):
+    """G11: the checker gets the policy itself, not the engine's resolved
+    assertions."""
+    import rulehawk_check
+    seen = {}
+    real = rulehawk_check.check
+
+    def spy(*a):
+        seen["args"] = a
+        return real(*a)
+    monkeypatch.setattr(rulehawk_check, "check", spy)
+    sh = _gate_shadow(_K00)
+    assert seen["args"][2] == _policy(), seen
+    assert sh["certificate"]["checker"]["agrees"] is True, sh
+
+
+def test_the_checker_resolves_the_zones_itself(monkeypatch, shadow):
+    """G11: an engine that resolves a zone wrongly, in the record and in
+    what it would hand the checker, is refused."""
+    from rulehawk import certificate
+    real = certificate.assertions
+
+    def forged(policy):
+        return [a.replace("203.0.113.0/24", "10.0.0.0/8") for a in real(policy)]
+    monkeypatch.setattr(certificate, "assertions", forged)
+    pol = _policy()
+    pol["zones"]["DMZ"] = ["203.0.113.0/24"]
+    pol.setdefault("must_not_reach", []).append({"src": "DMZ", "dst": "PCI"})
+    sh = _gate_shadow(_K00, pol)
+    assert any("10.0.0.0/8" in a for a in forged(pol)), forged(pol)
+    assert sh["certificate"]["checker"]["agrees"] is False, sh
+    assert sh["blocking_reason"] == "checker-disagrees", sh
+
+
+def test_a_record_that_fails_to_build_blocks_the_shadow_run(monkeypatch, shadow):
+    """G8: an error building the record fails closed, with no traceback."""
+    from rulehawk import certificate
+
+    def boom(*a):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(certificate, "build", boom)
+    sh = _gate_shadow(_K00)
+    c = sh["certificate"]
+    assert set(c) == _ENTRY, c
+    assert c["checker"]["agrees"] is False, c
+    assert c["blockers"], c
+    assert sh["blocking_reason"] == "checker-disagrees", sh
+    assert sh["blocking_reason_strict"] == "checker-disagrees", sh
+    assert sh["would_pass"] is False, sh
+
+
+def _drop_checker_modules():
+    for name in [m for m in sys.modules if m == "rulehawk_check" or m.startswith("rulehawk_check.")]:
+        del sys.modules[name]
+
+
+def test_the_engine_finds_the_checker_next_to_its_own_package(tmp_path, monkeypatch, shadow):
+    """G13: a `rulehawk_check` earlier on sys.path is not the checker."""
+    fake = tmp_path / "rulehawk_check"
+    fake.mkdir()
+    (fake / "__init__.py").write_text(
+        "def check(*a):\n    return {'agrees': True, 'reason': None, 'detail': 'fake'}\n")
+    saved = {m: sys.modules[m] for m in list(sys.modules)
+             if m == "rulehawk_check" or m.startswith("rulehawk_check.")}
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _drop_checker_modules()
+    try:
+        sh = _gate_shadow(_K00)
+    finally:
+        _drop_checker_modules()
+        sys.modules.update(saved)
+    assert sh["certificate"]["checker"].get("detail") != "fake", sh
+
+
+def test_a_loaded_checker_from_elsewhere_fails_closed(monkeypatch, shadow):
+    """G13: a module already loaded as `rulehawk_check` from another file
+    is refused."""
+    import types
+    fake = types.ModuleType("rulehawk_check")
+    fake.__file__ = "/elsewhere/rulehawk_check/__init__.py"
+    fake.check = lambda *a: {"agrees": True, "reason": None, "detail": "fake"}
+    monkeypatch.setitem(sys.modules, "rulehawk_check", fake)
+    sh = _gate_shadow(_K00)
+    assert sh["certificate"]["checker"]["agrees"] is False, sh
+    assert sh["blocking_reason"] == "checker-disagrees", sh
+
+
+def test_citations_does_nothing_at_import_but_build_its_tables():
+    """G12 (accepted: the checker loads citations.py by path): its module
+    level holds only the docstring, imports, definitions and assignments,
+    and the only calls it makes are to its own `_row` and `dataclass`."""
+    tree = ast.parse(_read(os.path.join(_ROOT, "rulehawk", "citations.py")))
+    for node in tree.body:
+        assert isinstance(node, (ast.Expr, ast.ImportFrom, ast.FunctionDef,
+                                 ast.ClassDef, ast.Assign, ast.AnnAssign)), ast.dump(node)[:80]
+        if isinstance(node, ast.Expr):
+            assert isinstance(node.value, ast.Constant), ast.dump(node)[:80]
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call):
+                    assert isinstance(sub.func, ast.Name) and sub.func.id == "_row", \
+                        ast.unparse(sub)[:80]

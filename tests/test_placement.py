@@ -42,8 +42,10 @@ _I00 = os.path.join(_D, "controls", "i00_base.sh")
 _POL = os.path.join(_D, "pol", "v4_ip.json")
 
 _HEADLINE = "assumes CORP and PCI are on separate segments"
-_SCOPE = ("RuleHawk checked the interfaces and static routes this file "
-          "configures; zones not attached in this file are assumed not to "
+# Review of #52-#57, G9: no grammar reads a static route, so the sentence
+# does not say routes were checked.
+_SCOPE = ("RuleHawk checked the interfaces this file configures; it read no "
+          "static route; zones not attached in this file are assumed not to "
           "share a segment with another asserted zone.")
 
 
@@ -175,8 +177,13 @@ def test_a_zone_cidr_that_is_not_ipv4_is_unpinned(shadow):
     pol = _policy()
     pol["zones"]["PCI"] = ["2001:db8::/32"]
     sh = _gate_shadow(_K00, pol)
-    assert sh["placement"]["unpinned"] == ["PCI"], sh
-    assert sh["blocking_reason_strict"] == "zone-placement-unpinned", sh
+    # Review of #52-#57, G3: PCI may sit on any segment, so CORP's is no
+    # longer its own either.
+    assert sh["placement"]["unpinned"] == ["CORP", "PCI"], sh
+    # Review of #52-#57, G3: a zone the placement cannot read is not
+    # dropped; placement is off, in both modes.
+    assert sh["blocking_reason"] == "zones-share-segment", sh
+    assert sh["blocking_reason_strict"] == "zones-share-segment", sh
 
 
 # -------------------------------------------- when there is no placement entry
@@ -262,3 +269,65 @@ def test_no_placement_without_the_switch(monkeypatch):
     d = json.loads(g.to_json(g.run_gate([_K00], _policy(), fail_on="high", vendor="auto")))
     (f,) = d["files"]
     assert "shadow" not in f, f
+
+
+# ------------------------------------------- review of #52-#57, G3, G4 and G8
+
+@pytest.mark.parametrize("corp", [["192.0.2.0/25", "2001:db8::/32"],
+                                  ["192.0.2.0/25", "not-a-cidr"]])
+def test_a_zone_with_any_unreadable_cidr_turns_placement_off(corp, shadow):
+    """G3, the reviewer's cases B and C: the file puts CORP and PCI on one
+    segment (192.0.2.1/24 holds both); an IPv6 or unreadable CIDR in CORP
+    must not take CORP out of rule (a)."""
+    pol = _policy()
+    pol["zones"] = {"CORP": corp, "PCI": ["192.0.2.128/25"]}
+    sh = _gate_shadow(_K00, pol)
+    pl = sh["placement"]
+    assert pl["reason"] == "zones-share-segment", pl
+    assert pl["unreadable"] == ["CORP"], pl
+    assert sh["blocking_reason"] == "zones-share-segment", sh
+    assert sh["blocking_reason_strict"] == "zones-share-segment", sh
+    assert pl["headline_assumptions"] == [], pl   # no claim of separation
+    assert sh["would_pass"] is False
+
+
+def test_the_readable_case_still_shares_a_segment(shadow):
+    """G3, case A: without the unreadable CIDR, (a) already blocks."""
+    pol = _policy()
+    pol["zones"] = {"CORP": ["192.0.2.0/25"], "PCI": ["192.0.2.128/25"]}
+    sh = _gate_shadow(_K00, pol)
+    assert sh["placement"]["reason"] == "zones-share-segment", sh
+    assert sh["placement"]["unreadable"] == [], sh
+
+
+def test_two_units_on_one_port_are_one_segment(tmp_path, shadow):
+    """G4: with no VLAN separation cited, the units of one physical port are
+    one L2 wire, so CORP and PCI share it."""
+    text = _read(_K00).replace(
+        "    ge-0/0/1 { unit 0 { family inet { filter { input F; } address 198.51.100.1/24; } } }\n", "")
+    text = text.replace(
+        "address 192.0.2.1/24; } } }",
+        "address 192.0.2.1/24; } } unit 1 { family inet { filter { input F; } "
+        "address 198.51.100.1/24; } } }")
+    assert "unit 1" in text and "ge-0/0/1" not in text
+    sh = _gate_shadow(_write(tmp_path, "k.conf", text))
+    assert "placement" in sh, sh
+    pl = sh["placement"]
+    assert pl["reason"] == "zones-share-segment", pl
+    assert pl["pinned"] == [], pl
+    assert sh["blocking_reason"] == "zones-share-segment", sh
+
+
+def test_a_placement_error_fails_closed(monkeypatch, shadow):
+    """G8: an exception in placement is a blocking reason in both modes,
+    never a traceback."""
+    from rulehawk import placement
+
+    def boom(*a):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(placement, "assess", boom)
+    sh = _gate_shadow(_K00)
+    assert sh["placement"]["error"] == "RuntimeError", sh
+    assert sh["blocking_reason"] == "zone-placement-unpinned", sh
+    assert sh["blocking_reason_strict"] == "zone-placement-unpinned", sh
+    assert sh["would_pass"] is False
