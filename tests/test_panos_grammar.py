@@ -251,7 +251,9 @@ def test_a_rule_name_twice_is_off_even_when_identical():
 
 _FILE_ROWS = {"panos-release-scope", "panos-lexing", "panos-list-semantics",
               "panos-default-rules", "panos-any-meaning", "panos-rule-type-default",
-              "panos-session-semantics"}
+              "panos-session-semantics",
+              # review of #52-#57, G1 and G2
+              "panos-rule-order", "panos-one-line-order"}
 
 
 def test_every_production_records_its_pending_rows():
@@ -268,12 +270,15 @@ def test_every_production_records_its_pending_rows():
         assert set(p.needs) <= set(citations.PENDING), p
 
 
-def test_every_production_cites_rule_order_and_the_one_line_form():
-    """Review of #52/#53, F3 and F6: the one-line form rests on the KB
-    article's one-line `set ... action allow source ...`, and rule order on
-    the Security Policy Rules page."""
+def test_every_production_cites_the_one_line_form_and_needs_rule_order():
+    """Review of #52/#53, F3, and of #52-#57, G1 and G2: the one-line form
+    rests on the KB article's one-line `set ... action allow source ...`;
+    rule order and the token order stay pending, in every production's
+    needs."""
     for p in _gm().PRODUCTIONS:
-        assert {"panos-one-line-form", "panos-rule-order"} <= set(p.cites), p
+        assert "panos-one-line-form" in p.cites, p
+        assert "panos-rule-order" not in p.cites, p
+        assert {"panos-rule-order", "panos-one-line-order"} <= set(p.needs), p
 
 
 def test_p00_lists_its_pending_rows():

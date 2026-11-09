@@ -315,7 +315,10 @@ def shadow_block(raw: bytes, vendor: str = "auto", policy: Optional[dict] = None
             if isinstance(zones, dict):
                 # Slice 6: zone placement, both modes (v4 sections 10, 13).
                 from . import placement
-                pl = placement.assess(model, zones)
+                try:
+                    pl = placement.assess(model, zones)
+                except Exception as e:  # fail closed (review of #52-#57, G8)
+                    pl = placement.unavailable(e)
                 block["placement"] = pl
                 if block["blocking_reason"] == UNCERTIFIED and pl["reason"]:
                     block["blocking_reason"] = pl["reason"]

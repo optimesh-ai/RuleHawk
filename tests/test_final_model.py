@@ -32,8 +32,7 @@ _P00 = os.path.join(_D, "controls", "p00_base.set")
 _I00 = os.path.join(_D, "controls", "i00_base.sh")
 
 _RULES = {"create", "append-in-order", "error"}
-_ORDER_ROWS = {"junos": "junos-term-order", "panos": "panos-rule-order",
-               "iptables": "iptables-append"}
+_ORDER_ROWS = {"junos": "junos-term-order", "iptables": "iptables-append"}
 
 
 def _read(path):
@@ -87,17 +86,23 @@ def test_an_ordered_write_rests_on_an_order_row(dialect):
     ordered = [p for p in gm.PRODUCTIONS if p.write[1] == "append-in-order"]
     assert ordered, dialect
     for p in ordered:
-        assert _ORDER_ROWS[dialect] in p.cites, p
+        if dialect == "panos":
+            # Review of #52-#57, G1: no cited row states where a new rule
+            # lands, so the order row is pending, in needs.
+            assert "panos-rule-order" in p.needs, p
+        else:
+            assert _ORDER_ROWS[dialect] in p.cites, p
 
 
-def test_panos_rule_order_is_cited_from_an_unversioned_page():
-    """Review of #52/#53, F6: cited, and its release recorded as
-    unversioned; a file still holds one rule (F2)."""
+def test_panos_rule_order_stays_pending():
+    """Review of #52-#57, G1: the order block is back."""
     from rulehawk import citations
-    assert "panos-rule-order" not in citations.PENDING
-    assert "unversioned" in citations.resolve("panos-rule-order").release
-    for p in _grammars()["panos"].PRODUCTIONS:
-        assert "panos-rule-order" in p.cites and "panos-rule-order" not in p.needs, p
+    gm = _grammars()["panos"]
+    assert "panos-rule-order" in citations.PENDING
+    assert gm._ORDER_NEEDS == ("panos-rule-order",)
+    for p in gm.PRODUCTIONS:
+        assert set(gm._ORDER_NEEDS) <= set(p.needs), p
+        assert "panos-rule-order" not in p.cites, p
 
 
 # ------------------------------------------------------------------- the fold
@@ -156,7 +161,7 @@ def test_p00_model():
         "from": "any", "to": "any", "source": "192.0.2.0/24",
         "destination": "198.51.100.0/24", "application": "any", "service": "any",
         "action": "deny"}
-    assert "panos-rule-order" in r["rows"], r
+    assert "panos-rule-order" in r["pending"], r
     assert "panos-default-rules" in r["pending"], r
 
 
