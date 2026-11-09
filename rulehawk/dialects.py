@@ -37,6 +37,7 @@ import os
 import re
 from typing import List, Optional
 
+from . import grammar_junos
 from .model import _PAGER
 from .parse import parse_acls
 from .parse_awssg import detect as _detect_awssg
@@ -264,8 +265,17 @@ def boundary(raw: bytes, vendor: str = "auto") -> dict:
 
 def shadow_block(raw: bytes, vendor: str = "auto") -> dict:
     """The shadow block for one file (v4 section 13). In this release no
-    file is certified, so `would_pass` is false and the first blocking
-    reason is the boundary's, or `file-uncertified`."""
+    file is certified, so `would_pass` is false. The first blocking reason
+    is the boundary's; then, for a file the boundary lets through as Junos,
+    the Junos grammar's (slice 4b: `line-not-allowlisted`,
+    `parse-ambiguous` or `config-incomplete`, in a `grammar` entry);
+    otherwise `file-uncertified`. PAN-OS and iptables get their grammars in
+    slices 4c and 4d."""
     b = boundary(raw, vendor)
-    return {"boundary": b, "would_pass": False,
-            "blocking_reason": b["reason"] or UNCERTIFIED}
+    block = {"boundary": b, "would_pass": False,
+             "blocking_reason": b["reason"] or UNCERTIFIED}
+    if b["reason"] is None and b["dialects"] == ["junos"]:
+        gm = grammar_junos.parse(raw)
+        block["grammar"] = gm
+        block["blocking_reason"] = gm["reason"] or UNCERTIFIED
+    return block

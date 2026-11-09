@@ -155,10 +155,19 @@ def test_toy_keyword_inside_a_class_is_caught():
 
 def test_toy_disjoint_pairs_pass():
     gm = _gm()
-    prods = [_toy("m", "filter", "LOWER", "{"), _toy("m", "filter", "DIGITS", "{"),
+    prods = [_toy("m", "filter", "LOWER", "{"), _toy("m", "filter", "123", "{"),
              _toy("m", "term", "LOWER", "{"), _toy("m", "filter", "LOWER", "LOWER", "{"),
              _toy("n", "filter", "LOWER", "{")]
     assert gm.overlaps(prods, _toy_classes()) == []
+
+
+def test_toy_two_classes_at_one_position_count_as_overlapping():
+    """The check does not compare two class languages: two different
+    classes at the same position count as overlapping, even when (as
+    here) their languages are disjoint. This only over-reports."""
+    gm = _gm()
+    prods = [_toy("m", "filter", "LOWER", "{"), _toy("m", "filter", "DIGITS", "{")]
+    assert len(gm.overlaps(prods, _toy_classes())) == 1
 
 
 def test_toy_optional_keyword_and_spacey_class_are_caught():

@@ -83,6 +83,25 @@ states, a verbatim quote confirmed by a second fetch, and the dates. Rows not
 yet confirmed are listed as pending and cannot be cited. It is data only: no
 verdict, exit code or output changes, and PASS is still never reported.
 
+### Junos grammar, computed in shadow only (#42 phase 2)
+
+`rulehawk/grammar_junos.py` is the first allowlist grammar: the Junos brace
+form, with a production only for a construct a cited row covers (interfaces
+with `unit`, `family inet`, `address` and `filter input`; firewall filters
+with terms, `source-address` and `destination-address` lists, and
+`then accept` / `then discard`). It reads LF line ends, printable ASCII,
+four-space indentation per level, single spaces between tokens, exact
+lowercase keywords, and whole-line comments; a Junos tag (`delete:`,
+`replace:`, `inactive:` ...) or a set-form command matches nothing. The
+citation registry gains the rows it rests on. Nothing reads the result:
+verdicts, exit codes and every output are unchanged, and PASS is still never
+reported. With `RULEHAWK_SHADOW=1`, a file the boundary lets through as Junos
+gets a `grammar` entry in its `shadow` block, and its blocking reason becomes
+the grammar's (`line-not-allowlisted`, `parse-ambiguous`, or
+`config-incomplete` for a file that ends inside a stanza) or, when it parses,
+still `file-uncertified`: parsing is not a certificate, and `would_pass` stays
+false.
+
 ### No file is certified, so code scanning and MCP coverage say so (#42 phase 2)
 
 **Under the stopgap, every config gets a standing `rulehawk/uncertified`

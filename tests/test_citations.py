@@ -33,7 +33,7 @@ _CITED = {
     "junos-match-source-address", "junos-implicit-discard", "junos-comments",
     "junos-config-indent", "junos-config-braces", "junos-config-leaf-semicolon",
     "junos-interface-family-hierarchy", "junos-interface-address-inet",
-    "junos-interface-filter-hierarchy", "junos-firewall-level",
+    "junos-interface-filter-hierarchy", "junos-top-firewall", "junos-top-interfaces",
     "junos-firewall-family-inet", "junos-filter-statement", "junos-term-statement",
     "junos-term-name", "junos-from-statement", "junos-then-statement",
     "junos-accept-terminating", "junos-discard-term",
