@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 import subprocess
 import sys
 
@@ -90,8 +91,12 @@ def test_the_harness_takes_named_files_and_a_policy():
 def test_the_harness_writes_no_all_clear_word():
     rc, out, _ = _run()
     assert rc == 0
-    for word in ("PASS", "VERIFIED", "certified", "NO_NEW_RISK", "complete"):
+    for word in ("PASS", "VERIFIED", "NO_NEW_RISK"):
         assert word not in out, word
+    # As values, not inside the reason codes `file-uncertified` and
+    # `config-incomplete`.
+    for word in ("certified", "complete"):
+        assert not re.search(r"(?<![-\w])" + word + r"(?![-\w])", out), word
 
 
 def test_the_harness_is_not_shipped_or_wired_into_an_action():
