@@ -117,9 +117,10 @@ def test_unaddressed_controls_rest_on_the_assumption(path, shadow):
     assert pl["headline_assumptions"] == [_HEADLINE], pl
     assert pl["scope_assumptions"] == [_SCOPE], pl
     assert pl["rows"] == ["zone-placement-assumed"], pl
-    # Review of #60-#62, F60-1: the checker is indeterminate on iptables
-    # while iptables-script-scope is pending, so i00 is checker-disagrees.
-    want = "checker-disagrees" if path == _I00 else "file-uncertified"
+    # Review of #60-#62, F60-1 and r2 F60-5: the checker is indeterminate on
+    # iptables and PAN-OS while their pending rows stand, so both controls
+    # are checker-disagrees.
+    want = "checker-disagrees"
     assert sh["blocking_reason"] == want, sh
     assert sh["blocking_reason_strict"] == "zone-placement-unpinned", sh
     assert sh["would_pass"] is False, sh
