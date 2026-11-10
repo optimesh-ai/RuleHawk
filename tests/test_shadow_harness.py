@@ -87,16 +87,23 @@ def test_the_harness_takes_named_files_and_a_policy():
     rc, out, err = _run("--policy", pol, os.path.join(_D, "controls", "i00_base.sh"))
     assert rc == 0, err
     (r,) = _table(out)
-    assert r["checker"] == "hole", r
+    # The checker is indeterminate on iptables while iptables-script-scope
+    # is pending (review of #60-#62, F60-1, merged from #58).
+    assert r["checker"] == "indeterminate", r
 
 
 def _all_clear_hits(out):
-    """The all-clear words in `out`."""
-    hits = [w for w in ("PASS", "VERIFIED", "NO_NEW_RISK") if w in out]
-    # As values, not inside the reason codes `file-uncertified` and
-    # `config-incomplete`.
-    hits += [w for w in ("certified", "complete")
-             if re.search(r"(?<![-\w])" + w + r"(?![-\w])", out)]
+    """The all-clear words in `out` (review of #60-#62, F61-1). Only the
+    exact reason codes `file-uncertified` and `config-incomplete` are taken
+    out; the rest is scanned case-insensitively. PASS and ACCEPTED are
+    matched in capitals only: `would pass`, `would_pass`, `bypass` and the
+    fixture names (`..._accepted_...`) are lower case (decided by agent,
+    unattended)."""
+    rest = out.replace("file-uncertified", "").replace("config-incomplete", "")
+    low = rest.lower()
+    hits = [w for w in ("certified", "complete", "verified", "no_new_risk", '"passed": true')
+            if w in low]
+    hits += [w for w in ("PASS", "ACCEPTED", "\u2713", "\u2714") if w in rest]
     return hits
 
 
