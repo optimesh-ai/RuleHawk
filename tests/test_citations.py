@@ -79,7 +79,15 @@ _PENDING = {"junos-lexing", "junos-evolved-scope",
             # slice 4d: iptables lexing, the script's scope, the release
             # scope and the iptables-save format
             "iptables-lexing", "iptables-script-scope", "iptables-release-scope",
-            "iptables-save-format"}
+            "iptables-save-format",
+            # v4 section 14 fetches: the PAN-OS route and interface pages are
+            # GUI only, and the iptables tcp section was not reached in full.
+            "panos-static-route", "panos-layer3-interface", "iptables-dport"}
+# v4 section 14 fetches: rows cited for a later slice; no production rests on
+# one yet, so the allowlist is unchanged.
+_NEW_CITED = {"junos-static-next-hop", "junos-static-direct-next-hop",
+              "iptables-protocol"}
+_CITED |= _NEW_CITED
 _FIRST_PARTY = ("https://www.juniper.net/documentation/",
                 "https://docs.paloaltonetworks.com/",
                 "https://knowledgebase.paloaltonetworks.com/",
@@ -166,3 +174,29 @@ def test_panos_one_line_order_is_pending():
     is an inference."""
     r = _mod().PENDING["panos-one-line-order"]
     assert "source" in r and "to" in r, r
+
+
+def test_new_section_14_rows_support_no_production():
+    """v4 section 14 fetches: the new rows add no production, so the
+    allowlist does not change."""
+    from rulehawk import grammar_iptables, grammar_junos, grammar_panos
+    for g in (grammar_junos, grammar_panos, grammar_iptables):
+        for p in g.PRODUCTIONS:
+            assert not set(p.cites) & _NEW_CITED, p
+            assert not set(p.needs) & _NEW_CITED, p
+
+
+def test_new_section_14_rows_state_their_release():
+    c = _mod()
+    for cid in ("junos-static-next-hop", "junos-static-direct-next-hop"):
+        assert c.ROWS[cid].release == "Statement introduced before Junos OS Release 7.4."
+    assert c.ROWS["iptables-protocol"].release.endswith("1.8.13.")
+
+
+def test_section_14_pending_reasons_say_why():
+    r = _mod().PENDING
+    assert "GUI" in r["panos-static-route"] and "11.1" in r["panos-static-route"]
+    assert "11.1.4" in r["panos-layer3-interface"]
+    assert "tcp" in r["iptables-dport"] and "highlight" in r["iptables-dport"]
+    assert "--noflush" in r["iptables-save-format"]
+    assert "not fetched" not in r["iptables-save-format"]
