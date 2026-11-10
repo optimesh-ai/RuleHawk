@@ -70,7 +70,10 @@ def test_the_harness_lists_every_attack_file_and_control_in_both_modes():
     assert k["checker_agrees"] == "true" and k["checker"] == "no-witness", k
     assert k["default"] == "file-uncertified", k
     p = by["controls/p00_base.set"]
-    assert p["default"] == "file-uncertified" and p["strict"] == "zone-placement-unpinned", p
+    # The checker is indeterminate on PAN-OS while panos-any-meaning is
+    # pending (review of #60-#62 r2, F60-5, merged from #58).
+    assert p["default"] == "checker-disagrees" and p["strict"] == "zone-placement-unpinned", p
+    assert p["checker"] == "indeterminate" and p["checker_agrees"] == "false", p
 
 
 def test_the_harness_prints_the_would_pass_lists_and_counts_for_both_modes():
