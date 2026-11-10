@@ -197,6 +197,22 @@ def test_section_14_pending_reasons_say_why():
     r = _mod().PENDING
     assert "GUI" in r["panos-static-route"] and "11.1" in r["panos-static-route"]
     assert "11.1.4" in r["panos-layer3-interface"]
-    assert "tcp" in r["iptables-dport"] and "highlight" in r["iptables-dport"]
+    # Review of #60-#62, F62-1: the full fetch does hold the tcp text; the
+    # row is pending because no production uses it yet.
+    d = r["iptables-dport"]
+    assert "--destination-port,--dport port[:port]" in d, d
+    assert "no production" in d, d
+    assert "highlight" not in d and "ends before" not in d, d
     assert "--noflush" in r["iptables-save-format"]
     assert "not fetched" not in r["iptables-save-format"]
+
+
+def test_iptables_protocol_records_both_hazards():
+    """Review of #60-#62, F62-1: the row's comment names the host lookup of a
+    protocol name and the checker that ignores -p."""
+    src = open(os.path.join(_ROOT, "rulehawk", "citations.py"), encoding="utf-8").read()
+    i = src.index('_row("iptables-protocol"')
+    # The comment lines just above the row.
+    note = src[src.rindex("),\n", 0, i):i]
+    assert "/etc/protocols" in note and "numeric" in note, note
+    assert "_iptables" in note and "together" in note, note
