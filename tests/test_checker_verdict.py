@@ -106,7 +106,7 @@ def test_every_built_record_keeps_the_deferred_blocker_and_its_pending_rows(path
 
 # ------------------------------------------------------------------ the controls
 
-@pytest.mark.parametrize("path", [_K00, _P00, _I00])
+@pytest.mark.parametrize("path", [_K00, _P00])
 def test_a_control_checker_and_engine_agree_there_is_no_witness(path, shadow):
     d = json.loads(g.to_json(g.run_gate([path], _policy(), fail_on="high", vendor="auto")))
     sh = d["files"][0]["shadow"]
@@ -120,11 +120,50 @@ def test_a_control_checker_and_engine_agree_there_is_no_witness(path, shadow):
     assert sh["would_pass"] is False, sh
 
 
-@pytest.mark.parametrize("path", [_K00, _P00, _I00])
+@pytest.mark.parametrize("path", [_K00, _P00])
 def test_a_control_under_must_reach_has_a_hole(path, tmp_path, shadow):
     sh = _shadow(tmp_path, os.path.basename(path), _read(path), _reach_policy())
     assert _verdicts(sh) == ["hole"], sh
     assert sh["would_pass"] is False
+
+
+# Review of #60-#62, F60-1, option (b): `iptables-script-scope` is pending.
+# `-A` appends after whatever the chain already holds, and no cited row
+# states the rule set before the script, so a rule loaded earlier may decide
+# any flow first: every iptables answer is indeterminate while it is pending.
+
+def test_iptables_control_is_indeterminate_while_the_script_scope_is_pending(shadow):
+    d = json.loads(g.to_json(g.run_gate([_I00], _policy(), fail_on="high", vendor="auto")))
+    sh = d["files"][0]["shadow"]
+    cv = sh["checker_verdict"]
+    (a,) = cv["assertions"]
+    assert a["checker"] == "indeterminate" and a["engine"] == "no-witness", a
+    assert cv["agrees"] is False, cv
+    assert sh["blocking_reason"] == "checker-disagrees", sh
+    assert sh["would_pass"] is False, sh
+
+
+def test_iptables_control_under_must_reach_is_indeterminate(tmp_path, shadow):
+    sh = _shadow(tmp_path, "i00.sh", _I, _reach_policy())
+    assert _verdicts(sh) == ["indeterminate"], sh
+    assert sh["would_pass"] is False
+
+
+@pytest.mark.parametrize("text", [
+    "iptables -P FORWARD ACCEPT\n",
+    "iptables -P FORWARD DROP\n",
+    "iptables -P FORWARD DROP\niptables -A FORWARD -j ACCEPT\n",
+    "iptables -P FORWARD ACCEPT\niptables -A FORWARD -s 192.0.2.0/24 -d "
+    "198.51.100.0/24 -j DROP\n",
+])
+def test_every_iptables_answer_is_indeterminate_while_the_script_scope_is_pending(
+        tmp_path, shadow, text):
+    from rulehawk.citations import PENDING
+    assert "iptables-script-scope" in PENDING
+    for pol in (_policy(), _reach_policy()):
+        sh = _shadow(tmp_path, "s.sh", text, pol)
+        assert _verdicts(sh) == ["indeterminate"], (text, sh)
+        assert sh["would_pass"] is False
 
 
 def test_no_checker_verdict_without_the_switch(tmp_path, monkeypatch):
@@ -158,6 +197,9 @@ def test_a_disagreement_blocks(tmp_path, shadow):
 _LEAK = "leak"          # truth: CORP reaches PCI
 _HOLE = "hole"          # under must_reach, truth: some part is denied
 _OPEN = None            # truth not settled by cited rows: never no-witness
+# Review of #60-#62, F60-1: every iptables LEAK label rested on the pending
+# `iptables-script-scope` (a rule before the script may drop the flow), so
+# those mutants are OPEN.
 
 _MUTANTS = [
     # family 1: cross-line rewrite, re-entry, `no` / `delete`
@@ -166,14 +208,14 @@ _MUTANTS = [
     ("f1-panos-second-rule.set", "set rulebase security rules z from any to any source any "
      "destination any application any service any action allow\n" + _P, None, _LEAK),
     ("f1-iptables-delete.sh", _I + "iptables -D FORWARD -s 192.0.2.0/24 -d 198.51.100.0/24 "
-     "-j DROP\niptables -P FORWARD ACCEPT\n", None, _LEAK),
+     "-j DROP\niptables -P FORWARD ACCEPT\n", None, _OPEN),
     ("f1-iptables-policy-twice.sh", _I + "iptables -P FORWARD ACCEPT\n", None, None),
     # family 3: mode and context
     ("f3-junos-unbound-ingress.conf",
      _K.replace("ge-0/0/0 { unit 0 { family inet { filter { input F; } address",
                 "ge-0/0/0 { unit 0 { family inet { address"), None, _LEAK),
     ("f3-iptables-input-chain.sh", "iptables -P FORWARD ACCEPT\niptables -A INPUT -s "
-     "192.0.2.0/24 -d 198.51.100.0/24 -j DROP\n", None, _LEAK),
+     "192.0.2.0/24 -d 198.51.100.0/24 -j DROP\n", None, _OPEN),
     ("f3-junos-output-binding.conf", _K.replace("input F;", "output F;"), None, _LEAK),
     # family 5: anchoring
     ("f5-junos-half-prefix.conf", _K.replace(
@@ -183,23 +225,23 @@ _MUTANTS = [
     ("f5-panos-half-prefix.set", _P.replace("source 192.0.2.0/24", "source 192.0.2.0/25"),
      None, None),
     ("f5-iptables-half-prefix.sh", "iptables -P FORWARD ACCEPT\niptables -A FORWARD -s "
-     "192.0.2.0/25 -d 198.51.100.0/24 -j DROP\n", None, _LEAK),
+     "192.0.2.0/25 -d 198.51.100.0/24 -j DROP\n", None, _OPEN),
     # family 6: name versus literal
     ("f6-junos-case.conf", _K.replace("input F;", "input f;"), None, None),
     ("f6-iptables-chain-case.sh", _I.replace("-A FORWARD", "-A forward"), None, None),
     # family 7: remote effect and defaults
     ("f7-iptables-no-policy.sh", "iptables -A FORWARD -s 192.0.2.0/25 -d 198.51.100.0/24 "
      "-j DROP\n", None, None),
-    ("f7-iptables-accept-policy.sh", "iptables -P FORWARD ACCEPT\n", None, _LEAK),
+    ("f7-iptables-accept-policy.sh", "iptables -P FORWARD ACCEPT\n", None, _OPEN),
     # family 8: platform swap
     ("f8-junos-as-panos.conf", _K, "panos", None),
     ("f8-iptables-as-junos.sh", _I, "junos", None),
     # family 9: completeness
     ("f9-junos-no-interfaces.conf", _K[_K.index("firewall {"):], None, None),
     # family 12: script control flow
-    ("f12-iptables-exit.sh", "iptables -P FORWARD ACCEPT\nexit\n" + _I, None, _LEAK),
+    ("f12-iptables-exit.sh", "iptables -P FORWARD ACCEPT\nexit\n" + _I, None, _OPEN),
     ("f12-iptables-accept-first.sh", "iptables -P FORWARD DROP\niptables -A FORWARD -j "
-     "ACCEPT\n" + _I.split("\n", 1)[1], None, _LEAK),
+     "ACCEPT\n" + _I.split("\n", 1)[1], None, _OPEN),
     ("f12-iptables-and.sh", _I.replace("\n", " && true\n", 1), None, None),
 ]
 
@@ -264,7 +306,10 @@ def test_family_10_no_mutant_with_a_hole_gets_all_permitted(tmp_path, shadow, na
     sh = _shadow(tmp_path, name, text, _reach_policy())
     assert sh["would_pass"] is False
     if "checker_verdict" in sh:
-        assert _verdicts(sh) == ["hole"], (name, sh["checker_verdict"])
+        # F60-1: an iptables hole rests on the pending script scope (a rule
+        # before the script may accept the flow): indeterminate.
+        want = ["indeterminate"] if name.endswith(".sh") else ["hole"]
+        assert _verdicts(sh) == want, (name, sh["checker_verdict"])
 
 
 def test_family_10_an_open_path_is_indeterminate_without_cited_forwarding(tmp_path, shadow):
