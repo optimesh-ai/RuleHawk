@@ -83,6 +83,11 @@ states, a verbatim quote confirmed by a second fetch, and the dates. Rows not
 yet confirmed are listed as pending and cannot be cited. It is data only: no
 verdict, exit code or output changes, and PASS is still never reported.
 
+The v4 section 14 fetches add three cited rows (Junos static next-hop, its
+directly connected default, and iptables `-p`) that no production uses yet,
+and keep PAN-OS static routes and Layer 3 interfaces, iptables `--dport` and
+the iptables-save format pending, each with the reason.
+
 ### Junos grammar, computed in shadow only (#42 phase 2)
 
 `rulehawk/grammar_junos.py` is the first allowlist grammar: the Junos brace
