@@ -147,6 +147,18 @@ def test_the_all_clear_scan_catches_mixed_case_and_compact_spellings(text):
 
 
 @pytest.mark.parametrize("text", [
+    "segmentation_passed", '"segmentation_passed": ["CORP"]', "Segmentation_Passed",
+    "seg_passed=1", "proven_line", "proven_line=True", '"passed": true',
+])
+def test_the_all_clear_scan_catches_the_design_s_all_clear_keys(text):
+    """Review of #60-#62 r3: the word match lets `segmentation_passed`
+    through by design (an underscore marks a name), so the keys on the
+    design's all-clear list (test_allowlist_design_attacks) are forbidden
+    by name."""
+    assert _all_clear_hits("x " + text + " y"), text
+
+
+@pytest.mark.parametrize("text", [
     "would pass (default placement): 0", "would pass (strict placement): 0", "would_pass",
     "bypass", "v4_ip_accepted", "g01_ios_accepted_violation_gate", "_iptables_nfqueue_bypass",
 ])
