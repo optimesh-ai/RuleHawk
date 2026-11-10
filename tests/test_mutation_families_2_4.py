@@ -10,12 +10,16 @@ the mutant's text, never from the engine:
 A truth that rests on a pending row is `OPEN` (review of #60-#62, F60-1
 and F60-2). Every iptables truth rests on `iptables-script-scope`: `-A`
 appends after the rules already loaded, which no cited row states, so a
-rule before the script may decide any flow first. A PAN-OS second rule
-rests on `panos-rule-order` and `panos-any-meaning`. A lexing variant
+rule before the script may decide any flow first. Every PAN-OS truth
+rests on `panos-any-meaning` (review of #60-#62 r2, F60-5): each rule the
+grammar reads uses `any`, and no cited row says what `any` matches; a
+second rule also rests on `panos-rule-order`. A lexing variant
 (tab, CRLF, doubled or trailing space) rests on `junos-lexing` or
 `panos-lexing`. The Junos rows left `SAFE` use only the canonical spelling
 the narrowed classes accept and rest on cited rows for their meaning; the
-file-level pending rows still block every record on their own.
+file-level pending rows still block every record on their own. `SAFE`
+means on Junos OS only: no fetched page states its rows for Junos OS
+Evolved (`junos-evolved-scope`, pending).
 
 Each also pins the checker's exact answer, or `REFUSED` when the grammar
 does not read the file (no `checker_verdict`). The pinned answer must fit
@@ -91,10 +95,11 @@ def _answer(text: str) -> str:
 
 def test_the_controls_are_what_the_mutants_start_from():
     assert _TD in _K and _TA in _K and _TD + _TA in _K
-    for text in (_K, _P):
-        assert _answer(text) == "no-witness"
-    # F60-1: i00's truth rests on the pending iptables-script-scope.
+    assert _answer(_K) == "no-witness"
+    # F60-1: i00's truth rests on the pending iptables-script-scope; r2
+    # F60-5: p00's on the pending panos-any-meaning.
     assert _answer(_I) == "indeterminate"
+    assert _answer(_P) == "indeterminate"
 
 
 # ------------------------------------------------- family 2: sequence and order
@@ -151,7 +156,7 @@ _FAMILY_4 = [
     ("panos-quoted-rule-name", _P.replace("rules d ", 'rules "d" '), OPEN, REFUSED),
     ("panos-tab", _P.replace(" action deny", "\taction deny"), OPEN, REFUSED),
     ("panos-crlf", _P.replace("\n", "\r\n"), OPEN, REFUSED),
-    ("iptables-rule-commented-out", "iptables -P FORWARD ACCEPT\n# " + _DROP, LEAK, REFUSED),
+    ("iptables-rule-commented-out", "iptables -P FORWARD ACCEPT\n# " + _DROP, OPEN, REFUSED),
     ("iptables-trailing-comment", _I.replace("-j DROP\n", "-j DROP # x\n"), OPEN, REFUSED),
     ("iptables-line-continuation",
      _I.replace("-d 198.51.100.0/24 -j DROP", "-d 198.51.100.0/24 \\\n  -j DROP"), OPEN,
@@ -292,3 +297,20 @@ def test_the_iptables_plan_still_reads_the_source_and_the_policy():
     ((_, default, _),) = _iptables(
         derive("iptables", split_bytes(_DROP.encode())), src, dst, "must_not_reach")
     assert default is None
+
+
+def test_the_panos_plan_still_reads_the_addresses_and_no_default():
+    """While panos-any-meaning is pending every PAN-OS answer is
+    indeterminate, so a wrong address or default reading cannot change an
+    answer (review of #60-#62 r2, F60-5). The plan is pinned directly, so
+    the mutant that reads the pending default rules as deny still dies."""
+    import ipaddress
+    from rulehawk_check.derive import derive
+    from rulehawk_check.evaluate import _panos
+    from rulehawk_check.split import split_bytes
+    n = ipaddress.IPv4Network
+    src, dst = [n("192.0.2.0/24")], [n("198.51.100.0/24")]
+    ((entries, default, space),) = _panos(
+        derive("panos", split_bytes(_P.encode())), src, dst, "must_not_reach")
+    assert entries == [([n("192.0.2.0/24")], [n("198.51.100.0/24")], "unknown")], entries
+    assert default is None and space == [(src[0], dst[0])]
