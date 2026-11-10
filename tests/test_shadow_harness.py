@@ -112,6 +112,9 @@ def _all_clear_hits(out):
     hits += re.findall(r"(?i)no[-_ ]new[-_ ]risk", rest)
     hits += re.findall(r"(?i)(?<![a-z0-9_])(?:pass(?:ed|es)?|accepted)(?![a-z0-9_])", rest)
     hits += [w for w in ("PASS", "ACCEPTED", "\u2713", "\u2714", "\u2705") if w in rest]
+    # The design's all-clear keys, by name (review of #60-#62 r3): the word
+    # match above treats an underscore as part of a name.
+    hits += [w for w in ("segmentation_passed", "seg_passed", "proven_line") if w in low]
     return hits
 
 
