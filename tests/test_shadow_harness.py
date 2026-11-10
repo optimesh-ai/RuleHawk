@@ -128,6 +128,24 @@ def test_the_all_clear_scan_ignores_only_the_two_reason_codes():
     assert _all_clear_hits("file-uncertified config-incomplete") == []
 
 
+@pytest.mark.parametrize("text", [
+    "Pass", "Passed", "pass", "passed", "passes", "PASSED", "Accepted", "accepted",
+    '"passed":true', "Pass: 0", "result: passed", "no new risk", "No-New-Risk",
+    "NO_NEW_RISK", "no_new-risk", "\u2705",
+])
+def test_the_all_clear_scan_catches_mixed_case_and_compact_spellings(text):
+    """Review of #60-#62 r2, R61-1."""
+    assert _all_clear_hits("x " + text + " y"), text
+
+
+@pytest.mark.parametrize("text", [
+    "would pass (default placement): 0", "would pass (strict placement): 0", "would_pass",
+    "bypass", "v4_ip_accepted", "g01_ios_accepted_violation_gate", "_iptables_nfqueue_bypass",
+])
+def test_the_all_clear_scan_ignores_the_harness_s_own_names(text):
+    assert _all_clear_hits("x " + text + " y") == [], text
+
+
 def test_the_harness_is_not_shipped_or_wired_into_an_action():
     with open(os.path.join(_ROOT, "pyproject.toml"), encoding="utf-8") as fh:
         text = fh.read()
