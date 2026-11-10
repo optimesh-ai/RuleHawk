@@ -314,3 +314,16 @@ def test_the_panos_plan_still_reads_the_addresses_and_no_default():
         derive("panos", split_bytes(_P.encode())), src, dst, "must_not_reach")
     assert entries == [([n("192.0.2.0/24")], [n("198.51.100.0/24")], "unknown")], entries
     assert default is None and space == [(src[0], dst[0])]
+
+
+def test_iptables_and_panos_must_reach_is_indeterminate_while_their_rows_are_pending():
+    """Review of #60-#62 r2: the unknown entry stands for must_reach too (a
+    rule before the script may accept the flow; `any` has no cited
+    meaning), so neither control has a cited hole."""
+    pol = _policy()
+    pol["must_reach"] = pol.pop("must_not_reach")
+    for text in (_I, _P):
+        sh = dialects.shadow_block(text.encode("utf-8"), "auto", pol)
+        assert sh["would_pass"] is False, sh
+        assert [a["checker"] for a in sh["checker_verdict"]["assertions"]] == \
+            ["indeterminate"], sh["checker_verdict"]
