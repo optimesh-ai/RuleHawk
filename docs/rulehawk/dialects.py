@@ -284,7 +284,11 @@ def shadow_block(raw: bytes, vendor: str = "auto") -> dict:
         except KeyError as e:
             block["grammar_unavailable"] = str(e.args[0] if e.args else e)
             return block
-        gm = grammar_junos.parse(raw)
+        try:
+            gm = grammar_junos.parse(raw)
+        except Exception as e:  # fail closed (review r2 of #52-#59, N2)
+            block["grammar_unavailable"] = "grammar failed: " + type(e).__name__
+            return block
         block["grammar"] = gm
         block["blocking_reason"] = gm["reason"] or UNCERTIFIED
     return block
