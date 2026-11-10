@@ -18,6 +18,8 @@ import re
 import subprocess
 import sys
 
+import pytest
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SCRIPT = os.path.join(_ROOT, "scripts", "shadow_harness.py")
 _D = os.path.join(_ROOT, "tests", "fixtures", "fail_closed", "variants", "design")
@@ -88,15 +90,35 @@ def test_the_harness_takes_named_files_and_a_policy():
     assert r["checker"] == "hole", r
 
 
+def _all_clear_hits(out):
+    """The all-clear words in `out`."""
+    hits = [w for w in ("PASS", "VERIFIED", "NO_NEW_RISK") if w in out]
+    # As values, not inside the reason codes `file-uncertified` and
+    # `config-incomplete`.
+    hits += [w for w in ("certified", "complete")
+             if re.search(r"(?<![-\w])" + w + r"(?![-\w])", out)]
+    return hits
+
+
 def test_the_harness_writes_no_all_clear_word():
     rc, out, _ = _run()
     assert rc == 0
-    for word in ("PASS", "VERIFIED", "NO_NEW_RISK"):
-        assert word not in out, word
-    # As values, not inside the reason codes `file-uncertified` and
-    # `config-incomplete`.
-    for word in ("certified", "complete"):
-        assert not re.search(r"(?<![-\w])" + word + r"(?![-\w])", out), word
+    assert _all_clear_hits(out) == [], _all_clear_hits(out)
+
+
+@pytest.mark.parametrize("text", [
+    "file-certified", "certified-ok", "certified_ok", "fully_certified", "completed",
+    "complete-match", "Certified", "CERTIFIED", "Complete", "ACCEPTED", "Verified",
+    '"passed": true', '"Passed": True', "\u2713", "\u2714",
+])
+def test_the_all_clear_scan_catches_every_spelling(text):
+    """Review of #60-#62, F61-1: the scan strips only the two exact reason
+    codes, then scans case-insensitively."""
+    assert _all_clear_hits("x " + text + " y"), text
+
+
+def test_the_all_clear_scan_ignores_only_the_two_reason_codes():
+    assert _all_clear_hits("file-uncertified config-incomplete") == []
 
 
 def test_the_harness_is_not_shipped_or_wired_into_an_action():
