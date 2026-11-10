@@ -93,17 +93,22 @@ def test_the_harness_takes_named_files_and_a_policy():
 
 
 def _all_clear_hits(out):
-    """The all-clear words in `out` (review of #60-#62, F61-1). Only the
-    exact reason codes `file-uncertified` and `config-incomplete` are taken
-    out; the rest is scanned case-insensitively. PASS and ACCEPTED are
-    matched in capitals only: `would pass`, `would_pass`, `bypass` and the
-    fixture names (`..._accepted_...`) are lower case (decided by agent,
-    unattended)."""
-    rest = out.replace("file-uncertified", "").replace("config-incomplete", "")
+    """The all-clear words in `out` (review of #60-#62, F61-1 and r2 R61-1).
+    Only the exact reason codes `file-uncertified` and `config-incomplete`
+    and the harness's own `would pass (` and `would_pass` are taken out.
+    Then, in any case: certified, complete, verified, `"passed": true`, no
+    new risk with any separator, and pass, passed, passes or accepted as a
+    word (a letter, digit or `_` on either side is part of a name, such as
+    `bypass` or `v4_ip_accepted`); and PASS, ACCEPTED and the check marks
+    as written."""
+    rest = out
+    for exact in ("file-uncertified", "config-incomplete", "would pass (", "would_pass"):
+        rest = rest.replace(exact, "")
     low = rest.lower()
-    hits = [w for w in ("certified", "complete", "verified", "no_new_risk", '"passed": true')
-            if w in low]
-    hits += [w for w in ("PASS", "ACCEPTED", "\u2713", "\u2714") if w in rest]
+    hits = [w for w in ("certified", "complete", "verified", '"passed": true') if w in low]
+    hits += re.findall(r"(?i)no[-_ ]new[-_ ]risk", rest)
+    hits += re.findall(r"(?i)(?<![a-z0-9_])(?:pass(?:ed|es)?|accepted)(?![a-z0-9_])", rest)
+    hits += [w for w in ("PASS", "ACCEPTED", "\u2713", "\u2714", "\u2705") if w in rest]
     return hits
 
 
