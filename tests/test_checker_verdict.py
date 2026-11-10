@@ -106,7 +106,7 @@ def test_every_built_record_keeps_the_deferred_blocker_and_its_pending_rows(path
 
 # ------------------------------------------------------------------ the controls
 
-@pytest.mark.parametrize("path", [_K00, _P00])
+@pytest.mark.parametrize("path", [_K00])
 def test_a_control_checker_and_engine_agree_there_is_no_witness(path, shadow):
     d = json.loads(g.to_json(g.run_gate([path], _policy(), fail_on="high", vendor="auto")))
     sh = d["files"][0]["shadow"]
@@ -120,11 +120,54 @@ def test_a_control_checker_and_engine_agree_there_is_no_witness(path, shadow):
     assert sh["would_pass"] is False, sh
 
 
-@pytest.mark.parametrize("path", [_K00, _P00])
+@pytest.mark.parametrize("path", [_K00])
 def test_a_control_under_must_reach_has_a_hole(path, tmp_path, shadow):
     sh = _shadow(tmp_path, os.path.basename(path), _read(path), _reach_policy())
     assert _verdicts(sh) == ["hole"], sh
     assert sh["would_pass"] is False
+
+
+# Review of #60-#62 r2, F60-5: `panos-any-meaning` is pending. p00's one rule
+# is `from any to any ... application any service any`, and no cited row
+# says what `any` matches; a flow it misses falls to the pending default
+# rules. So a rule that uses `any` is unknown and every PAN-OS answer is
+# indeterminate while the row is pending.
+
+def test_panos_control_is_indeterminate_while_any_is_pending(shadow):
+    d = json.loads(g.to_json(g.run_gate([_P00], _policy(), fail_on="high", vendor="auto")))
+    sh = d["files"][0]["shadow"]
+    cv = sh["checker_verdict"]
+    (a,) = cv["assertions"]
+    assert a["checker"] == "indeterminate" and a["engine"] == "no-witness", a
+    assert cv["agrees"] is False, cv
+    assert sh["blocking_reason"] == "checker-disagrees", sh
+    assert sh["would_pass"] is False, sh
+
+
+@pytest.mark.parametrize("text", [
+    _P,
+    "set rulebase security rules a from any to any source 192.0.2.0/24 destination "
+    "198.51.100.0/24 application any service any action allow\n",
+    "set rulebase security rules a from any to any source any destination any "
+    "application any service any action deny\n",
+])
+def test_every_panos_answer_is_indeterminate_while_any_is_pending(tmp_path, shadow, text):
+    from rulehawk.citations import PENDING
+    assert "panos-any-meaning" in PENDING
+    for pol in (_policy(), _reach_policy()):
+        sh = _shadow(tmp_path, "s.set", text, pol)
+        assert _verdicts(sh) == ["indeterminate"], (text, sh)
+        assert sh["would_pass"] is False
+
+
+@pytest.mark.parametrize("name", ["f3-iptables-input-chain.sh", "f5-iptables-half-prefix.sh",
+                                  "f12-iptables-accept-first.sh", "f5-panos-half-prefix.set"])
+def test_the_open_mutants_the_checker_reads_are_exactly_indeterminate(tmp_path, shadow, name):
+    """Review of #60-#62 r2: held to the exact answer, not only to "not
+    no-witness"."""
+    ((_, text, vendor, _),) = [m for m in _MUTANTS if m[0] == name]
+    sh = _shadow(tmp_path, name, text, vendor=vendor or "auto")
+    assert _verdicts(sh) == ["indeterminate"], (name, sh["checker_verdict"])
 
 
 # Review of #60-#62, F60-1, option (b): `iptables-script-scope` is pending.

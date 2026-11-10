@@ -13,7 +13,10 @@ Per-role rules, each the checker's own:
   indeterminate. A filter's end is the cited implicit discard
   (`junos-implicit-discard`).
 - PAN-OS: the security rulebase decides every flow (zones `any`). Its end
-  is the default rules, which are pending: indeterminate.
+  is the default rules, which are pending: indeterminate. No cited row
+  says what `any` matches (`panos-any-meaning`, pending), so a rule that
+  uses `any` in any field is an unknown entry, and every PAN-OS answer is
+  indeterminate while that row is pending (review of #60-#62 r2, F60-5).
 - iptables: transit traffic crosses only the filter table's FORWARD
   chain. Its end is the chain policy if one is set, else indeterminate.
   `-A` appends after whatever the chain already holds, and the rule set
@@ -180,8 +183,11 @@ def _panos(model, src, dst, kind):
             raise LookupError("rule matches more than addresses")
         nets = [[_ANY] if v.get(k) == "any" else [ipaddress.IPv4Network(v[k])]
                 for k in ("source", "destination")]
-        entries.append((nets[0], nets[1], {"allow": "permit", "deny": "deny"}.get(
-            v.get("action"), "unknown")))
+        act = {"allow": "permit", "deny": "deny"}.get(v.get("action"), "unknown")
+        if any(v.get(k) == "any" for k in ("from", "to", "source", "destination",
+                                           "application", "service")):
+            act = "unknown"                      # panos-any-meaning is pending
+        entries.append((nets[0], nets[1], act))
     return [(entries, None, [(s, d) for s in src for d in dst])]
 
 
