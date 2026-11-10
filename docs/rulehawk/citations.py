@@ -307,8 +307,14 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
          "(NET)."),
     _row("junos-static-direct-next-hop", _RESOLVE, _RESOLVE_TITLE, _SINCE_7_4,
          "Static routes can point only to a directly connected next hop."),
-    # A protocol name is looked up in /etc/protocols on the host, which the
-    # file does not hold; a production must take that into account.
+    # Two hazards for the slice that uses this row (review of #60-#62,
+    # F62-1): (1) a protocol name is looked up in /etc/protocols on the
+    # host, and a number may stand for "a different one", so name to number
+    # is host-dependent; a production takes numeric values and `all` only,
+    # or blocks names. (2) The checker's `_iptables` ignores -p by design;
+    # a grammar that reads `-p tcp -j DROP` without a matching checker
+    # change would have the checker read a DROP for every protocol (a wrong
+    # no-witness for udp), so grammar and checker change together.
     _row("iptables-protocol", _IPT, _IPT_TITLE, _IPT_RELEASE,
          "The protocol of the rule or of the packet to check. The specified "
          "protocol can be one of tcp, udp, udplite, icmp, icmpv6, esp, ah, "
@@ -468,14 +474,18 @@ PENDING: Dict[str, str] = {
         "Routing Engine.', so an interface address does not name one segment "
         "on every 11.1 release"),
     "iptables-dport": (
-        "iptables-extensions(8) (iptables 1.8.13) was fetched twice; the "
-        "fetch ends before the tcp section, and shows only 'If the -p or "
-        "--protocol was specified and if and only if an unknown option is "
-        "encountered, iptables will try load a match module of the same name "
-        "as the protocol, to try making the option available.' The tcp and "
-        "udp --dport text came only as a search highlight, not a full fetch, "
-        "and git.netfilter.org returned no content, so --dport, port ranges "
-        "and service names are off"),
+        "iptables-extensions(8) (iptables 1.8.13), fetched in full, holds the "
+        "tcp text '[!] --destination-port,--dport port[:port] Destination "
+        "port or port range specification. The flag --dport is a convenient "
+        "alias for this option.' and 'If the -p or --protocol was specified "
+        "and if and only if an unknown option is encountered, iptables will "
+        "try load a match module of the same name as the protocol, to try "
+        "making the option available.' (review of #60-#62, F62-1: an earlier "
+        "reason said the fetch stopped before the tcp section; that fetch "
+        "was cut short). The row stays pending because no production uses it "
+        "yet: --dport rests on -p, and the tcp --sport text says a port "
+        "'can either be a service name or a port number', looked up on the "
+        "host, so --dport, port ranges and service names are off"),
 }
 
 
