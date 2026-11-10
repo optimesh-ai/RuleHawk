@@ -16,6 +16,10 @@ Per-role rules, each the checker's own:
   is the default rules, which are pending: indeterminate.
 - iptables: transit traffic crosses only the filter table's FORWARD
   chain. Its end is the chain policy if one is set, else indeterminate.
+  `-A` appends after whatever the chain already holds, and the rule set
+  before the script is not cited (`iptables-script-scope`, pending): an
+  unknown entry heads the chain, so every iptables answer is indeterminate
+  while that row is pending (review of #60-#62, F60-1, option b).
 
 The search is exact over the address space: rectangles (source network,
 destination network), first match, each entry taking its part out of what
@@ -184,7 +188,8 @@ def _panos(model, src, dst, kind):
 def _iptables(model, src, dst, kind):
     chain = ("filter", "FORWARD")
     vals, ordered = model.get(chain, ({}, []))
-    entries = []
+    # The rules loaded before the script (iptables-script-scope, pending).
+    entries = [([_ANY], [_ANY], "unknown")]
     for rule in ordered:
         w = rule.split(" ")
         opts = dict(zip(w[0::2], w[1::2]))

@@ -130,7 +130,9 @@ def test_i00_agrees_and_lists_the_chain_hook_as_single(shadow):
     sh = _gate_shadow(_I00)
     assert sh["dual_read"] == {"reason": "reading-single", "compared": ["FORWARD"],
                                "single": ["iptables-chain-hook"], "mismatch": None}, sh
-    assert sh["blocking_reason"] == "file-uncertified", sh
+    # Review of #60-#62, F60-1: the checker is indeterminate on iptables
+    # while iptables-script-scope is pending.
+    assert sh["blocking_reason"] == "checker-disagrees", sh
     assert sh["would_pass"] is False, sh
 
 
