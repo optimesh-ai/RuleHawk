@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased
+
+### One exit-code table (#42 phase 2)
+
+Every command now takes its exit codes from one table, `rulehawk/exitcodes.py`.
+README, `docs/github-action.md` and the `--help` of `rulehawk`, `rulehawk gate`
+and `rulehawk combine` are generated from it. No exit code changes in this
+release: 1 FAIL, 2 parse failure, invalid input or usage, 3 UNKNOWN (combine:
+2), 0 only for the advisory `--fail-on none`, a combine with no enforced
+check, or `--help`. PASS is still never reported.
+
+Every would-be all-clear (PASS, VERIFIED, NO_NEW_RISK, `passed: true`, an
+enforced exit 0) now goes through one function, `rulehawk.allclear.emit`. It
+gives the stopgap's answer (UNKNOWN, exit 3) because its compiled-in switch is
+off; it is not read from the environment, and nothing overrides it at run
+time. Tests fail on an all-clear outside that module that is not on a pinned,
+reviewed exemption list: an all-clear literal; an exit-code constant or exit
+call worth 0; a PASS or VERIFIED constant, keyed by what the use does (a
+comparison by the whole condition it sits in); an assignment to, or a
+`setattr`/`delattr`/`vars` call on, a name bound to `allclear`; in any engine
+module (both copies), `sys.modules`, `exec`/`eval`/`compile`, an `importlib`
+import, `__dict__` and the other rebinding dunders, `setattr`/`delattr` on
+anything but `self`, or an absolute `rulehawk` import; outside their own
+files, a private (`_name`) attribute of `allclear` or `exitcodes`, either
+module object used as a value, `getattr`/`hasattr`/`setattr`/`delattr`/`type`/
+`vars`/`dir` on either or on a member of either, a method call on a member of
+either, or an assignment to or deletion of a member of `exitcodes`; any
+`operator.attrgetter` or `methodcaller`; or an environment write naming
+RULEHAWK_*. This is a static scan of spellings and structure, not of data
+flow: it catches the forms listed here, a spelling it does not recognise
+remains possible, and code review is the backstop. An override gated on an
+environment variable that no test sets is not caught by the behavioural tests
+either.
+`allclear.py` itself may import nothing but `typing` and `exitcodes`, may
+use no decorator, dunder attribute or environment and module hooks, has a
+fixed list of top-level statements, and is pinned whole, byte for byte, in
+both copies. The stopgap's guard blocks in `action.yml`,
+`comment/action.yml`, `docs/index.html` and `docs/worker.js` are pinned byte
+for byte as the 0.4.1 stopgap wrote them (`scripts/gen_stopgap_guards.py`
+re-derives the pins from git), and both Actions' enforce steps are run under
+bash.
+
+### Compatibility
+
+- **Exit code 4 is reserved for ACCEPTED** (a run whose only violations are
+  covered by a risk acceptance). It is not emitted by this release, and no
+  command uses 4 for anything else. When ACCEPTED ships, such a run exits 4 on
+  `rulehawk FILE`, `rulehawk gate` and `rulehawk combine`.
+- **Upgrading from 0.4.0 or earlier straight to the release that ships
+  ACCEPTED:** a run whose only violations are accepted risks exited `0` there
+  (reported PASS). It will exit `4`, never `0`, so a wrapper that treats any
+  non-zero code as a failure will stop on it. In 0.4.1 the same run already
+  exits `3`. To let such runs through once ACCEPTED ships, treat `4` as
+  success in the wrapper, or use the opt-in `--accepted-exit 0`, which makes
+  ACCEPTED and PASS indistinguishable to the exit code. `--accepted-exit 1`
+  will not exist, because 1 is FAIL's.
+
 ## 0.4.1: Fail-closed stopgap
 
 RuleHawk no longer emits PASS or VERIFIED, on any surface. Wherever it used to

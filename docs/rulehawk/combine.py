@@ -33,6 +33,7 @@ import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from . import exitcodes
 from .analyze import STOPGAP_MESSAGE
 from .gate import FOOTER, RESULT_SCHEMA, _COMMENT_MARKER
 
@@ -49,7 +50,10 @@ def _length(text: str) -> int:
 
 _RANK = {"PASS": 0, "UNKNOWN": 1, "FAIL": 2}
 _ICON = {"PASS": "✅", "UNKNOWN": "❌", "FAIL": "❌"}
-_EXIT = {"PASS": 0, "FAIL": 1, "UNKNOWN": 2}
+# combine never builds a PASS check: "PASS" is only enforced_verdict's value
+# when no check is enforced, which is the advisory exit 0.
+_EXIT = {"PASS": exitcodes.ADVISORY, "FAIL": exitcodes.FAIL,
+         "UNKNOWN": exitcodes.COMBINE_UNKNOWN}
 _NOT_ENFORCED = " (not enforced)"
 _FAIL_ON = ("critical", "high", "medium", "low", "none")
 _SEVERITIES = ("critical", "high", "medium", "low", "info", "none")
@@ -95,10 +99,8 @@ usage:
   -q, --quiet      no console report
 
 Directories are searched recursively for *.json.
-Exit code, over the enforced checks: 1 FAIL, 2 UNKNOWN (or a usage error);
-0 only when no enforced check exists (every check is `fail-on none`, shown
-with its verdict, not enforced).
-"""
+
+""" + exitcodes.help_section("combine")
 
 
 @dataclass
@@ -428,7 +430,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or "-h" in argv or "--help" in argv:
         print(_USAGE)
-        return 0 if argv else 2
+        return exitcodes.HELP if argv else exitcodes.INVALID
     quiet = False
     for q in ("-q", "--quiet"):
         while q in argv:

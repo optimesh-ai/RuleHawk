@@ -356,7 +356,8 @@ const SAMPLES = {
 };
 const ENGINE_MODULES = ["__init__", "model", "parse", "parse_junos", "parse_panos",
                         "parse_iptables", "parse_nxos", "parse_eos", "parse_awssg", "analyze", "report",
-                        "segcheck", "riskaccept", "evidence", "pathground", "boundary"];
+                        "segcheck", "riskaccept", "evidence", "pathground", "boundary",
+                        "allclear", "exitcodes"];
 const PYODIDE_VER = "v0.26.4";
 // Fallback (main-thread) analysis stays synchronous, so cap it; the worker path has no cap.
 const FALLBACK_MAX_LINES = 4000;

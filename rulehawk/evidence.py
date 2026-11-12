@@ -55,6 +55,7 @@ import hashlib
 import json
 from typing import Dict, List, Optional, Sequence
 
+from . import allclear
 from .analyze import (STOPGAP_CODE, STOPGAP_MESSAGE, Finding, score,
                       stopgap_reasons)
 from .riskaccept import Ledger, accepted_for, evaluate, finalize
@@ -416,7 +417,7 @@ def _fleet_status(per_subject: Sequence[dict], all_audited: bool) -> str:
     # isolation and must never roll up as one — it is an owned, expiring breach.
     if ACCEPTED_RISK in statuses:
         return ACCEPTED_RISK
-    return INDETERMINATE      # fail-closed stopgap: never VERIFIED
+    return allclear.emit(allclear.VERIFIED)  # fail-closed stopgap: INDETERMINATE
 
 
 def build_attestations(subjects: Sequence[Subject],
