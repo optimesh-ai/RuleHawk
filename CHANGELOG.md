@@ -75,6 +75,14 @@ since no grammar exists yet). The block is for testing the allowlist; it is
 not an interface, the Action and the MCP server never set the variable, and it
 may change in any release.
 
+### Citation registry for the allowlist grammar (#42 phase 2)
+
+`rulehawk/citations.py` records the first-party Junos documentation rows the
+allowlist grammar may rest on: the URL, the page title, the release the page
+states, a verbatim quote confirmed by a second fetch, and the dates. Rows not
+yet confirmed are listed as pending and cannot be cited. It is data only: no
+verdict, exit code or output changes, and PASS is still never reported.
+
 ### No file is certified, so code scanning and MCP coverage say so (#42 phase 2)
 
 **Under the stopgap, every config gets a standing `rulehawk/uncertified`
