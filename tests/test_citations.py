@@ -22,18 +22,30 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# The Junos rows fetched in full and confirmed by a second fetch on 2026-11-09.
+# The Junos rows fetched in full and confirmed by a second fetch on 2026-11-09
+# (slice 4a, then the slice 4b additions).
 _CITED = {
     "junos-term-order", "junos-terminating-action", "junos-terminating-replaced",
     "junos-firewall-family-inet-equivalent", "junos-filter-name",
     "junos-match-destination-address", "junos-filter-input",
     "junos-interface-address",
-}
-# v4 section 14 Junos rows (plus the interface address row) not yet cited.
-_PENDING = {
+    # slice 4b
     "junos-match-source-address", "junos-implicit-discard", "junos-comments",
-    "junos-lexing", "junos-evolved-scope",
+    "junos-config-indent", "junos-config-braces", "junos-config-leaf-semicolon",
+    "junos-interface-family-hierarchy", "junos-interface-address-inet",
+    "junos-interface-filter-hierarchy", "junos-top-firewall", "junos-top-interfaces",
+    "junos-firewall-family-inet", "junos-filter-statement", "junos-term-statement",
+    "junos-term-name", "junos-from-statement", "junos-then-statement",
+    "junos-accept-terminating", "junos-discard-term",
+    # review of #51, F4: the Statement cells of Table 2
+    "junos-top-statements", "junos-top-firewall-keyword", "junos-top-interfaces-keyword",
 }
+# v4 section 14 Junos rows not yet cited: keyword case has no first-party
+# statement found, and no fetched page states its rows for Junos OS Evolved.
+_PENDING = {"junos-lexing", "junos-evolved-scope",
+            # review of #51, F4: name classes and the address-list meaning
+            "junos-unit-number", "junos-interface-name", "junos-v4-prefix",
+            "junos-address-list-or"}
 
 
 def _mod():
@@ -66,7 +78,7 @@ def test_pending_rows_are_listed_and_not_cited():
 def test_resolve_refuses_a_pending_or_unknown_id():
     c = _mod()
     assert c.resolve("junos-term-order").quote.startswith("Firewall filter terms")
-    for bad in ("junos-implicit-discard", "no-such-row"):
+    for bad in ("junos-lexing", "junos-evolved-scope", "no-such-row"):
         with pytest.raises(KeyError):
             c.resolve(bad)
 

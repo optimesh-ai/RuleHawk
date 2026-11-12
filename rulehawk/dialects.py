@@ -264,8 +264,31 @@ def boundary(raw: bytes, vendor: str = "auto") -> dict:
 
 def shadow_block(raw: bytes, vendor: str = "auto") -> dict:
     """The shadow block for one file (v4 section 13). In this release no
-    file is certified, so `would_pass` is false and the first blocking
-    reason is the boundary's, or `file-uncertified`."""
+    file is certified, so `would_pass` is false. The first blocking reason
+    is the boundary's; then, for a file the boundary lets through as Junos,
+    the Junos grammar's (slice 4b: `line-not-allowlisted`,
+    `parse-ambiguous`, `config-incomplete` or `write-merge-uncited`, in a
+    `grammar` entry, or `file-uncertified` with a `grammar_unavailable`
+    entry when the grammar cannot load); otherwise `file-uncertified`. PAN-OS and iptables get their grammars in
+    slices 4c and 4d."""
     b = boundary(raw, vendor)
-    return {"boundary": b, "would_pass": False,
-            "blocking_reason": b["reason"] or UNCERTIFIED}
+    block = {"boundary": b, "would_pass": False,
+             "blocking_reason": b["reason"] or UNCERTIFIED}
+    if b["reason"] is None and b["dialects"] == ["junos"]:
+        # Imported here, not at module level (review of #51, F3): a grammar
+        # resolves its rows on import, and a row that went pending must not
+        # break a run with the switch unset. In a shadow run it fails
+        # closed: no grammar entry, and the file stays file-uncertified.
+        try:
+            from . import grammar_junos
+        except KeyError as e:
+            block["grammar_unavailable"] = str(e.args[0] if e.args else e)
+            return block
+        try:
+            gm = grammar_junos.parse(raw)
+        except Exception as e:  # fail closed (review r2 of #52-#59, N2)
+            block["grammar_unavailable"] = "grammar failed: " + type(e).__name__
+            return block
+        block["grammar"] = gm
+        block["blocking_reason"] = gm["reason"] or UNCERTIFIED
+    return block

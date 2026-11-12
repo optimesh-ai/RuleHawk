@@ -46,6 +46,22 @@ _ADDRESS = ("https://www.juniper.net/documentation/us/en/software/junos/"
             "cli-reference/topics/ref/statement/address-edit-interfaces.html")
 _ADDRESS_TITLE = "address | Junos OS | Juniper Networks"
 
+_EVALUATE = ("https://www.juniper.net/documentation/us/en/software/junos/"
+             "routing-policy/topics/concept/"
+             "firewall-filter-stateless-evaluate-packets.html")
+_EVALUATE_TITLE = "How Standard Firewall Filters Evaluate Packets | Junos OS | Juniper Networks"
+_JSON_MAP = ("https://www.juniper.net/documentation/us/en/software/junos/"
+             "junos-xml-protocol/topics/concept/"
+             "junos-xml-protocol-configuration-mapping-to-json.html")
+_JSON_MAP_TITLE = "Map Junos OS Configuration Statements to JSON | Junos OS | Juniper Networks"
+_CLI_CONFIG = ("https://www.juniper.net/documentation/us/en/software/junos/"
+               "cli/topics/topic-map/cli-configuration.html")
+_CLI_CONFIG_TITLE = "CLI Configuration Mode Overview | Junos OS | Juniper Networks"
+_PROTO_FAMILY = ("https://www.juniper.net/documentation/us/en/software/junos/"
+                 "interfaces-fundamentals/topics/topic-map/"
+                 "protocol-family-interface-address-properties.html")
+_PROTO_FAMILY_TITLE = "Protocol Family | Junos OS | Juniper Networks"
+
 _NO_RELEASE = "the page states no release (Junos OS documentation, current)"
 _SINCE_7_4 = "Statement introduced before Junos OS Release 7.4."
 _DATE = "2026-11-09"
@@ -80,29 +96,121 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
          "interface."),
     _row("junos-interface-address", _ADDRESS, _ADDRESS_TITLE, _SINCE_7_4,
          "Configure the interface address."),
+    # Slice 4b. The statement pages' Syntax and Hierarchy Level blocks do not
+    # come through a full Exa fetch, so the hierarchy is cited from prose.
+    _row("junos-match-source-address", _MATCH_V4, _MATCH_V4_TITLE, _NO_RELEASE,
+         "Match the IPv4 address of the source node sending the packet unless "
+         "the except option is included."),
+    _row("junos-interface-filter-hierarchy", _MATCH_V4, _MATCH_V4_TITLE, _NO_RELEASE,
+         "To assign a logical interface to an interface group group-number, "
+         "specify the group-number at the [interfaces interface-name unit "
+         "number family family filter group] hierarchy level."),
+    # The design's "Stateless Firewall Filter Components" page is not in the
+    # current documentation (the juniper.net URL is not found, and the copy
+    # on networkingdocs.hpe.com is the release-scoped Junos 12.3 set). This
+    # current page states the same implicit discard.
+    _row("junos-implicit-discard", _EVALUATE, _EVALUATE_TITLE, _NO_RELEASE,
+         "Every firewall filter configuration includes an implicit discard "
+         "action at the end of the filter."),
+    _row("junos-discard-term", _EVALUATE, _EVALUATE_TITLE, _NO_RELEASE,
+         "This implicit terminating action is equivalent to including the "
+         "following example term t_explicit_discard as the final term in the "
+         "firewall filter: term t_explicit_discard { then discard; }"),
+    _row("junos-accept-terminating", _EVALUATE, _EVALUATE_TITLE, _NO_RELEASE,
+         "In this case, we recommend that you configure the firewall filter "
+         "with a final term that specifies the accept terminating action."),
+    _row("junos-comments", _JSON_MAP, _JSON_MAP_TITLE, _NO_RELEASE,
+         "Comments are indicated using one of two delimiters: the paired "
+         "strings /* and */ enclosing the comment, or the # character "
+         "preceding the comment."),
+    _row("junos-config-indent", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
+         "The CLI indents each level in the hierarchy to indicate each "
+         "statement’s relative position in the hierarchy."),
+    _row("junos-config-braces", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
+         "Additionally, in general, it sets off each level with braces, using "
+         "an open brace at the beginning of each hierarchy level and a closing "
+         "brace at the end."),
+    _row("junos-config-leaf-semicolon", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
+         "Each leaf statement ends with a semicolon."),
+    _row("junos-interface-family-hierarchy", _PROTO_FAMILY, _PROTO_FAMILY_TITLE,
+         _NO_RELEASE,
+         "To configure the protocol family, complete the minimum configuration "
+         "tasks under the [edit interfaces interface-name unit "
+         "logical-unit-number family family] hierarchy."),
+    # Verbatim, with the page's interface for interfaces.
+    _row("junos-interface-address-inet", _PROTO_FAMILY, _PROTO_FAMILY_TITLE,
+         _NO_RELEASE,
+         "To configure an IP version 4 (IPv4) address on routers and switches, "
+         "use the interface interface-name unit number family inet address "
+         "a.b.c.d/nn statement at the [edit interfaces] hierarchy level."),
+    # Table 2, "Configuration Mode Top-Level Statements" (the firewall
+    # and interfaces rows).
+    _row("junos-top-firewall", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
+         "Configure filters that select packets based on their contents."),
+    # review of #51, F4: Table 2's Statement cells, not only its Description
+    _row("junos-top-statements", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
+         "Table 2 lists top-level configuration statements."),
+    _row("junos-top-firewall-keyword", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
+         "firewall"),
+    _row("junos-top-interfaces-keyword", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
+         "interfaces"),
+    _row("junos-top-interfaces", _CLI_CONFIG, _CLI_CONFIG_TITLE, _NO_RELEASE,
+         "Configure interface information, such as encapsulation, interfaces, "
+         "virtual channel identifiers (VCIs), and data-link connection "
+         "identifiers (DLCIs)."),
+    _row("junos-firewall-family-inet", _GUIDELINES, _GUIDELINES_TITLE, _NO_RELEASE,
+         "family inet—To filter Internet Protocol version 4 (IPv4) traffic."),
+    _row("junos-filter-statement", _GUIDELINES, _GUIDELINES_TITLE, _NO_RELEASE,
+         "Under the family family-name statement, you can include filter "
+         "filter-name statements to create and name firewall filters."),
+    _row("junos-term-statement", _GUIDELINES, _GUIDELINES_TITLE, _NO_RELEASE,
+         "Under the filter filter-name statement, you can include term "
+         "term-name statements to create and name filter terms."),
+    _row("junos-term-name", _GUIDELINES, _GUIDELINES_TITLE, _NO_RELEASE,
+         "The term name can contain letters, numbers, and hyphens (-) and can "
+         "be up to 64 characters long."),
+    _row("junos-from-statement", _GUIDELINES, _GUIDELINES_TITLE, _NO_RELEASE,
+         "With the exception of MPLS-tagged IPv4 or IPv6 traffic, you specify "
+         "the term’s match conditions under the from statement."),
+    _row("junos-then-statement", _GUIDELINES, _GUIDELINES_TITLE, _NO_RELEASE,
+         "Under the then statement for a firewall filter term, you can "
+         "specify the actions to be taken on a packet that matches the term."),
 )}
 
 # v4 section 14 Junos rows (and the interface address row's companions) that
 # are not cited yet. Until each is, every construct that needs it is off the
 # allowlist.
 PENDING: Dict[str, str] = {
-    "junos-match-source-address": (
-        "the source-address row sits further down the IPv4 match-conditions "
-        "page than the fetches so far reached; fetch and confirm it"),
-    "junos-implicit-discard": (
-        "the 'Stateless Firewall Filter Components' page is not yet found "
-        "and fetched; until it is, a packet that reaches the end of a filter "
-        "has no cited outcome"),
-    "junos-comments": (
-        "the XML/JSON mapping page for `#` and same-line `/* */` comments is "
-        "not yet fetched; until it is, a comment is off the allowlist"),
     "junos-lexing": (
-        "keyword case and quoting (Junos CLI user guide) are not yet fetched; "
-        "until they are, keywords match exact lowercase and a quoted name is "
-        "off the allowlist"),
+        "keyword case: no first-party page found that states configuration "
+        "keywords are case-sensitive (the CLI user guide's 'Modify the "
+        "Configuration of a Device' and 'CLI Configuration Mode Overview' "
+        "pages were fetched on 2026-11-09 and say nothing on it; its quoting "
+        "rule comes through Exa with the character list dropped). Until it "
+        "is cited, keywords match exact lowercase and a quoted name is off "
+        "the allowlist"),
     "junos-evolved-scope": (
-        "none of the fetched pages names Junos OS Evolved; v4 section 8 needs "
-        "each row cited for Junos OS and Junos OS Evolved"),
+        "none of the fetched pages states its rows for Junos OS Evolved (it "
+        "is named only in side notes); v4 section 8 needs each row cited for "
+        "Junos OS and Junos OS Evolved, so the uncited-remainder member "
+        "(v3 section 6.3) stays"),
+    # review of #51, F4: what the name classes and an address list rest on.
+    # A production that needs one of these still parses in shadow and
+    # lists it under `pending`; each needs a row before slice 7.
+    "junos-unit-number": (
+        "no fetched page states the range of a logical unit number; the "
+        "class is narrowed to 0-9999 (decided by agent, unattended)"),
+    "junos-interface-name": (
+        "no fetched page states the interface-naming rule; the class is "
+        "narrowed to ge-F/P/N with F 0-9, P 0-3 and N 0-47 (decided by "
+        "agent, unattended)"),
+    "junos-v4-prefix": (
+        "no fetched page states how an a.b.c.d/nn prefix is lexed; the class "
+        "is canonical dotted quad with a length 0-32, and a match prefix "
+        "with host bits set is off"),
+    "junos-address-list-or": (
+        "no fetched page states that the prefixes in one source-address or "
+        "destination-address list match as an OR"),
 }
 
 
