@@ -265,27 +265,33 @@ def boundary(raw: bytes, vendor: str = "auto") -> dict:
 def shadow_block(raw: bytes, vendor: str = "auto") -> dict:
     """The shadow block for one file (v4 section 13). In this release no
     file is certified, so `would_pass` is false. The first blocking reason
-    is the boundary's; then, for a file the boundary lets through as Junos,
-    the Junos grammar's (slice 4b: `line-not-allowlisted`,
-    `parse-ambiguous`, `config-incomplete` or `write-merge-uncited`, in a
-    `grammar` entry, or `file-uncertified` with a `grammar_unavailable`
-    entry when the grammar cannot load); otherwise `file-uncertified`. PAN-OS and iptables get their grammars in
-    slices 4c and 4d."""
+    is the boundary's; then, for a file the boundary lets through as Junos
+    or PAN-OS, that dialect's grammar's (slices 4b and 4c:
+    `line-not-allowlisted`, `parse-ambiguous`, `config-incomplete` or
+    `write-merge-uncited`, in a `grammar` entry, or `file-uncertified` with
+    a `grammar_unavailable` entry when the grammar cannot load); otherwise
+    `file-uncertified`. iptables gets its grammar in slice 4d."""
     b = boundary(raw, vendor)
     block = {"boundary": b, "would_pass": False,
              "blocking_reason": b["reason"] or UNCERTIFIED}
-    if b["reason"] is None and b["dialects"] == ["junos"]:
+    if b["reason"] is None and b["dialects"] in (["junos"], ["panos"]):
         # Imported here, not at module level (review of #51, F3): a grammar
         # resolves its rows on import, and a row that went pending must not
         # break a run with the switch unset. In a shadow run it fails
         # closed: no grammar entry, and the file stays file-uncertified.
         try:
-            from . import grammar_junos
-        except KeyError as e:
-            block["grammar_unavailable"] = str(e.args[0] if e.args else e)
+            if b["dialects"] == ["junos"]:
+                from . import grammar_junos as grammar
+            else:
+                from . import grammar_panos as grammar
+        except Exception as e:  # any failure fails closed (review of #52/#53, F9)
+            if isinstance(e, KeyError) and e.args:
+                block["grammar_unavailable"] = str(e.args[0])
+            else:
+                block["grammar_unavailable"] = str(e) or type(e).__name__
             return block
         try:
-            gm = grammar_junos.parse(raw)
+            gm = grammar.parse(raw)
         except Exception as e:  # fail closed (review r2 of #52-#59, N2)
             block["grammar_unavailable"] = "grammar failed: " + type(e).__name__
             return block

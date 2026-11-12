@@ -371,17 +371,17 @@ def test_only_the_positive_control_parses(shadow, monkeypatch):
     for rel in _junos_files():
         sh = _gate_shadow(os.path.join(_V, rel))
         assert sh["would_pass"] is False, (rel, sh)
-        if "grammar" not in sh:
+        # Slice 4c: PAN-OS files get the PAN-OS grammar's block.
+        if "grammar" not in sh or sh["boundary"]["dialects"] != ["junos"]:
             continue
-        assert sh["boundary"]["dialects"] == ["junos"], (rel, sh)
         if sh["grammar"]["parses"]:
             accepted.append(rel)
             assert sh["blocking_reason"] == "file-uncertified", (rel, sh)
     assert accepted == ["design/controls/k00_base.conf"], accepted
 
 
-def test_no_grammar_block_outside_junos(shadow):
-    for rel in ("controls/p00_base.set", "controls/i00_base.sh"):
+def test_no_grammar_block_outside_junos_and_panos(shadow):
+    for rel in ("controls/i00_base.sh",):
         sh = _gate_shadow(os.path.join(_D, rel))
         assert "grammar" not in sh, sh
         assert sh["blocking_reason"] == "file-uncertified", sh

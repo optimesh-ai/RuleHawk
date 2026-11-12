@@ -62,6 +62,25 @@ _PROTO_FAMILY = ("https://www.juniper.net/documentation/us/en/software/junos/"
                  "protocol-family-interface-address-properties.html")
 _PROTO_FAMILY_TITLE = "Protocol Family | Junos OS | Juniper Networks"
 
+# PAN-OS (slice 4c).
+_COMPONENTS = ("https://docs.paloaltonetworks.com/pan-os/11-1/pan-os-admin/policy/"
+               "security-policy/components-of-a-security-policy-rule")
+_COMPONENTS_TITLE = "Components of a Security Policy Rule"
+_COMPONENTS_RELEASE = "the PAN-OS 11.1 documentation set (the page URL); no other release"
+_KB_CREATE = ("https://knowledgebase.paloaltonetworks.com/KCSArticleDetail?"
+              "id=kA10g000000ClaCCAS")
+_KB_CREATE_TITLE = "How to View, Create and Delete Security Policies on the CLI"
+_KB_CREATE_RELEASE = "the article states Environment: Any Firewall, and no release"
+_KB_SET = ("https://knowledgebase.paloaltonetworks.com/KCSArticleDetail?"
+           "id=kA10g000000ClHoCAK&lang=en_US")
+_KB_SET_TITLE = "Viewing the configuration in set and XML format"
+_KB_SET_RELEASE = "the article states Environment: Any PAN-OS, and no release"
+_KB_ONE_LINE = ("https://knowledgebase.paloaltonetworks.com/KCSArticleDetail?"
+                "id=kA10g000000ClcLCAS")
+_KB_ONE_LINE_TITLE = ("How to Add and Verify Address Objects to Address Group and "
+                      "Security Policy through the CLI")
+_KB_ONE_LINE_RELEASE = "the article states Environment: PanOS's CLI access., and no release"
+
 _NO_RELEASE = "the page states no release (Junos OS documentation, current)"
 _SINCE_7_4 = "Statement introduced before Junos OS Release 7.4."
 _DATE = "2026-11-09"
@@ -175,11 +194,55 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
     _row("junos-then-statement", _GUIDELINES, _GUIDELINES_TITLE, _NO_RELEASE,
          "Under the then statement for a firewall filter term, you can "
          "specify the actions to be taken on a packet that matches the term."),
+    # PAN-OS (slice 4c)
+    _row("panos-rule-name", _COMPONENTS, _COMPONENTS_TITLE, _COMPONENTS_RELEASE,
+         "A label (up to 63 characters) that identifies the rule."),
+    _row("panos-source-zone", _COMPONENTS, _COMPONENTS_TITLE, _COMPONENTS_RELEASE,
+         "The zone from which the traffic originates."),
+    _row("panos-destination-zone", _COMPONENTS, _COMPONENTS_TITLE, _COMPONENTS_RELEASE,
+         "The zone at which the traffic terminates."),
+    _row("panos-source-address", _COMPONENTS, _COMPONENTS_TITLE, _COMPONENTS_RELEASE,
+         "Define host IP addresses, subnets, address objects (of type IP "
+         "netmask, IP range, FQDN, or IP wildcard mask), address groups, or "
+         "country-based enforcement."),
+    _row("panos-destination-address", _COMPONENTS, _COMPONENTS_TITLE, _COMPONENTS_RELEASE,
+         "The location or destination for the packet."),
+    _row("panos-application", _COMPONENTS, _COMPONENTS_TITLE, _COMPONENTS_RELEASE,
+         "The application that you wish to control."),
+    _row("panos-service-any", _COMPONENTS, _COMPONENTS_TITLE, _COMPONENTS_RELEASE,
+         "You can choose any, specify a port, or use application-default to "
+         "permit use of the standards-based port for the application."),
+    _row("panos-action", _COMPONENTS, _COMPONENTS_TITLE, _COMPONENTS_RELEASE,
+         "Specifies an Allow or Deny action for the traffic based on the "
+         "criteria you define in the rule."),
+    _row("panos-cli-create-rule", _KB_CREATE, _KB_CREATE_TITLE, _KB_CREATE_RELEASE,
+         "# set rulebase security rules <name> from <source zone> to "
+         "<destination zone> destination <ip> application <application> "
+         "service <any/application-default/service name> action <allow/deny> "
+         "(press enter)"),
+    _row("panos-set-from-any", _KB_SET, _KB_SET_TITLE, _KB_SET_RELEASE,
+         "set rulebase security rules rule1 from any"),
+    _row("panos-set-to-any", _KB_SET, _KB_SET_TITLE, _KB_SET_RELEASE,
+         "set rulebase security rules rule1 to any"),
+    _row("panos-set-source-any", _KB_SET, _KB_SET_TITLE, _KB_SET_RELEASE,
+         "set rulebase security rules rule1 source any"),
+    _row("panos-set-destination-any", _KB_SET, _KB_SET_TITLE, _KB_SET_RELEASE,
+         "set rulebase security rules rule1 destination any"),
+    _row("panos-set-application-any", _KB_SET, _KB_SET_TITLE, _KB_SET_RELEASE,
+         "set rulebase security rules rule1 application any"),
+    _row("panos-set-service-any", _KB_SET, _KB_SET_TITLE, _KB_SET_RELEASE,
+         "set rulebase security rules rule1 service any"),
+    _row("panos-set-action-allow", _KB_SET, _KB_SET_TITLE, _KB_SET_RELEASE,
+         "set rulebase security rules rule1 action allow"),
+    # review of #52/#53, F3: several attributes on one `set` line, in an
+    # order other than the create template's
+    _row("panos-one-line-form", _KB_ONE_LINE, _KB_ONE_LINE_TITLE, _KB_ONE_LINE_RELEASE,
+         "# set rulebase security rules trust-DMZ action allow source testgroup"),
 )}
 
-# v4 section 14 Junos rows (and the interface address row's companions) that
-# are not cited yet. Until each is, every construct that needs it is off the
-# allowlist.
+# v4 section 14 Junos and PAN-OS rows (and the interface address row's
+# companions) that are not cited yet. Until each is, every construct that
+# needs it is off the allowlist.
 PENDING: Dict[str, str] = {
     "junos-lexing": (
         "keyword case: no first-party page found that states configuration "
@@ -211,6 +274,70 @@ PENDING: Dict[str, str] = {
     "junos-address-list-or": (
         "no fetched page states that the prefixes in one source-address or "
         "destination-address list match as an OR"),
+    # PAN-OS (slice 4c)
+    "panos-release-scope": (
+        "the components page is in the PAN-OS 11.1 documentation set; the "
+        "knowledge-base articles (kA10g000000ClcLCAS among them) state no "
+        "release, and the Security Policy Rules page "
+        "(docs.paloaltonetworks.com/network-security/security-policy/"
+        "administration/security-rules) is in the unversioned Network "
+        "Security documentation set (review of #52-#57, G1); v4 section 8 needs "
+        "each row cited per supported release, so the uncited-remainder "
+        "member (v3 section 6.3) stays"),
+    "panos-lexing": (
+        "no first-party page fetched on 2026-11-09 states the set-CLI "
+        "quoting, `[ ]` list, escape or keyword-case rules; until one does, "
+        "keywords match exact lowercase and a quote or bracket is off"),
+    "panos-list-semantics": (
+        "setting an attribute of a rule that is already set adds members "
+        "for a list attribute (v4 section 14); no fetched page states it, so "
+        "a rule name set twice is off (v3 section 6.1)"),
+    # review of #52-#57, G1: verbatim on two fetches, but unversioned, and it
+    # states evaluation order, not where a new rule lands
+    "panos-rule-order": (
+        "the Security Policy Rules page "
+        "(docs.paloaltonetworks.com/network-security/security-policy/"
+        "administration/security-rules) says 'Security rules are evaluated "
+        "left to right and from top to bottom. A packet is matched against "
+        "the first rule that meets the defined criteria and, after a match "
+        "is triggered, subsequent rules are not evaluated.'; the page is in "
+        "the unversioned Network Security documentation set, and it states "
+        "evaluation order only, not where a `set` places a new rule (append "
+        "position)"),
+    # review of #52-#57, G2
+    "panos-one-line-order": (
+        "panos-one-line-form shows several attributes on one `set` line in "
+        "another order (`action allow source testgroup`); no fetched row "
+        "shows the grammar's seven attributes in its fixed order, `source` "
+        "after `to`, so that order is an inference"),
+    # review of #52/#53, F2: what the meaning of one rule still rests on
+    "panos-default-rules": (
+        "the Security Policy Rules page says traffic that matches no rule "
+        "goes to the default rules, which allow intrazone and deny interzone "
+        "traffic and can be overridden; the outcome depends on zones and "
+        "overrides the file does not hold (v4 section 3: not a row)"),
+    "panos-any-meaning": (
+        "the rows show the syntax `from any`, `to any`, `source any`, "
+        "`destination any`; no fetched row states that `any` means every "
+        "zone or every address"),
+    "panos-rule-type-default": (
+        "the Security Policy Rules page lists 'universal (default)' in its "
+        "Rule Type cell; no row quotes it, and v4 section 3 keeps rule-type "
+        "off until its KB row is cited"),
+    "panos-session-semantics": (
+        "the Security Policy Rules page says 'When a session match occurs, "
+        "the Security rule is applied to bidirectional traffic in that "
+        "session'; a per-packet reading differs, and no model of sessions is "
+        "built"),
+    # review of #51, F4, for PAN-OS
+    "panos-rule-name-chars": (
+        "panos-rule-name states the length only; the character set is "
+        "narrowed to letters, digits and hyphens, starting with a letter or "
+        "digit (decided by agent, unattended)"),
+    "panos-v4-prefix": (
+        "panos-source-address names subnets but no fetched page states the "
+        "a.b.c.d/nn form; the class is canonical dotted quad with a length "
+        "0-32, and a prefix with host bits set is off"),
 }
 
 

@@ -115,6 +115,38 @@ The grammar is imported only in a shadow run, so a row that went pending
 cannot affect a run with the switch unset; a shadow run then reports
 `grammar_unavailable` and stays `file-uncertified`.
 
+### PAN-OS grammar, computed in shadow only (#42 phase 2)
+
+`rulehawk/grammar_panos.py` is the second allowlist grammar: PAN-OS set
+form, and of it only a whole security rule on one line,
+`set rulebase security rules NAME from any to any source ADDR destination
+ADDR application any service any action allow|deny`, with an address `any` or
+one IPv4 prefix. Zone names, address objects, lists, quotes, per-attribute
+lines, a rule name set twice, `move`, `delete`, `disabled`, `vsys` and every
+other construct match nothing, because no fetched first-party row covers them
+yet. The citation registry gains the PAN-OS rows (the 11.1 "Components of a
+Security Policy Rule" page and two knowledge-base articles) and lists rule
+order, release scope, lexing and set-CLI list semantics as pending. Nothing
+reads the result: verdicts, exit codes and every output are unchanged. With
+`RULEHAWK_SHADOW=1`, a file the boundary lets through as PAN-OS gets a
+`grammar` entry in its `shadow` block, as Junos files do, and `would_pass`
+stays false. The #51 review rules apply here too: a rule name written twice
+is `write-merge-uncited`, a prefix with host bits is off, and the rule-name
+character set and the prefix form are listed under `pending`.
+After the #52 review, the grammar reads one security rule per file: a second
+rule is off at its line, and the predefined names `intrazone-default` and
+`interzone-default` (in any case) are never a user rule's name. The default
+rules' fall-through, the meaning of `any`, the rule-type default and session
+semantics are pending rows, and every production lists the file-level rows
+(release scope, lexing, list semantics and those four) under `pending`; the
+Junos productions now list `junos-lexing` and `junos-evolved-scope` too. The
+one-line form is cited from a knowledge-base article that sets several
+attributes on one line. Rule order (quoted from the unversioned "Security
+Policy Rules" page, which states evaluation order but not where a new rule
+lands) and the grammar's fixed token order stay pending, in every
+production's `needs`. A grammar that fails to load for any reason leaves a shadow run
+`file-uncertified` with a `grammar_unavailable` entry.
+
 ### No file is certified, so code scanning and MCP coverage say so (#42 phase 2)
 
 **Under the stopgap, every config gets a standing `rulehawk/uncertified`

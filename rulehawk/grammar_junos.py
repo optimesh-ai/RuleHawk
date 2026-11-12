@@ -164,10 +164,12 @@ CLASSES: Dict[str, Klass] = {
 _CLASS_NEEDS = {"IFNAME": "junos-interface-name", "UNIT": "junos-unit-number",
                 "V4PREFIX": "junos-v4-prefix"}
 _LIST_MODES = {"addrs": "junos-address-list-or"}
+# File-level rows every production rests on (review of #52/#53, F1).
+_FILE_NEEDS = ("junos-evolved-scope", "junos-lexing")
 
 
 def _needs(mode: str, slots: Tuple[str, ...]) -> Tuple[str, ...]:
-    out = {_CLASS_NEEDS[s] for s in slots if s in _CLASS_NEEDS}
+    out = {_CLASS_NEEDS[s] for s in slots if s in _CLASS_NEEDS} | set(_FILE_NEEDS)
     if mode in _LIST_MODES:
         out.add(_LIST_MODES[mode])
     return tuple(sorted(out))

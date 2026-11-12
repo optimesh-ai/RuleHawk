@@ -238,7 +238,9 @@ _NEEDS = {"IFNAME": "junos-interface-name", "UNIT": "junos-unit-number",
 def test_f4_every_production_records_its_pending_rows():
     from rulehawk import citations, grammar_junos as gm
     for p in gm.PRODUCTIONS:
-        want = {_NEEDS[s] for s in p.slots if s in _NEEDS}
+        # review of #52/#53, F1: the file-level rows are in every production
+        want = {_NEEDS[s] for s in p.slots if s in _NEEDS} | {
+            "junos-lexing", "junos-evolved-scope"}
         if p.mode == "addrs":
             want.add("junos-address-list-or")
         assert set(p.needs) == want, p
@@ -247,7 +249,8 @@ def test_f4_every_production_records_its_pending_rows():
 
 def test_f4_k00_lists_its_pending_rows():
     r = _parse(_BASE)
-    assert r["pending"] == ["junos-address-list-or", "junos-interface-name",
+    assert r["pending"] == ["junos-address-list-or", "junos-evolved-scope",
+                            "junos-interface-name", "junos-lexing",
                             "junos-unit-number", "junos-v4-prefix"], r
 
 
