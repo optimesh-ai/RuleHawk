@@ -380,13 +380,6 @@ def test_only_the_positive_control_parses(shadow, monkeypatch):
     assert accepted == ["design/controls/k00_base.conf"], accepted
 
 
-def test_no_grammar_block_outside_junos_and_panos(shadow):
-    for rel in ("controls/i00_base.sh",):
-        sh = _gate_shadow(os.path.join(_D, rel))
-        assert "grammar" not in sh, sh
-        assert sh["blocking_reason"] == "file-uncertified", sh
-
-
 def test_a_vendor_value_that_is_not_junos_runs_no_grammar(shadow):
     sh = _gate_shadow(_K00, "panos")
     assert sh["blocking_reason"] == "dialect-undetected", sh

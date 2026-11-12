@@ -81,6 +81,11 @@ _KB_ONE_LINE_TITLE = ("How to Add and Verify Address Objects to Address Group an
                       "Security Policy through the CLI")
 _KB_ONE_LINE_RELEASE = "the article states Environment: PanOS's CLI access., and no release"
 
+# iptables (slice 4d).
+_IPT = "https://man7.org/linux/man-pages/man8/iptables.8.html"
+_IPT_TITLE = "iptables(8) - Linux manual page"
+_IPT_RELEASE = "This manual page applies to iptables/ip6tables 1.8.13."
+
 _NO_RELEASE = "the page states no release (Junos OS documentation, current)"
 _SINCE_7_4 = "Statement introduced before Junos OS Release 7.4."
 _DATE = "2026-11-09"
@@ -238,6 +243,53 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
     # order other than the create template's
     _row("panos-one-line-form", _KB_ONE_LINE, _KB_ONE_LINE_TITLE, _KB_ONE_LINE_RELEASE,
          "# set rulebase security rules trust-DMZ action allow source testgroup"),
+    # iptables (slice 4d)
+    _row("iptables-synopsis-append", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "iptables [-t table] {-A|-C|-D|-V} chain rule-specification"),
+    _row("iptables-synopsis-policy", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "iptables [-t table] -P chain policy"),
+    _row("iptables-rule-specification", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "rule-specification := [matches...] [target]"),
+    _row("iptables-first-match", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "If the packet does not match, the next rule in the chain is "
+         "examined; if it does match, then the next rule is specified by the "
+         "value of the target, which can be the name of a user-defined "
+         "chain, one of the targets described in iptables-extensions(8), or "
+         "one of the special values ACCEPT, DROP or RETURN."),
+    _row("iptables-accept-drop", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "ACCEPT means to let the packet through. DROP means to drop the "
+         "packet on the floor."),
+    _row("iptables-policy-end", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "If the end of a built-in chain is reached or a rule in a built-in "
+         "chain with target RETURN is matched, the target specified by the "
+         "chain policy determines the fate of the packet."),
+    _row("iptables-filter-default", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "This is the default table (if no -t option is passed)."),
+    # Quoted up to the line wrap in `locally-` (review of #52/#53, F4:
+    # fetched twice more, verbatim); the rest of the sentence is not quoted.
+    _row("iptables-filter-chains", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "It contains the built-in chains INPUT (for packets destined to "
+         "local sockets), FORWARD (for packets being routed through the box), "
+         "and OUTPUT (for locally-"),
+    _row("iptables-append", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "Append one or more rules to the end of the selected chain."),
+    _row("iptables-policy", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "Set the policy for the built-in (non-user-defined) chain to the "
+         "given target. The policy target must be either ACCEPT or DROP."),
+    _row("iptables-source", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "Source specification. Address can be either a network name, a "
+         "hostname, a network IP address (with /mask), or a plain IP "
+         "address."),
+    _row("iptables-mask", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "The mask can be either an ipv4 network mask (for iptables) or a "
+         "plain number, specifying the number of 1's at the left side of the "
+         "network mask."),
+    _row("iptables-destination", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "Destination specification. See the description of the -s (source) "
+         "flag for a detailed description of the syntax."),
+    _row("iptables-jump", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "This specifies the target of the rule; i.e., what to do if the "
+         "packet matches it."),
 )}
 
 # v4 section 14 Junos and PAN-OS rows (and the interface address row's
@@ -338,6 +390,32 @@ PENDING: Dict[str, str] = {
         "panos-source-address names subnets but no fetched page states the "
         "a.b.c.d/nn form; the class is canonical dotted quad with a length "
         "0-32, and a prefix with host bits set is off"),
+    # iptables (slice 4d)
+    "iptables-lexing": (
+        "iptables(8) says 'For long versions of the command and option "
+        "names, you need to use only enough letters to ensure that iptables "
+        "can differentiate it from all other options.'; abbreviation, long "
+        "options, aliases and shell quoting are not read, so options match "
+        "their exact short spelling"),
+    "iptables-script-scope": (
+        "a script is run by a shell against the rule set already loaded; no "
+        "fetched first-party page states the rule set before the script, "
+        "that its lines run in order, or any shell construct, so every "
+        "production records this row and no shell syntax is read. Only the "
+        "filter table of iptables is read: iptables(8) says 'There are "
+        "currently five independent tables', and 'The security table is "
+        "called after the filter table'; rules in the security table, the "
+        "nat, mangle and raw tables, ip6tables and nftables on the same host "
+        "also decide a packet's fate and are not seen (review of #52/#53, "
+        "F5)"),
+    "iptables-release-scope": (
+        "the fetched page applies to iptables 1.8.13 only; the legacy and "
+        "nft back ends and other releases are not cited, so the "
+        "uncited-remainder member (v3 section 6.3) stays"),
+    "iptables-save-format": (
+        "iptables-save and iptables-restore(8) are not fetched in this "
+        "slice; the save format (*filter, :CHAIN, COMMIT, --noflush) is "
+        "off"),
 }
 
 

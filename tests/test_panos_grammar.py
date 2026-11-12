@@ -383,8 +383,8 @@ def _files():
 
 
 def test_only_the_positive_controls_parse(shadow):
-    """Across every design and boundary file, the grammars accept k00 and
-    p00 and nothing else, and none would pass."""
+    """Across every design and boundary file, the grammars accept i00, k00
+    and p00 and nothing else, and none would pass."""
     accepted = []
     for rel in _files():
         sh = _gate_shadow(os.path.join(_V, rel))
@@ -392,16 +392,11 @@ def test_only_the_positive_controls_parse(shadow):
         if sh.get("grammar", {}).get("parses"):
             accepted.append(rel)
             assert sh["blocking_reason"] == "file-uncertified", (rel, sh)
-    assert accepted == ["design/controls/k00_base.conf", "design/controls/p00_base.set"]
+    assert accepted == ["design/controls/i00_base.sh", "design/controls/k00_base.conf",
+                        "design/controls/p00_base.set"]
 
 
 def test_a_vendor_value_that_is_not_panos_runs_no_grammar(shadow):
     sh = _gate_shadow(_P00, "junos")
     assert sh["blocking_reason"] == "dialect-undetected", sh
     assert "grammar" not in sh, sh
-
-
-def test_iptables_has_no_grammar_yet(shadow):
-    sh = _gate_shadow(os.path.join(_D, "controls/i00_base.sh"))
-    assert "grammar" not in sh, sh
-    assert sh["blocking_reason"] == "file-uncertified", sh

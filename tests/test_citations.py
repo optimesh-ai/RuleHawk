@@ -51,6 +51,14 @@ _CITED |= {
     # review of #52/#53, F3
     "panos-one-line-form",
 }
+# slice 4d: the iptables rows (iptables(8), 1.8.13).
+_CITED |= {
+    "iptables-synopsis-append", "iptables-synopsis-policy", "iptables-rule-specification",
+    "iptables-first-match", "iptables-accept-drop", "iptables-policy-end",
+    "iptables-filter-default", "iptables-filter-chains", "iptables-append",
+    "iptables-policy", "iptables-source", "iptables-mask", "iptables-destination",
+    "iptables-jump",
+}
 # v4 section 14 Junos rows not yet cited: keyword case has no first-party
 # statement found, and no fetched page states its rows for Junos OS Evolved.
 _PENDING = {"junos-lexing", "junos-evolved-scope",
@@ -67,10 +75,15 @@ _PENDING = {"junos-lexing", "junos-evolved-scope",
             # evaluation order only) and the one-line token order
             "panos-rule-order", "panos-one-line-order",
             # review of #51, F4, for PAN-OS: the name class and the prefix form
-            "panos-rule-name-chars", "panos-v4-prefix"}
+            "panos-rule-name-chars", "panos-v4-prefix",
+            # slice 4d: iptables lexing, the script's scope, the release
+            # scope and the iptables-save format
+            "iptables-lexing", "iptables-script-scope", "iptables-release-scope",
+            "iptables-save-format"}
 _FIRST_PARTY = ("https://www.juniper.net/documentation/",
                 "https://docs.paloaltonetworks.com/",
-                "https://knowledgebase.paloaltonetworks.com/")
+                "https://knowledgebase.paloaltonetworks.com/",
+                "https://man7.org/linux/man-pages/man8/")
 
 
 def _mod():
