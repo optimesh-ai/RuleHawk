@@ -160,7 +160,11 @@ def test_a_control_gets_a_record_the_checker_agrees_with(path, shadow):
     assert c["checker"] == {"agrees": True, "reason": None, "detail": None}, c
     assert _DEFERRED in c["blockers"], c
     assert any(b.startswith("pending:") for b in c["blockers"]), c
-    assert sh["blocking_reason"] == "file-uncertified", sh
+    # Review of #60-#62, F60-1 and r2 F60-5: the checker is indeterminate on
+    # iptables and PAN-OS while iptables-script-scope and panos-any-meaning
+    # are pending, so i00 and p00 are checker-disagrees.
+    want = "file-uncertified" if path == _K00 else "checker-disagrees"
+    assert sh["blocking_reason"] == want, sh
     assert sh["would_pass"] is False, sh
 
 

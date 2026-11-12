@@ -12,11 +12,12 @@ re-derives the pending rows and rows the file rests on and checks the
 scope sentence and the blockers (review of #52-#57, G10, G11). Any
 difference, or anything it cannot read, is `checker-disagrees`.
 
-Its own evaluation of each assertion is not built yet: that comes after
-review, in the next part of slice 7.
+`evaluate` is its own evaluation of each assertion from its own reading
+(slice 7, second part); see `evaluate.py`.
 """
 from __future__ import annotations
 
+from .evaluate import evaluate
 from .verify import CHECKER_DISAGREES, check
 
-__all__ = ["CHECKER_DISAGREES", "check"]
+__all__ = ["CHECKER_DISAGREES", "check", "evaluate"]

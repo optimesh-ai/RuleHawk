@@ -379,7 +379,24 @@ def _certificate(block: dict, raw: bytes, gm: dict, model: dict, dr: dict,
                "detail": "checker unavailable: " + type(e).__name__}
     block["certificate"] = {"config_sha256": rec["config_sha256"],
                             "blockers": rec["blockers"], "checker": chk}
-    if not chk.get("agrees"):
+    # Slice 7, second part: the checker's own evaluation of each assertion,
+    # from its own reading, beside the engine's (a separate field).
+    # The checker gets the raw policy and resolves the zones itself (G11).
+    asserted = certificate.assertions(policy)
+    try:
+        mine = _checker().evaluate(model.get("dialect"), raw, policy)
+    except Exception:  # fail closed
+        mine = ["indeterminate" for _ in asserted]
+    try:
+        engine = certificate.engine_reading(raw, model.get("dialect"), policy)
+    except Exception:  # fail closed (review of #58, H5)
+        engine = ["error" for _ in asserted]
+    agree = len(mine) == len(engine) == len(asserted) and mine == engine
+    block["checker_verdict"] = {"agrees": agree, "assertions": [
+        {"assertion": a, "checker": c, "engine": e}
+        for a, c, e in zip(asserted, mine + ["indeterminate"] * len(asserted),
+                           engine + ["error"] * len(asserted))]}
+    if not chk.get("agrees") or not agree:
         _checker_blocks(block)
 
 
