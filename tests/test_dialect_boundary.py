@@ -49,7 +49,9 @@ _REASONS = {"dialect-not-exclusive", "dialect-undetected", "line-not-allowlisted
             "parse-ambiguous", "config-incomplete",
             # review of #51, F1: a second write with no cited merge rule
             # (v2 section 2.1, v3)
-            "write-merge-uncited"}
+            "write-merge-uncited",
+            # slice 6, zone placement (v3 section 5.1, v4 section 10)
+            "zones-share-segment", "zone-placement-unpinned"}
 _BOUNDARY_REASONS = {"dialect-not-exclusive", "dialect-undetected",
                      "line-not-allowlisted", "file-uncertified"}
 
@@ -144,6 +146,11 @@ def _well_formed(sh):
     if "model" in sh:                                # slice 5: parsed files only
         assert sh["grammar"]["parses"] is True, sh
         assert set(sh["model"]) == {"dialect", "objects"}, sh
+    if "placement" in sh:                            # slice 6: with a policy
+        assert "model" in sh, sh
+        assert sh["blocking_reason_strict"] in _REASONS, sh
+    else:
+        assert "blocking_reason_strict" not in sh, sh
     return sh
 
 

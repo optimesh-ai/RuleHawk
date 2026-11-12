@@ -335,6 +335,7 @@ class GateResult:
     fail_on: str
     ledger: object = None      # riskaccept.Ledger for this run (set by run_gate)
     vendor: str = "auto"       # the vendor the run forced, or auto
+    policy: object = None      # the run's policy (read only by the shadow block)
 
     @property
     def real_findings(self) -> List[Tuple[FileResult, Finding]]:
@@ -454,6 +455,7 @@ def run_gate(paths: List[str], policy: Optional[dict], fail_on: str = "high",
     finalize(ledger)
     gate = GateResult(files, fail_on, vendor=vendor or "auto")
     gate.ledger = ledger
+    gate.policy = policy
     # Exceptions that did NOT apply are reported against the policy itself.
     # An INVALID one is high severity: it looks like protection and gives none.
     if files and ledger.entries:
@@ -734,7 +736,7 @@ def to_json(gate: GateResult) -> str:
         asked = gate.vendor if gate.vendor == "auto" else \
             _VENDORS.get(gate.vendor.lower(), gate.vendor)
         for entry, fr in zip(d["files"], gate.files):
-            entry["shadow"] = dialects.shadow_block(fr.raw or b"", asked)
+            entry["shadow"] = dialects.shadow_block(fr.raw or b"", asked, gate.policy)
     return json.dumps(d, indent=2)
 
 
