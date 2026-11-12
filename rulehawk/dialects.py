@@ -262,7 +262,8 @@ def boundary(raw: bytes, vendor: str = "auto") -> dict:
             "cisco_veto": veto, "reason": reason, "line": line}
 
 
-def shadow_block(raw: bytes, vendor: str = "auto", policy: Optional[dict] = None) -> dict:
+def shadow_block(raw: bytes, vendor: str = "auto", policy: Optional[dict] = None,
+                 legacy: Optional[dict] = None) -> dict:
     """The shadow block for one file (v4 section 13). In this release no
     file is certified, so `would_pass` is false. The first blocking reason
     is the boundary's; then, for a file the boundary lets through as Junos,
@@ -276,7 +277,11 @@ def shadow_block(raw: bytes, vendor: str = "auto", policy: Optional[dict] = None
     strict placement mode. Before placement, the legacy-parser dual read
     (`dual_read` entry): `reading-mismatch` is the blocking reason in both
     modes; `reading-single` stays in the entry, and the file stays
-    `file-uncertified`."""
+    `file-uncertified`. Last, the certificate record (slice 7) and the
+    independent checker's answer, in a `certificate` entry; a checker
+    that disagrees (or fails) gives `checker-disagrees` where the file
+    would otherwise be `file-uncertified`. `legacy` is the legacy reason
+    set: the run's reason codes and parse notes."""
     b = boundary(raw, vendor)
     block = {"boundary": b, "would_pass": False,
              "blocking_reason": b["reason"] or UNCERTIFIED}
@@ -333,4 +338,75 @@ def shadow_block(raw: bytes, vendor: str = "auto", policy: Optional[dict] = None
                 block["blocking_reason_strict"] = (
                     block["blocking_reason"] if block["blocking_reason"] != UNCERTIFIED
                     else pl["strict_reason"] or UNCERTIFIED)
+            _certificate(block, raw, gm, model, dr, policy, legacy)
     return block
+
+
+CHECKER_DISAGREES = "checker-disagrees"
+
+
+def legacy_reasons(findings, notes) -> dict:
+    """The legacy reason set for the certificate record (slice 7, v2
+    section 1.1): every reason code on the run's findings but the
+    stopgap's, and its parse notes."""
+    from .analyze import STOPGAP_CODE
+    return {"reasons": sorted({r.get("code") for f in findings for r in (f.reasons or [])
+                               if isinstance(r, dict) and r.get("code") != STOPGAP_CODE}),
+            "notes": list(notes or [])}
+
+
+def _certificate(block: dict, raw: bytes, gm: dict, model: dict, dr: dict,
+                 policy: Optional[dict], legacy: Optional[dict]) -> None:
+    """Slice 7: the record and the independent checker's answer. No record
+    is eligible in this slice (`checker-verdict-deferred`)."""
+    import hashlib
+    from . import __version__, certificate
+    try:
+        rec = certificate.build(raw, gm, model, dr, block.get("placement"), policy, legacy)
+    except Exception as e:  # fail closed (review of #52-#57, G8)
+        block["certificate"] = {
+            "config_sha256": hashlib.sha256(raw).hexdigest(),
+            "blockers": ["record-unavailable", certificate.CHECKER_VERDICT_DEFERRED],
+            "checker": {"agrees": False, "reason": CHECKER_DISAGREES,
+                        "detail": "record failed: " + type(e).__name__}}
+        _checker_blocks(block)
+        return
+    try:
+        # The raw policy: the checker resolves the zones itself (G11).
+        chk = _checker().check(rec, raw, policy, __version__)
+    except Exception as e:  # no checker, or a checker that fails: fail closed
+        chk = {"agrees": False, "reason": CHECKER_DISAGREES,
+               "detail": "checker unavailable: " + type(e).__name__}
+    block["certificate"] = {"config_sha256": rec["config_sha256"],
+                            "blockers": rec["blockers"], "checker": chk}
+    if not chk.get("agrees"):
+        _checker_blocks(block)
+
+
+def _checker_blocks(block: dict) -> None:
+    for key in ("blocking_reason", "blocking_reason_strict"):
+        if block.get(key) == UNCERTIFIED:
+            block[key] = CHECKER_DISAGREES
+
+
+def _checker():
+    """The checker package next to this one, and no other (review of
+    #52-#57, G13): its directory goes first on the path for the import,
+    and a module loaded from any other file raises, so the caller fails
+    closed."""
+    import os
+    import sys
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    want = os.path.join(root, "rulehawk_check", "__init__.py")
+    sys.path.insert(0, root)
+    try:
+        import rulehawk_check
+    finally:
+        try:
+            sys.path.remove(root)
+        except ValueError:
+            pass
+    got = rulehawk_check.__file__ or ""
+    if os.path.realpath(got) != os.path.realpath(want):
+        raise ImportError("rulehawk_check is not the package next to rulehawk")
+    return rulehawk_check

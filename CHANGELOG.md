@@ -181,6 +181,50 @@ order, not where a new rule lands), so each PAN-OS rule records
 are unchanged. With `RULEHAWK_SHADOW=1`, a file the grammar parses gets a
 `model` entry beside `grammar`, and `would_pass` stays false.
 
+### Certificate record and independent checker, computed in shadow only (#42 phase 2)
+
+For each file the grammar parses, `rulehawk/certificate.py` builds a
+certificate record. The record holds:
+- the SHA-256 of the exact input bytes;
+- the policy's assertions as canonical JSON, with zones resolved to CIDRs;
+- the engine version;
+- the declaration (none yet);
+- one sub-record per reading, with the final model, the cited and pending
+  rows, and the scope assumptions;
+- its blockers.
+
+The new `rulehawk_check/` package is the independent checker. It loads
+only the standard library and `rulehawk/citations.py`, which it reads by
+file path, so importing it loads no engine module. With its own byte
+splitter and its own reader per dialect, it re-reads the final model from
+the raw bytes, and it checks the hash, the assertions, the version, the
+declaration and every citation. Any difference, or anything it cannot
+read, is `checker-disagrees`, which becomes the shadow blocking reason in
+place of `file-uncertified`.
+
+After the #57 review, the checker takes the raw policy and resolves the
+zones itself. From its own reading it also re-derives the pending rows the
+file's constructs rest on (any IPv4 prefix, an interface address included,
+needs `junos-v4-prefix`) and, in full, the cited rows: a dropped or added
+cited row disagrees. It checks the scope
+sentence and that the blockers name every pending row and
+`checker-verdict-deferred`; a record with any of these emptied or thinned
+is `checker-disagrees`. A record that fails to build is
+`checker-disagrees` too, and the engine uses only the `rulehawk_check`
+next to its own package.
+
+No record is eligible yet, whatever its blockers say. Every record lists
+its blockers:
+- pending rows;
+- the dual read and placement;
+- legacy reason codes and parse notes;
+- always `checker-verdict-deferred`, because the checker's own evaluation
+  of each assertion comes in a later part.
+
+Nothing reads the result: verdicts, exit codes and every output are
+unchanged. With `RULEHAWK_SHADOW=1`, a parsed file gets a `certificate`
+entry, and `would_pass` stays false.
+
 ### Legacy-parser dual read, computed in shadow only (#42 phase 2)
 
 `rulehawk/dualread.py` reads each file the grammar parses a second time

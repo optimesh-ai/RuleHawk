@@ -262,7 +262,8 @@ def main(argv: list[str] | None = None) -> int:
         if dialects.shadow_on():
             asked = ("junos" if force_junos else "panos" if force_panos
                      else "iptables" if force_iptables else "auto")
-            shadow = dialects.shadow_block(raw, asked, policy)
+            shadow = dialects.shadow_block(raw, asked, policy,
+                                           dialects.legacy_reasons(findings, notes))
         print(to_json(findings, notes, n_rules, vendor, shadow=shadow))
     else:
         print(to_text(findings, notes, n_rules, vendor))

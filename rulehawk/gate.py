@@ -736,7 +736,9 @@ def to_json(gate: GateResult) -> str:
         asked = gate.vendor if gate.vendor == "auto" else \
             _VENDORS.get(gate.vendor.lower(), gate.vendor)
         for entry, fr in zip(d["files"], gate.files):
-            entry["shadow"] = dialects.shadow_block(fr.raw or b"", asked, gate.policy)
+            entry["shadow"] = dialects.shadow_block(
+                fr.raw or b"", asked, gate.policy,
+                dialects.legacy_reasons(fr.findings, fr.notes))
     return json.dumps(d, indent=2)
 
 
