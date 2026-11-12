@@ -88,6 +88,9 @@ class Production:
     child: Optional[str]          # the mode a container opens, None for a leaf
     cites: Tuple[str, ...]
     needs: Tuple[str, ...] = ()   # pending rows the production still rests on
+    # The write it makes (slice 5, v2 section 2.1): what kind of attribute,
+    # and the merge rule (`create`, `append-in-order` or `error`).
+    write: Tuple[str, ...] = ()
 
 
 _OCTET = r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])"
@@ -175,8 +178,22 @@ def _needs(mode: str, slots: Tuple[str, ...]) -> Tuple[str, ...]:
     return tuple(sorted(out))
 
 
+def _write_of(mode: str, slots: Tuple[str, ...], child: Optional[str]) -> Tuple[str, str]:
+    """The write a production makes. A list member and a container create
+    an object; a term is appended in configuration order
+    (`junos-term-order`); a leaf sets a single value, and a second write is
+    an error (no `replace` row is cited)."""
+    if mode == "addrs":
+        return ("member", "create")
+    if child is None:
+        return (slots[0], "error")
+    if slots[0] == "term":
+        return ("term", "append-in-order")
+    return ("container", "create")
+
+
 PRODUCTIONS: Tuple[Production, ...] = tuple(
-    Production(m, slots, child, cites, _needs(m, slots))
+    Production(m, slots, child, cites, _needs(m, slots), _write_of(m, slots, child))
     for m, slots, child, cites in _PRODUCTION_TABLE)
 
 # Every production's rows resolve at import: a pending row raises here. Its
@@ -252,11 +269,65 @@ def shape_problems(prods: Iterable[Production], classes: Dict[str, Klass]) -> Li
     return out
 
 
+# ------------------------------------------------------------ the final model
+
+MERGE_RULES = ("create", "append-in-order", "error")
+
+
+class Fold:
+    """The final model (slice 5, v2 section 2.1, v3 section 6.1): every
+    write in text order, folded under its merge rule. An object is a path
+    of attribute names from the root.
+    - `create` makes the child object `path + (attribute,)`;
+    - `append-in-order` does the same and lists the child in the parent's
+      `ordered`, in text order (an order row must be cited, or pending);
+    - `error` sets a single value on the object.
+    A second write to one (object, attribute), under any rule, has no cited
+    merge rule: `write-merge-uncited`. No rule replaces or deletes."""
+
+    def __init__(self, dialect: str) -> None:
+        self.dialect = dialect
+        self._objs: Dict[Tuple[str, ...], dict] = {(): {"path": [], "values": {}, "ordered": []}}
+        self._paths: List[Tuple[str, ...]] = []
+        self._written: set = set()
+
+    def ensure(self, path: Tuple[str, ...]) -> None:
+        """Make an object that exists without a write (a built-in chain)."""
+        for i in range(1, len(path) + 1):
+            if path[:i] not in self._objs:
+                self._objs[path[:i]] = {"path": list(path[:i]), "values": {}, "ordered": []}
+                self._paths.append(path[:i])
+
+    def values(self, path: Tuple[str, ...]) -> dict:
+        return self._objs[path]["values"]
+
+    def write(self, line: int, path: Tuple[str, ...], attribute: str, rule: str,
+              value=None) -> Optional[str]:
+        """Apply one write; the reason it is refused, or None."""
+        if rule not in MERGE_RULES:
+            raise ValueError(rule)
+        obj = self._objs[path]          # KeyError: no such object
+        if (path, attribute) in self._written:
+            return WRITE_MERGE_UNCITED
+        self._written.add((path, attribute))
+        if rule == "error":
+            obj["values"][attribute] = value
+            return None
+        child = path + (attribute,)
+        self._objs[child] = {"path": list(child), "values": dict(value or {}), "ordered": []}
+        self._paths.append(child)
+        if rule == "append-in-order":
+            obj["ordered"].append(attribute)
+        return None
+
+    def model(self) -> dict:
+        return {"dialect": self.dialect,
+                "objects": [{"path": list(o["path"]), "values": dict(o["values"]),
+                             "ordered": list(o["ordered"])}
+                            for o in (self._objs[p] for p in self._paths)]}
+
+
 # ------------------------------------------------------------------- parsing
-
-# Leaves that hold one value: a second write replaces the first.
-_SINGLE = frozenset({"then", "input", "address"})
-
 
 def _result(reason: Optional[str], line: Optional[int], rows, tags, pending=()) -> dict:
     return {"parses": reason is None, "reason": reason, "line": line,
@@ -305,12 +376,14 @@ def _match(mode: str, stmt: List[str]) -> List[Production]:
     return out
 
 
-def _key(stmt: List[str]) -> Tuple[str, ...]:
-    """What a statement writes in its parent: a single-valued leaf by its
-    keyword, anything else by all its tokens."""
-    if stmt[-1] == ";" and stmt[0] in _SINGLE:
-        return (stmt[0],)
-    return tuple(t for t in stmt if t not in _PUNCT)
+def _attribute(p: Production, stmt: List[str]) -> Tuple[str, object]:
+    """The attribute a statement writes in its parent, and its value: a
+    leaf by its keyword (value: the rest), anything else by all its
+    tokens."""
+    words = [t for t in stmt if t not in _PUNCT]
+    if p.write[1] == "error":
+        return words[0], " ".join(words[1:])
+    return " ".join(words), None
 
 
 def _host_bits(prefix: str) -> bool:
@@ -322,16 +395,21 @@ def _host_bits(prefix: str) -> bool:
 
 
 class _Frame:
-    __slots__ = ("mode", "count", "keys")
+    __slots__ = ("mode", "count", "path")
 
-    def __init__(self, mode: str) -> None:
+    def __init__(self, mode: str, path: Tuple[str, ...]) -> None:
         self.mode = mode
         self.count = 0
-        self.keys: set = set()
+        self.path = path
 
 
 def parse(raw: bytes) -> dict:
     """The grammar result for one file's raw bytes."""
+    return parse_model(raw)[0]
+
+
+def parse_model(raw: bytes) -> Tuple[dict, Optional[dict]]:
+    """The grammar result, and the final model when the file parses."""
     lines = raw.decode("utf-8", errors="replace").split("\n")
     if lines and lines[-1] == "":
         lines = lines[:-1]          # the LF that ends the last line
@@ -339,10 +417,11 @@ def parse(raw: bytes) -> dict:
     rows: set = set()
     pending: set = set()
 
-    def off(reason: str, line: Optional[int]) -> dict:
-        return _result(reason, line, rows, tags, pending)
+    def off(reason: str, line: Optional[int]) -> Tuple[dict, None]:
+        return _result(reason, line, rows, tags, pending), None
 
-    top = _Frame("top")
+    fold = Fold("junos")
+    top = _Frame("top", ())
     stack: List[_Frame] = []
     statements = 0
     addresses: set = set()
@@ -374,7 +453,7 @@ def parse(raw: bytes) -> dict:
                 if stmt or not stack or stack[-1].count == 0:
                     return off(LINE_NOT_ALLOWLISTED, n)
                 closed = stack.pop()
-                if closed.mode == "term" and ("then",) not in closed.keys:
+                if closed.mode == "term" and "then" not in fold.values(closed.path):
                     # A term with no then: the pages disagree on its
                     # meaning (review of #51, F1 item 7).
                     return off(LINE_NOT_ALLOWLISTED, n)
@@ -389,10 +468,10 @@ def parse(raw: bytes) -> dict:
             if len(hits) > 1:
                 return off(PARSE_AMBIGUOUS, n)
             (p,) = hits
-            key = _key(stmt)
-            if key in parent.keys:
-                return off(WRITE_MERGE_UNCITED, n)
-            parent.keys.add(key)
+            attribute, value = _attribute(p, stmt)
+            refused = fold.write(n, parent.path, attribute, p.write[1], value)
+            if refused:
+                return off(refused, n)
             if p.mode == "addrs" and _host_bits(stmt[0]):
                 return off(LINE_NOT_ALLOWLISTED, n)
             if p.mode == "ifl-inet" and stmt[0] == "address":
@@ -409,7 +488,7 @@ def parse(raw: bytes) -> dict:
             parent.count += 1
             statements += 1
             if p.child is not None:
-                stack.append(_Frame(p.child))
+                stack.append(_Frame(p.child, parent.path + (attribute,)))
             stmt = []
         if stmt:
             # A statement must end on the line it starts.
@@ -423,4 +502,4 @@ def parse(raw: bytes) -> dict:
             return off(CONFIG_INCOMPLETE, n)
     if tags:
         return off(LINE_NOT_ALLOWLISTED, tags[0])
-    return _result(None, None, rows, tags, pending)
+    return _result(None, None, rows, tags, pending), fold.model()

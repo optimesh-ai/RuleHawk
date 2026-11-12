@@ -167,6 +167,20 @@ release scope under `pending`; the script-scope row says that only the filter
 table is read, and that the security, nat, mangle and raw tables, ip6tables
 and nftables are not seen; and the filter-chains row quotes OUTPUT too.
 
+### Final model and merge rules, computed in shadow only (#42 phase 2)
+
+Every production of the Junos, PAN-OS and iptables grammars now declares the
+write it makes: an attribute and a merge rule (`create`, `append-in-order`
+or `error`; none replaces or deletes, because no row cites that). The final
+model is the fold of every write in text order, and a second write to one
+(object, attribute) is `write-merge-uncited`. Ordered children rest on a
+cited order row (Junos term order, iptables append order); PAN-OS rule order
+is not cited (the unversioned "Security Policy Rules" page states evaluation
+order, not where a new rule lands), so each PAN-OS rule records
+`panos-rule-order` under `pending`, and a PAN-OS file holds one rule. Nothing reads the model: verdicts, exit codes and every output
+are unchanged. With `RULEHAWK_SHADOW=1`, a file the grammar parses gets a
+`model` entry beside `grammar`, and `would_pass` stays false.
+
 ### No file is certified, so code scanning and MCP coverage say so (#42 phase 2)
 
 **Under the stopgap, every config gets a standing `rulehawk/uncertified`

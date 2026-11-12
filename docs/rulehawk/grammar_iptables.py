@@ -46,8 +46,8 @@ from typing import Dict, FrozenSet, List, Optional, Tuple
 
 from .citations import PENDING, resolve
 from .grammar_junos import (_TOKEN, _V4PREFIX, LINE_NOT_ALLOWLISTED,
-                            PARSE_AMBIGUOUS, WRITE_MERGE_UNCITED, Klass,
-                            Production, _host_bits)
+                            PARSE_AMBIGUOUS, Fold, Klass, Production,
+                            _host_bits)
 
 _PRINTABLE = re.compile(r"[\x20-\x7e]*")
 MODE = "line"
@@ -95,8 +95,13 @@ CLASSES: Dict[str, Klass] = {
     "V4PREFIX": Klass(_V4PREFIX, KEYWORDS),
 }
 
+# Slice 5: `-P` sets the chain's one policy (a second write has no cited
+# rule: `-P` last-write-wins is not cited); `-A` appends a rule to the end
+# of the chain (`iptables-append`), in text order.
 PRODUCTIONS: Tuple[Production, ...] = tuple(
-    Production(MODE, slots, None, cites, _NEEDS) for slots, cites in _PRODUCTION_TABLE)
+    Production(MODE, slots, None, cites, _NEEDS,
+               ("policy", "error") if slots[1] == "-P" else ("rule", "append-in-order"))
+    for slots, cites in _PRODUCTION_TABLE)
 
 # Every production's rows resolve at import: a pending row raises here. Its
 # needs must be pending rows.
@@ -144,37 +149,52 @@ def _match(toks: List[str]) -> List[Production]:
 
 def parse(raw: bytes) -> dict:
     """The grammar result for one file's raw bytes."""
+    return parse_model(raw)[0]
+
+
+def parse_model(raw: bytes) -> Tuple[dict, Optional[dict]]:
+    """The grammar result, and the final model when the file parses: each
+    built-in chain an object under `filter`, with its policy and its rules
+    in append order."""
     lines = raw.decode("utf-8", errors="replace").split("\n")
     if lines and lines[-1] == "":
         lines = lines[:-1]          # the LF that ends the last line
-    if not lines:
-        return _result(LINE_NOT_ALLOWLISTED, None, ())
     rows: set = set()
     pending: set = set()
-    policies: set = set()
+
+    def off(reason: str, line: Optional[int]) -> Tuple[dict, None]:
+        return _result(reason, line, rows, pending), None
+
+    if not lines:
+        return off(LINE_NOT_ALLOWLISTED, None)
+    fold = Fold("iptables")
     rules: set = set()
     for n, ln in enumerate(lines, 1):
         if not ln or not _PRINTABLE.fullmatch(ln):
-            return _result(LINE_NOT_ALLOWLISTED, n, rows, pending)
+            return off(LINE_NOT_ALLOWLISTED, n)
         toks = ln.split(" ")
         if not all(_TOKEN.fullmatch(t) for t in toks):
-            return _result(LINE_NOT_ALLOWLISTED, n, rows, pending)
+            return off(LINE_NOT_ALLOWLISTED, n)
         hits = _match(toks)
         if not hits:
-            return _result(LINE_NOT_ALLOWLISTED, n, rows, pending)
+            return off(LINE_NOT_ALLOWLISTED, n)
         if len(hits) > 1:
-            return _result(PARSE_AMBIGUOUS, n, rows, pending)
+            return off(PARSE_AMBIGUOUS, n)
         (p,) = hits
         if any(s == "V4PREFIX" and _host_bits(t) for s, t in zip(p.slots, toks)):
-            return _result(LINE_NOT_ALLOWLISTED, n, rows, pending)
-        if toks[1] == "-P":
-            if toks[2] in policies:
-                return _result(WRITE_MERGE_UNCITED, n, rows, pending)
-            policies.add(toks[2])
-        else:
+            return off(LINE_NOT_ALLOWLISTED, n)
+        if toks[1] == "-A":
             if ln in rules:
-                return _result(LINE_NOT_ALLOWLISTED, n, rows, pending)
+                return off(LINE_NOT_ALLOWLISTED, n)
             rules.add(ln)
+        chain = ("filter", toks[2])
+        fold.ensure(chain)              # iptables-filter-chains: built in
+        if toks[1] == "-P":
+            refused = fold.write(n, chain, "policy", p.write[1], toks[3])
+        else:
+            refused = fold.write(n, chain, " ".join(toks[3:]), p.write[1])
+        if refused:
+            return off(refused, n)
         rows.update(p.cites)
         pending.update(p.needs)
-    return _result(None, None, rows, pending)
+    return _result(None, None, rows, pending), fold.model()

@@ -57,8 +57,8 @@ from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 from .citations import PENDING, resolve
 from .grammar_junos import (_TOKEN, _V4PREFIX, LINE_NOT_ALLOWLISTED,
-                            PARSE_AMBIGUOUS, WRITE_MERGE_UNCITED, Klass,
-                            Production, _host_bits)
+                            PARSE_AMBIGUOUS, Fold, Klass, Production,
+                            _host_bits)
 
 _PRINTABLE = re.compile(r"[\x20-\x7e]*")
 MODE = "line"
@@ -111,6 +111,14 @@ CLASSES: Dict[str, Klass] = {
 }
 
 _CLASS_NEEDS = {"RULENAME": "panos-rule-name-chars", "V4PREFIX": "panos-v4-prefix"}
+# Slice 5: a rule is appended to the rulebase in order; no cited row states
+# where a new rule lands (`panos-rule-order` is pending), so every production
+# records it (review of #52-#57, G1: the order block is back).
+_ORDER_NEEDS = ("panos-rule-order",)
+_WRITE = ("rules", "append-in-order")
+# The model's values for a rule: the keyword before each value slot.
+_VALUE_KEYS = ("from", "to", "source", "destination", "application", "service",
+               "action")
 # File-level rows every production rests on (review of #52/#53, F1, F2).
 _FILE_NEEDS = ("panos-release-scope", "panos-lexing", "panos-list-semantics",
                "panos-default-rules", "panos-any-meaning", "panos-rule-type-default",
@@ -121,7 +129,8 @@ _FILE_NEEDS = ("panos-release-scope", "panos-lexing", "panos-list-semantics",
 PRODUCTIONS: Tuple[Production, ...] = tuple(
     Production(MODE, slots, None, cites,
                tuple(sorted({_CLASS_NEEDS[s] for s in slots if s in _CLASS_NEEDS}
-                            | set(_FILE_NEEDS))))
+                            | set(_FILE_NEEDS) | set(_ORDER_NEEDS))),
+               _WRITE)
     for slots, cites in _PRODUCTION_TABLE)
 
 # Every production's rows resolve at import: a pending row raises here. Its
@@ -171,36 +180,54 @@ def _match(toks: List[str]) -> List[Production]:
 
 def parse(raw: bytes) -> dict:
     """The grammar result for one file's raw bytes."""
+    return parse_model(raw)[0]
+
+
+def parse_model(raw: bytes) -> Tuple[dict, Optional[dict]]:
+    """The grammar result, and the final model when the file parses: each
+    rule an object under `rulebase security`, appended in text order. A
+    rule name written twice is `write-merge-uncited` (the fold)."""
     lines = raw.decode("utf-8", errors="replace").split("\n")
     if lines and lines[-1] == "":
         lines = lines[:-1]          # the LF that ends the last line
-    if not lines:
-        return _result(LINE_NOT_ALLOWLISTED, None, ())
     rows: set = set()
     pending: set = set()
-    names: set = set()
+
+    def off(reason: str, line: Optional[int]) -> Tuple[dict, None]:
+        return _result(reason, line, rows, pending), None
+
+    if not lines:
+        return off(LINE_NOT_ALLOWLISTED, None)
+    fold = Fold("panos")
+    base = ("rulebase security",)
+    fold.ensure(base)
+    first: Optional[str] = None
     for n, ln in enumerate(lines, 1):
         if not ln or not _PRINTABLE.fullmatch(ln):
-            return _result(LINE_NOT_ALLOWLISTED, n, rows, pending)
+            return off(LINE_NOT_ALLOWLISTED, n)
         toks = ln.split(" ")
         if not all(_TOKEN.fullmatch(t) for t in toks):
-            return _result(LINE_NOT_ALLOWLISTED, n, rows, pending)
+            return off(LINE_NOT_ALLOWLISTED, n)
         hits = _match(toks)
         if not hits:
-            return _result(LINE_NOT_ALLOWLISTED, n, rows, pending)
+            return off(LINE_NOT_ALLOWLISTED, n)
         if len(hits) > 1:
-            return _result(PARSE_AMBIGUOUS, n, rows, pending)
+            return off(PARSE_AMBIGUOUS, n)
         (p,) = hits
-        name = toks[p.slots.index("RULENAME")]
-        if name in names:
-            return _result(WRITE_MERGE_UNCITED, n, rows, pending)
-        if names:
-            # One rule per file (review of #52/#53, F2): a second rule needs
-            # the default rules' fall-through and name case, uncited.
-            return _result(LINE_NOT_ALLOWLISTED, n, rows, pending)
-        names.add(name)
         if any(s == "V4PREFIX" and _host_bits(t) for s, t in zip(p.slots, toks)):
-            return _result(LINE_NOT_ALLOWLISTED, n, rows, pending)
+            return off(LINE_NOT_ALLOWLISTED, n)
+        name = toks[p.slots.index("RULENAME")]
+        if first is not None and name != first:
+            # One rule per file (review of #52/#53, F2): a second rule needs
+            # the default rules' fall-through and name case, uncited. The
+            # same name again goes to the fold: write-merge-uncited.
+            return off(LINE_NOT_ALLOWLISTED, n)
+        first = name
+        values = {k: toks[i + 1] for i, k in enumerate(toks[:-1]) if k in _VALUE_KEYS
+                  and i >= p.slots.index("RULENAME")}
+        refused = fold.write(n, base, f"rules {name}", p.write[1], values)
+        if refused:
+            return off(refused, n)
         rows.update(p.cites)
         pending.update(p.needs)
-    return _result(None, None, rows, pending)
+    return _result(None, None, rows, pending), fold.model()

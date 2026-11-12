@@ -270,7 +270,8 @@ def shadow_block(raw: bytes, vendor: str = "auto") -> dict:
     `line-not-allowlisted`, `parse-ambiguous`, `config-incomplete` or
     `write-merge-uncited`, in a `grammar` entry, or `file-uncertified` with
     a `grammar_unavailable` entry when the grammar cannot load); otherwise
-    `file-uncertified`."""
+    `file-uncertified`. A file the grammar parses also gets its final model
+    (slice 5) in a `model` entry."""
     b = boundary(raw, vendor)
     block = {"boundary": b, "would_pass": False,
              "blocking_reason": b["reason"] or UNCERTIFIED}
@@ -293,10 +294,13 @@ def shadow_block(raw: bytes, vendor: str = "auto") -> dict:
                 block["grammar_unavailable"] = str(e) or type(e).__name__
             return block
         try:
-            gm = grammar.parse(raw)
+            gm, model = grammar.parse_model(raw)
         except Exception as e:  # fail closed (review r2 of #52-#59, N2)
             block["grammar_unavailable"] = "grammar failed: " + type(e).__name__
             return block
         block["grammar"] = gm
         block["blocking_reason"] = gm["reason"] or UNCERTIFIED
+        if model is not None:
+            # Slice 5: the final model of a file the grammar parses.
+            block["model"] = model
     return block
