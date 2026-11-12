@@ -21,7 +21,9 @@ concurrency:
 jobs:
   tests:
     name: Engine test suite
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, where setup-python has no 3.9
+    # build. Unpin once 3.9 is available there or dropped from the matrix.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
