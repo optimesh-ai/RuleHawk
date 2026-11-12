@@ -1,0 +1,1 @@
+iptables -P FORWARD ACCEPT

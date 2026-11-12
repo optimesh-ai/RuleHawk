@@ -1,0 +1,2 @@
+{"zones": {"CORP": ["192.0.2.0/24"], "PCI": ["198.51.100.0/24"]},
+ "must_not_reach": [{"src": "CORP", "dst": "PCI", "proto": "ip"}]}
