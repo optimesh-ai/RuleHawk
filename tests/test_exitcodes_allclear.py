@@ -116,7 +116,7 @@ def test_rulehawk_cert_is_a_compiled_in_zero():
 @pytest.mark.parametrize("verdict,stopgap", [
     ("PASS", "UNKNOWN"), ("NO_NEW_RISK", "UNKNOWN"), ("VERIFIED", "INDETERMINATE"),
     ("segmentation-ok", "segmentation-unknown"),
-    ("connectivity-ok", "connectivity-unknown")])
+    ("connectivity-ok", "connectivity-unknown"), ("complete", "partial")])
 def test_emit_gives_the_stopgap_answer(verdict, stopgap):
     assert allclear.emit(verdict) == stopgap
     # A certificate does not help while RULEHAWK_CERT is 0.
@@ -139,7 +139,7 @@ def test_passed_and_exit_code_are_the_stopgaps():
 # --------------------------------------------------------------------------- #
 _TOKEN = re.compile(r"\bPASS\b|\bVERIFIED\b|NO_NEW_RISK|✅")
 _EXACT = {"complete", "segmentation-ok", "connectivity-ok", "certified"}
-_ALLCLEAR_NAMES = {"PASS", "VERIFIED", "NO_NEW_RISK", "SEG_OK", "REACH_OK"}
+_ALLCLEAR_NAMES = {"PASS", "VERIFIED", "NO_NEW_RISK", "SEG_OK", "REACH_OK", "COMPLETE"}
 
 
 def _docstrings(tree):
@@ -288,6 +288,8 @@ def _scan_module(name: str):
         elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             if node.value.id in ec and node.attr in _EXIT_NAMES:
                 hit(node, "exit-code", f"exitcodes.{node.attr}")
+            if node.value.id in ac and node.attr == "certified":
+                hit(node, "allclear-name", "allclear.certified")   # review of #48, L2
             if node.value.id in ac and node.attr in _ALLCLEAR_NAMES:
                 p = par.get(node)
                 first_arg_of_emit = (
@@ -300,7 +302,7 @@ def _scan_module(name: str):
                 hit(node, "cert-override", ast.unparse(node))
         elif isinstance(node, ast.ImportFrom) and node.module in ("exitcodes", "allclear"):
             for a in node.names:
-                if a.name in (_EXIT_NAMES | {"RULEHAWK_CERT"}) | _ALLCLEAR_NAMES:
+                if a.name in (_EXIT_NAMES | {"RULEHAWK_CERT", "certified"}) | _ALLCLEAR_NAMES:
                     hit(node, "import-name", f"{node.module}.{a.name}")
         elif isinstance(node, ast.Global) and "RULEHAWK_CERT" in node.names:
             hit(node, "cert-override", "global RULEHAWK_CERT")
@@ -332,10 +334,83 @@ def _scan_module(name: str):
             if f in ("setattr", "delattr", "vars") and node.args \
                     and isinstance(node.args[0], ast.Name) and node.args[0].id in ac:
                 hit(node, "allclear-write", ast.unparse(node))
+        _passed_sets(node, ac, hit)
         _rebind_hooks(node, hit)
         _module_uses(node, par, ac, ec, name, hit)
     return out
 
+
+def _is_passed_call(v, ac) -> bool:
+    return (isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "passed" and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in ac)
+
+
+def _names_passed(t) -> bool:
+    return ((isinstance(t, ast.Name) and t.id == "passed")
+            or (isinstance(t, ast.Attribute) and t.attr == "passed")
+            or (isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)
+                and t.slice.value == "passed"))
+
+
+def _flat(t):
+    if isinstance(t, (ast.Tuple, ast.List)):
+        for e in t.elts:
+            yield from _flat(e)
+    elif isinstance(t, ast.Starred):
+        yield from _flat(t.value)
+    else:
+        yield t
+
+
+def _passed_sets(node, ac, hit):
+    """Review of #47 (optional rule): a `passed` name, attribute, keyword or
+    dict key set to anything but an allclear.passed() call. Spelling only, like
+    the rest of the scan: `passed` read back from something set elsewhere is a
+    hit at the site that sets it."""
+    def h(n, text):
+        hit(n, "passed-set", text[:72])
+
+    if isinstance(node, ast.keyword) and node.arg == "passed" \
+            and not _is_passed_call(node.value, ac):
+        h(node, f"passed={ast.unparse(node.value)}")
+    elif isinstance(node, ast.Dict):
+        for k, v in zip(node.keys, node.values):
+            if isinstance(k, ast.Constant) and k.value == "passed" \
+                    and not _is_passed_call(v, ac):
+                h(node, f'"passed": {ast.unparse(v)}')
+    elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+        if node.value is None:                      # `passed: bool`, no value
+            return
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        aug = isinstance(node, ast.AugAssign)
+        for t in targets:
+            if _names_passed(t):
+                if aug or not _is_passed_call(node.value, ac):
+                    h(node, f"{ast.unparse(t)} = {ast.unparse(node.value)}")
+            else:
+                for e in _flat(t):
+                    if _names_passed(e):            # unpacked: never a passed() call
+                        h(node, ast.unparse(e))
+    elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension, ast.withitem)):
+        t = node.optional_vars if isinstance(node, ast.withitem) else node.target
+        for e in _flat(t) if t is not None else ():
+            if _names_passed(e):
+                h(e if isinstance(node, ast.comprehension) else node, ast.unparse(e))
+    elif isinstance(node, ast.Call):
+        f = ast.unparse(node.func)
+        if f in ("setattr", "dict.__setitem__") or f.endswith((".setdefault", ".__setitem__")):
+            key = node.args[1] if f == "setattr" and len(node.args) > 1 else (
+                node.args[0] if node.args and f != "setattr" else None)
+            val = node.args[2 if f == "setattr" else 1] if len(node.args) > (
+                2 if f == "setattr" else 1) else None
+            if isinstance(key, ast.Constant) and key.value == "passed" \
+                    and not _is_passed_call(val, ac):
+                h(node, ast.unparse(node))
+    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "passed":
+        for r in ast.walk(node):
+            if isinstance(r, ast.Return) and not _is_passed_call(r.value, ac):
+                h(r, f"def passed: return {ast.unparse(r.value) if r.value else 'None'}")
 
 def _root_alias(t, names):
     """The alias name an Attribute/Subscript/Call chain hangs off, or None."""
@@ -483,9 +558,8 @@ _EXEMPT = collections.Counter({
     "evidence.py::build_evidence::literal::complete": 1,
     "evidence.py::to_evidence_markdown::literal::complete": 1,
     "evidence.py::to_evidence_markdown::literal::**PASS — ": 1,
-    # mcp: the coverage state (slice 2 routes it through allclear) and the
-    # segmentation_passed filter, which no stopgap finding kind matches.
-    "mcp_server.py::_coverage::literal::complete": 2,
+    # mcp: the segmentation_passed filter, which no stopgap finding kind
+    # matches. (coverage.state goes through allclear.emit since slice 2.)
     "mcp_server.py::audit::literal::segmentation-ok": 1,
     "mcp_server.py::audit::literal::connectivity-ok": 1,
     # The MCP server process's own exit status, not a verdict.
@@ -516,6 +590,21 @@ _EXEMPT = collections.Counter({
     "evidence.py::_control_rollup::allclear-const-read::a['status'] == VERIFIED": 1,
     "evidence.py::_control_rollup::allclear-const-write::s['status'] = VERIFIED": 1,
     "evidence.py::build_evidence::allclear-const-read::a['status'] == VERIFIED": 1,
+    # allclear.certified(): the two sites that ask whether a file is
+    # certified (review of #48, L2). to_sarif skips a file's
+    # rulehawk/uncertified note only if it is; _coverage counts the files that
+    # are not. Both pass no certificate, so neither is ever true in 0.4.1.
+    "gate.py::to_sarif::allclear-name::allclear.certified": 1,
+    "mcp_server.py::_coverage::allclear-name::allclear.certified": 1,
+    # `passed` set to something other than an allclear.passed() call (review
+    # of #47, optional rule). The gate's JSON and result records copy
+    # GateResult.passed, a property that returns allclear.passed(); the
+    # failed-run record is a constant False; combine reads `passed` from a
+    # record and turns a true one into UNKNOWN (_load, "pre-stopgap record").
+    "gate.py::to_json::passed-set::\"passed\": gate.passed": 1,
+    "gate.py::to_result::passed-set::\"passed\": gate.passed": 1,
+    "gate.py::_failed_result::passed-set::\"passed\": False": 1,
+    "combine.py::_load::passed-set::passed": 1,
     # Rebind hooks (review of #47, R3-F1): the two package-version lookups
     # (importlib.metadata, read only) and iptables' match-module list, an
     # attribute of the parsed rule that happens to be called `modules`.
@@ -546,15 +635,58 @@ def test_scan_catches_a_planted_all_clear(tmp_path, monkeypatch):
         "    z = {'passed': True, 'shadow': {'certified': 1}}\n"
         "    f(passed=True)\n"
         "    allclear.RULEHAWK_CERT = 1\n"
+        "    if allclear.certified(x):\n"
+        "        pass\n"
+        "    ok = allclear.certified\n"
         "    return exitcodes.PASS\n"
         "def w():\n"
         "    return 0\n"
         "def a():\n"
         "    return 4\n", encoding="utf-8")
     monkeypatch.setattr(sys.modules[__name__], "_PKG", str(tmp_path))
-    rules = {k.split("::")[2] for k in _scan_module("planted.py")}
+    hits = _scan_module("planted.py")
+    rules = {k.split("::")[2] for k in hits}
     assert rules >= {"literal", "allclear-name", "passed-true", "cert-override",
                      "exit-code", "return-0", "return-4"}, rules
+    # Review of #48, L2: a certified() call, and certified held as a value.
+    assert hits.count("planted.py::v::allclear-name::allclear.certified") == 2, hits
+
+
+def test_scan_catches_a_planted_passed(tmp_path, monkeypatch):
+    """Review of #47 (optional rule): `passed` set to anything but an
+    allclear.passed() call is a hit, as attribute, name, keyword or dict key."""
+    planted = tmp_path / "planted.py"
+    planted.write_text(
+        "from . import allclear\n"
+        "class G:\n"
+        "    passed = not self.violations\n"
+        "    def passed(self):\n"
+        "        return not self.violations\n"
+        "    def a(self):\n"
+        "        self.passed = not self.violations\n"
+        "        R(passed=not self.violations)\n"
+        "        d = {'passed': len(self.violations) == 0}\n"
+        "        d['passed'] = ok\n"
+        "        setattr(d, 'passed', ok)\n"
+        "        passed, code = rec\n"
+        "        for passed in xs:\n"
+        "            pass\n"
+        "    def ok(self):\n"
+        "        passed = allclear.passed()\n"
+        "        self.passed = allclear.passed()\n"
+        "        R(passed=allclear.passed())\n"
+        "        return {'passed': allclear.passed()}\n"
+        "class H:\n"
+        "    @property\n"
+        "    def passed(self):\n"
+        "        return allclear.passed()\n",
+        encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "_PKG", str(tmp_path))
+    hits = [k for k in _scan_module("planted.py") if k.split("::")[2] == "passed-set"]
+    where = collections.Counter(k.split("::")[1] for k in hits)
+    # Nothing in G.ok or H.passed: those are allclear.passed() calls.
+    assert where == {"G": 1, "G.passed": 1, "G.a": 7}, hits
+    assert "planted.py::G::passed-set::passed = not self.violations" in hits, hits
 
 
 # --------------------------------------------------------------------------- #
@@ -1078,7 +1210,7 @@ def _allclear_violations(src: str) -> list:
 # slice 9 (the flip) edit these on purpose, with this table.
 _ALLCLEAR_PINNED = ("_STOPGAP", "_require_certified", "certified", "emit", "passed", "exit_code")
 _ALLCLEAR_FN_SHA = {
-    "_STOPGAP": "991eae3d066022f8",
+    "_STOPGAP": "64d59cc524f060de",     # slice 2: COMPLETE -> "partial"
     "_require_certified": "61774ed83da806bc",
     "certified": "ecf1fd02af0c4336",
     "emit": "ba0d1324b1ef76a3",
@@ -1119,6 +1251,7 @@ _ALLCLEAR_TOP_LEVEL = (
     "RULEHAWK_CERT = <int>",
     "PASS = <str>", "VERIFIED = <str>", "NO_NEW_RISK = <str>",
     "SEG_OK = <str>", "REACH_OK = <str>",
+    "COMPLETE = <str>",                     # slice 2: coverage.state
     "_STOPGAP = <dict of names to str>",
     "def _require_certified", "def certified", "def emit", "def passed", "def exit_code",
 )
@@ -1159,7 +1292,7 @@ def _allclear_shape_problems(src: str) -> list:
 # both copies, as well as the per-definition pins above (which name the
 # definition that changed). Any edit, a comment included, is a reviewed change
 # of this line.
-_ALLCLEAR_FILE_SHA = "e63acfaf32aa40ac2c8c85147266a0878f7b918c9e931d8cd30ab24da4e814e2"
+_ALLCLEAR_FILE_SHA = "ff894ef8c6b178caad0d2f6914f8a2aebd230a0338fd2a87691b981f4fff8440"  # slice 2: COMPLETE
 
 
 def _allclear_pin_problems(src: str) -> list:

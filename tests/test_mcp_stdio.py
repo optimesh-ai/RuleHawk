@@ -60,7 +60,7 @@ def test_audit_over_stdio_returns_verdict_coverage_and_scope():
                            "policy_path": os.path.join(SAMPLES, "policy.json")}))
     r = _payload(res)
     assert r["verdict"] == "FAIL"
-    assert r["coverage"]["state"] == "complete"
+    assert r["coverage"]["state"] == "partial"      # no file is certified
     assert any(f["kind"] == "segmentation-violation" for f in r["blocking_findings"])
     assert r["scope"]["statement"].startswith("Rule layer only")
 

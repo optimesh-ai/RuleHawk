@@ -19,10 +19,17 @@ time. Tests fail on an all-clear outside that module that is not on a pinned,
 reviewed exemption list: an all-clear literal; an exit-code constant or exit
 call worth 0; a PASS or VERIFIED constant, keyed by what the use does (a
 comparison by the whole condition it sits in); an assignment to, or a
-`setattr`/`delattr`/`vars` call on, a name bound to `allclear`; in any engine
-module (both copies), `sys.modules`, `exec`/`eval`/`compile`, an `importlib`
-import, `__dict__` and the other rebinding dunders, `setattr`/`delattr` on
-anything but `self`, or an absolute `rulehawk` import; outside their own
+`setattr`/`delattr`/`vars` call on, a name bound to `allclear`; any reference
+to `allclear.certified` (a call, the function held as a value, or an import of
+it by name); a `passed` name, attribute, keyword argument, dict key or
+`["passed"]` item given anything but an `allclear.passed()` call, by
+assignment (an augmented one always counts), by `setattr(x, "passed", ...)`,
+`x.setdefault("passed", ...)` or `x.__setitem__("passed", ...)`, or by a
+`return` in a function named `passed`, and any `passed` bound by unpacking or
+as a `for`, `with` or comprehension target; in any engine module (both
+copies), `sys.modules`, `exec`/`eval`/`compile`, an `importlib` import,
+`__dict__` and the other rebinding dunders, `setattr`/`delattr` on anything
+but `self`, or an absolute `rulehawk` import; outside their own
 files, a private (`_name`) attribute of `allclear` or `exitcodes`, either
 module object used as a value, `getattr`/`hasattr`/`setattr`/`delattr`/`type`/
 `vars`/`dir` on either or on a member of either, a method call on a member of
@@ -42,8 +49,45 @@ for byte as the 0.4.1 stopgap wrote them (`scripts/gen_stopgap_guards.py`
 re-derives the pins from git), and both Actions' enforce steps are run under
 bash.
 
+### No file is certified, so code scanning and MCP coverage say so (#42 phase 2)
+
+**Under the stopgap, every config gets a standing `rulehawk/uncertified`
+note (SARIF level `note`) in code scanning.** RuleHawk certifies no file in
+this release, so the SARIF report of every file in every dialect carries one
+`rulehawk/uncertified` result at level `note`: "<file> is not certified. ... a
+run with nothing flagged is UNKNOWN, not a clean result." An empty SARIF run no
+longer stands for a clean file. The note sits on line 1, and its fingerprint is
+the rule id plus the file path (no line number), so it is one alert per file
+that stays open across runs instead of churning; a file given twice (`a.cfg`
+and `./a.cfg`) gets one note. It is level `note` so a repository that blocks
+merges on code-scanning warnings or errors is not newly blocked; the exit code
+(3) is still what fails the check. Findings, their levels, fingerprints and
+lines are unchanged.
+
+**Cisco-family configs are planned to keep this note permanently (a later
+release).** When certificates ship, a certified file will lose its note. The
+plan is that a Cisco-family file (IOS, IOS XE, NX-OS, ASA, EOS, IOS XR) will
+not be certified, so it will keep its `rulehawk/uncertified` note.
+
+The MCP server's `coverage.state` is now `partial` unless every file is
+certified, which none is: a file that parsed with every line modelled used to
+report `complete` and now reports `partial`, with an explanation that gives
+the number of uncertified files, and a new count,
+`coverage.files_uncertified`: every input file that is not certified, analysed
+or not (in this release, every input). `incomplete` (an input not analysed) is
+unchanged, and so are every verdict and exit code.
+
 ### Compatibility
 
+- **`rulehawk/uncertified` in code scanning:** every config in every dialect
+  gets one `rulehawk/uncertified` note, from this release until the flip that
+  restores certified answers. After the flip, Cisco-family configs are
+  planned to keep it. A SARIF consumer that counts results, or treats
+  any result as non-clean, now sees one result per file; filter on `ruleId`
+  to skip it.
+- **MCP `coverage.state`** is `partial`, never `complete`, until a file is
+  certified. A client that went ahead on `complete` will not go ahead; it
+  already could not on the verdict, which is never PASS in 0.4.1.
 - **Exit code 4 is reserved for ACCEPTED** (a run whose only violations are
   covered by a risk acceptance). It is not emitted by this release, and no
   command uses 4 for anything else. When ACCEPTED ships, such a run exits 4 on
