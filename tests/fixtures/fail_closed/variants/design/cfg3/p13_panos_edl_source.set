@@ -1,0 +1,4 @@
+set external-list CORPLIST type ip url https://lists.example.com/corp.txt
+set rulebase security rules d from any to any source CORPLIST destination 198.51.100.0/24 application any service any action deny
+set rulebase security rules d2 from any to any source 192.0.2.0/25 destination 198.51.100.0/24 application any service any action deny
+set rulebase security rules z from any to any source any destination any application any service any action allow
