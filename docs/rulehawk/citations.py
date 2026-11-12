@@ -86,6 +86,14 @@ _IPT = "https://man7.org/linux/man-pages/man8/iptables.8.html"
 _IPT_TITLE = "iptables(8) - Linux manual page"
 _IPT_RELEASE = "This manual page applies to iptables/ip6tables 1.8.13."
 
+# v4 section 14 fetches (2026-11-09): Junos static routes.
+_STATIC = ("https://www.juniper.net/documentation/us/en/software/junos/"
+           "cli-reference/topics/ref/statement/static-edit-routing-options.html")
+_STATIC_TITLE = "static (Routing Options) | Junos OS | Juniper Networks"
+_RESOLVE = ("https://www.juniper.net/documentation/us/en/software/junos/"
+            "cli-reference/topics/ref/statement/resolve-edit-routing-options.html")
+_RESOLVE_TITLE = "resolve | Junos OS | Juniper Networks"
+
 _NO_RELEASE = "the page states no release (Junos OS documentation, current)"
 _SINCE_7_4 = "Statement introduced before Junos OS Release 7.4."
 _DATE = "2026-11-09"
@@ -290,6 +298,32 @@ ROWS: Dict[str, Row] = {r.id: r for r in (
     _row("iptables-jump", _IPT, _IPT_TITLE, _IPT_RELEASE,
          "This specifies the target of the rule; i.e., what to do if the "
          "packet matches it."),
+    # v4 section 14 fetches: cited for a later slice; no production rests on
+    # these rows yet. Neither Junos page states Junos OS Evolved
+    # (junos-evolved-scope stays pending).
+    _row("junos-static-next-hop", _STATIC, _STATIC_TITLE, _SINCE_7_4,
+         "next-hop address\u2014Reach the next-hop routing device by specifying "
+         "an IP address, an interface name, or an ISO network entity title "
+         "(NET)."),
+    _row("junos-static-direct-next-hop", _RESOLVE, _RESOLVE_TITLE, _SINCE_7_4,
+         "Static routes can point only to a directly connected next hop."),
+    # Two hazards for the slice that uses this row (review of #60-#62,
+    # F62-1): (1) a protocol name is looked up in /etc/protocols on the
+    # host, and a number may stand for "a different one", so name to number
+    # is host-dependent; a production takes numeric values and `all` only,
+    # or blocks names. (2) The checker's `_iptables` ignores -p by design;
+    # a grammar that reads `-p tcp -j DROP` without a matching checker
+    # change would have the checker read a DROP for every protocol (a wrong
+    # no-witness for udp), so grammar and checker change together.
+    _row("iptables-protocol", _IPT, _IPT_TITLE, _IPT_RELEASE,
+         "The protocol of the rule or of the packet to check. The specified "
+         "protocol can be one of tcp, udp, udplite, icmp, icmpv6, esp, ah, "
+         "sctp, mh or the special keyword \"all\", or it can be a numeric "
+         "value, representing one of these protocols or a different one. A "
+         "protocol name from /etc/protocols is also allowed. A \"!\" argument "
+         "before the protocol inverts the test. The number zero is equivalent "
+         "to all. \"all\" will match with all protocols and is taken as "
+         "default when this option is omitted."),
 )}
 
 # v4 section 14 Junos and PAN-OS rows (and the interface address row's
@@ -413,9 +447,45 @@ PENDING: Dict[str, str] = {
         "nft back ends and other releases are not cited, so the "
         "uncited-remainder member (v3 section 6.3) stays"),
     "iptables-save-format": (
-        "iptables-save and iptables-restore(8) are not fetched in this "
-        "slice; the save format (*filter, :CHAIN, COMMIT, --noflush) is "
-        "off"),
+        "iptables-save(8) and iptables-restore(8) (iptables 1.8.13) were "
+        "fetched twice on 2026-11-09 and state options only: no line states "
+        "the *filter, :CHAIN or COMMIT lines. The only format text is the "
+        "--noflush example '*filter :FILTERS - [0:0] -A FILTERS ... will "
+        "flush and re-build the FILTERS chain from scratch, while retaining "
+        "the content of all other chains in the table.', so the save format "
+        "is off"),
+    # v4 section 14 fetches (2026-11-09), kept pending
+    "panos-static-route": (
+        "the PAN-OS 11.1 web interface help page 'Static Routes' "
+        "(docs.paloaltonetworks.com/ngfw/help/11-1/network/"
+        "network-virtual-routers/static-routes), fetched twice, describes GUI "
+        "fields only ('IP Address\u2014Select to enter the IP address of the "
+        "next hop router, or select or create an address object of type IP "
+        "Netmask.'); it states no set-CLI form, and a next hop can also be "
+        "an address object name, Next VR, FQDN, Discard or None, so no "
+        "production"),
+    "panos-layer3-interface": (
+        "the PAN-OS 11.1 page 'Configure Layer 3 Interfaces' "
+        "(docs.paloaltonetworks.com/pan-os/11-1/pan-os-networking-admin/"
+        "configure-interfaces/layer-3-interfaces/configure-layer-3-interfaces), "
+        "fetched twice, is a GUI procedure with no set-CLI form, and says "
+        "'Beginning with PAN-OS 11.1.4, you can configure duplicate "
+        "(overlapping) IP addresses on Layer 3 interfaces for an Advanced "
+        "Routing Engine.', so an interface address does not name one segment "
+        "on every 11.1 release"),
+    "iptables-dport": (
+        "iptables-extensions(8) (iptables 1.8.13), fetched in full, holds the "
+        "tcp text '[!] --destination-port,--dport port[:port] Destination "
+        "port or port range specification. The flag --dport is a convenient "
+        "alias for this option.' and 'If the -p or --protocol was specified "
+        "and if and only if an unknown option is encountered, iptables will "
+        "try load a match module of the same name as the protocol, to try "
+        "making the option available.' (review of #60-#62, F62-1: an earlier "
+        "reason said the fetch stopped before the tcp section; that fetch "
+        "was cut short). The row stays pending because no production uses it "
+        "yet: --dport rests on -p, and the tcp --sport text says a port "
+        "'can either be a service name or a port number', looked up on the "
+        "host, so --dport, port ranges and service names are off"),
 }
 
 
