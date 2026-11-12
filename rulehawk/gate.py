@@ -42,7 +42,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from . import allclear, exitcodes
+from . import allclear, dialects, exitcodes
 from .analyze import (STOPGAP_CODE, STOPGAP_MESSAGE, UNKNOWN_KINDS, Finding,
                       analyze, score, stopgap_reasons)
 from .boundary import markdown_lines as boundary_markdown, triggers
@@ -693,7 +693,7 @@ def to_sarif(gate: GateResult, version: Optional[str] = None) -> str:
 # JSON (machine aggregate)
 # --------------------------------------------------------------------------- #
 def to_json(gate: GateResult) -> str:
-    return json.dumps({
+    d = {
         "passed": gate.passed,
         # FAIL | UNKNOWN, never PASS (fail-closed stopgap). Under fail-on none
         # the real verdict, with enforced false and exit_code 0.
@@ -725,7 +725,17 @@ def to_json(gate: GateResult) -> str:
             } for f in _sorted(fr.findings)],
             "parse_notes": fr.notes,
         } for fr in gate.files],
-    }, indent=2)
+    }
+    if dialects.shadow_on():
+        # #42 slice 3: the boundary result per file, only under
+        # RULEHAWK_SHADOW=1; without it the JSON is unchanged.
+        # The vendor value read through the gate's aliases, as _pick_parser
+        # reads it (`ios`, `cisco`, `juniper`...; review of #49, F2).
+        asked = gate.vendor if gate.vendor == "auto" else \
+            _VENDORS.get(gate.vendor.lower(), gate.vendor)
+        for entry, fr in zip(d["files"], gate.files):
+            entry["shadow"] = dialects.shadow_block(fr.raw or b"", asked)
+    return json.dumps(d, indent=2)
 
 
 # --------------------------------------------------------------------------- #
