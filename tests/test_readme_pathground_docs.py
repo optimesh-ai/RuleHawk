@@ -1,10 +1,12 @@
-"""README must document the Hammerhead path-grounding feature.
+"""The Hammerhead path-grounding feature must stay documented.
 
 Guards the doc fix for the "flagship feature invisible outside cli.py" gap:
 the `--hh-snapshot`/`--hh-from` flags, the fail-closed soundness rule, and the
-`rulehawk/pathground.py` module must all be discoverable from README.md. If a
-future edit drops them, this test fails rather than letting the docs silently
-regress to "feature only visible in shell history".
+`rulehawk/pathground.py` module must all be discoverable. The feature needs a
+separately licensed product, so its full description lives in
+docs/beyond-rulehawk.md (the README links there and keeps the module in its
+Layout list). If a future edit drops them, this test fails rather than letting
+the docs silently regress to "feature only visible in shell history".
 """
 
 from __future__ import annotations
@@ -12,19 +14,32 @@ from __future__ import annotations
 import pathlib
 import re
 
-README = pathlib.Path(__file__).resolve().parent.parent / "README.md"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+README = ROOT / "README.md"
+FEATURE_DOC = ROOT / "docs" / "beyond-rulehawk.md"
 
 
 def _readme_text() -> str:
     return README.read_text(encoding="utf-8")
 
 
+def _feature_doc_text() -> str:
+    return FEATURE_DOC.read_text(encoding="utf-8")
+
+
 def test_readme_exists() -> None:
     assert README.is_file(), f"README missing at {README}"
+    assert FEATURE_DOC.is_file(), f"feature doc missing at {FEATURE_DOC}"
+
+
+def test_readme_links_feature_doc() -> None:
+    assert "docs/beyond-rulehawk.md" in _readme_text(), (
+        "README must link docs/beyond-rulehawk.md, where path-grounding lives"
+    )
 
 
 def test_readme_documents_pathground_flags() -> None:
-    text = _readme_text()
+    text = _feature_doc_text()
     assert "--hh-snapshot" in text, "README must document --hh-snapshot"
     assert "--hh-from" in text, "README must document --hh-from"
     # A copy-pasteable usage line pairing both flags with --policy.
@@ -37,7 +52,7 @@ def test_readme_states_fail_closed_soundness_rule() -> None:
     """The soundness contract from cli.py's docstring must be user-visible:
     only a deterministic NAT-free 'not delivered' downgrades; everything else
     fails closed and keeps the finding."""
-    text = _readme_text()
+    text = _feature_doc_text()
     lower = text.lower()
     # Locate the path-grounding section specifically, not the general
     # fail-closed language elsewhere in the README.
