@@ -1,28 +1,53 @@
 # RuleHawk
 
-> **Free and open source (Apache-2.0).** Runs on your machine or
-> [in your browser](https://optimesh-ai.github.io/RuleHawk/), with no account, no API key
-> and no subscription, and your config never leaves your machine. Built and maintained by
-> [Optimesh](https://optimesh.ai); for checks across routing and reachability too, see
-> [where RuleHawk stops](#where-rulehawk-stops-and-hammerhead-starts).
+**Check a firewall or ACL rule set for mistakes before you push it.** RuleHawk
+reads the rules in a config file and points out the ones that are wrong: a deny
+that never takes effect because an earlier permit already lets the traffic
+through, a rule that never fires because an earlier one catches everything it
+would, duplicates you can delete, `permit ip any any`, and risky services
+(telnet, SMB, RDP, databases and similar) open to any source.
 
-> **0.4.1: fail-closed stopgap.** This release never reports PASS or VERIFIED.
-> A run with nothing at or above the threshold is **UNKNOWN**, exit **3**, with
-> reason `fail-closed-stopgap` ("fail-closed stopgap pending soundness
-> review"); FAIL (exit 1) and parse failures (exit 2) are unchanged. A GitHub
-> Action check with `fail-on` set fails with exit 3 until PASS returns, where
-> proven, in the next release; for a non-blocking run meanwhile, set
-> `fail-on: none`. Where this README describes a PASS, `segmentation-ok` or a
-> `VERIFIED` claim, this release reports UNKNOWN / INDETERMINATE instead. See
-> [CHANGELOG.md](CHANGELOG.md).
+**What you give it:** a config file or text export (or paste it on stdin). It
+reads:
 
-**Point it at a firewall/ACL config → get a ranked list of dead, shadowed, and
-dangerously-permissive rules, each with the line to change.** Free, local, no
-account, no API key.
+- Cisco IOS access lists (extended, standard and IPv6)
+- Cisco ASA access-lists, including object-groups
+- Cisco NX-OS and Arista EOS access-lists
+- Juniper Junos firewall filters (brace form or `show configuration | display set`)
+- Palo Alto PAN-OS security rules (set format)
+- Linux iptables / ip6tables filter rules (`iptables-save` output or commands)
+- AWS Security Groups (the JSON from `aws ec2 describe-security-groups`)
 
-RuleHawk tells you a rule is wrong and shows the packet that proves it. It
-audits the rule layer only, so it does not tell you what a change breaks on your
-network; see [*Scope & limits*](#scope--limits-what-it-does-not-model).
+The vendor is detected automatically.
+
+**What you get back:** findings, worst first. Each names the rule, its line in
+your file, why it is a problem and the change that fixes it. Add `--json` for
+machine-readable output; the exit code tells a CI job whether to stop. Given a
+small policy file ("CORP must not reach PCI"), it also checks that, and on a
+violation shows an example packet the rules let through.
+
+**It tells you when it cannot tell.** A line it cannot model is listed in the
+report, never silently skipped. A rule it can only approximate is marked
+"indeterminate, review" instead of being counted as safe. A file it cannot read
+fails the run. It checks the rules only: routing, NAT and the rest of the
+network are out of scope (see [*Scope & limits*](#scope--limits-what-it-does-not-model)).
+
+**Free and open source** under the Apache-2.0 licence. It runs on your machine,
+your config never leaves it, and there is no account, no API key and no paid
+tier.
+
+> **Read this first: version 0.4.1 never reports PASS.** While a soundness
+> review is under way, a config with no problems at or above your threshold
+> comes back **UNKNOWN** with exit code **3** (reason `fail-closed-stopgap`),
+> not PASS. Problems it finds still come back FAIL (exit 1), and a file it
+> cannot read still exits 2. For a CI gate this means a clean change also fails
+> the check, so a gate that blocks on problems blocks every run.
+> `--fail-on none` (Action input `fail-on: none`) stops all blocking, FAIL
+> included; to block on FAIL and exit 2 but let UNKNOWN through, use the
+> short workflow recipe in [CHANGELOG.md](CHANGELOG.md) under "If you use
+> `optimesh-ai/RuleHawk@v1`". Where this README describes a PASS,
+> `segmentation-ok` or a `VERIFIED` claim, this release reports UNKNOWN or
+> INDETERMINATE instead.
 
 ## Try it
 
@@ -49,9 +74,9 @@ One of the three findings it prints:
 ```
 
 Then `rulehawk edge-fw.txt` for one config, `rulehawk gate configs/` for a
-directory, `--json` for machines. Exit code is non-zero on a critical/high
-finding (1) or when nothing could be audited (2), so it drops into CI.
-Every command uses one exit-code table:
+directory, `--json` for machines. The exit code is 1 on a critical/high
+finding, 2 when nothing could be audited, and 3 (UNKNOWN) otherwise in this
+release, so it drops into CI. Every command uses one exit-code table:
 
 <!-- rulehawk:exit-codes:begin (generated from rulehawk/exitcodes.py) -->
 | outcome | `rulehawk FILE` | `rulehawk gate` | `rulehawk combine` | Actions (`action.yml`, `comment/action.yml`) |
@@ -121,7 +146,7 @@ claude mcp add --transport stdio rulehawk --env RULEHAWK_MCP_ROOT="$PWD" -- rule
 
 | Tool | What it does |
 |---|---|
-| `rulehawk_audit` | Audit a config file or a directory: verdict `PASS` / `FAIL` / `INCOMPLETE` / `ERROR`, the blocking findings, and what was and wasn't analysed |
+| `rulehawk_audit` | Audit a config file or a directory: verdict `FAIL` / `UNKNOWN` / `INCOMPLETE` / `ERROR` (`ADVISORY` with `fail_on` none; this release never returns `PASS`), the blocking findings, and what was and wasn't analysed |
 | `rulehawk_list_findings` | Every finding, worst first, filterable by severity and kind, each with a stable id |
 | `rulehawk_explain_finding` | One finding by id (rule, source line, witness, fix), or what a finding kind means |
 | `rulehawk_compare` | Before vs after (files or directories): the findings a change introduces or resolves, and the rules it adds |
@@ -166,32 +191,9 @@ ruleset permits **fails the gate** (`connectivity-broken`, high) before the
 rollout ships instead of during it. Filter-layer proof only — routing/NAT and
 the proxy itself are out of scope (see *Scope & limits*).
 
-### Path-grounded segmentation (Hammerhead customers)
-This requires a licensed Hammerhead install (licensed separately; see
-[Hammerhead pricing](https://optimesh.ai/#pricing)) and a Hammerhead snapshot of
-the network; RuleHawk alone cannot do it. With both, RuleHawk can verify each
-segmentation-violation witness against
-Hammerhead's forwarding model (`hammerhead traceroute`), so violations on
-routing paths that can't actually deliver the packet are suppressed to
-informational, while confirmed leaks are stamped **path-confirmed**:
-
-```
-rulehawk config.txt --policy policy.json --hh-snapshot DIR --hh-from DEVICE
-```
-
-`DIR` is the Hammerhead snapshot directory and `DEVICE` is the source device the
-witness packet originates from. **Soundness rule:** only a deterministic,
-NAT-free "not delivered" verdict ever downgrades a finding — NAT on the path, an
-oracle error, or an unknown device all **fail closed** and the violation is kept
-(see `rulehawk/pathground.py`). So does a degraded model: from Hammerhead 0.2.2,
-when Hammerhead could not read part of the snapshot it still answers but exits 3,
-and RuleHawk keeps the violation and names the unread lines and devices in it.
-
-When `DEVICE` is a Cisco ASA, Hammerhead decides the witness by the interface
-the packet arrives on (interface security levels), so a host-sourced probe with
-no received interface is Unknown and the violation is kept. Name that interface
-with `--hh-ingress NAME` (the ASA `nameif`, e.g. `inside`); RuleHawk passes it as
-`hammerhead traceroute --ingress NAME` and never picks one itself.
+The optional `--hh-snapshot` / `--hh-from` / `--hh-ingress` flags work only with
+a separate commercial product and are not needed for anything above; they are
+documented in [docs/beyond-rulehawk.md](docs/beyond-rulehawk.md).
 
 ## Compliance evidence (`--evidence`)
 A finding is not evidence. Auditors and GRC platforms need to know *what was
@@ -254,10 +256,11 @@ For the whole fleet on every PR, set `evidence: true` on the Action — see
 - A hygiene **score** and an exportable **JSON** report.
 
 ## Vendors today
-Cisco IOS extended ACLs, Cisco NX-OS access-lists, Cisco ASA access-lists (with
-object-group resolution), Arista EOS access-lists, Juniper Junos firewall filters
-(brace form), Palo Alto PAN-OS security policy (set format), Linux
-iptables/ip6tables filter rules, and **AWS Security Groups**
+Cisco IOS access lists (extended, standard and IPv6), Cisco NX-OS access-lists,
+Cisco ASA access-lists (with object-group resolution), Arista EOS access-lists,
+Juniper Junos firewall filters (brace form, or `display set` form), Palo Alto
+PAN-OS security policy (set format), Linux iptables/ip6tables filter rules
+(`iptables-save` output or commands), and **AWS Security Groups**
 (`aws ec2 describe-security-groups` JSON) — vendor auto-detected.
 (Roadmap: FortiGate, AWS Network ACLs, nftables.)
 
@@ -276,28 +279,6 @@ or a prefix list — is never dropped and never guessed: it becomes one opaque
 `imprecise` rule, so that part of the space stays **indeterminate** rather than
 silently passing.
 
-## Where RuleHawk stops (and Hammerhead starts)
-
-| Question | RuleHawk (free, Apache-2.0) | Hammerhead |
-|---|---|---|
-| Which rules are shadowed, dead, redundant, any-any, or expose risky services? | Yes | — |
-| Does this ACL permit a flow my policy forbids? (witness packet) | Yes, per ruleset | Yes |
-| Is that packet actually delivered across routing, NAT and topology? | No | Yes |
-| What does this change (or the fix) break, before I push? | No | Yes |
-| Blast radius of a change across multiple devices | No | Yes |
-
-**Checking changes, not just rules?** [Hammerhead](https://optimesh.ai) runs the
-change against a model of your whole network (routing, reachability and
-segmentation) and tells you what it breaks before you push.
-
-Every report states that scope (JSON: `verification_boundary`). When a result
-raises a question only a forwarding model can answer (a live segmentation
-violation, or a broken `must_reach` flow) the report adds one "next step" line
-pointing at [Hammerhead](https://optimesh.ai/#trial) (access by request). It stays quiet for hygiene-only
-results, for `*-indeterminate` findings (those need the rule fixed, not a
-forwarding model), for accepted risks, and for findings Hammerhead has already
-path-grounded.
-
 ## Scope & limits (what it does *not* model)
 RuleHawk is a fast, sound **rule-layer gate** for config changes, not a
 network-wide reachability or change-impact verifier. It reasons about the
@@ -309,20 +290,26 @@ network-wide reachability or change-impact verifier. It reasons about the
 - **No routing/topology** — each config is an independent first-match context, so a
   `segmentation-violation` means "a ruleset on the path permits the forbidden flow,"
   not a full end-to-end reachability proof (that needs a forwarding model such as
-  [Batfish](https://github.com/batfish/batfish), or [Hammerhead](https://optimesh.ai)
-  to also verify a change offline before you push).
+  the open-source [Batfish](https://github.com/batfish/batfish)).
 - **L7/identity** (PAN-OS app-ID, source-user), `time-range`, `inactive`, interface
   bindings, and fragments are over-approximated/treated conservatively and surfaced
   as notes — RuleHawk errs toward over-reporting and **fails closed**, never toward a
   false "isolated."
+
+Every report states that scope (JSON: `verification_boundary`). When a result
+raises a question only a forwarding model can answer (a live segmentation
+violation, or a broken `must_reach` flow), the report adds one "Next:" line
+saying so and naming Batfish as an open-source forwarding model. It stays quiet
+for hygiene-only results, for `*-indeterminate` findings (those need the rule
+fixed, not a forwarding model), for accepted risks, and for findings already
+checked with `--hh-snapshot`.
 
 ## Hosted page analytics
 The hosted page sends nothing unless its operator sets an endpoint, and never
 sends config text or findings. See [docs/hosted-analytics.md](docs/hosted-analytics.md).
 
 ## License
-RuleHawk is Apache-2.0 — see `LICENSE`. This licence covers RuleHawk only;
-Hammerhead is proprietary and licensed separately.
+RuleHawk is Apache-2.0 — see `LICENSE`.
 
 ## Layout
 - `rulehawk/model.py` — normalized ACE + `covers()` (packet-space containment).
@@ -330,7 +317,7 @@ Hammerhead is proprietary and licensed separately.
 - `rulehawk/parse_nxos.py` / `parse_eos.py` / `parse_junos.py` / `parse_panos.py` / `parse_iptables.py` — vendor frontends.
 - `rulehawk/analyze.py` — the rule-space analysis engine (the core IP).
 - `rulehawk/segcheck.py` — segmentation-intent proof (witness packets).
-- `rulehawk/pathground.py` — Hammerhead path-grounding of segmentation witnesses (`--hh-snapshot`/`--hh-from`).
+- `rulehawk/pathground.py` — optional path check of segmentation witnesses (`--hh-snapshot`/`--hh-from`; see [docs/beyond-rulehawk.md](docs/beyond-rulehawk.md)).
 - `rulehawk/boundary.py` — the verification boundary: the scope every report states, and when a finding needs a forwarding model.
 - `rulehawk/report.py` — text + JSON reports.
 - `rulehawk/gate.py` — the CI gate: multi-file audit → SARIF + PR comment + summary.
@@ -357,5 +344,10 @@ serves a stale parser while the CLI is already fixed — this has happened befor
 
 CI enforces this automatically: `tests/test_vendor_sync.py` runs on every
 `python -m pytest` invocation and will fail the build if any `.py` file drifts.
+
+## Who maintains this
+
+RuleHawk is maintained by Optimesh. It is free, with no paid tier; what it does
+not check is described in [docs/beyond-rulehawk.md](docs/beyond-rulehawk.md).
 
 <!-- mcp-name: io.github.optimesh-ai/rulehawk -->

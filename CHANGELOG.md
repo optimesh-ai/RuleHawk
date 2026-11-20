@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### README rewritten for a first-time reader (docs only)
+
+The README now opens with what RuleHawk checks, which config formats it reads,
+what it gives back, that it is free (Apache-2.0, no account, no API key, no
+paid tier) and that it says so when it cannot tell. The 0.4.1 notice (never
+PASS; a clean config is UNKNOWN, exit 3) stays near the top and says what that
+means for a CI gate. The vendor list now names what the parsers read today
+(Junos `display set` form, IOS standard and IPv6 ACLs, `iptables-save` or
+commands). The `--hh-snapshot` path-grounding feature, which needs a separately
+licensed product, and the list of what RuleHawk does not check moved to
+`docs/beyond-rulehawk.md`. Stale text fixed: the report's "Next:" line names
+Batfish, not a commercial product; the MCP `rulehawk_audit` verdict list no
+longer shows PASS; the exit-code summary mentions exit 3. No behaviour change.
+
 ### One exit-code table (#42 phase 2)
 
 Every command now takes its exit codes from one table, `rulehawk/exitcodes.py`.
