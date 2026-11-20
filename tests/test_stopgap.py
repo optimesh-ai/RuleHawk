@@ -842,6 +842,32 @@ def _sweep(label: str, text: str):
                        f"...{text[max(0, m.start() - 80):m.end() + 80]}...")
 
 
+
+# The plain reason sentence names PASS only to say it is never given. The
+# sweep exempts that exact, whole sentence and nothing shorter: a near miss
+# (the denial dropped, or a bare PASS next to it) still fails.
+PLAIN_REASON = ("this version of RuleHawk never gives an all-clear (PASS), even "
+                "when it reports no blocking finding (see 'Read this first' in "
+                "the README)")
+
+
+def test_sweep_exempts_only_the_exact_reason_sentence():
+    _sweep("reason sentence", f"UNKNOWN (fail-closed-stopgap: {PLAIN_REASON}).")
+    _sweep("reason sentence, JSON", json.dumps({"message": PLAIN_REASON}))
+    near_misses = [
+        PLAIN_REASON.replace("never gives", "gives"),
+        PLAIN_REASON.replace("never ", ""),
+        PLAIN_REASON.replace("(PASS)", "(PASS) PASS"),
+        PLAIN_REASON[:-1],                                  # truncated
+        PLAIN_REASON.upper(),
+        f"{PLAIN_REASON}. Result: PASS",
+        f"PASS {PLAIN_REASON}",
+        f"{PLAIN_REASON} all-clear",
+    ]
+    for text in near_misses:
+        with pytest.raises(AssertionError):
+            _sweep("near miss", text)
+
 def _all_outputs(tmp_path, cfg, pol_path, pol_obj):
     pargs = ["--policy", pol_path] if pol_path else []
     out = {}
