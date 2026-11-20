@@ -133,8 +133,9 @@ def test_pass_verdict_rendered_in_markdown_and_console(tmp_path):
     md = gate.to_markdown(g)
     # exact UNKNOWN wording — the first line a reviewer reads on a clean gate
     assert ("**UNKNOWN** — no finding at or above `high`, but this run is not "
-            "certified (`fail-closed-stopgap`: fail-closed stopgap pending "
-            "soundness review). Exit 3 fails the check.") in md
+            "certified (`fail-closed-stopgap`: this version of RuleHawk never "
+            "gives an all-clear (PASS), even when it reports no blocking finding "
+            "(see 'Read this first' in the README)). Exit 3 fails the check.") in md
     assert "✅" not in md and "FAIL" not in md
     # the undecided isolation is named, not hidden
     assert "Segmentation UNKNOWN (`fail-closed-stopgap`:" in md

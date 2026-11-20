@@ -200,7 +200,9 @@ def test_clean_config_text_says_policy_is_clean():
     findings = analyze(aces)
     out = to_text(findings, notes, len(aces), vendor="ios-asa")
     # fail-closed stopgap: a clean config says UNKNOWN with the reason
-    assert "verdict UNKNOWN: fail-closed stopgap pending soundness review" in out
+    assert ("verdict UNKNOWN: this version of RuleHawk never gives an all-clear "
+            "(PASS), even when it reports no blocking finding (see 'Read this "
+            "first' in the README)") in out
 
 
 def test_clean_config_json_has_vendor_field():

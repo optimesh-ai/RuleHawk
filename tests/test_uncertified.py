@@ -171,7 +171,7 @@ def test_fingerprint_is_stable_across_runs_and_line_shifts(tmp_path):
 
 def test_uncertified_message_says_what_it_is():
     msg = _uncertified(_sarif([CLEAN]))[0]["message"]["text"]
-    assert "not certified" in msg and "fail-closed stopgap" in msg
+    assert "not certified" in msg and allclear.STOPGAP_MESSAGE in msg
     assert "UNKNOWN" in msg
 
 

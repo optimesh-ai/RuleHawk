@@ -35,6 +35,13 @@ SEG_OK = "segmentation-ok"
 REACH_OK = "connectivity-ok"
 COMPLETE = "complete"         # MCP coverage.state: every file is file-certified
 
+# The text of reason code `fail-closed-stopgap`, the one copy every surface
+# prints. It names no verdict word: UNKNOWN, ADVISORY and INDETERMINATE
+# results all carry it.
+STOPGAP_MESSAGE = ("this version of RuleHawk never gives an all-clear (PASS), even "
+                   "when it reports no blocking finding (see 'Read this first' in "
+                   "the README)")
+
 # What each one is while it is not certified (the 0.4.1 stopgap's answers).
 _STOPGAP = {
     PASS: "UNKNOWN",

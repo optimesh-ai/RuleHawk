@@ -104,9 +104,10 @@ definition in version control next to the configs):
 **Scope caveat (read this):** `connectivity-ok` proves the **filter layer does
 not block the flow** in the audited configs. RuleHawk does not model routing,
 NAT, or the proxy itself (see the README's *Scope & limits*) — it is the
-firewall-side precheck, not an end-to-end path proof. Path grounding against a
-forwarding model needs [Hammerhead](https://optimesh.ai); Hammerhead customers
-can combine it with `--hh-snapshot`/`--hh-from`.
+firewall-side precheck, not an end-to-end path proof. An end-to-end answer
+needs a forwarding model; Batfish is an open-source one. The optional
+`--hh-snapshot DIR` and `--hh-from DEVICE` flags read a Hammerhead snapshot
+directory and a source device for path grounding (see `rulehawk --help`).
 
 ## Examples
 
@@ -167,7 +168,7 @@ section above. For `must_not_reach` entries:
   guess "isolated."
 - **`segmentation-unknown`** (info) — no permitted witness flow was found, but
   RuleHawk 0.4.1 does not certify the assertion: reason `fail-closed-stopgap`,
-  "fail-closed stopgap pending soundness review". It is not an isolation claim.
+  "this version of RuleHawk never gives an all-clear (PASS), even when it reports no blocking finding (see 'Read this first' in the README)". It is not an isolation claim.
   (Before 0.4.1 this case was reported as `segmentation-ok`; that ID is no
   longer emitted.)
 - **`segmentation-error`** (high) — the policy itself is invalid: a

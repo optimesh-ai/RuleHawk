@@ -1,6 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.4.2: Plain reason text for UNKNOWN
+
+### What a clean run says (message text only)
+
+Message text only; no verdict or exit code changes. A run with no blocking
+finding used to say `fail-closed-stopgap: fail-closed stopgap pending
+soundness review`, which reads as if the tool were broken. The text that goes
+with reason code `fail-closed-stopgap` is now:
+
+> this version of RuleHawk never gives an all-clear (PASS), even when it
+> reports no blocking finding (see 'Read this first' in the README)
+
+It is the same sentence on every surface: the CLI, `--json` `reasons`, the
+evidence report, the gate's markdown, console and PR comment, the SARIF note,
+`rulehawk combine`, the MCP tools (UNKNOWN, and ADVISORY under
+`fail_on=none`), `--help` and the exit-code table. It does not say the config
+is safe or that nothing is wrong: with a policy, a run can have no blocking
+finding while a problem RuleHawk does not model is still there.
+
+Unchanged: the reason code `fail-closed-stopgap`, every verdict, every exit
+code, every JSON key, the SARIF rule ids and `passed`. This version still
+never reports PASS. The two Actions keep their own annotation text for now.
+`server.json` now carries the package version (it said 0.4.0).
 
 ### README rewritten for a first-time reader (docs only)
 

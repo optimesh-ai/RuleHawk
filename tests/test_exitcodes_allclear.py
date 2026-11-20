@@ -525,7 +525,7 @@ _EXEMPT = collections.Counter({
     "exitcodes.py::<module>::literal::PASS (certified). Not emitted by this release (fail-closed stopgap)": 1,
     "exitcodes.py::<module>::literal::only for --help; an audited run never exits 0 (PASS is not\n     emitted ": 1,
     "exitcodes.py::<module>::literal::only with --fail-on none (advisory; the verdict still says\n     UNKNOWN/": 1,
-    "exitcodes.py::help_section::literal:: (0.4.1, fail-closed stopgap: PASS is never reported):": 1,
+    "exitcodes.py::help_section::literal:: (this version never reports PASS):": 1,
     "exitcodes.py::markdown_table::literal::. The Actions never report an exit code as a PASS, and `comment/action.y": 1,
     # Negated messages: they name PASS only to deny it (test_stopgap NEGATIONS).
     "gate.py::<module>::literal::The segmentation policy itself is invalid (unknown zone, bad CIDR or por": 1,
@@ -1252,6 +1252,7 @@ _ALLCLEAR_TOP_LEVEL = (
     "PASS = <str>", "VERIFIED = <str>", "NO_NEW_RISK = <str>",
     "SEG_OK = <str>", "REACH_OK = <str>",
     "COMPLETE = <str>",                     # slice 2: coverage.state
+    "STOPGAP_MESSAGE = <str>",              # 0.4.2: the reason text, one copy
     "_STOPGAP = <dict of names to str>",
     "def _require_certified", "def certified", "def emit", "def passed", "def exit_code",
 )
@@ -1292,7 +1293,7 @@ def _allclear_shape_problems(src: str) -> list:
 # both copies, as well as the per-definition pins above (which name the
 # definition that changed). Any edit, a comment included, is a reviewed change
 # of this line.
-_ALLCLEAR_FILE_SHA = "ff894ef8c6b178caad0d2f6914f8a2aebd230a0338fd2a87691b981f4fff8440"  # slice 2: COMPLETE
+_ALLCLEAR_FILE_SHA = "2a40999dfab941a6fb48ae1dacb17e56f1754d61d8a8e31788b9ab212f0fb90b"  # 0.4.2: STOPGAP_MESSAGE
 
 
 def _allclear_pin_problems(src: str) -> list:

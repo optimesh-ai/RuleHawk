@@ -29,7 +29,10 @@ ACCEPTED = 4         # reserved: not emitted until ACCEPTED ships
 
 ACCEPTED_EMITTED = False
 
-_STOPGAP = "fail-closed stopgap pending soundness review"
+# Stands for the reason text of `fail-closed-stopgap`, which lives in
+# rulehawk/allclear.py (STOPGAP_MESSAGE). allclear imports this module, so the
+# text is filled in when a table or --help section is rendered, not here.
+_STOPGAP = "{stopgap}"
 _RESERVED = "reserved: not emitted until ACCEPTED ships"
 
 # (outcome, rulehawk FILE, rulehawk gate, rulehawk combine, Actions)
@@ -60,10 +63,16 @@ MARK_BEGIN = "<!-- rulehawk:exit-codes:begin (generated from rulehawk/exitcodes.
 MARK_END = "<!-- rulehawk:exit-codes:end -->"
 
 
+def _with_reason(text: str) -> str:
+    from .allclear import STOPGAP_MESSAGE
+    return text.replace(_STOPGAP, STOPGAP_MESSAGE)
+
+
 def markdown_table() -> str:
     """The exit-code table as it appears in README and docs/github-action.md."""
     lines = [_HEADER, "|---|---|---|---|---|"]
     lines += ["| " + " | ".join(r) + " |" for r in _ROWS]
+    lines = [_with_reason(line) for line in lines]
     lines.append("")
     lines.append(f"Precedence on `rulehawk FILE` and `rulehawk gate`: {INVALID}, "
                  f"then {FAIL}, then {UNKNOWN}, then {ACCEPTED}, then {PASS}. "
@@ -116,9 +125,8 @@ _HELP_TAIL = {
 def help_section(command: str) -> str:
     """The `exit codes` section of `--help` for "file", "gate" or "combine"."""
     scope = ", over the enforced checks" if command == "combine" else ""
-    out = [f"exit codes{scope} (0.4.1, fail-closed stopgap: PASS is never "
-           f"reported):"]
-    out += [f"  {code}  {text}" for code, text in _HELP[command]]
+    out = [f"exit codes{scope} (this version never reports PASS):"]
+    out += [f"  {code}  {_with_reason(text)}" for code, text in _HELP[command]]
     return "\n".join(out) + "\n" + _HELP_TAIL[command]
 
 

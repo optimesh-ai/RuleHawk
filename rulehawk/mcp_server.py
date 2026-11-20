@@ -345,8 +345,8 @@ def _coverage(gate, base: str, skipped: List[dict]) -> dict:
         state = allclear.emit(allclear.COMPLETE)
         # The text names the state emit() gave, so the two cannot disagree.
         why = ("every file was parsed and every line was modelled; "
-               f"{uncertified} file(s) are not certified (fail-closed stopgap "
-               f"pending soundness review), so coverage is {state}")
+               f"{uncertified} file(s) are not certified because "
+               f"{STOPGAP_MESSAGE}, so coverage is {state}")
     return {
         "state": state,
         "explanation": why,
@@ -773,9 +773,8 @@ def supported_inputs() -> dict:
 INSTRUCTIONS = (
     "RuleHawk audits firewall/ACL rulesets locally (rule layer only). Before "
     "pushing an ACL or firewall change, call rulehawk_audit (or rulehawk_compare "
-    "with the running and candidate configs), using absolute paths. This "
-    "release gives no all-clear (fail-closed stopgap pending soundness "
-    "review): a run with nothing blocking is UNKNOWN. Treat FAIL, "
+    "with the running and candidate configs), using absolute paths. A run "
+    f"with nothing blocking is UNKNOWN because {STOPGAP_MESSAGE}. Treat FAIL, "
     "INTRODUCES_RISK, UNKNOWN, INCOMPLETE, ADVISORY or ERROR as a stop, and "
     "show the human the blocking findings and the coverage.not_analysed list. "
     "RuleHawk does not model routing, NAT or topology."
