@@ -13,7 +13,9 @@ python3 -m venv ~/.venvs/rulehawk
 ~/.venvs/rulehawk/bin/rulehawk-mcp --version
 ```
 
-`--version` should print `rulehawk-mcp 0.4.0 (Python 3.x, MCP SDK 2.x)`.
+`--version` should print `rulehawk-mcp <version> (Python 3.x, MCP SDK 2.x)`,
+where `<version>` is the RuleHawk version you installed (0.4.2 at the time
+of writing).
 The CLI runs on Python 3.9+; the MCP server needs 3.10+ (on 3.9 pip quietly
 skips the `[mcp]` extra, and `--version` tells you so). To pin a version, add
 `@<commit-sha>` after `RuleHawk` in the URL.
@@ -54,7 +56,7 @@ Then your own configs:
 | a directory of configs, mixed vendors | `rulehawk gate configs/` |
 | a segmentation policy | add `--policy policy.json` ([schema](policy.md)) |
 
-Exit code (0.4.1, fail-closed stopgap: PASS is never reported): 1 a
+Exit code (this version never reports PASS): 1 a
 critical/high finding (`rulehawk gate`: a finding at or above `--fail-on`), 2
 nothing could be audited, or bad usage (a file with no rules RuleHawk
 recognises is never reported as clean), 3 UNKNOWN: no such finding, but not
