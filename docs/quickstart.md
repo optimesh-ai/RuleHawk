@@ -127,8 +127,7 @@ RuleHawk"* or *"Before I push it, compare running.cfg with candidate.cfg"*.
 ### What the agent gets back
 
 - `verdict`: `UNKNOWN` (nothing blocking was found, but the result is not
-  certified: reason `fail-closed-stopgap`, "fail-closed stopgap pending
-  soundness review" — treat it as a stop), `FAIL`, `INCOMPLETE` (something
+  certified: reason `fail-closed-stopgap`, "this version of RuleHawk never gives an all-clear (PASS), even when it reports no blocking finding (see 'Read this first' in the README)" — treat it as a stop), `FAIL`, `INCOMPLETE` (something
   was not analysed), `ADVISORY` (`fail_on: none`), or `ERROR` (with
   `error_code` and a `hint` saying what to change). `rulehawk_compare`
   returns `UNKNOWN` / `INTRODUCES_RISK`. RuleHawk 0.4.1 never returns `PASS`

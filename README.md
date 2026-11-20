@@ -36,7 +36,7 @@ network are out of scope (see [*Scope & limits*](#scope--limits-what-it-does-not
 your config never leaves it, and there is no account, no API key and no paid
 tier.
 
-> **Read this first: version 0.4.1 never reports PASS.** While a soundness
+> **Read this first: version 0.4.2, like 0.4.1, never reports PASS.** While a soundness
 > review is under way, a config with no problems at or above your threshold
 > comes back **UNKNOWN** with exit code **3** (reason `fail-closed-stopgap`),
 > not PASS. Problems it finds still come back FAIL (exit 1), and a file it
@@ -84,7 +84,7 @@ release, so it drops into CI. Every command uses one exit-code table:
 | PASS (certified). Not emitted by this release (fail-closed stopgap) | 0 | 0 | 0 | not emitted; an enforced exit 0 fails the step closed |
 | FAIL | 1 | 1 | 1 | `verdict=FAIL`; the step fails |
 | config parsed to zero rules, unreadable or invalid input, usage | 2 | 2 | 2 (usage only) | the step fails (fail-closed) |
-| UNKNOWN (reason `fail-closed-stopgap`: fail-closed stopgap pending soundness review) | 3 | 3 | 2 | `verdict=UNKNOWN`; the step fails |
+| UNKNOWN (reason `fail-closed-stopgap`: this version of RuleHawk never gives an all-clear (PASS), even when it reports no blocking finding (see 'Read this first' in the README)) | 3 | 3 | 2 | `verdict=UNKNOWN`; the step fails |
 | ACCEPTED (reserved: not emitted until ACCEPTED ships) | 4 | 4 | 4 | not emitted; any code but 0 fails the step |
 | advisory: `gate --fail-on none`, or combine with no enforced check | n/a | 0, with the verdict (UNKNOWN or FAIL) reported | 0 | the step succeeds with a warning naming the verdict |
 | `--help` | 0 | 0 | 0 | n/a |

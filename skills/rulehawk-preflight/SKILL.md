@@ -45,7 +45,7 @@ Before any of these, for any file that holds firewall or ACL rules:
    | `INCOMPLETE` | **Stop.** Something was not analysed. |
    | `ERROR` | **Stop.** Read `error` and `hint`, fix the call (usually the path: make it absolute) and re-run. |
 | `ADVISORY` | You ran with `fail_on: none`, which never blocks. Not an all-clear: re-run with the default unless the human asked for advisory. |
-   | `UNKNOWN` (audit or compare) | **Stop.** Not a pass, whatever `coverage.state` says: nothing blocking was found, but the result is not certified — reason `fail-closed-stopgap`, "fail-closed stopgap pending soundness review". Tell the human exactly that and go on only if they say so (see Overrides). |
+   | `UNKNOWN` (audit or compare) | **Stop.** Not a pass, whatever `coverage.state` says: nothing blocking was found, but the result is not certified — reason `fail-closed-stopgap`, "this version of RuleHawk never gives an all-clear (PASS), even when it reports no blocking finding (see 'Read this first' in the README)". Tell the human exactly that and go on only if they say so (see Overrides). |
 
    RuleHawk 0.4.1 never returns `PASS` or `NO_NEW_RISK` (fail-closed stopgap):
    every audit or compare that does not fail is `UNKNOWN`.
@@ -107,7 +107,7 @@ rulehawk gate CONFIG_DIR_OR_FILES... --policy policy.json --fail-on high
 Exit 1 means a finding at or above the threshold (FAIL), 2 means a file could
 not be read or parsed to zero rules, and 3 means UNKNOWN: nothing reached the
 threshold, but the run is not certified (reason `fail-closed-stopgap`,
-"fail-closed stopgap pending soundness review"). Treat 1, 2 and 3 as a stop,
+"this version of RuleHawk never gives an all-clear (PASS), even when it reports no blocking finding (see 'Read this first' in the README)"). Treat 1, 2 and 3 as a stop,
 exactly as above. RuleHawk 0.4.1 exits 0 only with `--fail-on none`, which
 never blocks and is not an all-clear. The CLI has no compare mode: audit the candidate, then the current
 config, and compare the two finding lists yourself.

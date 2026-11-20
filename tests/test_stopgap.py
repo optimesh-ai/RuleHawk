@@ -37,7 +37,19 @@ DIRTY = os.path.join(_S, "ios_acl.txt")             # critical findings + violat
 POLICY = os.path.join(_S, "policy.json")
 
 CODE = "fail-closed-stopgap"
-MESSAGE = "fail-closed stopgap pending soundness review"
+MESSAGE = ("this version of RuleHawk never gives an all-clear (PASS), even when "
+           "it reports no blocking finding (see 'Read this first' in the README)")
+# docs/index.html carries its own copy of the reason text, used when a run's
+# own reasons are [] (a FAIL run with an undecided segmentation panel). The
+# page is held for the owner's decision and still says the 0.4.1 sentence;
+# replace this constant with MESSAGE when the page is next edited.
+HOSTED_PAGE_FALLBACK_MESSAGE = "fail-closed stopgap pending soundness review"
+# action.yml and comment/action.yml write their own annotation text, and their
+# guard blocks are pinned byte for byte to e04630e (tests/
+# test_exitcodes_allclear.py::test_guard_blocks_are_byte_for_byte_from_e04630e),
+# so they still say the 0.4.1 sentence. Replace with MESSAGE when that pin is
+# next re-cut.
+ACTION_ANNOTATION_MESSAGE = "fail-closed stopgap pending soundness review"
 REASONS = [{"code": CODE, "message": MESSAGE}]
 
 # A config whose must_reach flow is fully permitted: before the stopgap this
@@ -265,7 +277,7 @@ def test_action_exit_3_fails_the_check_with_a_stopgap_annotation(tmp_path):
     p = _enforce(tmp_path, "3", "high", "UNKNOWN")
     assert p.returncode == 1
     assert "::error title=RuleHawk gate UNKNOWN" in p.stdout
-    assert CODE in p.stdout and MESSAGE in p.stdout
+    assert CODE in p.stdout and ACTION_ANNOTATION_MESSAGE in p.stdout
     assert "passed" not in p.stdout
 
 
@@ -773,7 +785,18 @@ def test_hosted_page_never_shows_an_empty_reason():
     for html in _render_hosted(envs):
         assert "Segmentation UNKNOWN" in html
         assert "()" not in html and "( )" not in html
-        assert f"{CODE}: {MESSAGE}" in html
+        assert f"{CODE}: {HOSTED_PAGE_FALLBACK_MESSAGE}" in html
+
+
+def test_hosted_page_fallback_reason_is_the_pinned_sentence():
+    """The pin above follows the page: the fallback sentence read from
+    docs/index.html is exactly HOSTED_PAGE_FALLBACK_MESSAGE, and not empty."""
+    html = open(os.path.join(_ROOT, "docs", "index.html"), encoding="utf-8").read()
+    m = re.search(r'const STOPGAP_REASONS = \[\{code: "([^"]*)",\s*'
+                  r'message: "([^"]*)"\}\];', html)
+    assert m, "STOPGAP_REASONS not found in docs/index.html"
+    assert m.group(1) == CODE
+    assert m.group(2) and m.group(2) == HOSTED_PAGE_FALLBACK_MESSAGE
 
 
 def test_hosted_page_static_copy_promises_no_passing_claim():
@@ -824,6 +847,11 @@ NEGATIONS = (
     "no claim in this report is marked verified",                         # evidence md
     "nothing unanalysed can pass",                                        # mcp INCOMPLETE
     "no all-clear is given",                                              # mcp INCOMPLETE
+    # The reason text of `fail-closed-stopgap` (rulehawk/allclear.py
+    # STOPGAP_MESSAGE): CLI, JSON reasons, evidence, gate, SARIF note,
+    # combine, MCP, --help. Exact and whole; see the near-miss test below.
+    "this version of RuleHawk never gives an all-clear (PASS), even when it "
+    "reports no blocking finding (see 'Read this first' in the README)",
 )
 BANNED = [re.compile(p, re.I) for p in (
     r"\bPASS\b", r"\bVERIFIED\b", r"segmentation-ok", r"connectivity-ok",
@@ -832,10 +860,18 @@ BANNED = [re.compile(p, re.I) for p in (
     r"all[- ]clear")]
 
 
+def _html_esc(s: str) -> str:
+    """docs/index.html's esc(), character for character."""
+    return "".join({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;",
+                    "'": "&#39;"}.get(c, c) for c in s)
+
+
 def _sweep(label: str, text: str):
     for n in NEGATIONS:
-        # the phrase as written, and as a JSON string escapes it (— is \u2014)
-        text = text.replace(n, "").replace(json.dumps(n)[1:-1], "")
+        # the phrase as written, as a JSON string escapes it (— is \u2014),
+        # and as the hosted page's esc() escapes it (' is &#39;)
+        text = (text.replace(n, "").replace(json.dumps(n)[1:-1], "")
+                .replace(_html_esc(n), ""))
     for pat in BANNED:
         m = pat.search(text)
         assert not m, (f"{label} emits {m.group(0)!r}: "
@@ -867,6 +903,9 @@ def test_sweep_exempts_only_the_exact_reason_sentence():
     for text in near_misses:
         with pytest.raises(AssertionError):
             _sweep("near miss", text)
+        with pytest.raises(AssertionError):
+            _sweep("near miss, hosted page", _html_esc(text))
+    _sweep("reason sentence, hosted page", _html_esc(f"x: {PLAIN_REASON}"))
 
 def _all_outputs(tmp_path, cfg, pol_path, pol_obj):
     pargs = ["--policy", pol_path] if pol_path else []

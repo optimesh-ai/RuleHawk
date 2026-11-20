@@ -141,8 +141,10 @@ def _surfaces(tmp_path):
         out.append((f"--help exit codes {cmd}",
                     " ".join(exitcodes.help_section(cmd).split())))
     out.append(("exit-code table", exitcodes.markdown_table()))
-    for p in ("action.yml", os.path.join("comment", "action.yml")):
-        out.append((p, open(os.path.join(_ROOT, p), encoding="utf-8").read()))
+    # action.yml and comment/action.yml are not listed: their guard blocks,
+    # annotation text included, are pinned byte for byte to e04630e
+    # (tests/test_exitcodes_allclear.py, test_guard_blocks_are_byte_for_byte_
+    # from_e04630e). The PR comment they post is gate.comment_body, above.
     return out
 
 
@@ -152,7 +154,7 @@ def test_every_surface_carries_the_one_sentence(tmp_path):
     for want in ("cli headline", "cli json reasons", "evidence INDETERMINATE",
                  "sarif note", "mcp UNKNOWN reasons", "mcp ADVISORY reasons",
                  "segmentation-unknown finding in a FAIL run", "combine",
-                 os.path.join("comment", "action.yml")):
+                 "gate comment"):
         assert want in labels, want
     for label, text in surfaces:
         assert SENTENCE in text, label

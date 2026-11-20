@@ -122,15 +122,14 @@ _KIND_HELP: Dict[str, str] = {
         "(neq / complex mask / unresolved group). Review manually.",
     "segmentation-unknown":
         "No parsed rule permits a witness flow for a declared zone isolation, "
-        "but it is not certified: fail-closed stopgap pending soundness "
-        "review. Verdict UNKNOWN (exit 3).",
+        f"but it is not certified: {STOPGAP_MESSAGE}. Verdict UNKNOWN (exit 3).",
     "segmentation-error":
         "The segmentation policy itself is invalid (unknown zone, bad CIDR or "
         "port) — fail-closed: the affected assertion gets no PASS until fixed.",
     "connectivity-unknown":
         "The parsed rules permit a declared must_reach flow (a witness packet "
-        "is shown), but connectivity is not certified: fail-closed stopgap "
-        "pending soundness review. Verdict UNKNOWN (exit 3).",
+        f"is shown), but connectivity is not certified: {STOPGAP_MESSAGE}. "
+        "Verdict UNKNOWN (exit 3).",
     "connectivity-broken":
         "A declared must_reach deployment flow (e.g. hosts -> proxy/vendor "
         "egress ranges) is permitted by NO parsed ruleset — the traffic will "
@@ -534,8 +533,8 @@ def _fingerprint(uri: str, f: Finding) -> str:
 
 UNCERTIFIED_RULE = "rulehawk/uncertified"
 _UNCERTIFIED_TEXT = (
-    "This release certifies no file (fail-closed stopgap pending soundness "
-    "review), so a run with nothing flagged is UNKNOWN, not a clean result. "
+    f"Reason: {STOPGAP_MESSAGE}. A run with nothing "
+    "flagged is UNKNOWN, not a clean result. "
     "This note is not a finding in the file; the exit code (3) is what blocks.")
 
 

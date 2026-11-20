@@ -38,6 +38,15 @@ import pytest
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _D = os.path.join(_ROOT, "tests", "fixtures", "junos_binding")
+# The reason text of `fail-closed-stopgap` names PASS only to say it is never
+# given. Exactly this whole sentence is removed before the "PASS" checks; any
+# other PASS in the output still fails them.
+_REASON = ("this version of RuleHawk never gives an all-clear (PASS), even when "
+           "it reports no blocking finding (see 'Read this first' in the README)")
+
+
+def _no_pass(out: str) -> bool:
+    return "PASS" not in out.replace(_REASON, "")
 _POLICY = os.path.join(_D, "policy.json")
 _CASES = sorted(n for n in os.listdir(_D) if n.startswith("g1_"))
 _H = [("h1_third_unfiltered_unit.conf", "policy.json"),
@@ -66,7 +75,7 @@ def test_cli_never_reports_isolation(name):
     path = os.path.join(_D, name)
     rc, out = _run(path, "--policy", _POLICY)
     assert rc != 0, (rc, out)
-    assert "PASS" not in out, out
+    assert _no_pass(out), out
     rc, out = _run(path, "--policy", _POLICY, "--json")
     assert rc != 0, (rc, out)
     d = json.loads(out)
@@ -99,7 +108,7 @@ def test_h_cases_never_report_an_all_clear(name, policy):
     for args in ((path, "--policy", pol), ("gate", path, "--policy", pol)):
         rc, out = _run(*args)
         assert rc != 0, (args, rc, out)
-        assert "PASS" not in out, out
+        assert _no_pass(out), out
     rc, out = _run(path, "--policy", pol, "--json")
     assert rc != 0
     for f in json.loads(out)["findings"]:

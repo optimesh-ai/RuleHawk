@@ -167,7 +167,7 @@ section above. For `must_not_reach` entries:
   guess "isolated."
 - **`segmentation-unknown`** (info) — no permitted witness flow was found, but
   RuleHawk 0.4.1 does not certify the assertion: reason `fail-closed-stopgap`,
-  "fail-closed stopgap pending soundness review". It is not an isolation claim.
+  "this version of RuleHawk never gives an all-clear (PASS), even when it reports no blocking finding (see 'Read this first' in the README)". It is not an isolation claim.
   (Before 0.4.1 this case was reported as `segmentation-ok`; that ID is no
   longer emitted.)
 - **`segmentation-error`** (high) — the policy itself is invalid: a

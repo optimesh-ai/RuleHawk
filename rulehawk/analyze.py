@@ -23,6 +23,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Dict, List, Optional, Tuple
 
+from .allclear import STOPGAP_MESSAGE  # the one copy of the reason text
 from .model import (ACE, _PORTED, _WILDCARD_PROTO, _compatible_coverer, covered_dimensions,
                     covers, _union_covers)
 
@@ -62,7 +63,6 @@ _SSH_PORT = 22  # reported at MEDIUM
 # invalid input, 3 UNKNOWN; 0 only for the advisory `--fail-on none`.
 # --------------------------------------------------------------------------- #
 STOPGAP_CODE = "fail-closed-stopgap"
-STOPGAP_MESSAGE = "fail-closed stopgap pending soundness review"
 # The assertion findings that replace `segmentation-ok` / `connectivity-ok`.
 UNKNOWN_KINDS = ("segmentation-unknown", "connectivity-unknown")
 
